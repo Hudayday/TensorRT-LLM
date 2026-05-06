@@ -132,6 +132,7 @@ class KvCacheCreator:
         self._skip_est = skip_est
 
     def _get_model_kv_cache_manager_cls(self, model_engine: PyTorchModelEngine):
+        config = model_engine.model.model_config.pretrained_config
         cls = get_kv_cache_manager_cls(model_engine.model.model_config,
                                        self._kv_cache_config)
         if cls == KVCacheManagerV2:
@@ -140,6 +141,18 @@ class KvCacheCreator:
                     > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
                         self._cache_transceiver_config is not None
                         and self._cache_transceiver_config.backend is not None):
+                # Per-layer head_dim models (e.g., Gemma4 hybrid) require V2's
+                # split-pool layout. KVCacheManager (V1) coerces head_dim list
+                # to max(head_dim), changing per-layer KV byte sizes — which
+                # breaks correctness, not just efficiency. Fail fast here
+                # rather than silently producing wrong outputs.
+                if is_gemma4_hybrid(config):
+                    raise NotImplementedError(
+                        "Gemma4 hybrid attention requires KVCacheManagerV2, "
+                        "which is not yet supported with kv_connector_manager, "
+                        "beam_width > 1, event_buffer_max_size > 0, or "
+                        "cache_transceiver. Disable these features to run "
+                        "Gemma4 hybrid models.")
                 logger.warning(
                     "KVCacheManagerV2 is not supported with kv_connector_manager, beam width > 1, "
                     "event buffer max size > 0, or cache transceiver. Falling back to KVCacheManager."
@@ -381,17 +394,21 @@ class KvCacheCreator:
         # proportional split. Inferred from the model config since the hybrid
         # max_attention_window hasn't been populated in kv_cache_config yet at
         # this stage (it's filled in later by _create_kv_cache_manager).
+        # Only V2 has split-pool semantics — Mamba hybrid (which also has
+        # heterogeneous layer_types) uses MambaHybridCacheManager and would
+        # have its max_tokens estimate inflated incorrectly otherwise.
         num_pool_groups = 1
-        model_cfg = self._model_engine.model.model_config.pretrained_config
-        layer_types = getattr(model_cfg, "layer_types", None)
-        if isinstance(layer_types, (list, tuple)):
-            distinct = len(set(layer_types))
-            if distinct > 1:
-                num_pool_groups = distinct
-        elif (self._kv_cache_config.max_attention_window is not None
-              and len(set(self._kv_cache_config.max_attention_window)) > 1):
-            num_pool_groups = len(
-                set(self._kv_cache_config.max_attention_window))
+        if self._kv_cache_manager_cls == KVCacheManagerV2:
+            model_cfg = self._model_engine.model.model_config.pretrained_config
+            layer_types = getattr(model_cfg, "layer_types", None)
+            if isinstance(layer_types, (list, tuple)):
+                distinct = len(set(layer_types))
+                if distinct > 1:
+                    num_pool_groups = distinct
+            elif (self._kv_cache_config.max_attention_window is not None
+                  and len(set(self._kv_cache_config.max_attention_window)) > 1):
+                num_pool_groups = len(
+                    set(self._kv_cache_config.max_attention_window))
         num_cache_blocks *= num_pool_groups
 
         free_mem, total_mem = torch.cuda.mem_get_info()
@@ -760,16 +777,15 @@ class KvCacheCreator:
         )
 
     def _split_kv_cache_budget_for_draft(self) -> Optional[KvCacheConfig]:
-        """Split max_gpu_total_bytes between target and draft KV caches.
+        """Split KV cache budgets between target and draft KV caches.
 
         When using KVCacheManagerV2 with a separate draft KV cache,
-        max_gpu_total_bytes represents the total budget for both target and
-        draft combined.  This method splits the budget proportionally based
-        on their per-token KV cache sizes.
+        max_gpu_total_bytes and host_cache_size each represent the total
+        budget for both target and draft combined.  This method splits both
+        budgets proportionally based on their per-token KV cache sizes.
 
         Returns a cloned KvCacheConfig for the draft, or None if no split is
-        needed.  Also modifies self._kv_cache_config.max_gpu_total_bytes
-        in-place for the target.
+        needed.  Also modifies self._kv_cache_config in-place for the target.
         """
         total_budget = self._kv_cache_config.max_gpu_total_bytes
         if total_budget is None or total_budget <= 0:
@@ -784,7 +800,9 @@ class KvCacheCreator:
         if total_kv <= 0 or draft_kv <= 0:
             return None
 
-        draft_budget = int(total_budget * draft_kv / total_kv)
+        draft_ratio = draft_kv / total_kv
+
+        draft_budget = int(total_budget * draft_ratio)
         target_budget = total_budget - draft_budget
 
         logger.info(
@@ -796,6 +814,18 @@ class KvCacheCreator:
 
         draft_kv_cache_config = self._kv_cache_config.model_copy()
         draft_kv_cache_config.max_gpu_total_bytes = draft_budget
+
+        host_budget = self._kv_cache_config.host_cache_size
+        if host_budget is not None and host_budget > 0:
+            draft_host_budget = int(host_budget * draft_ratio)
+            target_host_budget = host_budget - draft_host_budget
+            self._kv_cache_config.host_cache_size = target_host_budget
+            draft_kv_cache_config.host_cache_size = draft_host_budget
+            logger.info(
+                f"Splitting KV cache host budget: total={host_budget / GB:.2f} GiB, "
+                f"target={target_host_budget / GB:.2f} GiB, "
+                f"draft={draft_host_budget / GB:.2f} GiB")
+
         return draft_kv_cache_config
 
     def build_managers(self,
