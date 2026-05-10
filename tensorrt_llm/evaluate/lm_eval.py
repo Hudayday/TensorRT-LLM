@@ -37,9 +37,10 @@ from .._tensorrt_engine import LLM
 from ..inputs import (ConversationMessage, MultimodalDataTracker,
                       add_multimodal_placeholders, convert_image_mode)
 from ..inputs.content_format import ContentFormat
+from ..inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from ..inputs.utils import _resolve_content_format
 from ..inputs.utils import apply_chat_template as trtllm_apply_chat_template
-from ..inputs.utils import resolve_hf_chat_template
+from ..inputs.utils import interleave_mm_placeholders, resolve_hf_chat_template
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -69,9 +70,8 @@ class LmEvalWrapper(TemplateLM):
         self.chat_template_kwargs = chat_template_kwargs
         self.output_dir = output_dir
         # When True, CLI-provided sampling params (temperature/top_k/top_p/seed)
-        # take precedence over task yaml gen_kwargs.  Needed to match the
-        # sampling recipe published by a model card (e.g., Gemma4 26B:
-        # temperature=1.0, top_p=0.95, top_k=64).
+        # take precedence over task yaml gen_kwargs. Lets users reproduce a
+        # model-card sampling recipe without editing the task yaml.
         self.sampling_override = sampling_override
 
     @property
@@ -206,34 +206,37 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             output_dir: Directory to save the task infos.
             sampling_override: If True, sampling_params override task gen_kwargs.
         """
-        super().__init__(llm,
-                         sampling_params,
-                         streaming,
-                         output_dir=output_dir,
-                         sampling_override=sampling_override)
+        super().__init__(
+            llm,
+            sampling_params=sampling_params,
+            streaming=streaming,
+            chat_template_kwargs=chat_template_kwargs,
+            model_type=model_type,
+            is_force_single_image=is_force_single_image,
+            output_dir=output_dir,
+            sampling_override=sampling_override,
+        )
 
         # NOTE: Required by lm_eval to identify this as a multimodal model
         self.MULTIMODAL = True
         self.max_images = max_images
-        self.chat_template_kwargs = chat_template_kwargs
         self.model_type = model_type if model_type is not None else self._get_model_type(
             llm)
         self.is_force_single_image = is_force_single_image
 
-        # For OPENAI content-format templates (e.g., Gemma4, Qwen2.5-VL), preserve
-        # the original interleaved positions of images inside the question text.
-        # Benchmarks such as MMMU Pro embed ``<image N>`` tags inside the question
-        # (e.g., "Consider <image 1>. What does <image 2> show?") and lose answer
-        # grounding when all images are bulk-prepended before the text.  Setting
-        # interleave=True makes apply_chat_template below produce a
-        # ``content_parts`` list that interleaves text segments with media entries,
-        # which ``_build_openai_content`` turns into a correctly-ordered OpenAI
-        # content list.  Effect is bounded by the fraction of multi-image
-        # questions in the task — modest on MMMU Pro (~8% multi-image, ~+1 pp)
-        # but critical when it matters.  STRING-template paths still use the old
-        # strip-and-prepend behaviour (interleaving is handled via the registered
-        # placeholder_placement at the content-flattening step).
-        self.interleave = True
+        # Default off; models opt in via
+        # ``MultimodalPlaceholderMetadata.interleave_placeholders=True`` in
+        # their ``@register_input_processor`` registration. When opted in,
+        # ``apply_chat_template`` below builds a ``content_parts`` list whose
+        # order mirrors the original ``<image>`` positions in the user
+        # prompt — required by benchmarks like MMMU Pro which embed
+        # ``<image N>`` tags inside the question (e.g., "Consider <image 1>.
+        # What does <image 2> show?") and lose grounding under bulk
+        # prepend/append. Off-by-default preserves the historical
+        # strip-and-bulk-insert behaviour for every other registered model
+        # so existing scores stay identical.
+        self.interleave = MULTIMODAL_PLACEHOLDER_REGISTRY.get_interleave_placeholders(
+            self.model_type)
 
     def _get_model_type(self, llm: Union[LLM, PyTorchLLM]) -> str:
         """Extract model type from the model configuration."""
@@ -284,11 +287,11 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             image_count = min(self.max_images,
                               text.count(LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER))
 
-            # Interleaved content_parts is only meaningful for OPENAI
-            # templates (which consume a list-of-dicts content). STRING
-            # templates use add_multimodal_placeholders on the flat text.
-            build_interleaved = (self.interleave and image_count > 1
-                                 and content_format == ContentFormat.OPENAI)
+            # Build a content_parts list that interleaves text segments with
+            # media dicts, mirroring the user's original placeholder positions.
+            # OPENAI templates consume the list directly; STRING templates
+            # flatten it via ``interleave_mm_placeholders`` below.
+            build_interleaved = self.interleave and image_count >= 1
             content_parts = None
             if build_interleaved:
                 segments = text.split(LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER)
@@ -325,10 +328,22 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                 mm_data_tracker.add_data("image", None)
             mm_placeholder_count = mm_data_tracker.placeholder_counts()
             if mm_placeholder_count and content_format != ContentFormat.OPENAI:
-                # Only pre-insert placeholders for STRING templates.
-                # OPENAI templates handle media natively via content dicts.
-                conv["content"] = add_multimodal_placeholders(
-                    self.model_type, conv["content"], mm_placeholder_count)
+                # STRING templates expect placeholders pre-inserted into the
+                # text.  When ``content_parts`` was built (interleave path),
+                # use ``interleave_mm_placeholders`` so the placeholders land
+                # at the original media positions; otherwise fall back to the
+                # registry placeholder_placement-driven bulk insertion.
+                if content_parts is not None:
+                    placeholder_modalities = {
+                        ph: "image"
+                        for ph in mm_placeholder_count
+                    }
+                    conv["content"] = interleave_mm_placeholders(
+                        self.model_type, content_parts, mm_placeholder_count,
+                        placeholder_modalities)
+                else:
+                    conv["content"] = add_multimodal_placeholders(
+                        self.model_type, conv["content"], mm_placeholder_count)
             mm_placeholder_counts.append(mm_placeholder_count)
             chat_history[i] = conv
 
@@ -971,9 +986,9 @@ class MMMUPro(LmEvalEvaluator):
 
     MMMU Pro (https://huggingface.co/datasets/MMMU/MMMU_Pro) is a harder
     sibling of MMMU with an expanded option set and a broader mix of
-    subjects.  Gemma4's HF blog reports MMMU Pro numbers, so we expose it
-    here as a first-class trtllm-eval task backed by a custom lm-eval
-    task yaml under ``tensorrt_llm/evaluate/lm_eval_tasks/mmmu_pro``.
+    subjects. Exposed as a first-class trtllm-eval task backed by a
+    custom lm-eval task yaml under
+    ``tensorrt_llm/evaluate/lm_eval_tasks/mmmu_pro``.
     """
 
     def __init__(self, subset: str = "standard_10", **kwargs):
@@ -988,9 +1003,9 @@ class MMMUPro(LmEvalEvaluator):
                   type=click.Choice(["standard_10", "standard_4"]),
                   default="standard_10",
                   help=("MMMU Pro subset to evaluate. "
-                        "'standard_10' is the 10-option multiple-choice set "
-                        "reported on the Gemma4 model card (default); "
-                        "'standard_4' is the easier 4-option variant."))
+                        "'standard_10' is the 10-option multiple-choice "
+                        "set (default); 'standard_4' is the easier "
+                        "4-option variant."))
     @click.option("--dataset_path",
                   type=str,
                   default=None,
@@ -1020,14 +1035,24 @@ class MMMUPro(LmEvalEvaluator):
         help=
         "The system prompt to be added on the prompt. If specified, it will add {'role': 'system', 'content': system_prompt} to the prompt."
     )
-    @click.option("--max_input_length",
-                  type=int,
-                  default=8192,
-                  help="Maximum prompt length.")
-    @click.option("--max_output_length",
-                  type=int,
-                  default=512,
-                  help="Maximum generation length.")
+    @click.option(
+        "--max_input_length",
+        type=int,
+        default=8192,
+        show_default=True,
+        help="Maximum prompt length. Image-MM prompts include image soft "
+        "tokens — e.g. Gemma4 Image Processor's ``image_seq_length=280`` "
+        "(processor_config.json) per image — plus the question text and "
+        "chat-template overhead. 8192 (2x the text-task 4096 default) "
+        "covers MMMU Pro multi-image questions without truncation.")
+    @click.option(
+        "--max_output_length",
+        type=int,
+        default=32000,
+        show_default=True,
+        help="Maximum generation length. Default mirrors the lm-eval "
+        "harness yaml (``max_gen_toks: 32000``) under "
+        "tensorrt_llm/evaluate/lm_eval_tasks/mmmu_pro/_template_yaml.")
     @click.option("--temperature",
                   type=float,
                   default=None,
@@ -1145,10 +1170,15 @@ class MMMU(LmEvalEvaluator):
         help=
         "The system prompt to be added on the prompt. If specified, it will add {'role': 'system', 'content': system_prompt} to the prompt."
     )
-    @click.option("--max_input_length",
-                  type=int,
-                  default=8192,
-                  help="Maximum prompt length.")
+    @click.option(
+        "--max_input_length",
+        type=int,
+        default=8192,
+        show_default=True,
+        help="Maximum prompt length. Image-MM prompts include image soft "
+        "tokens (e.g. ~280 per image for Gemma3/4-style processors) plus "
+        "question text and chat-template overhead, so 8192 (2x the text-task "
+        "4096 default) covers multi-image MMMU questions without truncation.")
     @click.option(
         "--max_output_length",
         type=int,
@@ -1400,10 +1430,11 @@ class AIME2026(LmEvalEvaluator):
         default='{"thinking_budget": 32768}',
         show_default=True,
         callback=lambda ctx, param, value: json.loads(value) if value else None,
-        help='Chat template kwargs as JSON string. Default enables Gemma-style '
-        'thinking with a 32k budget (set thinking_budget to 0 to disable '
-        'thinking, or pass e.g. \'{"enable_thinking": true}\' for Qwen-style '
-        'templates).')
+        help='Chat template kwargs as JSON string. Default enables thinking '
+        'with a 32k budget for chat templates that consume '
+        '``thinking_budget`` (set to 0 to disable thinking; for templates '
+        'that use a different key, pass the appropriate JSON, e.g. '
+        '\'{"enable_thinking": true}\').')
     @click.option("--fewshot_as_multiturn",
                   is_flag=True,
                   default=False,
@@ -1515,10 +1546,11 @@ class AIME2025(LmEvalEvaluator):
         default='{"thinking_budget": 32768}',
         show_default=True,
         callback=lambda ctx, param, value: json.loads(value) if value else None,
-        help='Chat template kwargs as JSON string. Default enables Gemma-style '
-        'thinking with a 32k budget (set thinking_budget to 0 to disable '
-        'thinking, or pass e.g. \'{"enable_thinking": true}\' for Qwen-style '
-        'templates).')
+        help='Chat template kwargs as JSON string. Default enables thinking '
+        'with a 32k budget for chat templates that consume '
+        '``thinking_budget`` (set to 0 to disable thinking; for templates '
+        'that use a different key, pass the appropriate JSON, e.g. '
+        '\'{"enable_thinking": true}\').')
     @click.option("--fewshot_as_multiturn",
                   is_flag=True,
                   default=False,
