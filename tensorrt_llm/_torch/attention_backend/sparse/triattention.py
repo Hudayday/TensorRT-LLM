@@ -12,7 +12,7 @@ Calibration is computed offline via
 at LLM init time. See the calibration module for the statistic schema.
 """
 
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, ClassVar, Dict, Optional
 
 import torch
 
@@ -42,6 +42,11 @@ class TriAttention(SparseAttentionManager):
     physically evicts blocks below the top-B keep set. All other hooks remain
     no-op (form-III does not need context-phase or per-attention work).
     """
+
+    # TriAttention physically evicts tokens during decode based on per-request
+    # query / step state, so the resulting cache is not safe to reuse across
+    # requests (a different request would have evicted a different token set).
+    supports_kv_cache_reuse: ClassVar[bool] = False
 
     def __init__(
         self,

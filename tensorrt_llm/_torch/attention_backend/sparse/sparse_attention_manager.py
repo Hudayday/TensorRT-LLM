@@ -27,7 +27,7 @@ attention forward path, mirroring how speculative decoding wires Eagle3 /
 MTPHiddenStatesManager.
 """
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, ClassVar, Optional, Tuple
 
 import torch
 
@@ -54,6 +54,27 @@ class SparseAttentionManager:
     resource manager because this layer decides *how* the physical KV is used,
     not *what* physical KV exists.
     """
+
+    # ------------------------------------------------------------------ #
+    # Capability declarations (class-level metadata)                      #
+    # ------------------------------------------------------------------ #
+
+    # Whether this method is compatible with cross-request KV cache reuse
+    # (radix-tree / APC block reuse). Default conservative ``False``; subclasses
+    # must explicitly opt in if they are safe with reuse.
+    #
+    # Eviction-based methods (TriAttention, H2O, RocketKV Stage I, SnapKV,
+    # Scissorhands, ...) are generally ``False``: the evicted token set is
+    # query- / request-specific, so a reused prefix from a different request
+    # carries tokens this method would have evicted differently. Methods that
+    # operate only on the query side with a full physical cache (e.g., Quest
+    # building a per-page summary and computing query-aware masks without ever
+    # mutating cache contents) can declare ``True``.
+    #
+    # The LLM init factory enforces a mutex: combining a sparse manager whose
+    # ``supports_kv_cache_reuse=False`` with ``KvCacheConfig.enable_block_reuse=
+    # True`` raises a configuration error at init time.
+    supports_kv_cache_reuse: ClassVar[bool] = False
 
     def __init__(self, kv_cache_manager: "KVCacheManagerV2"):
         self.kv_cache_manager = kv_cache_manager

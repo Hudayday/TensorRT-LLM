@@ -1591,6 +1591,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
                 )
 
+        # TODO(sparse-attention): wire on_context_attention / on_generation_attention
+        # hooks of SparseAttentionManager here. Both fire after the attention forward
+        # for the corresponding phase (context vs generation) and may either return an
+        # input-side ``(indices, offsets)`` sparse mask (Quest / RocketKV Stage II HSA)
+        # or accumulate output-side ``attn_scores`` (H2O / Scissorhands). Exposing
+        # ``attn_scores`` to the hook requires a kernel ``RETURN_SCORES`` compile-time
+        # template flag (``false`` instantiation is byte-identical to the current path,
+        # 0 overhead); see sparse_attention_manager.py docstring and design doc 15
+        # §3.4.1 / §5.7.2. The legacy ``sparse_kv_predict`` / ``sparse_attn_predict``
+        # dispatch above (RocketKV / DSA) stays in place during the migration.
+
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger
         # recomputation when cache_seq_lens change. The metadata must always match the
