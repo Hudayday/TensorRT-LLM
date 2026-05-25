@@ -279,6 +279,22 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         """
         return False
 
+    @property
+    def is_behavior_layer_method(self) -> bool:
+        """
+        Whether this sparse-attention method lives in the behavior layer
+        (``SparseAttentionManager`` subclass holding ``KVCacheManagerV2`` as a
+        tool) rather than the memory layer (cache-manager subclass).
+
+        Default ``False``: legacy methods (RocketKV / DSA / skip_softmax) are
+        cache-manager subclasses dispatched through
+        ``get_sparse_attn_kv_cache_manager``. Behavior-layer methods
+        (TriAttention, future H2O / SnapKV) override this to ``True`` so the
+        framework picks the standard V2 cache manager and instantiates the
+        method via ``create_sparse_attention_manager`` instead.
+        """
+        return False
+
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for RocketKV sparse attention."""
@@ -473,6 +489,37 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
                 'prefill': _compute('prefill', self.target_sparsity_prefill),
                 'decode': _compute('decode', self.target_sparsity_decode),
             })
+
+
+class TriAttentionConfig(BaseSparseAttentionConfig):
+    """Configuration for TriAttention sparse attention.
+
+    Behavior-layer method: dispatched through the
+    ``SparseAttentionManager`` framework rather than via a custom KV-cache
+    manager subclass. The runtime instance is constructed by
+    ``create_sparse_attention_manager`` and consumes the offline ``.pt``
+    statistics produced by
+    ``tensorrt_llm._torch.attention_backend.sparse.triattention_calibration.
+    compute_triattention_calibration``.
+    """
+    algorithm: Literal["triattention"] = "triattention"
+    top_B: int = Field(
+        default=1024,
+        description="Number of tokens to keep at each periodic eviction.")
+    beta: int = Field(
+        default=128,
+        description="Eviction period (in generation steps). The eviction hook "
+        "fires once every ``beta`` decode steps.")
+    calibration_path: str = Field(
+        description="Path to the offline-computed calibration ``.pt`` produced "
+        "by ``compute_triattention_calibration``. Required.")
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    @property
+    def is_behavior_layer_method(self) -> bool:
+        return True
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
@@ -2477,6 +2524,7 @@ SparseAttentionConfig: TypeAlias = Annotated[
         RocketSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
+        TriAttentionConfig,
     ],
     Field(discriminator="algorithm"),
 ]

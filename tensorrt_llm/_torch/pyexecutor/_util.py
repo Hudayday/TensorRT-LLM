@@ -88,9 +88,16 @@ def get_kv_cache_manager_cls(
     """
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
-    if sparse_attn_config is not None:
+    if (sparse_attn_config is not None
+            and not sparse_attn_config.is_behavior_layer_method):
+        # Legacy memory-layer dispatch (RocketKV / DSA / skip_softmax own a
+        # sparse-aware cache manager subclass). Behavior-layer methods
+        # (TriAttention, future H2O / SnapKV) fall through to the standard
+        # non-hybrid V2 manager below; their algorithm runs inside a
+        # ``SparseAttentionManager`` constructed via
+        # ``create_sparse_attention_manager`` after PyExecutor instantiation.
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-    elif is_hybrid_linear(config):
+    if is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid manager.
         if model_config.get_num_mamba_layers() == 0:
@@ -1723,7 +1730,7 @@ def create_py_executor_instance(
                             if scheduler_config is not None else
                             WaitingQueuePolicy.FCFS)
 
-    return PyExecutor(
+    py_executor = PyExecutor(
         resource_manager,
         scheduler,
         model_engine=model_engine,
@@ -1753,6 +1760,18 @@ def create_py_executor_instance(
         waiting_queue_policy=waiting_queue_policy,
         dwdp_manager=dwdp_manager,
     )
+
+    # Wire SparseAttentionManager for behavior-layer sparse methods
+    # (TriAttention, future H2O / SnapKV). Legacy memory-layer methods
+    # (RocketKV / DSA / skip_softmax) leave ``sparse_attention_manager`` at the
+    # default ``None`` and continue to use their cache-manager subclass.
+    if (llm_args.sparse_attention_config is not None and
+            llm_args.sparse_attention_config.is_behavior_layer_method):
+        from ..attention_backend.sparse import create_sparse_attention_manager
+        py_executor.sparse_attention_manager = create_sparse_attention_manager(
+            llm_args.sparse_attention_config, kv_cache_manager)
+
+    return py_executor
 
 
 def create_torch_sampler_args(

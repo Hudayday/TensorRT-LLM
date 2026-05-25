@@ -1583,6 +1583,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 skip_softmax_threshold_scale_factor_prefill = self.sparse_attention_config.threshold_scale_factor_prefill
                 skip_softmax_threshold_scale_factor_decode = self.sparse_attention_config.threshold_scale_factor_decode
 
+            elif self.sparse_attention_config.is_behavior_layer_method:
+                # Behavior-layer methods (TriAttention, future H2O / SnapKV)
+                # dispatch through SparseAttentionManager hooks wired in
+                # PyExecutor and run the attention forward on the dense
+                # (possibly compacted) cache. Skip the legacy
+                # sparse_kv_predict / sparse_attn_predict path which on the
+                # base TrtllmAttention is ``raise NotImplementedError``.
+                pass
+
             else:
                 sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
                     q, k, metadata, forward_args)
