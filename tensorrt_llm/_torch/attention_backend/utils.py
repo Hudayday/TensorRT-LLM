@@ -16,6 +16,16 @@ def get_attention_backend(
     backend_name: str,
     sparse_attn_config: Optional["SparseAttentionConfig"] = None
 ) -> Type[AttentionBackend]:
+    # Behavior-layer sparse methods (e.g., TriAttention) live in a
+    # SparseAttentionManager subclass and operate out-of-band via PyExecutor
+    # hook call sites. They do NOT require a per-method attention subclass:
+    # the base attention class for the chosen backend is used unchanged, and
+    # any cache mutation happens through KVCacheManagerV2 API calls from the
+    # manager. Short-circuit the per-method dispatch below for these configs.
+    if (sparse_attn_config is not None
+            and sparse_attn_config.is_behavior_layer_method):
+        sparse_attn_config = None
+
     if backend_name == "VANILLA":
         if sparse_attn_config is not None:
             return get_vanilla_sparse_attn_attention_backend(sparse_attn_config)

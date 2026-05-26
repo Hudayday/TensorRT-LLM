@@ -21,10 +21,15 @@ def get_sparse_attn_kv_cache_manager(
     instance owns sparse-aware physical storage (RocketKV / DSA / plain V1).
 
     Behavior-layer methods (where ``config.is_behavior_layer_method == True``)
-    must not be routed through this factory; callers should short-circuit using
-    that property and use the standard V2 cache manager instead, then construct
-    the behavior-layer instance via :func:`create_sparse_attention_manager`.
+    do NOT own a sparse-aware cache manager — they use the standard V2 manager
+    and run their algorithm in a :class:`SparseAttentionManager` subclass.
+    This function returns ``None`` for such configs (caller falls through to
+    the standard V2 manager); top-level callers in ``_util.py`` short-circuit
+    earlier via ``is_behavior_layer_method``, so this defensive None-return is
+    mainly for tests and future direct callers.
     """
+    if sparse_attn_config.is_behavior_layer_method:
+        return None
     if sparse_attn_config.algorithm == "rocket":
         return RocketKVCacheManager
     elif sparse_attn_config.algorithm == "dsa":
@@ -88,6 +93,15 @@ def create_sparse_attention_manager(
 
 def get_vanilla_sparse_attn_attention_backend(
         sparse_attn_config: "SparseAttentionConfig"):
+    # Behavior-layer sparse methods use the base attention class without any
+    # method-specific shim; their work happens out-of-band in a
+    # SparseAttentionManager subclass invoked by PyExecutor. Top-level callers
+    # in attention_backend.utils.get_attention_backend short-circuit before
+    # reaching here, but we also short-circuit defensively for tests / future
+    # direct callers.
+    if sparse_attn_config.is_behavior_layer_method:
+        from ..vanilla import VanillaAttention
+        return VanillaAttention
     if sparse_attn_config.algorithm == "rocket":
         return RocketVanillaAttention
     else:
@@ -98,6 +112,11 @@ def get_vanilla_sparse_attn_attention_backend(
 
 def get_trtllm_sparse_attn_attention_backend(
         sparse_attn_config: "SparseAttentionConfig"):
+    # Behavior-layer sparse methods use the base attention class without any
+    # method-specific shim. Top-level callers short-circuit before reaching
+    # here; this defensive guard catches tests / future direct callers.
+    if sparse_attn_config.is_behavior_layer_method:
+        return TrtllmAttention
     if sparse_attn_config.algorithm == "rocket":
         return RocketTrtllmAttention
     elif sparse_attn_config.algorithm == "dsa":
@@ -112,6 +131,11 @@ def get_trtllm_sparse_attn_attention_backend(
 
 def get_flashinfer_sparse_attn_attention_backend(
         sparse_attn_config: "SparseAttentionConfig"):
+    # Behavior-layer sparse methods use the base attention class. Defensive
+    # short-circuit (mirrors get_trtllm / get_vanilla variants).
+    if sparse_attn_config.is_behavior_layer_method:
+        from ..flashinfer import FlashInferAttention
+        return FlashInferAttention
     raise ValueError(
         f"Unsupported sparse attention algorithm in flashinfer attention backend: {sparse_attn_config.algorithm}"
     )
