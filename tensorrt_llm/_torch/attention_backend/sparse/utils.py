@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -6,13 +6,16 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from .dsa import DSACacheManager, DSATrtllmAttention
 from .rocket import (RocketKVCacheManager, RocketTrtllmAttention,
                      RocketVanillaAttention)
-from .sparse_attention_manager import SparseAttentionManager
+from .sparse_attention_manager import (BaseKVCacheBehaviorManager,
+                                       SparseAttentionManager)
 from .triattention import TriAttention
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.resource_manager import \
         KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
+
+    from .coordinator import KVCacheBehaviorCoordinator
 
 
 def get_sparse_attn_kv_cache_manager(
@@ -89,6 +92,44 @@ def create_sparse_attention_manager(
     raise ValueError(
         f"Unsupported behavior-layer sparse attention algorithm: "
         f"{sparse_attn_config.algorithm}")
+
+
+def create_behavior_coordinator(
+    sparse_attn_config: "Optional[SparseAttentionConfig]",
+    kv_cache_manager: "KVCacheManagerV2",
+) -> "Optional[KVCacheBehaviorCoordinator]":
+    """Multi-manager factory: build a :class:`KVCacheBehaviorCoordinator`
+    from the user-facing config(s).
+
+    Currently (Phase 3 ship) only accepts a single
+    ``sparse_attention_config`` (legacy ``LlmArgs`` slot); when the v17
+    multi-manager ``LlmArgs`` field (``behavior_managers: List[...]``)
+    lands, this factory will accept a list of axis-discriminated configs
+    instead. The Phase 3 wrapping path constructs at most one manager
+    (axis-C sparse) and returns a coordinator owning that single manager.
+    Returns ``None`` if no manager is configured (no behavior-layer config
+    or only legacy memory-layer configs).
+
+    Note: PyExecutor does not yet call this factory — the legacy
+    :func:`create_sparse_attention_manager` path is still active. This
+    factory is shipped now (Phase 3) so the v17 PyExecutor wire can slot
+    it in without further factory changes.
+    """
+    if sparse_attn_config is None:
+        return None
+
+    managers: List[BaseKVCacheBehaviorManager] = []
+    sparse_mgr = create_sparse_attention_manager(sparse_attn_config,
+                                                 kv_cache_manager)
+    if sparse_mgr is not None:
+        managers.append(sparse_mgr)
+
+    if not managers:
+        return None
+
+    # Local import to avoid circular dependency at module load time.
+    from .coordinator import KVCacheBehaviorCoordinator
+    return KVCacheBehaviorCoordinator(managers)
 
 
 def get_vanilla_sparse_attn_attention_backend(
