@@ -21,8 +21,10 @@ from pydantic import TypeAdapter, ValidationError
 
 from tensorrt_llm._torch.attention_backend.sparse import (
     SparseAttentionManager,
-    TriAttention,
     create_sparse_attention_manager,
+)
+from tensorrt_llm._torch.attention_backend.sparse.triattention import (
+    TriAttention,
 )
 from tensorrt_llm.llmapi.llm_args import (
     DeepSeekSparseAttentionConfig,
