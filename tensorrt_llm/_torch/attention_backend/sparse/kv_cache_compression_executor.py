@@ -12,11 +12,11 @@ This module defines:
   ``BaseKVCacheCompressionExecutor`` per architectural discussion 2026-05-27 —
   it is not a "manager" (lifecycle owner), it is an "executor" of compression
   algorithm work driven by PyExecutor lifecycle hooks. The per-axis subclasses
-  (``SparseAttentionManager`` etc.) are still "managers" in that each manages
+  (``SparseAttentionExecutor`` etc.) are still "managers" in that each manages
   one axis of compression algorithm work. A backward-compat alias
   ``BaseKVCacheBehaviorManager = BaseKVCacheCompressionExecutor`` is exported.
 
-- :class:`SparseAttentionManager`: axis-C convenience subclass for sparse /
+- :class:`SparseAttentionExecutor`: axis-C convenience subclass for sparse /
   per-token eviction methods (RocketKV-V2-migrated, TriAttention, H2O,
   SnapKV, ...). Currently the only axis subclass shipped; future
   ``KVCacheStorageManager`` (axis B for KVTC etc.) and ``CRCLManager``
@@ -97,7 +97,7 @@ class BaseKVCacheCompressionExecutor:
     Subclasses must set ``axis`` ClassVar to one of:
 
     - ``"sparse"`` — sparse / per-token eviction
-      (:class:`SparseAttentionManager`, shipped now).
+      (:class:`SparseAttentionExecutor`, shipped now).
     - ``"storage"`` — storage / transform-coding
       (:class:`KVCacheStorageManager`, planned Phase 4 for KVTC).
     - ``"crcl"`` — cross-request cache lifecycle
@@ -317,7 +317,7 @@ class BaseKVCacheCompressionExecutor:
 BaseKVCacheBehaviorManager = BaseKVCacheCompressionExecutor
 
 
-class SparseAttentionManager(BaseKVCacheCompressionExecutor):
+class SparseAttentionExecutor(BaseKVCacheCompressionExecutor):
     """Axis-C subclass for sparse / per-token eviction methods.
 
     Subclasses: :class:`TriAttention` (Phase 3 first instance), and future
@@ -327,9 +327,9 @@ class SparseAttentionManager(BaseKVCacheCompressionExecutor):
     ``dsa.py``) and do NOT inherit from this base.
 
     The framework base is :class:`BaseKVCacheCompressionExecutor`;
-    ``SparseAttentionManager`` is the axis-specific convenience subclass
+    ``SparseAttentionExecutor`` is the axis-specific convenience subclass
     that sparse algorithms inherit from. Existing call sites that import
-    ``SparseAttentionManager`` continue to work unchanged — TriAttention
+    ``SparseAttentionExecutor`` continue to work unchanged — TriAttention
     still inherits from it.
 
     Future axis-C-specific helpers (e.g., ``_read_req_k_cache`` for K-cache
@@ -348,3 +348,13 @@ class SparseAttentionManager(BaseKVCacheCompressionExecutor):
     # H2O); ``False`` if it operates form-I (RocketKV Stage II HSA, DSA,
     # Quest) — returns a sparse mask but does not mutate cache contents.
     is_form_iii_evict: ClassVar[bool] = False
+
+
+# Backward-compat alias — ``SparseAttentionManager`` was the v15.9 / v16.0
+# axis-C subclass name (committed `7d74c8dae6` / `bfc910c02b` / `23bfff4a16` /
+# `eaa5c71aaf`). Renamed 2026-05-27 to ``SparseAttentionExecutor`` to match
+# the ``BaseKVCacheCompressionExecutor`` base — per-axis subclasses are also
+# "executors" of one axis of compression algorithm work, not "managers" of
+# resources. Existing imports continue to work via this alias. Deprecate over
+# v17+; remove v20+.
+SparseAttentionManager = SparseAttentionExecutor

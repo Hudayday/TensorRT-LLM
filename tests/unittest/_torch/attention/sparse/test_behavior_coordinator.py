@@ -32,6 +32,7 @@ import pytest
 from tensorrt_llm._torch.attention_backend.sparse import (
     BaseKVCacheCompressionExecutor,
     KVCacheBehaviorCoordinator,
+    SparseAttentionExecutor,
     SparseAttentionManager,
     create_behavior_coordinator,
 )
@@ -58,7 +59,7 @@ class _RecordingMixin:
         self._record_list.append(f"{self._name}:{hook_name}")
 
 
-class _MockSparseManager(_RecordingMixin, SparseAttentionManager):
+class _MockSparseManager(_RecordingMixin, SparseAttentionExecutor):
     """Mock axis-C manager."""
 
     def on_request_init(self, request):
@@ -451,24 +452,47 @@ class TestHookOrderTable:
 
 
 class TestNamingFlip:
-    """v17 (2026-05-27) renamed BaseKVCacheBehaviorManager →
-    BaseKVCacheCompressionExecutor. Backward-compat alias must work."""
+    """v17 (2026-05-27) two-step rename:
+    - Base: BaseKVCacheBehaviorManager → BaseKVCacheCompressionExecutor
+    - Axis-C subclass: SparseAttentionManager → SparseAttentionExecutor
+    - File: sparse_attention_manager.py → kv_cache_compression_executor.py
+    Both aliases preserved for backward compat."""
 
-    def test_canonical_name_importable(self):
+    def test_canonical_base_name_importable(self):
         from tensorrt_llm._torch.attention_backend.sparse import (
             BaseKVCacheCompressionExecutor, )
         assert BaseKVCacheCompressionExecutor is not None
 
-    def test_alias_points_to_same_class(self):
+    def test_canonical_axis_c_name_importable(self):
+        from tensorrt_llm._torch.attention_backend.sparse import (
+            SparseAttentionExecutor, )
+        assert SparseAttentionExecutor is not None
+
+    def test_base_alias_points_to_same_class(self):
         from tensorrt_llm._torch.attention_backend.sparse import (
             BaseKVCacheBehaviorManager, BaseKVCacheCompressionExecutor)
         assert BaseKVCacheBehaviorManager is BaseKVCacheCompressionExecutor
 
-    def test_sparse_attention_manager_still_subclass_of_new_name(self):
+    def test_axis_c_alias_points_to_same_class(self):
         from tensorrt_llm._torch.attention_backend.sparse import (
-            BaseKVCacheCompressionExecutor, SparseAttentionManager)
-        assert issubclass(SparseAttentionManager,
+            SparseAttentionExecutor, SparseAttentionManager)
+        assert SparseAttentionManager is SparseAttentionExecutor
+
+    def test_axis_c_is_subclass_of_base(self):
+        from tensorrt_llm._torch.attention_backend.sparse import (
+            BaseKVCacheCompressionExecutor, SparseAttentionExecutor)
+        assert issubclass(SparseAttentionExecutor,
                           BaseKVCacheCompressionExecutor)
+
+    def test_old_module_path_still_importable_via_new_file(self):
+        """File renamed sparse_attention_manager.py → kv_cache_compression_executor.py.
+        New file path must export the same classes."""
+        from tensorrt_llm._torch.attention_backend.sparse.kv_cache_compression_executor import (
+            BaseKVCacheCompressionExecutor,
+            SparseAttentionExecutor,
+        )
+        assert BaseKVCacheCompressionExecutor is not None
+        assert SparseAttentionExecutor is not None
 
 
 # ---------------------------------------------------------------------- #

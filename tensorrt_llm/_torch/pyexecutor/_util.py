@@ -1768,7 +1768,7 @@ def create_py_executor_instance(
     if (llm_args.sparse_attention_config is not None and
             llm_args.sparse_attention_config.is_behavior_layer_method):
         from ..attention_backend.sparse import create_sparse_attention_manager
-        py_executor.sparse_attention_manager = create_sparse_attention_manager(
+        py_executor.kv_cache_compression_executor = create_sparse_attention_manager(
             llm_args.sparse_attention_config, kv_cache_manager)
 
     return py_executor

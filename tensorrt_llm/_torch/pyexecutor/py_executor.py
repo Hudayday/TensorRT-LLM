@@ -78,7 +78,7 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
 from .scheduler.adp_router import ADPRouter
 
 if TYPE_CHECKING:
-    from ..attention_backend.sparse.sparse_attention_manager import \
+    from ..attention_backend.sparse.kv_cache_compression_executor import \
         SparseAttentionManager
 
 # Environment variable to specify iteration ranges for profiling start/stop.
@@ -434,7 +434,7 @@ class PyExecutor:
         # not wired yet -- requires kernel ``RETURN_SCORES`` template work).
         # TODO(sparse-attention): wire factory `create_sparse_attention_manager` from
         # `sparse_attention_config` in py_executor_creator and inject here.
-        self.sparse_attention_manager: Optional["SparseAttentionManager"] = None
+        self.kv_cache_compression_executor: Optional["SparseAttentionManager"] = None
         # TODO: Remove PP size == 1 gate for disagg + block reuse with PP > 1.
         # Buffer for responses generated inside _end_transfer_and_maybe_terminate.
         # With ADP, _enqueue_responses does a tp_gather collective.  When called
@@ -1740,9 +1740,9 @@ class PyExecutor:
                 #   - RocketKV use here: initialize per-req KT-build tracking
                 #     (deferred; sparse/rocketkv.py Phase 7 skeleton)
                 #   - Future CRCL executors use here: cross-request pool lookup
-                if self.sparse_attention_manager is not None:
+                if self.kv_cache_compression_executor is not None:
                     for _req in new_requests:
-                        self.sparse_attention_manager.on_request_init(_req)
+                        self.kv_cache_compression_executor.on_request_init(_req)
                 if self.should_stop_processing:
                     break
 
@@ -2141,8 +2141,8 @@ class PyExecutor:
                 #     attention hooks not step_end; per sparse/rocketkv.py)
                 #   - Future H2O use here: cumulative attention sum threshold
                 #     check + per-token evict
-                if self.sparse_attention_manager is not None:
-                    self.sparse_attention_manager.on_generation_step_end(
+                if self.kv_cache_compression_executor is not None:
+                    self.kv_cache_compression_executor.on_generation_step_end(
                         sample_state_scheduled_requests, attn_metadata)
 
                 self._remove_inflight_ids(scheduled_requests)
@@ -2686,8 +2686,8 @@ class PyExecutor:
                     # See call site 1/3 (above) for per-method use:
                     # TriAttention beta=128 evict / RocketKV typically no-op /
                     # H2O cumulative-sum evict / etc.
-                    if self.sparse_attention_manager is not None:
-                        self.sparse_attention_manager.on_generation_step_end(
+                    if self.kv_cache_compression_executor is not None:
+                        self.kv_cache_compression_executor.on_generation_step_end(
                             scheduled_batch, attn_metadata)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
@@ -3147,8 +3147,8 @@ class PyExecutor:
         # _process_previous_batch overlap-scheduler path).
         # See call site 1/3 for per-method use (TriAttention beta=128 evict /
         # RocketKV typically no-op / H2O cumulative-sum evict).
-        if self.sparse_attention_manager is not None:
-            self.sparse_attention_manager.on_generation_step_end(
+        if self.kv_cache_compression_executor is not None:
+            self.kv_cache_compression_executor.on_generation_step_end(
                 scheduled_requests, attn_metadata)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
@@ -4101,8 +4101,8 @@ class PyExecutor:
                 #   - Future KVTC (storage axis, Phase 4) use here: PCA encode
                 #     of finalized prompt cache → compressed_pool[req.id]
                 #   - SnapKV would use here: one-shot prefill-end token select
-                if self.sparse_attention_manager is not None:
-                    self.sparse_attention_manager.on_context_end(request, None)
+                if self.kv_cache_compression_executor is not None:
+                    self.kv_cache_compression_executor.on_context_end(request, None)
 
     def _update_request_states_star_attention(
             self, scheduled_requests: ScheduledRequests):
@@ -4111,8 +4111,8 @@ class PyExecutor:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
                 # Sparse attention hook: on_context_end (star-attention path).
                 # See main on_context_end call site above for per-method use.
-                if self.sparse_attention_manager is not None:
-                    self.sparse_attention_manager.on_context_end(request, None)
+                if self.kv_cache_compression_executor is not None:
+                    self.kv_cache_compression_executor.on_context_end(request, None)
             request.ctx_iters += 1
 
         for request in scheduled_requests.generation_requests:
@@ -4322,8 +4322,8 @@ class PyExecutor:
         #   - Future KVTC (storage axis) use here: final compress + insert into
         #     own idle_pool for cross-request reuse (per CRCL stacking)
         #   - Future CRCL use here: promote to cross-request pool with TTL
-        if self.sparse_attention_manager is not None:
-            self.sparse_attention_manager.on_request_finish(request)
+        if self.kv_cache_compression_executor is not None:
+            self.kv_cache_compression_executor.on_request_finish(request)
         # Dummy requests don't participate in disagg KV cache transfers,
         # so they must bypass the PP termination handler to avoid stale
         # sequences in the KV cache manager (the handler delays removal,

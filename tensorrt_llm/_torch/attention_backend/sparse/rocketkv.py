@@ -41,9 +41,9 @@ from typing import TYPE_CHECKING, ClassVar, Optional
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.sparse_attention_manager import (
+from tensorrt_llm._torch.attention_backend.sparse.kv_cache_compression_executor import (
     SparseAttentionIndices,
-    SparseAttentionManager,
+    SparseAttentionExecutor,
 )
 
 if TYPE_CHECKING:
@@ -54,7 +54,7 @@ if TYPE_CHECKING:
         KVCacheManagerV2
 
 
-class RocketKV(SparseAttentionManager):
+class RocketKV(SparseAttentionExecutor):
     """V2-migrated RocketKV form-I HSA + KT_CACHE auxiliary pool (skeleton).
 
     See module docstring for design choices. Algorithm body待写 (Phase 7

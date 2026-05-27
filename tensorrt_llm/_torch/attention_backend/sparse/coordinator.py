@@ -26,7 +26,7 @@ into.
 import warnings
 from typing import Dict, Iterable, List, Optional, TYPE_CHECKING
 
-from .sparse_attention_manager import (BaseKVCacheCompressionExecutor,
+from .kv_cache_compression_executor import (BaseKVCacheCompressionExecutor,
                                        SparseAttentionManager)
 
 if TYPE_CHECKING:
@@ -151,7 +151,7 @@ class KVCacheBehaviorCoordinator:
         """Convenience accessor — returns the axis-C manager if present.
 
         Used by code that historically accessed
-        ``PyExecutor.sparse_attention_manager`` directly. Returns the
+        ``PyExecutor.kv_cache_compression_executor`` directly. Returns the
         axis-C ``SparseAttentionManager`` instance, narrowed for type
         hinting; falls back to ``None`` if no axis-C manager registered.
         """

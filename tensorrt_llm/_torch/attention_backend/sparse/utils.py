@@ -6,7 +6,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from .dsa import DSACacheManager, DSATrtllmAttention
 from .rocket import (RocketKVCacheManager, RocketTrtllmAttention,
                      RocketVanillaAttention)
-from .sparse_attention_manager import (BaseKVCacheBehaviorManager,
+from .kv_cache_compression_executor import (BaseKVCacheBehaviorManager,
                                        SparseAttentionManager)
 from .triattention import TriAttention
 

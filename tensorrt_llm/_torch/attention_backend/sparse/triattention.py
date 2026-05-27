@@ -16,8 +16,8 @@ from typing import TYPE_CHECKING, ClassVar, Dict, Optional
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.sparse_attention_manager import \
-    SparseAttentionManager
+from tensorrt_llm._torch.attention_backend.sparse.kv_cache_compression_executor import \
+    SparseAttentionExecutor
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 _REQUIRED_CALIBRATION_KEYS = frozenset({"E_q", "E_q_norm", "R", "omega", "phi"})
 
 
-class TriAttention(SparseAttentionManager):
+class TriAttention(SparseAttentionExecutor):
     """Form-III periodic KV eviction driven by trigonometric importance scoring.
 
     Overrides only ``on_generation_step_end``: every ``beta`` generation steps,
