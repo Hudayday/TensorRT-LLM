@@ -2,17 +2,26 @@
 
 This module defines:
 
-- :class:`BaseKVCacheBehaviorManager`: framework-level abstract base for all
-  L2 behavior managers (sparse / storage transform / cross-request lifecycle).
+- :class:`BaseKVCacheCompressionExecutor`: framework-level abstract base for all
+  L2 behavior executors (sparse / storage transform / cross-request lifecycle).
   Subclasses must set ``axis`` ClassVar and may override any subset of the 8
   lifecycle hooks (default no-op).
+
+  *Naming note*: this class was previously called ``BaseKVCacheBehaviorManager``
+  (commits ``7d74c8dae6`` / ``bfc910c02b``). Renamed to
+  ``BaseKVCacheCompressionExecutor`` per architectural discussion 2026-05-27 —
+  it is not a "manager" (lifecycle owner), it is an "executor" of compression
+  algorithm work driven by PyExecutor lifecycle hooks. The per-axis subclasses
+  (``SparseAttentionManager`` etc.) are still "managers" in that each manages
+  one axis of compression algorithm work. A backward-compat alias
+  ``BaseKVCacheBehaviorManager = BaseKVCacheCompressionExecutor`` is exported.
 
 - :class:`SparseAttentionManager`: axis-C convenience subclass for sparse /
   per-token eviction methods (RocketKV-V2-migrated, TriAttention, H2O,
   SnapKV, ...). Currently the only axis subclass shipped; future
   ``KVCacheStorageManager`` (axis B for KVTC etc.) and ``CRCLManager``
   (cross-request lifecycle for Continuum etc.) will be added as sibling
-  subclasses of ``BaseKVCacheBehaviorManager`` in Phase 4 / Phase 5.
+  subclasses of ``BaseKVCacheCompressionExecutor`` in Phase 4 / Phase 5.
 
 Architecture (3-layer stack):
 
@@ -20,9 +29,30 @@ Architecture (3-layer stack):
 - L1 ``KVCacheManagerV2`` — physical page management, dtype storage, 3-tier.
 - L2 behavior (this module) — algorithm orchestration, lifecycle hooks.
 
-Behavior managers hold the underlying ``KVCacheManagerV2`` as a tool and
+Behavior executors hold the underlying ``KVCacheManagerV2`` as a tool and
 never inherit from it. The behavior/memory split mirrors how speculative
 decoding wires Eagle3 / MTPHiddenStatesManager into PyExecutor.
+
+V2 specialization patterns (per 2026-05-27 design discussion, see doc 27 §5):
+
+- **Pattern 1 (default)** — Subclass uses default plain ``KVCacheManagerV2``;
+  any per-method state (scoring buffer / compressed pool / TTL pool) is owned
+  by the subclass instance directly. ``kv_cache_manager_class`` ClassVar stays
+  ``None``. Applies to: TriAttention, H2O, SnapKV, KVTC, Continuum (most).
+
+- **Pattern 2 (declarative BufferConfig)** — Subclass uses plain
+  ``KVCacheManagerV2`` but PyExecutor factory adds extra ``BufferConfig`` per
+  layer (new ``DataRole``) at V2 instantiation, for page-aligned auxiliary
+  pools locked to KEY/VALUE lifecycle. ``kv_cache_manager_class`` ClassVar
+  stays ``None``. Applies to: RocketKV (KT_CACHE), Quest (page summary),
+  GEAR (low-rank/sparse aux tensors). Same mechanism as NVFP4
+  ``KEY_BLOCK_SCALE`` (already in production).
+
+- **Pattern 3 (V2 subclass)** — Escape hatch when V2 behavioral
+  specialization is needed (custom allocator, custom tier policy, etc.).
+  Subclass declares ``kv_cache_manager_class = MyV2Subclass``; PyExecutor
+  factory consults this ClassVar to instantiate the right V2 type.
+  **No current method needs this**; reserved for unforeseen future needs.
 
 Hooks (8 total):
 
@@ -35,14 +65,14 @@ Hooks (8 total):
   - ``on_forward_begin`` / ``on_forward_end``
         Per-forward async coordination (wait pending / trigger async).
         Used primarily by future axis-B (storage) and axis-D (CRCL)
-        managers; most axis-C sparse managers leave these as no-op.
+        executors; most axis-C sparse executors leave these as no-op.
 
 A :class:`KVCacheBehaviorCoordinator` (see ``coordinator.py``) owns a list of
-``BaseKVCacheBehaviorManager`` instances and dispatches each hook to them in
-a deterministic axis-priority order (see ``coordinator.HOOK_ORDER``).
+``BaseKVCacheCompressionExecutor`` instances and dispatches each hook to them
+in a deterministic axis-priority order (see ``coordinator.HOOK_ORDER``).
 """
 
-from typing import TYPE_CHECKING, Any, ClassVar, Optional, Tuple
+from typing import (TYPE_CHECKING, Any, ClassVar, Optional, Tuple, Type)
 
 import torch
 
@@ -61,8 +91,8 @@ if TYPE_CHECKING:
 SparseAttentionIndices = Tuple[torch.Tensor, torch.Tensor]
 
 
-class BaseKVCacheBehaviorManager:
-    """Framework-level base class for all L2 KV-cache behavior managers.
+class BaseKVCacheCompressionExecutor:
+    """Framework-level base class for all L2 KV-cache compression executors.
 
     Subclasses must set ``axis`` ClassVar to one of:
 
@@ -75,11 +105,19 @@ class BaseKVCacheBehaviorManager:
 
     All 8 hooks default to no-op; subclasses override what they need. A
     :class:`KVCacheBehaviorCoordinator` instance dispatches each hook to all
-    registered managers in deterministic axis-priority order.
+    registered executors in deterministic axis-priority order.
 
     The behavior layer never inherits from any cache / resource manager
     because this layer decides *how* the physical KV is used, not *what*
     physical KV exists. Subclasses hold ``KVCacheManagerV2`` as a tool.
+
+    V2 selection (see module docstring for full patterns):
+
+    - Default (Patterns 1 + 2): ``kv_cache_manager_class`` stays ``None``;
+      PyExecutor factory passes plain ``KVCacheManagerV2`` instance.
+    - Pattern 3 escape hatch: subclass sets
+      ``kv_cache_manager_class = MyV2Subclass``; factory instantiates that
+      type instead. No current method uses this.
     """
 
     # ------------------------------------------------------------------ #
@@ -89,18 +127,36 @@ class BaseKVCacheBehaviorManager:
     # Axis identifier — subclass MUST override.
     axis: ClassVar[str] = ""
 
-    # Whether this manager class is compatible with cross-request KV cache
+    # Whether this executor class is compatible with cross-request KV cache
     # reuse (radix-tree / APC block reuse). Default conservative ``False``;
     # subclasses opt in explicitly. The LLM init factory may enforce a mutex:
-    # combining a manager with ``supports_kv_cache_reuse=False`` and
+    # combining an executor with ``supports_kv_cache_reuse=False`` and
     # ``KvCacheConfig.enable_block_reuse=True`` raises a config error at init.
     supports_kv_cache_reuse: ClassVar[bool] = False
+
+    # Pattern 3 (V2 subclass) escape hatch: subclass may declare a specific
+    # ``KVCacheManagerV2`` subclass type via this ClassVar. PyExecutor factory
+    # uses this to instantiate the right V2 type. ``None`` (default) means use
+    # plain ``KVCacheManagerV2`` — adequate for Patterns 1 and 2 (i.e., for
+    # essentially all known methods, including RocketKV V2 migration since
+    # the KT_CACHE auxiliary pool is added via Pattern 2 declarative
+    # ``BufferConfig`` rather than V2 subclassing).
+    kv_cache_manager_class: ClassVar[Optional[Type["KVCacheManagerV2"]]] = None
 
     def __init__(self, kv_cache_manager: "KVCacheManagerV2"):
         if not self.axis:
             raise NotImplementedError(
                 f"{type(self).__name__} must set the 'axis' ClassVar "
                 f"to one of: 'sparse', 'storage', 'crcl'.")
+        # Pattern 3 type assertion: if subclass declared a V2 subclass
+        # requirement, verify the injected instance matches.
+        if self.kv_cache_manager_class is not None:
+            assert isinstance(kv_cache_manager, self.kv_cache_manager_class), (
+                f"{type(self).__name__} declared "
+                f"kv_cache_manager_class={self.kv_cache_manager_class.__name__} "
+                f"but received {type(kv_cache_manager).__name__}. "
+                f"PyExecutor factory should consult the ClassVar to pick "
+                f"the right V2 instance.")
         self.kv_cache_manager = kv_cache_manager
 
     # ------------------------------------------------------------------ #
@@ -112,7 +168,7 @@ class BaseKVCacheBehaviorManager:
 
         Override to allocate per-request accumulators (e.g., H2O cumulative
         attention sum buffers indexed by (layer, head, token)). CRCL
-        managers (future) check a cross-request pool for hits here.
+        executors (future) check a cross-request pool for hits here.
         """
         pass
 
@@ -122,7 +178,7 @@ class BaseKVCacheBehaviorManager:
         Override to release per-request state allocated in
         ``on_request_init``. Underlying KV blocks are still freed by the
         ``KVCacheManagerV2``; subclasses must not free them here. Storage
-        managers (future) emit final compressed bytes here; CRCL managers
+        executors (future) emit final compressed bytes here; CRCL executors
         (future) promote those to a cross-request pool here.
         """
         pass
@@ -146,10 +202,10 @@ class BaseKVCacheBehaviorManager:
         attention kernel instantiation exposes scores (compile-time
         template flag); ``None`` when scores are not materialized.
 
-        Form-I sparse managers return an ``(indices, offsets)`` tuple as an
-        input-side sparse mask; form-III (eviction-after-compute) managers,
-        storage managers, and CRCL managers return ``None``. The coordinator
-        enforces single-source: at most one manager may return non-None per
+        Form-I sparse executors return an ``(indices, offsets)`` tuple as an
+        input-side sparse mask; form-III (eviction-after-compute) executors,
+        storage executors, and CRCL executors return ``None``. The coordinator
+        enforces single-source: at most one executor may return non-None per
         attention call.
         """
         return None
@@ -183,9 +239,9 @@ class BaseKVCacheBehaviorManager:
         """Per-layer hook after every generation-phase attention forward.
 
         Same single-source invariant as ``on_context_attention``: at most
-        one manager may return non-None metadata. Used by form-I sparse
-        managers (RocketKV Stage II HSA, Quest) to return query-aware
-        masks; form-III managers (TriAttention) and non-sparse managers
+        one executor may return non-None metadata. Used by form-I sparse
+        executors (RocketKV Stage II HSA, Quest) to return query-aware
+        masks; form-III executors (TriAttention) and non-sparse executors
         return ``None``.
         """
         return None
@@ -200,7 +256,7 @@ class BaseKVCacheBehaviorManager:
 
         Override for periodic eviction (TriAttention ``beta=128`` trigger),
         budget-triggered eviction (H2O, Scissorhands), or runtime cleanup
-        (RocketKV rewind). Storage managers may invalidate active
+        (RocketKV rewind). Storage executors may invalidate active
         compressed copies here if the cache shape changed (e.g., after a
         sparse evict).
         """
@@ -214,9 +270,9 @@ class BaseKVCacheBehaviorManager:
     def on_forward_begin(self, forward_batch: Any) -> None:
         """Per-forward hook BEFORE the forward pass starts.
 
-        Storage managers (future) wait for pending async decompress
-        streams here; CRCL managers (future) may resume cache from
-        cross-request pool here. Most axis-C sparse managers leave this
+        Storage executors (future) wait for pending async decompress
+        streams here; CRCL executors (future) may resume cache from
+        cross-request pool here. Most axis-C sparse executors leave this
         as no-op.
         """
         pass
@@ -224,9 +280,9 @@ class BaseKVCacheBehaviorManager:
     def on_forward_end(self, forward_batch: Any) -> None:
         """Per-forward hook AFTER the forward pass completes.
 
-        Storage managers (future) trigger async re-compress here; CRCL
-        managers (future) update TTL counters and GC expired entries
-        here. Most axis-C sparse managers leave this as no-op.
+        Storage executors (future) trigger async re-compress here; CRCL
+        executors (future) update TTL counters and GC expired entries
+        here. Most axis-C sparse executors leave this as no-op.
         """
         pass
 
@@ -237,16 +293,16 @@ class BaseKVCacheBehaviorManager:
     def implements(self, hook_name: str) -> bool:
         """Return ``True`` if this subclass actually overrides
         ``hook_name`` (treating the default no-op inherited from
-        :class:`BaseKVCacheBehaviorManager` as not implementing).
+        :class:`BaseKVCacheCompressionExecutor` as not implementing).
 
-        Used by the coordinator to optionally skip-iterate managers that
+        Used by the coordinator to optionally skip-iterate executors that
         don't implement a particular hook (perf micro-optimization, off by
         default).
         """
         own_method = getattr(type(self), hook_name, None)
         if own_method is None:
             return False
-        base_method = getattr(BaseKVCacheBehaviorManager, hook_name, None)
+        base_method = getattr(BaseKVCacheCompressionExecutor, hook_name, None)
         if base_method is None:
             return False
         # In Python 3, accessing a method via class returns the function directly
@@ -255,16 +311,22 @@ class BaseKVCacheBehaviorManager:
         return own_method is not base_method
 
 
-class SparseAttentionManager(BaseKVCacheBehaviorManager):
+# Backward-compat alias — code committed under the old name (``7d74c8dae6`` /
+# ``bfc910c02b``) and external references continue to work. Deprecate over
+# v17+; remove in v20+.
+BaseKVCacheBehaviorManager = BaseKVCacheCompressionExecutor
+
+
+class SparseAttentionManager(BaseKVCacheCompressionExecutor):
     """Axis-C subclass for sparse / per-token eviction methods.
 
     Subclasses: :class:`TriAttention` (Phase 3 first instance), and future
-    H2O / SnapKV / RocketKV-V2-migrated. The legacy RocketKV / DSA /
-    skip_softmax follow the older 5-class plugin pattern (separate
-    cache-manager + attention shim classes) and do NOT inherit from this
-    base.
+    H2O / SnapKV / RocketKV-V2-migrated (``rocketkv.py``). The legacy
+    RocketKV / DSA / skip_softmax follow the older 5-class plugin pattern
+    (separate cache-manager + attention shim classes, in ``rocket.py`` /
+    ``dsa.py``) and do NOT inherit from this base.
 
-    The framework base is :class:`BaseKVCacheBehaviorManager`;
+    The framework base is :class:`BaseKVCacheCompressionExecutor`;
     ``SparseAttentionManager`` is the axis-specific convenience subclass
     that sparse algorithms inherit from. Existing call sites that import
     ``SparseAttentionManager`` continue to work unchanged — TriAttention

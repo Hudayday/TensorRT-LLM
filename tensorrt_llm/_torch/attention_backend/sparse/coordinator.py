@@ -1,7 +1,7 @@
 """Multi-manager runtime coordinator for the L2 behavior layer.
 
 A :class:`KVCacheBehaviorCoordinator` owns a list of
-:class:`BaseKVCacheBehaviorManager` instances (typically 1–3: one per axis
+:class:`BaseKVCacheCompressionExecutor` instances (typically 1–3: one per axis
 from ``sparse`` / ``storage`` / ``crcl``) and dispatches each lifecycle hook
 to all managers in a deterministic axis-priority order. PyExecutor sees only
 the coordinator; the coordinator handles per-axis dispatch + mutex
@@ -26,7 +26,7 @@ into.
 import warnings
 from typing import Dict, Iterable, List, Optional, TYPE_CHECKING
 
-from .sparse_attention_manager import (BaseKVCacheBehaviorManager,
+from .sparse_attention_manager import (BaseKVCacheCompressionExecutor,
                                        SparseAttentionManager)
 
 if TYPE_CHECKING:
@@ -70,7 +70,7 @@ _HOOK_ORDER: Dict[str, List[str]] = {
 class KVCacheBehaviorCoordinator:
     """Multi-manager runtime coordinator.
 
-    Owns ``managers: List[BaseKVCacheBehaviorManager]`` and dispatches each
+    Owns ``managers: List[BaseKVCacheCompressionExecutor]`` and dispatches each
     of the 8 lifecycle hooks to all managers in deterministic axis-priority
     order.
 
@@ -93,9 +93,9 @@ class KVCacheBehaviorCoordinator:
     #: override on the class to customize per-deployment ordering.
     HOOK_ORDER: Dict[str, List[str]] = _HOOK_ORDER
 
-    def __init__(self, managers: List[BaseKVCacheBehaviorManager]):
-        self.managers: List[BaseKVCacheBehaviorManager] = list(managers)
-        self._by_axis: Dict[str, List[BaseKVCacheBehaviorManager]] = {}
+    def __init__(self, managers: List[BaseKVCacheCompressionExecutor]):
+        self.managers: List[BaseKVCacheCompressionExecutor] = list(managers)
+        self._by_axis: Dict[str, List[BaseKVCacheCompressionExecutor]] = {}
         for mgr in self.managers:
             self._by_axis.setdefault(mgr.axis, []).append(mgr)
         self._validate()
@@ -142,7 +142,7 @@ class KVCacheBehaviorCoordinator:
         return axis in self._by_axis and bool(self._by_axis[axis])
 
     def get_manager(
-            self, axis: str) -> Optional[BaseKVCacheBehaviorManager]:
+            self, axis: str) -> Optional[BaseKVCacheCompressionExecutor]:
         """Return the single manager for the given axis (or ``None``)."""
         mgrs = self._by_axis.get(axis, [])
         return mgrs[0] if mgrs else None
@@ -163,7 +163,7 @@ class KVCacheBehaviorCoordinator:
 
     def _iter_for_hook(
             self,
-            hook_name: str) -> Iterable[BaseKVCacheBehaviorManager]:
+            hook_name: str) -> Iterable[BaseKVCacheCompressionExecutor]:
         """Yield managers in dispatch order for the given hook."""
         order = self.HOOK_ORDER.get(
             hook_name,
