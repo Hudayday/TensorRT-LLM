@@ -1610,6 +1610,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # 0 overhead); see sparse_attention_manager.py docstring and design doc 15
         # §3.4.1 / §5.7.2. The legacy ``sparse_kv_predict`` / ``sparse_attn_predict``
         # dispatch above (RocketKV / DSA) stays in place during the migration.
+        #
+        # Methods that use these hooks (once wired):
+        #   - on_context_attention:
+        #       * RocketKV use here: Stage I builds per-page KT summary from K
+        #         and writes to KT_CACHE pool via V2 generic write_kt_cache API
+        #         (see sparse/rocketkv.py docstring; Phase 7 algorithm body)
+        #       * H2O / Scissorhands use here: accumulate per-token attn_scores
+        #         into cumulative-sum buffer (requires RETURN_SCORES kernel flag)
+        #       * TriAttention use here: typically NO (M3.1 algorithm uses
+        #         step_end trigger, not per-attention)
+        #   - on_generation_attention:
+        #       * RocketKV use here: Stage II reads KT_CACHE + computes HSA mask
+        #         within prompt_budget, returns (indices, offsets) tuple
+        #       * Quest use here: per-page summary lookup + top-K page select
+        #       * TriAttention use here: typically NO
+        #
+        # When BOTH legacy plugin path (sparse_kv_predict / sparse_attn_predict
+        # above) AND v17 hook path are active, framework guarantees at most one
+        # writer per attention call via single-source invariant in coordinator
+        # (see attention_backend/sparse/coordinator.py on_*_attention dispatch).
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger
