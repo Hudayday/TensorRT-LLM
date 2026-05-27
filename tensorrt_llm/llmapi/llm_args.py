@@ -541,9 +541,9 @@ class RocketKVSparseAttentionConfig(BaseSparseAttentionConfig):
     Status: skeleton — ``RocketKV.on_context_attention`` (Stage I) and
     ``RocketKV.on_generation_attention`` (Stage II) are stubs (Phase 7
     algorithm body待). This config exists to lock the pipeline wire so the
-    framework can be verified end-to-end with both TriAttention (axis-C
-    physical evict) and RocketKV (axis-C form-I sparse mask + KT_CACHE pool)
-    as parallel test cases.
+    framework can be verified end-to-end with both TriAttention (physical
+    KV eviction) and RocketKV (sparse mask + KT_CACHE auxiliary pool) as
+    parallel sparse-attention test cases.
     """
     algorithm: Literal["rocketkv"] = "rocketkv"
     page_size: Optional[int] = Field(

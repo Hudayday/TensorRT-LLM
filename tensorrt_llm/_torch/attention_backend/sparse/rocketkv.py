@@ -10,10 +10,22 @@ Paper: arXiv:2502.14837. See ``~/docs/kv-reduction/07-rocketkv-deep-dive.md``
 for paper-code cross-reference and ``~/docs/kv-reduction/27-framework-walkthrough-triattention-rocketkv.md``
 §3 for V2 migration architectural design.
 
+This file defines BOTH halves of the RocketKV plug-in:
+
+- :class:`RocketKV` — L2 behavior executor (subclass of
+  :class:`SparseAttentionExecutor`). Drives Stage I + Stage II algorithm
+  work via lifecycle hooks (``on_context_attention`` / ``on_generation_attention``).
+- :class:`RocketKVTrtllmAttention` + :class:`RocketKVVanillaAttention` —
+  L0 attention shims (subclasses of ``TrtllmAttention`` / ``VanillaAttention``).
+  Carry RocketKV-specific metadata (KT cache block offsets, prompt budget)
+  and consume the ``(indices, offsets)`` sparse mask produced by the
+  executor. The attention factory in ``sparse/utils.py`` routes to them
+  when ``algorithm="rocketkv"``.
+
 Key design choices (per 5/27 architectural discussion, doc 27 §3):
 
-- **Form-I sparse** — Stage II returns ``(indices, offsets)`` sparse mask via
-  :meth:`on_generation_attention`; cache contents are NOT modified.
+- **Sparse-mask method** — Stage II returns an ``(indices, offsets)`` sparse
+  mask via :meth:`on_generation_attention`; cache contents are NOT modified.
 - **KT_CACHE auxiliary pool — Pattern 2 declarative BufferConfig** — V2 stays
   unchanged. PyExecutor factory adds a ``KT_CACHE`` ``BufferConfig`` per layer
   at V2 instantiation, with ``tokens_per_block_override=kt_tokens_per_block``.
@@ -28,8 +40,10 @@ Key design choices (per 5/27 architectural discussion, doc 27 §3):
   query-aware HSA mask within ``prompt_budget``, returns mask tuple.
 
 **Status: SKELETON ONLY** — :meth:`on_context_attention` and
-:meth:`on_generation_attention` are stubs (return ``None``). Algorithm body
-is Phase 7 work (parallel to TriAttention M3.1 Phase 3 work).
+:meth:`on_generation_attention` are stubs (return ``None``). The attention
+shim classes carry the class hierarchy and metadata fields but inherit
+forward() from their base classes; method-specific kernels (paged KT bmm,
+triton scoring, etc.) are Phase 7 ports from ``rocket.py``.
 
 Existing 5-class V1 RocketKV (``sparse/rocket.py``) stays in place. The
 ``rocketkv`` algorithm flag is reserved for this V2-migrated version when it
@@ -40,6 +54,11 @@ the legacy ``is_behavior_layer_method=False`` config branch.
 from typing import TYPE_CHECKING, ClassVar, Optional
 
 import torch
+
+from tensorrt_llm._torch.attention_backend.trtllm import (
+    TrtllmAttention, TrtllmAttentionMetadata)
+from tensorrt_llm._torch.attention_backend.vanilla import (
+    VanillaAttention, VanillaAttentionMetadata)
 
 from tensorrt_llm._torch.attention_backend.sparse.kv_cache_compression_executor import (
     SparseAttentionIndices,
@@ -54,8 +73,105 @@ if TYPE_CHECKING:
         KVCacheManagerV2
 
 
+# ====================================================================== #
+# L0 attention shims — RocketKV-specific attention classes                #
+#                                                                        #
+# These subclass the framework attention bases and add RocketKV-specific  #
+# metadata (KT cache offsets, prompt budget). The attention forward()    #
+# bodies in Phase 7 will consume the ``(indices, offsets)`` sparse mask  #
+# the executor returns from ``on_generation_attention`` and skip pages   #
+# outside the HSA top-K budget. Until Phase 7 they fall through to the   #
+# base-class dense forward.                                              #
+#                                                                        #
+# Routed from ``sparse/utils.py:get_*_sparse_attn_attention_backend``    #
+# when ``sparse_attn_config.algorithm == "rocketkv"``.                   #
+# ====================================================================== #
+
+
+class RocketKVTrtllmAttentionMetadata(TrtllmAttentionMetadata):
+    """Sparse-mask-aware metadata for RocketKV under the TRT-LLM backend.
+
+    Skeleton: structural placeholder so the factory dispatch + executor
+    pipeline can be exercised end-to-end. Real metadata population is
+    Phase 7 work — port from ``rocket.py:RocketTrtllmAttentionMetadata``
+    (line 38).
+
+    Differences from V1 metadata (when ported):
+
+    - V1 pre-allocates ``kt_cache_block_offsets`` tensors via a V1-cache-
+      manager API. In V17, these come from the KT_CACHE auxiliary pool
+      via the V2 generic ``get_buffers(layer, data_role=KT_CACHE)`` API.
+    - The sparse mask itself (``indices``/``offsets``) is provided by the
+      executor's ``on_generation_attention`` return value rather than
+      computed inline here.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        # TODO (Phase 7): populate RocketKV-specific fields here.
+        # Reference: rocket.py:RocketTrtllmAttentionMetadata (line 38).
+
+
+class RocketKVTrtllmAttention(TrtllmAttention):
+    """Sparse attention forward for RocketKV under the TRT-LLM backend.
+
+    Skeleton: subclasses :class:`TrtllmAttention` and sets
+    :attr:`Metadata` to :class:`RocketKVTrtllmAttentionMetadata`. In
+    Phase 7 the ``forward_context`` / ``forward_generation`` methods
+    will be overridden to consume the executor-provided sparse mask;
+    until then it inherits the dense forward from
+    :class:`TrtllmAttention` (so the pipeline runs end-to-end but
+    behaves like dense attention until algorithm bodies land).
+
+    Port reference: ``rocket.py:RocketTrtllmAttention`` (line 318).
+    The legacy V1 class is ~270 lines including triton kernel calls
+    for paged KT bmm scoring (Stage II). In V17 those scoring kernels
+    live inside :meth:`RocketKV.on_generation_attention`; the
+    attention class only needs to consume the resulting mask.
+    """
+
+    Metadata = RocketKVTrtllmAttentionMetadata
+
+    # TODO (Phase 7): override forward_context() / forward_generation() to
+    # consume the (indices, offsets) sparse mask from the executor and
+    # skip non-selected pages. See rocket.py:RocketTrtllmAttention.forward
+    # (line 487+) for the V1 paged-attention path.
+
+
+class RocketKVVanillaAttentionMetadata(VanillaAttentionMetadata):
+    """Sparse-mask-aware metadata for RocketKV under the vanilla backend.
+
+    Skeleton parallel to :class:`RocketKVTrtllmAttentionMetadata` but for
+    the eager vanilla attention backend (used for unit-test parity).
+    Port reference: ``rocket.py:RocketVanillaAttentionMetadata`` (line 580).
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        # TODO (Phase 7): populate prompt_budget / kt cache offsets here.
+        # Reference: rocket.py:RocketVanillaAttentionMetadata (line 580).
+
+
+class RocketKVVanillaAttention(VanillaAttention):
+    """Sparse attention forward for RocketKV under the vanilla backend.
+
+    Skeleton. Port reference: ``rocket.py:RocketVanillaAttention`` (line 624).
+    """
+
+    Metadata = RocketKVVanillaAttentionMetadata
+
+    # TODO (Phase 7): override forward() to consume executor-provided sparse
+    # mask. See rocket.py:RocketVanillaAttention (line 624+).
+
+
+# ====================================================================== #
+# L2 behavior executor — Stage I + Stage II algorithm orchestration       #
+# ====================================================================== #
+
+
 class RocketKV(SparseAttentionExecutor):
-    """V2-migrated RocketKV form-I HSA + KT_CACHE auxiliary pool (skeleton).
+    """V2-migrated RocketKV: sparse-mask HSA + KT_CACHE auxiliary pool
+    (skeleton).
 
     See module docstring for design choices. Algorithm body待写 (Phase 7
     parallel to TriAttention M3.1).
@@ -65,13 +181,12 @@ class RocketKV(SparseAttentionExecutor):
     .. code-block:: python
 
         from tensorrt_llm import LLM
-        from tensorrt_llm.llmapi import RocketSparseAttentionConfig, KvCacheConfig
+        from tensorrt_llm.llmapi import RocketKVSparseAttentionConfig, KvCacheConfig
 
         llm = LLM(
             model="meta-llama/Llama-3.1-8B",
             kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-            sparse_attention_config=RocketSparseAttentionConfig(
-                method="rocketkv",            # routes to THIS class
+            sparse_attention_config=RocketKVSparseAttentionConfig(
                 page_size=16,
                 prompt_budget=2048,
                 kt_cache_dtype="bfloat16",
@@ -86,8 +201,9 @@ class RocketKV(SparseAttentionExecutor):
 
     axis: ClassVar[str] = "sparse"
 
-    # Form-I sparse: returns mask via on_*_attention, does NOT mutate cache.
-    is_form_iii_evict: ClassVar[bool] = False
+    # Returns a sparse mask via on_*_attention; does NOT mutate cache
+    # contents. (Compare TriAttention which sets physically_evicts_kv=True.)
+    physically_evicts_kv: ClassVar[bool] = False
 
     # KT cache is request-specific and built per-context; cannot be reused
     # across requests (cross-request KT would have wrong K-source for current
@@ -136,8 +252,8 @@ class RocketKV(SparseAttentionExecutor):
     ) -> Optional[SparseAttentionIndices]:
         """Stage I — compute per-page KT summary from K, write to KT_CACHE.
 
-        Currently a stub. Returns ``None`` (context phase form-I does not
-        return a sparse mask; full prompt attended dense).
+        Currently a stub. Returns ``None`` (context phase here does not
+        emit a sparse mask; the full prompt is attended dense).
 
         TODO (Phase 7 algorithm body):
 

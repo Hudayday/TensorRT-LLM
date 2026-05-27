@@ -2,10 +2,10 @@
 
 This module defines:
 
-- :class:`BaseKVCacheCompressionExecutor`: framework-level abstract base for all
-  L2 behavior executors (sparse / storage transform / cross-request lifecycle).
-  Subclasses must set ``axis`` ClassVar and may override any subset of the 8
-  lifecycle hooks (default no-op).
+- :class:`BaseKVCacheCompressionExecutor`: framework-level abstract base for
+  every L2 behavior executor (sparse attention, KV storage transform-coding,
+  cross-request lifecycle). Subclasses set an ``axis`` ClassVar and override
+  any subset of the 6 lifecycle hooks (default no-op).
 
   *Naming note*: this class was previously called ``BaseKVCacheBehaviorManager``
   (commits ``7d74c8dae6`` / ``bfc910c02b``). Renamed to
@@ -16,12 +16,12 @@ This module defines:
   one axis of compression algorithm work. A backward-compat alias
   ``BaseKVCacheBehaviorManager = BaseKVCacheCompressionExecutor`` is exported.
 
-- :class:`SparseAttentionExecutor`: axis-C convenience subclass for sparse /
-  per-token eviction methods (RocketKV-V2-migrated, TriAttention, H2O,
-  SnapKV, ...). Currently the only axis subclass shipped; future
-  ``KVCacheStorageManager`` (axis B for KVTC etc.) and ``CRCLManager``
-  (cross-request lifecycle for Continuum etc.) will be added as sibling
-  subclasses of ``BaseKVCacheCompressionExecutor`` in Phase 4 / Phase 5.
+- :class:`SparseAttentionExecutor`: subclass for sparse attention methods
+  (RocketKV V2-migrated, TriAttention, H2O, SnapKV, ...). The only subclass
+  shipped today; future ``KVCacheStorageExecutor`` (for KVTC etc.) and
+  ``CRCLExecutor`` (cross-request lifecycle, for Continuum etc.) will be
+  added as sibling subclasses of ``BaseKVCacheCompressionExecutor`` in
+  Phase 4 / Phase 5.
 
 Architecture (3-layer stack):
 
@@ -54,25 +54,21 @@ V2 specialization patterns (per 2026-05-27 design discussion, see doc 27 §5):
   factory consults this ClassVar to instantiate the right V2 type.
   **No current method needs this**; reserved for unforeseen future needs.
 
-Hooks (8 total):
+Hooks (6 total):
 
   - ``on_request_init`` / ``on_request_finish``
         Request lifecycle (entry / exit).
   - ``on_context_attention`` / ``on_context_end``
-        Prefill phase, per attention layer and per phase-boundary.
+        Prefill phase: per attention layer, and once at phase boundary.
   - ``on_generation_attention`` / ``on_generation_step_end``
-        Decode phase, per attention layer and per generation step.
-  - ``on_forward_begin`` / ``on_forward_end``
-        Per-forward async coordination (wait pending / trigger async).
-        Used primarily by future axis-B (storage) and axis-D (CRCL)
-        executors; most axis-C sparse executors leave these as no-op.
+        Decode phase: per attention layer, and once at end of step.
 
 A :class:`KVCacheBehaviorCoordinator` (see ``coordinator.py``) owns a list of
 ``BaseKVCacheCompressionExecutor`` instances and dispatches each hook to them
-in a deterministic axis-priority order (see ``coordinator.HOOK_ORDER``).
+in deterministic order (see ``coordinator.HOOK_ORDER``).
 """
 
-from typing import (TYPE_CHECKING, Any, ClassVar, Optional, Tuple, Type)
+from typing import (TYPE_CHECKING, ClassVar, Optional, Tuple, Type)
 
 import torch
 
@@ -96,16 +92,17 @@ class BaseKVCacheCompressionExecutor:
 
     Subclasses must set ``axis`` ClassVar to one of:
 
-    - ``"sparse"`` — sparse / per-token eviction
+    - ``"sparse"`` — sparse attention / per-token eviction
       (:class:`SparseAttentionExecutor`, shipped now).
-    - ``"storage"`` — storage / transform-coding
-      (:class:`KVCacheStorageManager`, planned Phase 4 for KVTC).
+    - ``"storage"`` — KV storage / transform-coding
+      (:class:`KVCacheStorageExecutor`, planned Phase 4 for KVTC).
     - ``"crcl"`` — cross-request cache lifecycle
-      (:class:`CRCLManager`, planned Phase 5 if α candidate selected).
+      (:class:`CRCLExecutor`, planned Phase 5 if Continuum-style candidate
+      selected).
 
-    All 8 hooks default to no-op; subclasses override what they need. A
-    :class:`KVCacheBehaviorCoordinator` instance dispatches each hook to all
-    registered executors in deterministic axis-priority order.
+    All 6 hooks default to no-op; subclasses override what they need. A
+    :class:`KVCacheBehaviorCoordinator` dispatches each hook to all
+    registered executors in deterministic order.
 
     The behavior layer never inherits from any cache / resource manager
     because this layer decides *how* the physical KV is used, not *what*
@@ -167,8 +164,8 @@ class BaseKVCacheCompressionExecutor:
         """Per-request init hook.
 
         Override to allocate per-request accumulators (e.g., H2O cumulative
-        attention sum buffers indexed by (layer, head, token)). CRCL
-        executors (future) check a cross-request pool for hits here.
+        attention sum buffers indexed by (layer, head, token)). Future
+        cross-request executors check a cross-request pool for hits here.
         """
         pass
 
@@ -178,8 +175,8 @@ class BaseKVCacheCompressionExecutor:
         Override to release per-request state allocated in
         ``on_request_init``. Underlying KV blocks are still freed by the
         ``KVCacheManagerV2``; subclasses must not free them here. Storage
-        executors (future) emit final compressed bytes here; CRCL executors
-        (future) promote those to a cross-request pool here.
+        executors (future) emit final compressed bytes here; cross-request
+        executors (future) promote those to a cross-request pool here.
         """
         pass
 
@@ -202,11 +199,12 @@ class BaseKVCacheCompressionExecutor:
         attention kernel instantiation exposes scores (compile-time
         template flag); ``None`` when scores are not materialized.
 
-        Form-I sparse executors return an ``(indices, offsets)`` tuple as an
-        input-side sparse mask; form-III (eviction-after-compute) executors,
-        storage executors, and CRCL executors return ``None``. The coordinator
-        enforces single-source: at most one executor may return non-None per
-        attention call.
+        Sparse-mask executors (e.g., RocketKV, Quest) return an
+        ``(indices, offsets)`` tuple as an input-side sparse mask;
+        physical-evict executors (e.g., TriAttention), storage executors,
+        and cross-request executors return ``None``. The coordinator
+        enforces single-source: at most one executor may return non-None
+        per attention call.
         """
         return None
 
@@ -239,10 +237,10 @@ class BaseKVCacheCompressionExecutor:
         """Per-layer hook after every generation-phase attention forward.
 
         Same single-source invariant as ``on_context_attention``: at most
-        one executor may return non-None metadata. Used by form-I sparse
-        executors (RocketKV Stage II HSA, Quest) to return query-aware
-        masks; form-III executors (TriAttention) and non-sparse executors
-        return ``None``.
+        one executor may return non-None metadata. Used by sparse-mask
+        executors (e.g., RocketKV Stage II HSA, Quest) to return query-aware
+        masks; physical-evict executors (e.g., TriAttention) and non-sparse
+        executors return ``None``.
         """
         return None
 
@@ -259,30 +257,6 @@ class BaseKVCacheCompressionExecutor:
         (RocketKV rewind). Storage executors may invalidate active
         compressed copies here if the cache shape changed (e.g., after a
         sparse evict).
-        """
-        pass
-
-    # ------------------------------------------------------------------ #
-    # Forward-pass async coordination hooks                              #
-    # (added for async storage / CRCL operations)                        #
-    # ------------------------------------------------------------------ #
-
-    def on_forward_begin(self, forward_batch: Any) -> None:
-        """Per-forward hook BEFORE the forward pass starts.
-
-        Storage executors (future) wait for pending async decompress
-        streams here; CRCL executors (future) may resume cache from
-        cross-request pool here. Most axis-C sparse executors leave this
-        as no-op.
-        """
-        pass
-
-    def on_forward_end(self, forward_batch: Any) -> None:
-        """Per-forward hook AFTER the forward pass completes.
-
-        Storage executors (future) trigger async re-compress here; CRCL
-        executors (future) update TTL counters and GC expired entries
-        here. Most axis-C sparse executors leave this as no-op.
         """
         pass
 
@@ -318,7 +292,7 @@ BaseKVCacheBehaviorManager = BaseKVCacheCompressionExecutor
 
 
 class SparseAttentionExecutor(BaseKVCacheCompressionExecutor):
-    """Axis-C subclass for sparse / per-token eviction methods.
+    """Convenience subclass for sparse-attention methods.
 
     Subclasses: :class:`TriAttention` (Phase 3 first instance), and future
     H2O / SnapKV / RocketKV-V2-migrated (``rocketkv.py``). The legacy
@@ -327,12 +301,12 @@ class SparseAttentionExecutor(BaseKVCacheCompressionExecutor):
     ``dsa.py``) and do NOT inherit from this base.
 
     The framework base is :class:`BaseKVCacheCompressionExecutor`;
-    ``SparseAttentionExecutor`` is the axis-specific convenience subclass
-    that sparse algorithms inherit from. Existing call sites that import
+    ``SparseAttentionExecutor`` is the convenience subclass that sparse
+    algorithms inherit from. Existing call sites that import
     ``SparseAttentionExecutor`` continue to work unchanged — TriAttention
     still inherits from it.
 
-    Future axis-C-specific helpers (e.g., ``_read_req_k_cache`` for K-cache
+    Future sparse-specific helpers (e.g., ``_read_req_k_cache`` for K-cache
     pool readback, ``_compact_req`` for physical eviction through the V2
     ``compact_request_cache`` wrapper API) will live on this class so all
     sparse subclasses share them without duplication.
@@ -341,17 +315,18 @@ class SparseAttentionExecutor(BaseKVCacheCompressionExecutor):
     axis: ClassVar[str] = "sparse"
 
     # ------------------------------------------------------------------ #
-    # Axis-C-specific capability declarations (subclass overrides)        #
+    # Sparse-specific capability declarations (subclass overrides)        #
     # ------------------------------------------------------------------ #
 
-    # ``True`` if this method physically compacts the cache (TriAttention,
-    # H2O); ``False`` if it operates form-I (RocketKV Stage II HSA, DSA,
-    # Quest) — returns a sparse mask but does not mutate cache contents.
-    is_form_iii_evict: ClassVar[bool] = False
+    # ``True`` if this method physically deletes (compacts) tokens from the
+    # KV cache (TriAttention, H2O). ``False`` if it only returns a sparse
+    # mask via :class:`SparseAttentionIndices`, leaving cache contents
+    # unchanged (RocketKV Stage II HSA, DSA, Quest).
+    physically_evicts_kv: ClassVar[bool] = False
 
 
 # Backward-compat alias — ``SparseAttentionManager`` was the v15.9 / v16.0
-# axis-C subclass name (committed `7d74c8dae6` / `bfc910c02b` / `23bfff4a16` /
+# subclass name (committed `7d74c8dae6` / `bfc910c02b` / `23bfff4a16` /
 # `eaa5c71aaf`). Renamed 2026-05-27 to ``SparseAttentionExecutor`` to match
 # the ``BaseKVCacheCompressionExecutor`` base — per-axis subclasses are also
 # "executors" of one axis of compression algorithm work, not "managers" of

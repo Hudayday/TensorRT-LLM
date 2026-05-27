@@ -3,21 +3,21 @@
 A :class:`KVCacheBehaviorCoordinator` owns a list of
 :class:`BaseKVCacheCompressionExecutor` instances (typically 1–3: one per axis
 from ``sparse`` / ``storage`` / ``crcl``) and dispatches each lifecycle hook
-to all managers in a deterministic axis-priority order. PyExecutor sees only
-the coordinator; the coordinator handles per-axis dispatch + mutex
-validation + cross-axis dependency wiring.
+to all managers in deterministic order. PyExecutor sees only the
+coordinator; the coordinator handles per-axis dispatch + mutex validation +
+cross-axis dependency wiring.
 
 Currently (Phase 3 ship) only axis ``"sparse"`` has a concrete subclass
-(:class:`SparseAttentionManager`). Phase 4 adds axis ``"storage"``
-(KVCacheStorageManager + KVTC); Phase 5 may add axis ``"crcl"``
-(CRCLManager + Continuum or chosen candidate). The :data:`HOOK_ORDER`
+(:class:`SparseAttentionExecutor`). Phase 4 adds axis ``"storage"``
+(``KVCacheStorageExecutor`` + KVTC); Phase 5 may add axis ``"crcl"``
+(``CRCLExecutor`` + Continuum or chosen candidate). The :data:`HOOK_ORDER`
 table is already set up for all three axes — no changes needed at
 coordinator level when new axes ship.
 
 This module is part of the planned v17 multi-manager runtime evolution
 (see ``~/docs/kv-reduction/23-multi-manager-runtime-refactor-plan.md`` and
 ``24-l2-behavior-layer-concrete-design.md``). **PyExecutor is NOT yet wired
-to use the coordinator** — the existing single-SparseAttentionManager path
+to use the coordinator** — the existing single-SparseAttentionExecutor path
 stays active. The coordinator class is shipped now (Phase 3) so the
 framework scaffolding is in place for Phase 4 KVTC integration to slot
 into.
@@ -27,7 +27,7 @@ import warnings
 from typing import Dict, Iterable, List, Optional, TYPE_CHECKING
 
 from .kv_cache_compression_executor import (BaseKVCacheCompressionExecutor,
-                                       SparseAttentionManager)
+                                       SparseAttentionExecutor)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
@@ -39,31 +39,25 @@ if TYPE_CHECKING:
 
 # Hook execution order across axes. Each hook name maps to a list of axis
 # identifiers in dispatch order. A manager whose axis is not in the list for
-# a given hook is silently skipped for that hook (e.g., axis-D hooks are not
-# called for axis-C-only managers).
+# a given hook is silently skipped for that hook.
 _HOOK_ORDER: Dict[str, List[str]] = {
-    # Request lifecycle: CRCL first (pool lookup) -> SPARSE (init state) ->
-    # STORAGE (may decompress on pool hit).
+    # Request lifecycle: cross-request first (pool lookup) -> sparse (init
+    # state) -> storage (may decompress on pool hit).
     "on_request_init":         ["crcl", "sparse", "storage"],
-    # Final cleanup: SPARSE (final evict) -> STORAGE (final encode) ->
-    # CRCL (promote compressed bytes to cross-request pool).
+    # Final cleanup: sparse (final evict) -> storage (final encode) ->
+    # cross-request (promote compressed bytes to cross-request pool).
     "on_request_finish":       ["sparse", "storage", "crcl"],
-    # Attention hooks: only SPARSE writes attention metadata (form I);
-    # STORAGE and CRCL stay out of the attention path.
+    # Attention hooks: only sparse-attention executors write attention
+    # metadata; storage and cross-request executors stay out of the
+    # attention path.
     "on_context_attention":    ["sparse"],
     "on_generation_attention": ["sparse"],
-    # Phase boundary: SPARSE evict first -> STORAGE compresses remaining
-    # cache -> CRCL marks eligible for cross-request retention.
+    # Phase boundary: sparse evict first -> storage compresses remaining
+    # cache -> cross-request marks eligible for retention.
     "on_context_end":          ["sparse", "storage", "crcl"],
-    # Per-step: SPARSE periodic evict (beta=128) -> STORAGE invalidate
-    # active compressed copy -> CRCL TTL GC.
+    # Per-step: sparse periodic evict (e.g., TriAttention beta=128) ->
+    # storage invalidate active compressed copy -> cross-request TTL GC.
     "on_generation_step_end":  ["sparse", "storage", "crcl"],
-    # Per-forward async: STORAGE waits pending decompress -> CRCL resumes
-    # from pool -> SPARSE typically no-op for begin.
-    "on_forward_begin":        ["storage", "crcl", "sparse"],
-    # After forward: SPARSE -> STORAGE triggers async re-compress -> CRCL
-    # TTL update.
-    "on_forward_end":          ["sparse", "storage", "crcl"],
 }
 
 
@@ -71,21 +65,20 @@ class KVCacheBehaviorCoordinator:
     """Multi-manager runtime coordinator.
 
     Owns ``managers: List[BaseKVCacheCompressionExecutor]`` and dispatches each
-    of the 8 lifecycle hooks to all managers in deterministic axis-priority
-    order.
+    of the 6 lifecycle hooks to all managers in deterministic order.
 
     Mutex rules (enforced in ``__init__``):
 
     - At most one manager per axis (intra-axis stacking not supported, see
       ``~/docs/kv-reduction/21-framework-architecture-rationale.md`` §6).
     - Soft warnings for some cross-axis combos (e.g., sparse-evicted cache
-      in a CRCL pool) — emitted via ``warnings.warn`` at init time.
+      in a cross-request pool) — emitted via ``warnings.warn`` at init time.
 
     Dependency wiring (in ``__init__``):
 
-    - If both axis ``"crcl"`` and axis ``"storage"`` managers are present,
-      the CRCL manager's ``storage_delegate`` attribute (if it exists) is
-      automatically set to the storage manager, so cross-request pool
+    - If both a ``"crcl"`` and a ``"storage"`` manager are present, the
+      cross-request manager's ``storage_delegate`` attribute (if it exists)
+      is automatically set to the storage manager, so cross-request pool
       entries are stored as storage-compressed bytes.
     """
 
@@ -113,17 +106,19 @@ class KVCacheBehaviorCoordinator:
                 raise ValueError(
                     f"Intra-axis stacking not supported: {len(mgrs)} "
                     f"managers found for axis={axis!r}. Most sparse / "
-                    f"storage / CRCL methods assume sole arbiter; stacking "
-                    f"two of the same axis would invalidate per-method "
-                    f"correctness assumptions. For intra-axis composition, "
-                    f"write a hybrid algorithm subclass instead.")
+                    f"storage / cross-request methods assume sole arbiter; "
+                    f"stacking two of the same axis would invalidate "
+                    f"per-method correctness assumptions. For intra-axis "
+                    f"composition, write a hybrid algorithm subclass "
+                    f"instead.")
 
     def _wire_dependencies(self) -> None:
         """Wire optional cross-axis delegate attributes.
 
-        CRCL managers (Phase 5+) may use a storage manager for their
-        cross-request compressed pool. Auto-wire if both are present and
-        the CRCL manager exposes a ``storage_delegate`` attribute.
+        Cross-request managers (Phase 5+) may use a storage manager for
+        their cross-request compressed pool. Auto-wire if both are present
+        and the cross-request manager exposes a ``storage_delegate``
+        attribute.
         """
         crcl_list = self._by_axis.get("crcl", [])
         storage_list = self._by_axis.get("storage", [])
@@ -147,18 +142,19 @@ class KVCacheBehaviorCoordinator:
         mgrs = self._by_axis.get(axis, [])
         return mgrs[0] if mgrs else None
 
-    def get_sparse_manager(self) -> Optional[SparseAttentionManager]:
-        """Convenience accessor — returns the axis-C manager if present.
+    def get_sparse_manager(self) -> Optional[SparseAttentionExecutor]:
+        """Convenience accessor — returns the sparse-attention manager if
+        present.
 
         Used by code that historically accessed
         ``PyExecutor.kv_cache_compression_executor`` directly. Returns the
-        axis-C ``SparseAttentionManager`` instance, narrowed for type
-        hinting; falls back to ``None`` if no axis-C manager registered.
+        ``SparseAttentionExecutor`` instance, narrowed for type hinting;
+        falls back to ``None`` if no sparse-attention manager registered.
         """
         return self.get_manager("sparse")  # type: ignore[return-value]
 
     # ------------------------------------------------------------------ #
-    # Hook dispatch — 8 methods, all sequential per HOOK_ORDER            #
+    # Hook dispatch — 6 methods, all sequential per HOOK_ORDER            #
     # ------------------------------------------------------------------ #
 
     def _iter_for_hook(
@@ -198,8 +194,8 @@ class KVCacheBehaviorCoordinator:
                 if result is not None:
                     raise RuntimeError(
                         "Multiple managers returned attention metadata "
-                        "from on_context_attention; form-I sparse "
-                        "attention metadata writes must be single-source.")
+                        "from on_context_attention; sparse-attention "
+                        "metadata writes must be single-source.")
                 result = r
         return result
 
@@ -224,8 +220,8 @@ class KVCacheBehaviorCoordinator:
                 if result is not None:
                     raise RuntimeError(
                         "Multiple managers returned attention metadata "
-                        "from on_generation_attention; form-I sparse "
-                        "attention metadata writes must be single-source.")
+                        "from on_generation_attention; sparse-attention "
+                        "metadata writes must be single-source.")
                 result = r
         return result
 
@@ -234,11 +230,3 @@ class KVCacheBehaviorCoordinator:
             attn_metadata: "AttentionMetadata") -> None:
         for mgr in self._iter_for_hook("on_generation_step_end"):
             mgr.on_generation_step_end(scheduled_batch, attn_metadata)
-
-    def on_forward_begin(self, forward_batch) -> None:
-        for mgr in self._iter_for_hook("on_forward_begin"):
-            mgr.on_forward_begin(forward_batch)
-
-    def on_forward_end(self, forward_batch) -> None:
-        for mgr in self._iter_for_hook("on_forward_end"):
-            mgr.on_forward_end(forward_batch)

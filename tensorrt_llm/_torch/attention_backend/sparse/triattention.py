@@ -1,11 +1,11 @@
-"""TriAttention sparse-attention method (form-III periodic eviction).
+"""TriAttention sparse-attention method (periodic physical KV eviction).
 
 TriAttention performs periodic generation-phase KV eviction guided by a
 trigonometric importance score computed from offline-calibrated statistics of
-the model's Q-pre-RoPE vectors (paper §4.1, §4.3). It is a form-III method:
-no work in context phase, no per-step attention-time mask, and a single
-``on_generation_step_end`` hook that fires every ``beta`` steps to physically
-evict blocks below the top-B keep set.
+the model's Q-pre-RoPE vectors (paper §4.1, §4.3). It physically deletes
+tokens from the cache: no work in context phase, no per-step attention-time
+mask, and a single ``on_generation_step_end`` hook that fires every ``beta``
+steps to evict blocks below the top-B keep set.
 
 Calibration is computed offline via
 ``triattention_calibration.compute_triattention_calibration`` and loaded once
@@ -34,19 +34,23 @@ _REQUIRED_CALIBRATION_KEYS = frozenset({"E_q", "E_q_norm", "R", "omega", "phi"})
 
 
 class TriAttention(SparseAttentionExecutor):
-    """Form-III periodic KV eviction driven by trigonometric importance scoring.
+    """Periodic physical KV eviction driven by trigonometric importance
+    scoring.
 
     Overrides only ``on_generation_step_end``: every ``beta`` generation steps,
     reads the current K cache through the underlying ``KVCacheManagerV2``,
     computes a per-token importance score using offline-calibrated stats, and
     physically evicts blocks below the top-B keep set. All other hooks remain
-    no-op (form-III does not need context-phase or per-attention work).
+    no-op (this method does not need context-phase or per-attention work).
     """
 
     # TriAttention physically evicts tokens during decode based on per-request
     # query / step state, so the resulting cache is not safe to reuse across
     # requests (a different request would have evicted a different token set).
     supports_kv_cache_reuse: ClassVar[bool] = False
+
+    # Physically deletes tokens from cache (vs. RocketKV-style sparse mask).
+    physically_evicts_kv: ClassVar[bool] = True
 
     def __init__(
         self,

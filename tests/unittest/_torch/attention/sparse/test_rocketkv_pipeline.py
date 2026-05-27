@@ -20,7 +20,8 @@ Covers the wiring landed in commit c92690ef09 + this commit's additions:
 The tests intentionally do *not* exercise actual KT-summary computation or
 HSA-mask construction; those are Phase 7 algorithm-body work. This is a
 **pipeline-level wire test** mirroring the TriAttention pipeline test —
-ensures the framework can adapt both axis-C methods.
+ensures the framework can adapt both sparse-attention methods (TriAttention
+physical-evict + RocketKV sparse-mask).
 """
 
 import pytest
@@ -197,8 +198,9 @@ class TestRocketKVClass:
         assert RocketKV.axis == "sparse"
 
     def test_capability_declarations(self):
-        # form-I (sparse mask via metadata, cache contents unchanged)
-        assert RocketKV.is_form_iii_evict is False
+        # Sparse-mask method: returns indices, cache contents unchanged
+        # (contrast: TriAttention physically_evicts_kv=True)
+        assert RocketKV.physically_evicts_kv is False
         # KT cache is request-specific; cannot survive cross-request reuse
         assert RocketKV.supports_kv_cache_reuse is False
         # Pattern 1+2: uses default plain V2 (no Pattern 3 subclass)
@@ -228,15 +230,42 @@ class TestRocketKVClass:
 
     def test_other_hooks_default_noop(self):
         """All other hooks inherit base no-op (RocketKV does not override
-        them — Stage I/II are sufficient for form-I sparse)."""
+        them — Stage I/II are sufficient for a sparse-mask method)."""
         mgr = RocketKV(kv_cache_manager=MagicMock())
-        # 6 inherited no-op hooks
+        # 4 inherited no-op hooks (besides Stage I/II)
         assert mgr.on_request_init(MagicMock()) is None
         assert mgr.on_context_end(MagicMock(), MagicMock()) is None
         assert mgr.on_generation_step_end(MagicMock(), MagicMock()) is None
         assert mgr.on_request_finish(MagicMock()) is None
-        assert mgr.on_forward_begin(MagicMock()) is None
-        assert mgr.on_forward_end(MagicMock()) is None
+
+    def test_attention_shims_defined_in_same_module(self):
+        """RocketKV ships its own attention shim classes alongside the
+        executor (per 2026-05-27 design: structure must be finalized so the
+        executor pipeline routes to the correct KV manager AND the correct
+        attention class)."""
+        from tensorrt_llm._torch.attention_backend.sparse.rocketkv import (
+            RocketKVTrtllmAttention, RocketKVTrtllmAttentionMetadata,
+            RocketKVVanillaAttention, RocketKVVanillaAttentionMetadata)
+        assert RocketKVTrtllmAttention.Metadata is \
+            RocketKVTrtllmAttentionMetadata
+        assert RocketKVVanillaAttention.Metadata is \
+            RocketKVVanillaAttentionMetadata
+
+    def test_attention_factory_routes_rocketkv_to_its_shim(self):
+        """``get_trtllm_sparse_attn_attention_backend`` must return the
+        RocketKV-specific attention class for algorithm="rocketkv", NOT
+        the default ``TrtllmAttention`` short-circuit used by other
+        behavior-layer methods (e.g., TriAttention)."""
+        from tensorrt_llm._torch.attention_backend.sparse.utils import (
+            get_trtllm_sparse_attn_attention_backend,
+            get_vanilla_sparse_attn_attention_backend)
+        from tensorrt_llm._torch.attention_backend.sparse.rocketkv import (
+            RocketKVTrtllmAttention, RocketKVVanillaAttention)
+        cfg = RocketKVSparseAttentionConfig()
+        assert get_trtllm_sparse_attn_attention_backend(cfg) is \
+            RocketKVTrtllmAttention
+        assert get_vanilla_sparse_attn_attention_backend(cfg) is \
+            RocketKVVanillaAttention
 
 
 # ---------------------------------------------------------------------------

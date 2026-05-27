@@ -8,7 +8,8 @@ from .rocket import (RocketKVCacheManager, RocketTrtllmAttention,
                      RocketVanillaAttention)
 from .kv_cache_compression_executor import (BaseKVCacheCompressionExecutor,
                                             SparseAttentionExecutor)
-from .rocketkv import RocketKV
+from .rocketkv import (RocketKV, RocketKVTrtllmAttention,
+                       RocketKVVanillaAttention)
 from .triattention import TriAttention
 
 if TYPE_CHECKING:
@@ -26,7 +27,7 @@ def get_sparse_attn_kv_cache_manager(
 
     Behavior-layer methods (where ``config.is_behavior_layer_method == True``)
     do NOT own a sparse-aware cache manager — they use the standard V2 manager
-    and run their algorithm in a :class:`SparseAttentionManager` subclass.
+    and run their algorithm in a :class:`SparseAttentionExecutor` subclass.
     This function returns ``None`` for such configs (caller falls through to
     the standard V2 manager); top-level callers in ``_util.py`` short-circuit
     earlier via ``is_behavior_layer_method``, so this defensive None-return is
@@ -52,20 +53,20 @@ def create_sparse_attention_manager(
 ) -> Optional[SparseAttentionExecutor]:
     """Behavior-layer factory: dispatches on ``config.algorithm`` (the same
     Pydantic ``Literal`` discriminator as the rest of the sparse stack) and
-    returns a fully constructed :class:`SparseAttentionManager` subclass
+    returns a fully constructed :class:`SparseAttentionExecutor` subclass
     instance, or ``None`` when the configured algorithm is *not* a behavior-
-    layer method (RocketKV / DSA / skip_softmax stay on the legacy cache-
-    manager path).
+    layer method (legacy RocketKV / DSA / skip_softmax stay on the legacy
+    cache-manager path).
 
     Callers should also check ``sparse_attn_config.is_behavior_layer_method``
     to decide whether to invoke this factory at all; this function additionally
     guards against misuse by returning ``None`` for non-behavior-layer configs.
 
     Behavior-layer methods require :class:`KVCacheManagerV2` as the underlying
-    KV-cache manager (see ``SparseAttentionManager`` docstring). The legacy V1
-    manager lacks the page-table / block-read API the behavior layer depends
-    on; passing it raises ``TypeError`` here so the misconfiguration is caught
-    at LLM init rather than at the first eviction.
+    KV-cache manager (see :class:`SparseAttentionExecutor` docstring). The
+    legacy V1 manager lacks the page-table / block-read API the behavior layer
+    depends on; passing it raises ``TypeError`` here so the misconfiguration
+    is caught at LLM init rather than at the first eviction.
     """
     if not sparse_attn_config.is_behavior_layer_method:
         # Legacy memory-layer methods are not handled by this factory; the
@@ -118,9 +119,9 @@ def create_behavior_coordinator(
     multi-manager ``LlmArgs`` field (``behavior_managers: List[...]``)
     lands, this factory will accept a list of axis-discriminated configs
     instead. The Phase 3 wrapping path constructs at most one manager
-    (axis-C sparse) and returns a coordinator owning that single manager.
-    Returns ``None`` if no manager is configured (no behavior-layer config
-    or only legacy memory-layer configs).
+    (sparse-attention executor) and returns a coordinator owning that single
+    manager. Returns ``None`` if no manager is configured (no behavior-layer
+    config or only legacy memory-layer configs).
 
     Note: PyExecutor does not yet call this factory — the legacy
     :func:`create_sparse_attention_manager` path is still active. This
@@ -130,7 +131,7 @@ def create_behavior_coordinator(
     if sparse_attn_config is None:
         return None
 
-    managers: List[BaseKVCacheBehaviorManager] = []
+    managers: List[BaseKVCacheCompressionExecutor] = []
     sparse_mgr = create_sparse_attention_manager(sparse_attn_config,
                                                  kv_cache_manager)
     if sparse_mgr is not None:
@@ -146,12 +147,20 @@ def create_behavior_coordinator(
 
 def get_vanilla_sparse_attn_attention_backend(
         sparse_attn_config: "SparseAttentionConfig"):
-    # Behavior-layer sparse methods use the base attention class without any
-    # method-specific shim; their work happens out-of-band in a
-    # SparseAttentionManager subclass invoked by PyExecutor. Top-level callers
-    # in attention_backend.utils.get_attention_backend short-circuit before
-    # reaching here, but we also short-circuit defensively for tests / future
-    # direct callers.
+    # ``rocketkv`` is a behavior-layer method but ALSO ships its own
+    # attention shim (in sparse/rocketkv.py) — the executor produces a
+    # sparse mask via on_*_attention hooks but the attention shim is what
+    # actually consumes the mask in the kernel forward. So check rocketkv
+    # BEFORE the generic behavior-layer short-circuit.
+    if sparse_attn_config.algorithm == "rocketkv":
+        return RocketKVVanillaAttention
+    # Other behavior-layer methods (e.g., TriAttention) use the base
+    # attention class without a method-specific shim; their work happens
+    # out-of-band in a SparseAttentionExecutor subclass invoked by
+    # PyExecutor. Top-level callers in
+    # attention_backend.utils.get_attention_backend short-circuit before
+    # reaching here, but we also short-circuit defensively for tests /
+    # future direct callers.
     if sparse_attn_config.is_behavior_layer_method:
         from ..vanilla import VanillaAttention
         return VanillaAttention
@@ -165,7 +174,12 @@ def get_vanilla_sparse_attn_attention_backend(
 
 def get_trtllm_sparse_attn_attention_backend(
         sparse_attn_config: "SparseAttentionConfig"):
-    # Behavior-layer sparse methods use the base attention class without any
+    # ``rocketkv`` is a behavior-layer method but ALSO ships its own
+    # attention shim (in sparse/rocketkv.py); check BEFORE the generic
+    # behavior-layer short-circuit.
+    if sparse_attn_config.algorithm == "rocketkv":
+        return RocketKVTrtllmAttention
+    # Other behavior-layer methods use the base attention class without a
     # method-specific shim. Top-level callers short-circuit before reaching
     # here; this defensive guard catches tests / future direct callers.
     if sparse_attn_config.is_behavior_layer_method:

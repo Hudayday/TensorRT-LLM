@@ -1,13 +1,13 @@
 """Unit tests for the v17 multi-manager runtime framework skeleton.
 
 Covers the framework scaffolding shipped on top of the existing
-``SparseAttentionManager`` baseline:
+``SparseAttentionExecutor`` baseline:
 
 - :class:`BaseKVCacheCompressionExecutor` ABC contract (axis ClassVar enforced,
-  8 hook defaults, ``implements()`` introspection).
-- :class:`SparseAttentionManager` is now an axis-C convenience subclass of
-  ``BaseKVCacheCompressionExecutor`` (existing ``TriAttention`` inherits via
-  this layer unchanged).
+  6 hook defaults, ``implements()`` introspection).
+- :class:`SparseAttentionExecutor` is the convenience subclass of
+  ``BaseKVCacheCompressionExecutor`` for sparse-attention methods (existing
+  ``TriAttention`` inherits via this layer unchanged).
 - :class:`KVCacheBehaviorCoordinator` mutex (intra-axis stacking raises),
   HOOK_ORDER deterministic dispatch, single-source attention metadata
   enforcement, introspection helpers (``has_axis`` / ``get_manager`` /
@@ -60,7 +60,7 @@ class _RecordingMixin:
 
 
 class _MockSparseManager(_RecordingMixin, SparseAttentionExecutor):
-    """Mock axis-C manager."""
+    """Mock sparse-attention manager (axis ``sparse``)."""
 
     def on_request_init(self, request):
         self._record("on_request_init")
@@ -76,7 +76,7 @@ class _MockSparseManager(_RecordingMixin, SparseAttentionExecutor):
 
 
 class _MockStorageManager(_RecordingMixin, BaseKVCacheCompressionExecutor):
-    """Mock axis-B manager (storage transform)."""
+    """Mock KV-storage manager (axis ``storage``)."""
 
     axis: ClassVar[str] = "storage"
 
@@ -94,7 +94,7 @@ class _MockStorageManager(_RecordingMixin, BaseKVCacheCompressionExecutor):
 
 
 class _MockCRCLManager(_RecordingMixin, BaseKVCacheCompressionExecutor):
-    """Mock 4th-category manager (cross-request lifecycle)."""
+    """Mock cross-request lifecycle manager (axis ``crcl``)."""
 
     axis: ClassVar[str] = "crcl"
     # Storage delegate slot used by coordinator's _wire_dependencies.
@@ -131,14 +131,13 @@ class TestBaseABC:
         with pytest.raises(NotImplementedError, match="must set the 'axis'"):
             BadManager(fake_kv_cache_manager)
 
-    def test_8_hooks_default_noop(self, fake_kv_cache_manager):
-        """All 8 hooks return None / no-op by default."""
+    def test_6_hooks_default_noop(self, fake_kv_cache_manager):
+        """All 6 hooks return None / no-op by default."""
 
         class TrivialManager(BaseKVCacheCompressionExecutor):
             axis = "sparse"
 
         mgr = TrivialManager(fake_kv_cache_manager)
-        # 6 lifecycle hooks
         assert mgr.on_request_init(MagicMock()) is None
         assert mgr.on_context_attention(0, None, None, None,
                                         MagicMock()) is None
@@ -147,9 +146,6 @@ class TestBaseABC:
                                            MagicMock()) is None
         assert mgr.on_generation_step_end(MagicMock(), MagicMock()) is None
         assert mgr.on_request_finish(MagicMock()) is None
-        # 2 async hooks
-        assert mgr.on_forward_begin(MagicMock()) is None
-        assert mgr.on_forward_end(MagicMock()) is None
 
     def test_implements_introspection(self, fake_kv_cache_manager):
         """``implements()`` reports True only for actually-overridden hooks."""
@@ -164,42 +160,48 @@ class TestBaseABC:
         mgr = PartialManager(fake_kv_cache_manager)
         assert mgr.implements("on_generation_step_end") is True
         assert mgr.implements("on_request_init") is False
-        assert mgr.implements("on_forward_begin") is False
+        assert mgr.implements("on_context_attention") is False
         # Non-existent hook name returns False.
         assert mgr.implements("nonexistent_hook") is False
 
 
 # ---------------------------------------------------------------------- #
-# 2. SparseAttentionManager axis-C subclass                              #
+# 2. SparseAttentionExecutor subclass                                     #
 # ---------------------------------------------------------------------- #
 
 
-class TestSparseAttentionManagerSubclass:
+class TestSparseAttentionExecutorSubclass:
 
     def test_is_subclass_of_base(self):
-        assert issubclass(SparseAttentionManager,
+        assert issubclass(SparseAttentionExecutor,
                           BaseKVCacheCompressionExecutor)
 
     def test_axis_is_sparse(self):
-        assert SparseAttentionManager.axis == "sparse"
+        assert SparseAttentionExecutor.axis == "sparse"
 
     def test_supports_kv_cache_reuse_default_false(self):
         # Inherited from base, sparse default conservative.
-        assert SparseAttentionManager.supports_kv_cache_reuse is False
+        assert SparseAttentionExecutor.supports_kv_cache_reuse is False
 
-    def test_is_form_iii_evict_default_false(self):
-        # Axis-C-specific declaration; subclass overrides.
-        assert SparseAttentionManager.is_form_iii_evict is False
+    def test_physically_evicts_kv_default_false(self):
+        # Sparse-specific declaration; subclass overrides (TriAttention
+        # sets True, RocketKV stays False).
+        assert SparseAttentionExecutor.physically_evicts_kv is False
 
     def test_triattention_inheritance_unchanged(self):
-        """TriAttention must remain a SparseAttentionManager subclass
+        """TriAttention must remain a SparseAttentionExecutor subclass
         (and therefore a BaseKVCacheCompressionExecutor subclass too)."""
         from tensorrt_llm._torch.attention_backend.sparse.triattention import (
             TriAttention, )
-        assert issubclass(TriAttention, SparseAttentionManager)
+        assert issubclass(TriAttention, SparseAttentionExecutor)
         assert issubclass(TriAttention, BaseKVCacheCompressionExecutor)
         # axis ClassVar inherited
         assert TriAttention.axis == "sparse"
+
+    def test_triattention_physically_evicts_true(self):
+        from tensorrt_llm._torch.attention_backend.sparse.triattention import (
+            TriAttention, )
+        assert TriAttention.physically_evicts_kv is True
 
 
 # ---------------------------------------------------------------------- #
@@ -248,8 +250,9 @@ class TestCoordinatorConstruction:
 
     def test_crcl_storage_dependency_auto_wired(self,
                                                  fake_kv_cache_manager):
-        """If both CRCL and storage managers present, CRCL.storage_delegate
-        is auto-set to the storage manager."""
+        """If both cross-request and storage managers present,
+        cross-request manager's ``storage_delegate`` is auto-set to the
+        storage manager."""
         record = []
         storage = _MockStorageManager(fake_kv_cache_manager, record, "st")
         crcl = _MockCRCLManager(fake_kv_cache_manager, record, "cr")
@@ -330,10 +333,10 @@ class TestAttentionMetadataSingleSource:
     def test_only_sparse_dispatched_for_attention(self,
                                                    fake_kv_cache_manager):
         """``on_context_attention`` / ``on_generation_attention`` only
-        dispatch to axis-C managers per HOOK_ORDER."""
+        dispatch to sparse-attention managers per HOOK_ORDER."""
         called_axes: List[str] = []
 
-        class TrackingSparse(SparseAttentionManager):
+        class TrackingSparse(SparseAttentionExecutor):
 
             def on_context_attention(self, layer_idx, q, k, attn_scores,
                                      metadata):
@@ -355,14 +358,14 @@ class TestAttentionMetadataSingleSource:
         assert called_axes == ["sparse"]
 
     def test_multiple_sparse_writers_raises(self, fake_kv_cache_manager):
-        """If two axis-C managers existed and both returned non-None
-        attention metadata, the coordinator must raise. We trigger this by
-        bypassing the intra-axis mutex (constructing _by_axis manually);
-        normally the mutex prevents two sparse managers, but the
+        """If two sparse-attention managers existed and both returned
+        non-None attention metadata, the coordinator must raise. We trigger
+        this by bypassing the intra-axis mutex (constructing _by_axis
+        manually); normally the mutex prevents two sparse managers, but the
         single-source guard is a runtime correctness backstop."""
         record: List[str] = []
 
-        class WritingSparse(SparseAttentionManager):
+        class WritingSparse(SparseAttentionExecutor):
 
             def on_context_attention(self, layer_idx, q, k, attn_scores,
                                      metadata):
@@ -414,7 +417,7 @@ class TestBehaviorCoordinatorFactory:
 
 class TestHookOrderTable:
 
-    def test_all_8_hooks_have_order_entry(self):
+    def test_all_6_hooks_have_order_entry(self):
         expected_hooks = {
             "on_request_init",
             "on_request_finish",
@@ -422,8 +425,6 @@ class TestHookOrderTable:
             "on_generation_attention",
             "on_context_end",
             "on_generation_step_end",
-            "on_forward_begin",
-            "on_forward_end",
         }
         actual_hooks = set(KVCacheBehaviorCoordinator.HOOK_ORDER.keys())
         assert actual_hooks == expected_hooks, (
@@ -437,7 +438,8 @@ class TestHookOrderTable:
             "on_generation_attention"] == ["sparse"]
 
     def test_phase_boundary_hooks_have_three_axes(self):
-        """Phase-boundary hooks must dispatch in C -> B -> D order."""
+        """Phase-boundary hooks must dispatch in sparse → storage →
+        cross-request order."""
         for hook_name in ("on_context_end", "on_generation_step_end",
                           "on_request_finish"):
             order = KVCacheBehaviorCoordinator.HOOK_ORDER[hook_name]
@@ -454,7 +456,7 @@ class TestHookOrderTable:
 class TestNamingFlip:
     """v17 (2026-05-27) two-step rename:
     - Base: BaseKVCacheBehaviorManager → BaseKVCacheCompressionExecutor
-    - Axis-C subclass: SparseAttentionManager → SparseAttentionExecutor
+    - Subclass: SparseAttentionManager → SparseAttentionExecutor
     - File: sparse_attention_manager.py → kv_cache_compression_executor.py
     Both aliases preserved for backward compat."""
 
@@ -463,7 +465,7 @@ class TestNamingFlip:
             BaseKVCacheCompressionExecutor, )
         assert BaseKVCacheCompressionExecutor is not None
 
-    def test_canonical_axis_c_name_importable(self):
+    def test_canonical_sparse_executor_name_importable(self):
         from tensorrt_llm._torch.attention_backend.sparse import (
             SparseAttentionExecutor, )
         assert SparseAttentionExecutor is not None
@@ -473,12 +475,12 @@ class TestNamingFlip:
             BaseKVCacheBehaviorManager, BaseKVCacheCompressionExecutor)
         assert BaseKVCacheBehaviorManager is BaseKVCacheCompressionExecutor
 
-    def test_axis_c_alias_points_to_same_class(self):
+    def test_sparse_alias_points_to_same_class(self):
         from tensorrt_llm._torch.attention_backend.sparse import (
             SparseAttentionExecutor, SparseAttentionManager)
         assert SparseAttentionManager is SparseAttentionExecutor
 
-    def test_axis_c_is_subclass_of_base(self):
+    def test_sparse_is_subclass_of_base(self):
         from tensorrt_llm._torch.attention_backend.sparse import (
             BaseKVCacheCompressionExecutor, SparseAttentionExecutor)
         assert issubclass(SparseAttentionExecutor,
@@ -511,12 +513,12 @@ class TestKVCacheManagerClassClassVar:
 
     def test_default_classvar_is_none(self):
         assert BaseKVCacheCompressionExecutor.kv_cache_manager_class is None
-        assert SparseAttentionManager.kv_cache_manager_class is None
+        assert SparseAttentionExecutor.kv_cache_manager_class is None
 
     def test_default_no_type_assert(self, fake_kv_cache_manager):
         """When ClassVar is None, constructor accepts any V2-shaped object."""
 
-        class PlainV2User(SparseAttentionManager):
+        class PlainV2User(SparseAttentionExecutor):
             pass
 
         # Should not raise; ClassVar is None, type check skipped.
@@ -529,7 +531,7 @@ class TestKVCacheManagerClassClassVar:
         class FakeV2Subclass:
             """Imaginary specialized V2 subclass."""
 
-        class StrictMethod(SparseAttentionManager):
+        class StrictMethod(SparseAttentionExecutor):
             kv_cache_manager_class = FakeV2Subclass
 
         # MagicMock is not an instance of FakeV2Subclass → must raise.
@@ -546,24 +548,31 @@ class TestKVCacheManagerClassClassVar:
         # Construction should succeed with plain V2 (here a MagicMock).
         mgr = RocketKV(fake_kv_cache_manager)
         assert mgr.kv_cache_manager is fake_kv_cache_manager
-        # Form-I + does not break reuse via own state, but KT cache is
+        # Sparse-mask method: does NOT physically evict; KT cache is
         # request-specific → block reuse incompatible.
-        assert RocketKV.is_form_iii_evict is False
+        assert RocketKV.physically_evicts_kv is False
         assert RocketKV.supports_kv_cache_reuse is False
 
 
 # ---------------------------------------------------------------------- #
-# 10. RocketKV skeleton — basic class-level shape                         #
+# 10. RocketKV skeleton — executor + attention shims                       #
 # ---------------------------------------------------------------------- #
 
 
 class TestRocketKVSkeleton:
-    """v17 RocketKV V2-migrated skeleton in ``sparse/rocketkv.py``."""
+    """v17 RocketKV V2-migrated skeleton in ``sparse/rocketkv.py``.
 
-    def test_subclass_of_sparse_attention_manager(self):
+    The module ships BOTH halves of the plug-in:
+    - executor (RocketKV) — L2 behavior, orchestrates Stage I/II via hooks
+    - attention shims (RocketKV*Attention + Metadata) — L0, consume the
+      sparse mask. These are skeleton subclasses of the framework bases
+      (Phase 7 will port forward bodies from rocket.py).
+    """
+
+    def test_subclass_of_sparse_attention_executor(self):
         from tensorrt_llm._torch.attention_backend.sparse.rocketkv import (
             RocketKV, )
-        assert issubclass(RocketKV, SparseAttentionManager)
+        assert issubclass(RocketKV, SparseAttentionExecutor)
         assert issubclass(RocketKV, BaseKVCacheCompressionExecutor)
 
     def test_axis_classvar(self):
@@ -574,9 +583,12 @@ class TestRocketKVSkeleton:
     def test_capability_declarations(self):
         from tensorrt_llm._torch.attention_backend.sparse.rocketkv import (
             RocketKV, )
-        assert RocketKV.is_form_iii_evict is False    # form-I (HSA mask)
-        assert RocketKV.supports_kv_cache_reuse is False    # KT cache req-specific
-        assert RocketKV.kv_cache_manager_class is None    # Pattern 2, plain V2
+        # Sparse-mask method, does not physically evict
+        assert RocketKV.physically_evicts_kv is False
+        # KT cache is request-specific
+        assert RocketKV.supports_kv_cache_reuse is False
+        # Pattern 2 (BufferConfig declarative), plain V2
+        assert RocketKV.kv_cache_manager_class is None
 
     def test_stage_i_stub_returns_none(self, fake_kv_cache_manager):
         """Stage I (on_context_attention) is stub; returns None."""
@@ -595,3 +607,31 @@ class TestRocketKVSkeleton:
         result = mgr.on_generation_attention(0, None, None, None,
                                              MagicMock())
         assert result is None
+
+    def test_trtllm_attention_shim_classes_exist(self):
+        """Skeleton attention shims are defined alongside the executor."""
+        from tensorrt_llm._torch.attention_backend.sparse.rocketkv import (
+            RocketKVTrtllmAttention, RocketKVTrtllmAttentionMetadata,
+            RocketKVVanillaAttention, RocketKVVanillaAttentionMetadata)
+        # Class identity + Metadata wiring is what the factory routes on.
+        assert RocketKVTrtllmAttention.Metadata is \
+            RocketKVTrtllmAttentionMetadata
+        assert RocketKVVanillaAttention.Metadata is \
+            RocketKVVanillaAttentionMetadata
+
+    def test_attention_shim_inherits_framework_bases(self):
+        """The shims must subclass the framework attention bases so they
+        plug into the existing attention-class factory and forward paths."""
+        from tensorrt_llm._torch.attention_backend.trtllm import (
+            TrtllmAttention, TrtllmAttentionMetadata)
+        from tensorrt_llm._torch.attention_backend.vanilla import (
+            VanillaAttention, VanillaAttentionMetadata)
+        from tensorrt_llm._torch.attention_backend.sparse.rocketkv import (
+            RocketKVTrtllmAttention, RocketKVTrtllmAttentionMetadata,
+            RocketKVVanillaAttention, RocketKVVanillaAttentionMetadata)
+        assert issubclass(RocketKVTrtllmAttention, TrtllmAttention)
+        assert issubclass(RocketKVTrtllmAttentionMetadata,
+                          TrtllmAttentionMetadata)
+        assert issubclass(RocketKVVanillaAttention, VanillaAttention)
+        assert issubclass(RocketKVVanillaAttentionMetadata,
+                          VanillaAttentionMetadata)
