@@ -243,15 +243,16 @@ class BaseKVCacheBehaviorManager:
         don't implement a particular hook (perf micro-optimization, off by
         default).
         """
-        own_method = getattr(self, hook_name, None)
+        own_method = getattr(type(self), hook_name, None)
         if own_method is None:
             return False
         base_method = getattr(BaseKVCacheBehaviorManager, hook_name, None)
         if base_method is None:
             return False
-        own_func = getattr(own_method, "__func__", None)
-        base_func = getattr(base_method, "__func__", None)
-        return own_func is not base_func
+        # In Python 3, accessing a method via class returns the function directly
+        # (no .__func__ needed). MRO lookup means an inherited (non-overridden) hook
+        # returns the SAME function object as the base, so identity check suffices.
+        return own_method is not base_method
 
 
 class SparseAttentionManager(BaseKVCacheBehaviorManager):
