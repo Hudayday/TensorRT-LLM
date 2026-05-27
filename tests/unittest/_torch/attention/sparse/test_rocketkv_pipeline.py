@@ -198,10 +198,12 @@ class TestRocketKVClass:
         assert RocketKV.axis == "sparse"
 
     def test_capability_declarations(self):
-        # Sparse-mask method: returns indices, cache contents unchanged
-        # (contrast: TriAttention physically_evicts_kv=True)
-        assert RocketKV.physically_evicts_kv is False
-        # KT cache is request-specific; cannot survive cross-request reuse
+        # RocketKV is a 2-stage hybrid: Stage I-b at prefill end PHYSICALLY
+        # evicts (SnapKV top-pB keep), then Stage II does sparse mask over
+        # the shrunk cache. So physically_evicts_kv MUST be True.
+        # (Earlier False was a hallucination — see README v16.0.16.)
+        assert RocketKV.physically_evicts_kv is True
+        # KT cache + Stage I-b keep-set are both request-specific.
         assert RocketKV.supports_kv_cache_reuse is False
         # Pattern 1+2: uses default plain V2 (no Pattern 3 subclass)
         assert RocketKV.kv_cache_manager_class is None
@@ -229,14 +231,29 @@ class TestRocketKVClass:
         assert result is None
 
     def test_other_hooks_default_noop(self):
-        """All other hooks inherit base no-op (RocketKV does not override
-        them — Stage I/II are sufficient for a sparse-mask method)."""
+        """The 3 hooks RocketKV does NOT override inherit base no-op
+        (request_init / generation_step_end / request_finish).
+
+        The 3 hooks it DOES override are tested separately:
+        - on_context_attention (Stage I-a) — stub returns None
+        - on_context_end       (Stage I-b) — stub returns None (will do
+          SnapKV physical evict in Phase 7)
+        - on_generation_attention (Stage II) — stub returns None
+        """
         mgr = RocketKV(kv_cache_manager=MagicMock())
-        # 4 inherited no-op hooks (besides Stage I/II)
         assert mgr.on_request_init(MagicMock()) is None
-        assert mgr.on_context_end(MagicMock(), MagicMock()) is None
         assert mgr.on_generation_step_end(MagicMock(), MagicMock()) is None
         assert mgr.on_request_finish(MagicMock()) is None
+
+    def test_stage_i_b_overrides_context_end(self):
+        """Stage I-b lives in on_context_end. Even though the body is a
+        stub right now, the method MUST be overridden on RocketKV (not
+        inherited from base) — that's how the framework dispatches the
+        physical evict at prefill end."""
+        mgr = RocketKV(kv_cache_manager=MagicMock())
+        assert mgr.implements("on_context_end") is True
+        # Stub returns None for now; Phase 7 will do compact_request_cache.
+        assert mgr.on_context_end(MagicMock(), MagicMock()) is None
 
     def test_attention_shims_defined_in_same_module(self):
         """RocketKV ships its own attention shim classes alongside the

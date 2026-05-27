@@ -548,9 +548,10 @@ class TestKVCacheManagerClassClassVar:
         # Construction should succeed with plain V2 (here a MagicMock).
         mgr = RocketKV(fake_kv_cache_manager)
         assert mgr.kv_cache_manager is fake_kv_cache_manager
-        # Sparse-mask method: does NOT physically evict; KT cache is
-        # request-specific → block reuse incompatible.
-        assert RocketKV.physically_evicts_kv is False
+        # 2-stage hybrid: Stage I-b at prefill end PHYSICALLY evicts;
+        # KT cache + Stage I-b keep-set are request-specific → block
+        # reuse incompatible.
+        assert RocketKV.physically_evicts_kv is True
         assert RocketKV.supports_kv_cache_reuse is False
 
 
@@ -583,9 +584,10 @@ class TestRocketKVSkeleton:
     def test_capability_declarations(self):
         from tensorrt_llm._torch.attention_backend.sparse.rocketkv import (
             RocketKV, )
-        # Sparse-mask method, does not physically evict
-        assert RocketKV.physically_evicts_kv is False
-        # KT cache is request-specific
+        # 2-stage hybrid: Stage I-b at prefill end PHYSICALLY evicts.
+        # (Earlier False was a hallucination — see README v16.0.16.)
+        assert RocketKV.physically_evicts_kv is True
+        # KT cache + Stage I-b keep-set are request-specific
         assert RocketKV.supports_kv_cache_reuse is False
         # Pattern 2 (BufferConfig declarative), plain V2
         assert RocketKV.kv_cache_manager_class is None

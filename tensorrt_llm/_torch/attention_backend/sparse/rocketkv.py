@@ -24,26 +24,35 @@ This file defines BOTH halves of the RocketKV plug-in:
 
 Key design choices (per 5/27 architectural discussion, doc 27 §3):
 
-- **Sparse-mask method** — Stage II returns an ``(indices, offsets)`` sparse
-  mask via :meth:`on_generation_attention`; cache contents are NOT modified.
+- **2-stage hybrid method** — RocketKV does BOTH physical eviction AND
+  sparse-mask compute (corrected 2026-05-27; earlier "sparse-mask-only"
+  wording was a hallucination, see README v16.0.16):
+
+  - **Stage I-a (streaming, prefill, per layer)** — :meth:`on_context_attention`
+    summarizes K per page and writes to KT_CACHE. Returns ``None`` (prefill
+    stays dense).
+  - **Stage I-b (one-shot, prefill end)** — :meth:`on_context_end` does
+    SnapKV-style permanent eviction: score every prompt token via the
+    last-window attention scores, keep top-pB tokens, **physically evict
+    the rest** through ``self.kv_cache_manager.compact_request_cache``.
+    Hence ``physically_evicts_kv = True``.
+  - **Stage II (per layer, decode)** — :meth:`on_generation_attention`
+    reads KT_CACHE, computes a query-aware HSA mask within
+    ``prompt_budget``, returns ``(indices, offsets)``. The kernel applies
+    the mask. Cache contents are NOT further modified in decode.
+
 - **KT_CACHE auxiliary pool — Pattern 2 declarative BufferConfig** — V2 stays
   unchanged. PyExecutor factory adds a ``KT_CACHE`` ``BufferConfig`` per layer
   at V2 instantiation, with ``tokens_per_block_override=kt_tokens_per_block``.
   Page IDs share with KEY (per-layer multi-pool design, same mechanism as
   NVFP4 ``KEY_BLOCK_SCALE``). No V2 subclass needed (``kv_cache_manager_class``
   ClassVar stays ``None``).
-- **Stage I** — :meth:`on_context_attention` computes per-page KT summary
-  from K and writes to ``KT_CACHE`` pool via the V2 generic
-  ``write_kt_cache(req, layer, data)`` wrapper API (added by factory).
-- **Stage II** — :meth:`on_generation_attention` reads ``KT_CACHE`` via V2
-  generic ``get_buffers(layer, data_role=KT_CACHE)`` API, computes
-  query-aware HSA mask within ``prompt_budget``, returns mask tuple.
-
-**Status: SKELETON ONLY** — :meth:`on_context_attention` and
-:meth:`on_generation_attention` are stubs (return ``None``). The attention
-shim classes carry the class hierarchy and metadata fields but inherit
-forward() from their base classes; method-specific kernels (paged KT bmm,
-triton scoring, etc.) are Phase 7 ports from ``rocket.py``.
+**Status: SKELETON ONLY** — :meth:`on_context_attention` (Stage I-a),
+:meth:`on_context_end` (Stage I-b), and :meth:`on_generation_attention`
+(Stage II) are stubs. The attention shim classes carry the class hierarchy
+and metadata fields but inherit forward() from their base classes;
+method-specific kernels (paged KT bmm, triton scoring, SnapKV scoring,
+V2 compact_request_cache trigger, etc.) are Phase 7 ports from ``rocket.py``.
 
 Existing 5-class V1 RocketKV (``sparse/rocket.py``) stays in place. The
 ``rocketkv`` algorithm flag is reserved for this V2-migrated version when it
@@ -170,8 +179,9 @@ class RocketKVVanillaAttention(VanillaAttention):
 
 
 class RocketKV(SparseAttentionExecutor):
-    """V2-migrated RocketKV: sparse-mask HSA + KT_CACHE auxiliary pool
-    (skeleton).
+    """V2-migrated RocketKV: 2-stage hybrid — Stage I-b prefill-end physical
+    evict (SnapKV-style) + Stage II decode-time sparse HSA mask, backed by a
+    KT_CACHE auxiliary pool (skeleton).
 
     See module docstring for design choices. Algorithm body待写 (Phase 7
     parallel to TriAttention M3.1).
@@ -201,13 +211,18 @@ class RocketKV(SparseAttentionExecutor):
 
     axis: ClassVar[str] = "sparse"
 
-    # Returns a sparse mask via on_*_attention; does NOT mutate cache
-    # contents. (Compare TriAttention which sets physically_evicts_kv=True.)
-    physically_evicts_kv: ClassVar[bool] = False
+    # RocketKV physically deletes tokens at prefill end (Stage I-b SnapKV-
+    # style top-pB keep + compact_request_cache). Stage II then runs a
+    # sparse HSA mask over the already-shrunk cache. (Earlier
+    # ``physically_evicts_kv = False`` was a hallucination — corrected
+    # 2026-05-27.)
+    physically_evicts_kv: ClassVar[bool] = True
 
-    # KT cache is request-specific and built per-context; cannot be reused
-    # across requests (cross-request KT would have wrong K-source for current
-    # query). Enforced via factory mutex at LLM init.
+    # Two reuse-breakers: (a) Stage I-b keep-set depends on this prompt's
+    # last-window attention scores → different prompts share no suffix.
+    # (b) KT_CACHE is computed from THIS request's K vectors so cross-
+    # request reuse would have wrong K-source for the query. Enforced via
+    # factory mutex at LLM init.
     supports_kv_cache_reuse: ClassVar[bool] = False
 
     # Pattern 1 + Pattern 2: default plain V2 (None ClassVar). KT_CACHE pool
@@ -239,7 +254,7 @@ class RocketKV(SparseAttentionExecutor):
         # e.g. self._kt_built_per_req: dict[req_id, set[layer_idx]] = {}).
 
     # ------------------------------------------------------------------ #
-    # Stage I — context-phase hook (build KT summary per page)            #
+    # Stage I-a — streaming KT_CACHE build (per prefill attention layer)  #
     # ------------------------------------------------------------------ #
 
     def on_context_attention(
@@ -250,10 +265,11 @@ class RocketKV(SparseAttentionExecutor):
         attn_scores: Optional[torch.Tensor],
         metadata: "AttentionMetadata",
     ) -> Optional[SparseAttentionIndices]:
-        """Stage I — compute per-page KT summary from K, write to KT_CACHE.
+        """Stage I-a — streaming: compute per-page KT summary from K and
+        write into the KT_CACHE auxiliary pool.
 
-        Currently a stub. Returns ``None`` (context phase here does not
-        emit a sparse mask; the full prompt is attended dense).
+        Currently a stub. Returns ``None`` (prefill itself is attended
+        dense; no mask emitted here).
 
         TODO (Phase 7 algorithm body):
 
@@ -265,6 +281,42 @@ class RocketKV(SparseAttentionExecutor):
            (factory-added V2 generic API).
         """
         return None
+
+    # ------------------------------------------------------------------ #
+    # Stage I-b — one-shot prefill-end SnapKV physical eviction           #
+    # ------------------------------------------------------------------ #
+
+    def on_context_end(
+        self,
+        request: "LlmRequest",
+        metadata: "AttentionMetadata",
+    ) -> None:
+        """Stage I-b — fires ONCE per request after the whole prompt has
+        been consumed across all chunks and all layers.
+
+        Score every token using the last-window attention scores
+        (SnapKV §3), keep top-pB tokens, **physically evict the rest**
+        through the V2 ``compact_request_cache`` wrapper API. This is
+        why ``physically_evicts_kv = True``.
+
+        After this hook returns, the cache for this request holds only
+        ``self.prompt_budget`` tokens per layer; Stage II then runs HSA
+        masking over that already-shrunk cache.
+
+        Currently a stub.
+
+        TODO (Phase 7 algorithm body):
+
+        1. Aggregate last-window attention scores per token (SnapKV-style).
+           These can be collected from ``attn_scores`` in
+           ``on_context_attention`` and stored per-request, OR re-derived
+           here from the V2-readable K cache + Q-window.
+        2. ``keep_idx = topk(last_window_scores, self.prompt_budget)``.
+        3. ``self.kv_cache_manager.compact_request_cache(request,
+           keep=keep_idx)`` — V2 frees evicted pages and rebuilds the
+           page table so subsequent decode reads see only the kept tokens.
+        """
+        ...
 
     # ------------------------------------------------------------------ #
     # Stage II — generation-phase hook (query-aware HSA mask)             #
