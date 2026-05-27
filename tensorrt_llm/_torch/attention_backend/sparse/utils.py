@@ -6,8 +6,9 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from .dsa import DSACacheManager, DSATrtllmAttention
 from .rocket import (RocketKVCacheManager, RocketTrtllmAttention,
                      RocketVanillaAttention)
-from .kv_cache_compression_executor import (BaseKVCacheBehaviorManager,
-                                       SparseAttentionManager)
+from .kv_cache_compression_executor import (BaseKVCacheCompressionExecutor,
+                                            SparseAttentionExecutor)
+from .rocketkv import RocketKV
 from .triattention import TriAttention
 
 if TYPE_CHECKING:
@@ -48,7 +49,7 @@ def get_sparse_attn_kv_cache_manager(
 def create_sparse_attention_manager(
     sparse_attn_config: "SparseAttentionConfig",
     kv_cache_manager: "KVCacheManagerV2",
-) -> Optional[SparseAttentionManager]:
+) -> Optional[SparseAttentionExecutor]:
     """Behavior-layer factory: dispatches on ``config.algorithm`` (the same
     Pydantic ``Literal`` discriminator as the rest of the sparse stack) and
     returns a fully constructed :class:`SparseAttentionManager` subclass
@@ -88,6 +89,17 @@ def create_sparse_attention_manager(
             top_B=sparse_attn_config.top_B,
             beta=sparse_attn_config.beta,
             calibration_path=sparse_attn_config.calibration_path,
+        )
+    if sparse_attn_config.algorithm == "rocketkv":
+        # v17 V2-migrated path (RocketKV executor in sparse/rocketkv.py).
+        # Coexists with legacy "rocket" algorithm which routes through
+        # get_sparse_attn_kv_cache_manager → RocketKVCacheManager (V1).
+        return RocketKV(
+            kv_cache_manager=kv_cache_manager,
+            page_size=sparse_attn_config.page_size,
+            prompt_budget=sparse_attn_config.prompt_budget,
+            kt_cache_dtype=sparse_attn_config.kt_cache_dtype,
+            kt_tokens_per_block=sparse_attn_config.kt_tokens_per_block,
         )
     raise ValueError(
         f"Unsupported behavior-layer sparse attention algorithm: "

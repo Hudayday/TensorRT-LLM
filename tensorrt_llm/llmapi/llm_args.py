@@ -522,6 +522,56 @@ class TriAttentionConfig(BaseSparseAttentionConfig):
         return True
 
 
+
+class RocketKVSparseAttentionConfig(BaseSparseAttentionConfig):
+    """Configuration for the v17 V2-migrated RocketKV sparse attention.
+
+    Routes to the behavior-layer L2 executor framework — uses the standard
+    ``KVCacheManagerV2`` and a ``RocketKV(SparseAttentionExecutor)`` subclass
+    in ``sparse/rocketkv.py``. **Coexists with** the legacy
+    :class:`RocketSparseAttentionConfig` (``algorithm="rocket"``) which routes
+    to the V1 5-class plugin pattern (:class:`RocketKVCacheManager` subclass
+    in ``sparse/rocket.py``). Both can be selected at LLM init time; the
+    Pydantic discriminator picks based on ``algorithm``:
+
+    - ``algorithm="rocket"`` → legacy V1 path (``RocketKVCacheManager``)
+    - ``algorithm="rocketkv"`` → v17 V2 path (this class →
+      ``RocketKV`` executor in ``sparse/rocketkv.py``, currently SKELETON)
+
+    Status: skeleton — ``RocketKV.on_context_attention`` (Stage I) and
+    ``RocketKV.on_generation_attention`` (Stage II) are stubs (Phase 7
+    algorithm body待). This config exists to lock the pipeline wire so the
+    framework can be verified end-to-end with both TriAttention (axis-C
+    physical evict) and RocketKV (axis-C form-I sparse mask + KT_CACHE pool)
+    as parallel test cases.
+    """
+    algorithm: Literal["rocketkv"] = "rocketkv"
+    page_size: Optional[int] = Field(
+        default=16,
+        description="KT cache page size (tokens per KT block).")
+    prompt_budget: Optional[int] = Field(
+        default=2048,
+        description="Top-K budget for HSA mask in Stage II decode.")
+    kt_cache_dtype: Optional[str] = Field(
+        default="bfloat16",
+        description="KT cache dtype — bfloat16 or float8_e5m2.")
+    kt_tokens_per_block: Optional[int] = Field(
+        default=None,
+        description="Tokens per KT_CACHE block (page-aligned auxiliary pool); "
+                    "None lets the framework compute from page_size.")
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    def get_indices_block_size(self) -> int:
+        return self.page_size
+
+    @property
+    def is_behavior_layer_method(self) -> bool:
+        return True
+
+
+
 class MoeLoadBalancerConfig(StrictBaseModel):
     """
     Pydantic configuration model for the Mixture of Experts (MoE) load balancer.
@@ -2522,6 +2572,7 @@ SpeculativeConfig: TypeAlias = Annotated[
 SparseAttentionConfig: TypeAlias = Annotated[
     Union[
         RocketSparseAttentionConfig,
+        RocketKVSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
         TriAttentionConfig,
