@@ -1,10 +1,10 @@
-"""Unit tests for the TriAttention SparseAttentionManager pipeline.
+"""Unit tests for the TriAttention SparseAttentionExecutor pipeline.
 
 Covers the wiring landed in commits e0a29e3b50, 79cf1adcd9, 6b9719bc10:
 
 - Pydantic discriminator dispatch via ``SparseAttentionConfig`` Annotated Union.
 - ``BaseSparseAttentionConfig.is_behavior_layer_method`` property semantics.
-- ``SparseAttentionManager`` base-class default hook contract (no-op return
+- ``SparseAttentionExecutor`` base-class default hook contract (no-op return
   values, ``supports_kv_cache_reuse`` capability).
 - ``create_sparse_attention_manager`` factory dispatch + ``KVCacheManagerV2``
   isinstance assertion.
@@ -20,7 +20,7 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from tensorrt_llm._torch.attention_backend.sparse import (
-    SparseAttentionManager,
+    SparseAttentionExecutor,
     create_sparse_attention_manager,
 )
 from tensorrt_llm._torch.attention_backend.sparse.triattention import (
@@ -156,19 +156,19 @@ class TestUnionDiscriminator:
 
 
 # ---------------------------------------------------------------------------
-# SparseAttentionManager base class default hooks
+# SparseAttentionExecutor base class default hooks
 # ---------------------------------------------------------------------------
 
 
-class TestSparseAttentionManagerBase:
+class TestSparseAttentionExecutorBase:
     """Base hooks must be no-op so subclasses can override only what they need
     without breaking the dispatch wired in PyExecutor / trtllm.py."""
 
     def test_supports_kv_cache_reuse_default_false(self):
-        assert SparseAttentionManager.supports_kv_cache_reuse is False
+        assert SparseAttentionExecutor.supports_kv_cache_reuse is False
 
     def test_default_hooks_no_op(self):
-        mgr = SparseAttentionManager.__new__(SparseAttentionManager)
+        mgr = SparseAttentionExecutor.__new__(SparseAttentionExecutor)
         mgr.kv_cache_manager = None
         # Phase hooks return None (no input-side sparse mask)
         assert mgr.on_context_attention(0, None, None, None, None) is None

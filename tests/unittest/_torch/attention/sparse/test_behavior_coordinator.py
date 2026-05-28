@@ -10,8 +10,8 @@ Covers the framework scaffolding shipped on top of the existing
   ``TriAttention`` inherits via this layer unchanged).
 - :class:`KVCacheBehaviorCoordinator` mutex (intra-axis stacking raises),
   HOOK_ORDER deterministic dispatch, single-source attention metadata
-  enforcement, introspection helpers (``has_axis`` / ``get_manager`` /
-  ``get_sparse_manager``).
+  enforcement, introspection helpers (``has_axis`` / ``get_executor`` /
+  ``get_sparse_executor``).
 - :func:`create_behavior_coordinator` factory dispatch contract.
 
 These tests intentionally use lightweight in-memory mock managers and do not
@@ -38,7 +38,6 @@ from tensorrt_llm._torch.attention_backend.sparse import (
     BaseKVCacheCompressionExecutor,
     KVCacheBehaviorCoordinator,
     SparseAttentionExecutor,
-    SparseAttentionManager,
     create_behavior_coordinator,
 )
 
@@ -98,10 +97,10 @@ class _MockStorageManager(_RecordingMixin, BaseKVCacheCompressionExecutor):
         self._record("on_request_finish")
 
 
-class _MockCRCLManager(_RecordingMixin, BaseKVCacheCompressionExecutor):
-    """Mock cross-request lifecycle manager (axis ``crcl``)."""
+class _MockCrossRequestManager(_RecordingMixin, BaseKVCacheCompressionExecutor):
+    """Mock cross-request lifecycle manager (axis ``cross_request``)."""
 
-    axis: ClassVar[str] = "crcl"
+    axis: ClassVar[str] = "cross_request"
     # Storage delegate slot used by coordinator's _wire_dependencies.
     storage_delegate = None
 
@@ -218,10 +217,10 @@ class TestCoordinatorConstruction:
 
     def test_empty_coordinator(self):
         coord = KVCacheBehaviorCoordinator(executors=[])
-        assert coord.managers == []
+        assert coord.executors == []
         assert coord.has_axis("sparse") is False
-        assert coord.get_manager("sparse") is None
-        assert coord.get_sparse_manager() is None
+        assert coord.get_executor("sparse") is None
+        assert coord.get_sparse_executor() is None
 
     def test_single_sparse_manager(self, fake_kv_cache_manager):
         record = []
@@ -229,20 +228,20 @@ class TestCoordinatorConstruction:
         coord = KVCacheBehaviorCoordinator(executors=[sparse])
         assert coord.has_axis("sparse") is True
         assert coord.has_axis("storage") is False
-        assert coord.get_manager("sparse") is sparse
-        assert coord.get_sparse_manager() is sparse
+        assert coord.get_executor("sparse") is sparse
+        assert coord.get_sparse_executor() is sparse
 
     def test_three_axes_coexist(self, fake_kv_cache_manager):
-        """sparse + storage + crcl managers can coexist (Phase 5 scenario)."""
+        """sparse + storage + cross_request managers can coexist (Phase 5 scenario)."""
         record = []
         sparse = _MockSparseManager(fake_kv_cache_manager, record, "sp")
         storage = _MockStorageManager(fake_kv_cache_manager, record, "st")
-        crcl = _MockCRCLManager(fake_kv_cache_manager, record, "cr")
+        cross_request = _MockCrossRequestManager(fake_kv_cache_manager, record, "xr")
         coord = KVCacheBehaviorCoordinator(
-            executors=[sparse, storage, crcl])
+            executors=[sparse, storage, cross_request])
         assert coord.has_axis("sparse") is True
         assert coord.has_axis("storage") is True
-        assert coord.has_axis("crcl") is True
+        assert coord.has_axis("cross_request") is True
 
     def test_intra_axis_stacking_raises(self, fake_kv_cache_manager):
         """Two managers of the same axis must raise at coordinator init."""
@@ -253,17 +252,17 @@ class TestCoordinatorConstruction:
                            match="Intra-axis stacking not supported"):
             KVCacheBehaviorCoordinator(executors=[m1, m2])
 
-    def test_crcl_storage_dependency_auto_wired(self,
+    def test_cross_request_storage_dependency_auto_wired(self,
                                                  fake_kv_cache_manager):
         """If both cross-request and storage managers present,
         cross-request manager's ``storage_delegate`` is auto-set to the
         storage manager."""
         record = []
         storage = _MockStorageManager(fake_kv_cache_manager, record, "st")
-        crcl = _MockCRCLManager(fake_kv_cache_manager, record, "cr")
-        assert crcl.storage_delegate is None
-        KVCacheBehaviorCoordinator(executors=[storage, crcl])
-        assert crcl.storage_delegate is storage
+        cross_request = _MockCrossRequestManager(fake_kv_cache_manager, record, "xr")
+        assert cross_request.storage_delegate is None
+        KVCacheBehaviorCoordinator(executors=[storage, cross_request])
+        assert cross_request.storage_delegate is storage
 
 
 # ---------------------------------------------------------------------- #
@@ -277,37 +276,37 @@ class TestHookDispatchOrder:
         record: List[str] = []
         sparse = _MockSparseManager(fake_kv_cache_manager, record, "sp")
         storage = _MockStorageManager(fake_kv_cache_manager, record, "st")
-        crcl = _MockCRCLManager(fake_kv_cache_manager, record, "cr")
+        cross_request = _MockCrossRequestManager(fake_kv_cache_manager, record, "xr")
         coord = KVCacheBehaviorCoordinator(
-            executors=[sparse, storage, crcl])
+            executors=[sparse, storage, cross_request])
         return coord, record
 
-    def test_on_request_init_order_crcl_sparse_storage(
+    def test_on_request_init_order_cross_request_sparse_storage(
             self, fake_kv_cache_manager):
         coord, record = self._build_three_axis_coord(fake_kv_cache_manager)
         coord.on_request_init(MagicMock())
         # storage manager does not implement on_request_init, but per
         # HOOK_ORDER it is dispatched anyway (default no-op).
         # Expected hooks recorded by the manager subclasses that implement
-        # the method: cr (crcl) first, then sp (sparse), then st (storage).
+        # the method: xr (cross_request) first, then sp (sparse), then st (storage).
         assert record == [
-            "cr:on_request_init",
+            "xr:on_request_init",
             "sp:on_request_init",
             "st:on_request_init",
         ]
 
-    def test_on_context_end_order_sparse_storage_crcl(
+    def test_on_context_end_order_sparse_storage_cross_request(
             self, fake_kv_cache_manager):
         coord, record = self._build_three_axis_coord(fake_kv_cache_manager)
         coord.on_context_end(MagicMock(), MagicMock())
-        # crcl mock does not implement on_context_end, so only sparse +
+        # cross_request mock does not implement on_context_end, so only sparse +
         # storage are recorded.
         assert record == [
             "sp:on_context_end",
             "st:on_context_end",
         ]
 
-    def test_on_generation_step_end_order_sparse_storage_crcl(
+    def test_on_generation_step_end_order_sparse_storage_cross_request(
             self, fake_kv_cache_manager):
         coord, record = self._build_three_axis_coord(fake_kv_cache_manager)
         coord.on_generation_step_end(MagicMock(), MagicMock())
@@ -316,7 +315,7 @@ class TestHookDispatchOrder:
             "st:on_generation_step_end",
         ]
 
-    def test_on_request_finish_order_sparse_storage_crcl(
+    def test_on_request_finish_order_sparse_storage_cross_request(
             self, fake_kv_cache_manager):
         coord, record = self._build_three_axis_coord(fake_kv_cache_manager)
         coord.on_request_finish(MagicMock())
@@ -324,7 +323,7 @@ class TestHookDispatchOrder:
         assert record == [
             "sp:on_request_finish",
             "st:on_request_finish",
-            "cr:on_request_finish",
+            "xr:on_request_finish",
         ]
 
 
@@ -386,7 +385,7 @@ class TestAttentionMetadataSingleSource:
         with pytest.raises(
                 RuntimeError,
                 match=
-                "Multiple managers returned attention metadata"):
+                "Multiple executors returned attention metadata"):
             coord.on_context_attention(0, None, None, None, MagicMock())
 
 
@@ -448,22 +447,21 @@ class TestHookOrderTable:
         for hook_name in ("on_context_end", "on_generation_step_end",
                           "on_request_finish"):
             order = KVCacheBehaviorCoordinator.HOOK_ORDER[hook_name]
-            assert order == ["sparse", "storage", "crcl"], (
+            assert order == ["sparse", "storage", "cross_request"], (
                 f"{hook_name} order is {order}, expected "
-                f"['sparse', 'storage', 'crcl']")
+                f"['sparse', 'storage', 'cross_request']")
 
 
 # ---------------------------------------------------------------------- #
-# 8. Naming flip — backward-compat alias + new canonical name             #
+# 8. Canonical name imports (post-cleanup; old aliases removed v17)        #
 # ---------------------------------------------------------------------- #
 
 
-class TestNamingFlip:
-    """v17 (2026-05-27) two-step rename:
-    - Base: BaseKVCacheBehaviorManager → BaseKVCacheCompressionExecutor
-    - Subclass: SparseAttentionManager → SparseAttentionExecutor
-    - File: sparse_attention_manager.py → kv_cache_compression_executor.py
-    Both aliases preserved for backward compat."""
+class TestCanonicalImports:
+    """All backward-compat aliases (``BaseKVCacheBehaviorManager`` /
+    ``SparseAttentionManager``) were removed in the v17 alias cleanup.
+    Only the canonical names are importable; this test locks that contract.
+    """
 
     def test_canonical_base_name_importable(self):
         from tensorrt_llm._torch.attention_backend.sparse import (
@@ -475,15 +473,15 @@ class TestNamingFlip:
             SparseAttentionExecutor, )
         assert SparseAttentionExecutor is not None
 
-    def test_base_alias_points_to_same_class(self):
-        from tensorrt_llm._torch.attention_backend.sparse import (
-            BaseKVCacheBehaviorManager, BaseKVCacheCompressionExecutor)
-        assert BaseKVCacheBehaviorManager is BaseKVCacheCompressionExecutor
+    def test_legacy_base_alias_removed(self):
+        """``BaseKVCacheBehaviorManager`` alias was removed; import must fail."""
+        import tensorrt_llm._torch.attention_backend.sparse as sparse_pkg
+        assert not hasattr(sparse_pkg, "BaseKVCacheBehaviorManager")
 
-    def test_sparse_alias_points_to_same_class(self):
-        from tensorrt_llm._torch.attention_backend.sparse import (
-            SparseAttentionExecutor, SparseAttentionManager)
-        assert SparseAttentionManager is SparseAttentionExecutor
+    def test_legacy_sparse_alias_removed(self):
+        """``SparseAttentionManager`` alias was removed; import must fail."""
+        import tensorrt_llm._torch.attention_backend.sparse as sparse_pkg
+        assert not hasattr(sparse_pkg, "SparseAttentionManager")
 
     def test_sparse_is_subclass_of_base(self):
         from tensorrt_llm._torch.attention_backend.sparse import (
@@ -491,9 +489,7 @@ class TestNamingFlip:
         assert issubclass(SparseAttentionExecutor,
                           BaseKVCacheCompressionExecutor)
 
-    def test_old_module_path_still_importable_via_new_file(self):
-        """File renamed sparse_attention_manager.py → kv_cache_compression_executor.py.
-        New file path must export the same classes."""
+    def test_executor_classes_importable_via_module_path(self):
         from tensorrt_llm._torch.attention_backend.sparse.kv_cache_compression_executor import (
             BaseKVCacheCompressionExecutor,
             SparseAttentionExecutor,
@@ -735,16 +731,16 @@ class TestPrepareResourcesFansOutToInit:
         assert coord._seen_req_ids == {1, 2, 3}
 
     def test_axis_order_in_init_fan_out(self, fake_kv_cache_manager):
-        """HOOK_ORDER for on_request_init is ['crcl', 'sparse', 'storage'];
+        """HOOK_ORDER for on_request_init is ['cross_request', 'sparse', 'storage'];
         prepare_resources fan-out must respect this."""
         record = []
         sparse = _MockSparseManager(fake_kv_cache_manager, record, "sp")
         storage = _MockStorageManager(fake_kv_cache_manager, record, "st")
-        crcl = _MockCRCLManager(fake_kv_cache_manager, record, "cr")
-        coord = KVCacheBehaviorCoordinator(executors=[sparse, storage, crcl])
+        cross_request = _MockCrossRequestManager(fake_kv_cache_manager, record, "xr")
+        coord = KVCacheBehaviorCoordinator(executors=[sparse, storage, cross_request])
         coord.prepare_resources(self._make_batch([self._make_req(7)], []))
         assert record == [
-            "cr:on_request_init",
+            "xr:on_request_init",
             "sp:on_request_init",
             "st:on_request_init",
         ]
@@ -857,17 +853,17 @@ class TestFreeResourcesFansOutToFinish:
         assert 42 not in coord._prev_req_state
 
     def test_axis_order_in_finish_fan_out(self, fake_kv_cache_manager):
-        """HOOK_ORDER for on_request_finish is ['sparse', 'storage', 'crcl']."""
+        """HOOK_ORDER for on_request_finish is ['sparse', 'storage', 'cross_request']."""
         record = []
         sparse = _MockSparseManager(fake_kv_cache_manager, record, "sp")
         storage = _MockStorageManager(fake_kv_cache_manager, record, "st")
-        crcl = _MockCRCLManager(fake_kv_cache_manager, record, "cr")
-        coord = KVCacheBehaviorCoordinator(executors=[sparse, storage, crcl])
+        cross_request = _MockCrossRequestManager(fake_kv_cache_manager, record, "xr")
+        coord = KVCacheBehaviorCoordinator(executors=[sparse, storage, cross_request])
         coord.free_resources(self._make_req(7))
         assert record == [
             "sp:on_request_finish",
             "st:on_request_finish",
-            "cr:on_request_finish",
+            "xr:on_request_finish",
         ]
 
 

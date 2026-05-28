@@ -10,16 +10,8 @@
 # objects in LLM(...); production code goes through the dispatcher, not
 # direct class imports.
 from .coordinator import KVCacheBehaviorCoordinator
-from .kv_cache_compression_executor import (
-    # Canonical names (post 2026-05-27 v17 renames)
-    BaseKVCacheCompressionExecutor,
-    SparseAttentionExecutor,
-    # Backward-compat aliases (pre-rename names committed in `7d74c8dae6`
-    # / `bfc910c02b` / `23bfff4a16` / `eaa5c71aaf`). Deprecate over v17+;
-    # remove v20+. Existing imports of either old name continue to work.
-    BaseKVCacheBehaviorManager,
-    SparseAttentionManager,
-)
+from .kv_cache_compression_executor import (BaseKVCacheCompressionExecutor,
+                                            SparseAttentionExecutor)
 from .utils import (create_behavior_coordinator,
                     create_sparse_attention_manager,
                     get_flashinfer_sparse_attn_attention_backend,
@@ -28,12 +20,8 @@ from .utils import (create_behavior_coordinator,
                     get_vanilla_sparse_attn_attention_backend)
 
 __all__ = [
-    # Canonical names
     "BaseKVCacheCompressionExecutor",
     "SparseAttentionExecutor",
-    # Backward-compat aliases
-    "BaseKVCacheBehaviorManager",
-    "SparseAttentionManager",
     "KVCacheBehaviorCoordinator",
     "create_sparse_attention_manager",
     "create_behavior_coordinator",

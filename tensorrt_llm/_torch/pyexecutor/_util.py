@@ -94,7 +94,7 @@ def get_kv_cache_manager_cls(
         # sparse-aware cache manager subclass). Behavior-layer methods
         # (TriAttention, future H2O / SnapKV) fall through to the standard
         # non-hybrid V2 manager below; their algorithm runs inside a
-        # ``SparseAttentionManager`` constructed via
+        # ``SparseAttentionExecutor`` constructed via
         # ``create_sparse_attention_manager`` after PyExecutor instantiation.
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
     if is_hybrid_linear(config):
@@ -1761,7 +1761,7 @@ def create_py_executor_instance(
         dwdp_manager=dwdp_manager,
     )
 
-    # Wire SparseAttentionManager for behavior-layer sparse methods
+    # Wire SparseAttentionExecutor for behavior-layer sparse methods
     # (TriAttention, future H2O / SnapKV). Legacy memory-layer methods
     # (RocketKV / DSA / skip_softmax) leave ``sparse_attention_manager`` at the
     # default ``None`` and continue to use their cache-manager subclass.

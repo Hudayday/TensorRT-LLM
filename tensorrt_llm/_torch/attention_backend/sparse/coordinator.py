@@ -2,7 +2,7 @@
 
 A :class:`KVCacheBehaviorCoordinator` owns N
 :class:`BaseKVCacheCompressionExecutor` instances (typically 1–3: one per axis
-``sparse`` / ``storage`` / ``crcl``) and is registered with PyExecutor as a
+``sparse`` / ``storage`` / ``cross_request``) and is registered with PyExecutor as a
 :class:`BaseResourceManager`. PyExecutor's main loop already invokes
 ``prepare_resources / update_resources / free_resources`` on every registered
 resource manager — the Coordinator's overrides translate those 3 callbacks
@@ -42,7 +42,7 @@ Why Path A:
 
 Currently (Phase 3 ship) only axis ``"sparse"`` has a concrete subclass
 (:class:`SparseAttentionExecutor`). Phase 4 adds axis ``"storage"`` (KVTC);
-Phase 5 may add axis ``"crcl"`` (Continuum or chosen candidate).
+Phase 5 may add axis ``"cross_request"`` (Continuum or chosen candidate).
 
 PyExecutor wiring (Phase 3 NOT YET wired — coordinator class is shipped so
 the framework scaffolding is in place; LLM init factory + attention metadata
@@ -82,10 +82,10 @@ if TYPE_CHECKING:
 _HOOK_ORDER: Dict[str, List[str]] = {
     # Request lifecycle: cross-request first (pool lookup) -> sparse (init
     # state) -> storage (may decompress on pool hit).
-    "on_request_init":         ["crcl", "sparse", "storage"],
+    "on_request_init":         ["cross_request", "sparse", "storage"],
     # Final cleanup: sparse (final evict) -> storage (final encode) ->
     # cross-request (promote compressed bytes to pool).
-    "on_request_finish":       ["sparse", "storage", "crcl"],
+    "on_request_finish":       ["sparse", "storage", "cross_request"],
     # Attention hooks: only sparse-attention executors write attention
     # metadata; storage and cross-request executors stay out of the
     # attention path.
@@ -93,10 +93,10 @@ _HOOK_ORDER: Dict[str, List[str]] = {
     "on_generation_attention": ["sparse"],
     # Phase boundary: sparse evict first -> storage compresses remaining
     # cache -> cross-request marks eligible for retention.
-    "on_context_end":          ["sparse", "storage", "crcl"],
+    "on_context_end":          ["sparse", "storage", "cross_request"],
     # Per-step: sparse periodic evict -> storage invalidate active
     # compressed copy -> cross-request TTL GC.
-    "on_generation_step_end":  ["sparse", "storage", "crcl"],
+    "on_generation_step_end":  ["sparse", "storage", "cross_request"],
 }
 
 
@@ -124,17 +124,6 @@ class KVCacheBehaviorCoordinator(BaseResourceManager):
         self._prev_req_state: Dict[int, LlmRequestState] = {}
         self._validate()
         self._wire_dependencies()
-
-    # ------------------------------------------------------------------ #
-    # Backward-compat alias for previous attribute name (Phase 3 tests + #
-    # external code that pre-dates Path A reference ``managers``).        #
-    # ------------------------------------------------------------------ #
-
-    @property
-    def managers(self) -> List[BaseKVCacheCompressionExecutor]:
-        """Alias for :attr:`executors` — retained for backward compatibility
-        with code written before the Path A rename. Use :attr:`executors`."""
-        return self.executors
 
     # ================================================================== #
     # Tier 1 — low-level direct dispatch (6 hooks).                       #
@@ -188,7 +177,7 @@ class KVCacheBehaviorCoordinator(BaseResourceManager):
             if r is not None:
                 if result is not None:
                     raise RuntimeError(
-                        "Multiple managers returned attention metadata "
+                        "Multiple executors returned attention metadata "
                         "from on_context_attention; sparse-attention "
                         "metadata writes must be single-source.")
                 result = r
@@ -213,7 +202,7 @@ class KVCacheBehaviorCoordinator(BaseResourceManager):
             if r is not None:
                 if result is not None:
                     raise RuntimeError(
-                        "Multiple managers returned attention metadata "
+                        "Multiple executors returned attention metadata "
                         "from on_generation_attention; sparse-attention "
                         "metadata writes must be single-source.")
                 result = r
@@ -311,13 +300,13 @@ class KVCacheBehaviorCoordinator(BaseResourceManager):
         their cross-request compressed pool. Auto-wire if both are present
         and the cross-request executor exposes a ``storage_delegate`` attr.
         """
-        crcl_list = self._by_axis.get("crcl", [])
+        cross_request_list = self._by_axis.get("cross_request", [])
         storage_list = self._by_axis.get("storage", [])
-        if crcl_list and storage_list:
-            crcl_exec = crcl_list[0]
+        if cross_request_list and storage_list:
+            cross_request_exec = cross_request_list[0]
             storage_exec = storage_list[0]
-            if hasattr(crcl_exec, "storage_delegate"):
-                crcl_exec.storage_delegate = storage_exec
+            if hasattr(cross_request_exec, "storage_delegate"):
+                cross_request_exec.storage_delegate = storage_exec
 
     # ================================================================== #
     # Introspection                                                       #
@@ -333,13 +322,7 @@ class KVCacheBehaviorCoordinator(BaseResourceManager):
         exs = self._by_axis.get(axis, [])
         return exs[0] if exs else None
 
-    # Backward-compat alias (old method name was ``get_manager``).
-    def get_manager(
-            self, axis: str) -> Optional[BaseKVCacheCompressionExecutor]:
-        """Alias for :meth:`get_executor` — kept for backward compatibility."""
-        return self.get_executor(axis)
-
-    def get_sparse_manager(self) -> Optional[SparseAttentionExecutor]:
+    def get_sparse_executor(self) -> Optional[SparseAttentionExecutor]:
         """Convenience accessor — returns the sparse-attention executor if
         present."""
         return self.get_executor("sparse")  # type: ignore[return-value]
@@ -354,7 +337,7 @@ class KVCacheBehaviorCoordinator(BaseResourceManager):
         """Yield executors in dispatch order for the given hook."""
         order = self.HOOK_ORDER.get(
             hook_name,
-            ["sparse", "storage", "crcl"],  # default fallback order
+            ["sparse", "storage", "cross_request"],  # default fallback order
         )
         for axis in order:
             for e in self._by_axis.get(axis, []):

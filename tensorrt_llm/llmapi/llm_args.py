@@ -283,7 +283,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     def is_behavior_layer_method(self) -> bool:
         """
         Whether this sparse-attention method lives in the behavior layer
-        (``SparseAttentionManager`` subclass holding ``KVCacheManagerV2`` as a
+        (``SparseAttentionExecutor`` subclass holding ``KVCacheManagerV2`` as a
         tool) rather than the memory layer (cache-manager subclass).
 
         Default ``False``: legacy methods (RocketKV / DSA / skip_softmax) are
@@ -495,7 +495,7 @@ class TriAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for TriAttention sparse attention.
 
     Behavior-layer method: dispatched through the
-    ``SparseAttentionManager`` framework rather than via a custom KV-cache
+    ``SparseAttentionExecutor`` framework rather than via a custom KV-cache
     manager subclass. The runtime instance is constructed by
     ``create_sparse_attention_manager`` and consumes the offline ``.pt``
     statistics produced by

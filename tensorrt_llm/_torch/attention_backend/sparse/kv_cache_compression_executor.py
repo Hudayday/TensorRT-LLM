@@ -4,24 +4,15 @@ This module defines:
 
 - :class:`BaseKVCacheCompressionExecutor`: framework-level abstract base for
   every L2 behavior executor (sparse attention, KV storage transform-coding,
-  cross-request lifecycle). Subclasses set an ``axis`` ClassVar and override
-  any subset of the 6 lifecycle hooks (default no-op).
-
-  *Naming note*: this class was previously called ``BaseKVCacheBehaviorManager``
-  (commits ``7d74c8dae6`` / ``bfc910c02b``). Renamed to
-  ``BaseKVCacheCompressionExecutor`` per architectural discussion 2026-05-27 —
-  it is not a "manager" (lifecycle owner), it is an "executor" of compression
-  algorithm work driven by PyExecutor lifecycle hooks. The per-axis subclasses
-  (``SparseAttentionExecutor`` etc.) are still "managers" in that each manages
-  one axis of compression algorithm work. A backward-compat alias
-  ``BaseKVCacheBehaviorManager = BaseKVCacheCompressionExecutor`` is exported.
+  cross-request cache reuse). Subclasses set an ``axis`` ClassVar and
+  override any subset of the 6 lifecycle hooks (default no-op).
 
 - :class:`SparseAttentionExecutor`: subclass for sparse attention methods
   (RocketKV V2-migrated, TriAttention, H2O, SnapKV, ...). The only subclass
   shipped today; future ``KVCacheStorageExecutor`` (for KVTC etc.) and
-  ``CRCLExecutor`` (cross-request lifecycle, for Continuum etc.) will be
-  added as sibling subclasses of ``BaseKVCacheCompressionExecutor`` in
-  Phase 4 / Phase 5.
+  ``CrossRequestExecutor`` (cross-request cache reuse, for Continuum etc.)
+  will be added as sibling subclasses of
+  :class:`BaseKVCacheCompressionExecutor` in Phase 4 / Phase 5.
 
 Architecture (3-layer stack):
 
@@ -96,9 +87,9 @@ class BaseKVCacheCompressionExecutor:
       (:class:`SparseAttentionExecutor`, shipped now).
     - ``"storage"`` — KV storage / transform-coding
       (:class:`KVCacheStorageExecutor`, planned Phase 4 for KVTC).
-    - ``"crcl"`` — cross-request cache lifecycle
-      (:class:`CRCLExecutor`, planned Phase 5 if Continuum-style candidate
-      selected).
+    - ``"cross_request"`` — cross-request KV cache reuse (e.g., Continuum-
+      style prefix-share / cross-session pool)
+      (:class:`CrossRequestExecutor`, planned Phase 5 if candidate selected).
 
     All 6 hooks default to no-op; subclasses override what they need. A
     :class:`KVCacheBehaviorCoordinator` dispatches each hook to all
@@ -144,7 +135,7 @@ class BaseKVCacheCompressionExecutor:
         if not self.axis:
             raise NotImplementedError(
                 f"{type(self).__name__} must set the 'axis' ClassVar "
-                f"to one of: 'sparse', 'storage', 'crcl'.")
+                f"to one of: 'sparse', 'storage', 'cross_request'.")
         # Pattern 3 type assertion: if subclass declared a V2 subclass
         # requirement, verify the injected instance matches.
         if self.kv_cache_manager_class is not None:
@@ -285,12 +276,6 @@ class BaseKVCacheCompressionExecutor:
         return own_method is not base_method
 
 
-# Backward-compat alias — code committed under the old name (``7d74c8dae6`` /
-# ``bfc910c02b``) and external references continue to work. Deprecate over
-# v17+; remove in v20+.
-BaseKVCacheBehaviorManager = BaseKVCacheCompressionExecutor
-
-
 class SparseAttentionExecutor(BaseKVCacheCompressionExecutor):
     """Convenience subclass for sparse-attention methods.
 
@@ -299,12 +284,6 @@ class SparseAttentionExecutor(BaseKVCacheCompressionExecutor):
     RocketKV / DSA / skip_softmax follow the older 5-class plugin pattern
     (separate cache-manager + attention shim classes, in ``rocket.py`` /
     ``dsa.py``) and do NOT inherit from this base.
-
-    The framework base is :class:`BaseKVCacheCompressionExecutor`;
-    ``SparseAttentionExecutor`` is the convenience subclass that sparse
-    algorithms inherit from. Existing call sites that import
-    ``SparseAttentionExecutor`` continue to work unchanged — TriAttention
-    still inherits from it.
 
     Future sparse-specific helpers (e.g., ``_read_req_k_cache`` for K-cache
     pool readback, ``_compact_req`` for physical eviction through the V2
@@ -323,13 +302,3 @@ class SparseAttentionExecutor(BaseKVCacheCompressionExecutor):
     # mask via :class:`SparseAttentionIndices`, leaving cache contents
     # unchanged (RocketKV Stage II HSA, DSA, Quest).
     physically_evicts_kv: ClassVar[bool] = False
-
-
-# Backward-compat alias — ``SparseAttentionManager`` was the v15.9 / v16.0
-# subclass name (committed `7d74c8dae6` / `bfc910c02b` / `23bfff4a16` /
-# `eaa5c71aaf`). Renamed 2026-05-27 to ``SparseAttentionExecutor`` to match
-# the ``BaseKVCacheCompressionExecutor`` base — per-axis subclasses are also
-# "executors" of one axis of compression algorithm work, not "managers" of
-# resources. Existing imports continue to work via this alias. Deprecate over
-# v17+; remove v20+.
-SparseAttentionManager = SparseAttentionExecutor
