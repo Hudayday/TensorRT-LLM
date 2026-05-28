@@ -51,7 +51,10 @@ from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention_backend.vanilla import (
     VanillaAttention, VanillaAttentionMetadata)
-from tensorrt_llm._torch.pyexecutor.resource_manager import BlockManager
+# Pattern 2: V2 KVCacheManagerV2 owns the KT_CACHE pool via Role.KT_CACHE
+# BufferConfig (resource_manager.py:Role.KT_CACHE). Executor delegates
+# allocation + lifecycle to V2 instead of holding its own BlockManager
+# (which was the Pattern 1 shortcut before 2026-05-28).
 from tensorrt_llm._utils import prefer_pinned
 
 from tensorrt_llm._torch.attention_backend.sparse.kv_cache_compression_executor import (
@@ -568,69 +571,72 @@ class RocketKV(SparseAttentionExecutor):
         self.topk = topk
         self.topr = topr
 
-        # Derive KT pool dimensions from V2 cache manager. V1
-        # RocketKVCacheManager.__init__ uses these same params.
-        # Defensive int conversion: MagicMock-like objects auto-generate
-        # attribute mocks that aren't ints — fall back to 0 in that case
-        # so test fixtures don't crash and we skip KT pool allocation.
-        def _safe_int(obj, attr, default):
-            v = getattr(obj, attr, default)
-            return v if isinstance(v, int) else default
-
-        num_local_layers = _safe_int(kv_cache_manager, "num_local_layers", 0)
-        num_kv_heads = _safe_int(kv_cache_manager, "num_kv_heads", 0)
-        head_dim = _safe_int(kv_cache_manager, "head_dim", 0)
-        tokens_per_block = _safe_int(kv_cache_manager, "tokens_per_block",
-                                     page_size)
-        num_blocks = _safe_int(kv_cache_manager, "blocks_in_primary_pool", 0)
-
-        self.kt_tokens_per_block = (kt_tokens_per_block
-                                    or next_power_of_2(
-                                        math.ceil(tokens_per_block /
-                                                  page_size)))
-        self.kt_cache_dtype = (torch.bfloat16 if kt_cache_dtype == "bfloat16"
-                               else torch.float8_e5m2)
-
-        # ---- Pattern 1: executor owns KT cache pool per layer ----
-        # Allocation deferred to first use (or lazy init) when num_blocks > 0;
-        # otherwise stays as empty list so test mocks don't OOM.
-        if num_local_layers > 0 and num_kv_heads > 0 and num_blocks > 0:
-            self.kt_cache_pool_per_layer: List[torch.Tensor] = [
-                torch.empty((num_blocks, self.kt_tokens_per_block,
-                             num_kv_heads, head_dim * 2),
-                            device="cuda",
-                            dtype=self.kt_cache_dtype)
-                for _ in range(num_local_layers)
-            ]
-            self.max_kt_blocks_per_seq = num_blocks
-            self.kt_cache_manager = BlockManager(num_blocks,
-                                                 self.kt_tokens_per_block)
+        # Pattern 2 (V2 declarative BufferConfig, 2026-05-28): KT cache pool
+        # is owned by KVCacheManagerV2 via Role.KT_CACHE BufferConfig (added
+        # in resource_manager.py:_build_cache_config when
+        # sparse_attn_config.algorithm == "rocketkv"). The executor delegates
+        # to V2's get_kt_buffers / blocks_in_primary_pool / kt_tokens_per_block
+        # for sizing + access. This replaces the earlier Pattern 1
+        # (executor-owned pool) which didn't sync with V2 page lifecycle.
+        #
+        # When the V2 manager doesn't expose KT_CACHE (e.g., tests with
+        # MagicMock cache mgr or non-rocketkv configs), executor methods
+        # degrade gracefully (return None) — algorithm body skips KT-related
+        # work in that case.
+        # MagicMock-truthy gate trap [[feedback_mock_truthy_gate_trap]]:
+        # ``hasattr(MagicMock, "_kt_cache_enabled")`` is True (auto-attr) and
+        # ``getattr(MagicMock, "_kt_cache_enabled", False)`` returns a Mock
+        # which is truthy. Use ``is True`` (boolean identity) to short-circuit
+        # MagicMock test fixtures down the no-op path.
+        self._kt_supported = (
+            hasattr(kv_cache_manager, "_kt_cache_enabled") and getattr(
+                kv_cache_manager, "_kt_cache_enabled", False) is True)
+        if self._kt_supported:
+            # V2 derives kt_tokens_per_block + dtype from sparse_attn_config
+            # at construction. We mirror them here for the algorithm body
+            # to access without an extra V2 round-trip.
+            self.kt_tokens_per_block = kv_cache_manager.kt_tokens_per_block
+            self.kt_cache_dtype = kv_cache_manager._kt_torch_dtype
+            self.max_kt_blocks_per_seq = kv_cache_manager.max_kt_blocks_per_seq
         else:
-            # Test-friendly path: zero-sized pool, BlockManager unused.
-            self.kt_cache_pool_per_layer = []
+            self.kt_tokens_per_block = (kt_tokens_per_block
+                                        or next_power_of_2(
+                                            math.ceil(page_size / page_size)))
+            self.kt_cache_dtype = (torch.bfloat16
+                                   if kt_cache_dtype == "bfloat16" else
+                                   torch.float8_e5m2)
             self.max_kt_blocks_per_seq = 0
-            self.kt_cache_manager = None
 
     # ===================================================================== #
-    # Pool access helpers (V1 RocketKVCacheManager.{get_kt_buffers,          #
-    # copy_kt_block_offsets} ports).                                         #
+    # Pool access helpers — delegate to V2's KT_CACHE BufferConfig pool      #
+    # (Pattern 2). V2 inner manages allocation + lifecycle; executor just    #
+    # exposes the V1-compatible API surface for algorithm body to call.     #
     # ===================================================================== #
 
     def get_kt_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
-        """V1 line 1001 port — KT pool slice for given attention layer."""
-        if not self.kt_cache_pool_per_layer:
+        """Return KT pool tensor for the given attention layer. Delegates
+        to V2 ``get_kt_buffers(layer_idx)`` when V2 has KT_CACHE BufferConfig
+        wired; returns ``None`` otherwise (mocked tests / non-rocketkv config).
+        V1 RocketKVCacheManager.get_kt_buffers parity."""
+        if not self._kt_supported:
             return None
-        return self.kt_cache_pool_per_layer[layer_idx]
+        return self.kv_cache_manager.get_kt_buffers(layer_idx)
 
     def copy_kt_block_offsets(self, request_ids: List[int],
                               block_offsets: torch.Tensor) -> torch.Tensor:
-        """V1 line 1004 port — copy per-request KT block offsets into the
-        provided host-side tensor (which metadata then async-copies to
-        device). No-op when KT pool not allocated."""
-        if self.kt_cache_manager is None:
+        """Copy per-request block offsets into the provided host-side tensor.
+        Pattern 2: KT shares block IDs with KEY/VALUE (same logical block
+        in V2 multi-pool layout), so we delegate to V2's standard
+        ``copy_block_offsets`` for the KEY role. V1 used a separate
+        BlockManager for KT; V2 unifies via shared block IDs."""
+        if not self._kt_supported:
             return block_offsets
-        return self.kt_cache_manager.copy_block_offsets(
-            request_ids, block_offsets)
+        # V2 exposes block offset copy via the standard API; KT block IDs
+        # are the same as KEY block IDs in Pattern 2 multi-pool layout.
+        copy_fn = getattr(self.kv_cache_manager, "copy_block_offsets", None)
+        if copy_fn is None:
+            return block_offsets
+        return copy_fn(request_ids, block_offsets)
 
     # ===================================================================== #
     # HOOK 1 — on_request_init (V1 RocketKVCacheManager.prepare_resources    #
@@ -638,18 +644,13 @@ class RocketKV(SparseAttentionExecutor):
     # ===================================================================== #
 
     def on_request_init(self, request: "LlmRequest") -> None:
-        """Allocate KT cache pages for this request based on prompt_len.
-        V1 line 1015 port:
-            kt_token_num = math.ceil(num_tokens / self.page_size)
-            self.kt_cache_manager.add_tokens(request_id, kt_token_num)
-        """
-        if self.kt_cache_manager is None:
-            return
-        num_tokens = getattr(request, "prompt_len", 0)
-        kt_token_num = math.ceil(num_tokens / self.page_size) if num_tokens else 0
-        if kt_token_num > 0:
-            self.kt_cache_manager.add_tokens(request.py_request_id,
-                                             kt_token_num)
+        """V1 used to call ``self.kt_cache_manager.add_tokens(...)`` to grow
+        KT pages per request (V1 line 1015). Pattern 2 (Path A v17): V2's
+        KT_CACHE BufferConfig shares block IDs with KEY, so KT pages are
+        allocated implicitly when V2 allocates KEY pages — no explicit
+        call needed. This hook stays no-op for now (per-request init
+        accumulators can be added by future methods)."""
+        return
 
     # ===================================================================== #
     # HOOK 2 — on_context_attention (V1 sparse_kv_predict port,              #
@@ -813,10 +814,15 @@ class RocketKV(SparseAttentionExecutor):
             seq_len = request.get_num_tokens(0)
             rewind_len = max(seq_len - 1 - self.prompt_budget, 0)
             self.rewind_kv_cache(request, rewind_len)
-            # plus kt cache rewind
         Fires once per request at prefill→decode state transition.
+
+        Pattern 2 (Path A v17): KT pool is sub-page of the same V2 logical
+        block as KEY (shared block IDs). When V2's ``rewind_kv_cache``
+        frees the physical pages, KT slots living in those pages are
+        freed automatically — no separate KT rewind needed (vs V1's
+        explicit auxiliary-pool rewind at rocket.py line 1031).
         """
-        if self.kt_cache_manager is None:
+        if not self._kt_supported:
             return
         # V1 filter: skip terminated mid-prefill
         try:
@@ -833,19 +839,10 @@ class RocketKV(SparseAttentionExecutor):
         if rewind_len <= 0:
             return
 
-        # V2 cache manager rewind — V1 calls super().rewind_kv_cache which
-        # is on V1 KVCacheManager. V2 has an equivalent method on V2
-        # cache manager.
+        # V2 cache manager rewind — shrinks the physical pages; KT slots
+        # in the freed pages go with them (shared block IDs).
         if hasattr(self.kv_cache_manager, "rewind_kv_cache"):
             self.kv_cache_manager.rewind_kv_cache(request, rewind_len)
-
-        # KT cache rewind (V1 line 1031)
-        num_tokens = getattr(request, "max_beam_num_tokens", seq_len)
-        updated_kt_token_num = num_tokens - rewind_len
-        kt_rewind_len = (math.ceil(num_tokens / self.page_size) -
-                         math.ceil(updated_kt_token_num / self.page_size))
-        if kt_rewind_len > 0:
-            self.kt_cache_manager.rewind_cache(request, kt_rewind_len)
 
     # ===================================================================== #
     # HOOK 4 — on_generation_attention (V1 sparse_attn_predict port,         #
@@ -966,10 +963,14 @@ class RocketKV(SparseAttentionExecutor):
     # ===================================================================== #
 
     def on_request_finish(self, request: "LlmRequest") -> None:
-        """Free KT cache pages for the finished request. V1 line 1038."""
-        if self.kt_cache_manager is None:
-            return
-        self.kt_cache_manager.free_resources(request)
+        """Free hook. Pattern 2 (Path A v17): KT pool shares block IDs with
+        KEY/VALUE in V2's multi-pool BufferConfig, so when V2's
+        ``free_resources`` releases the request's blocks the KT slots
+        living inside those blocks are released automatically. V1's
+        explicit auxiliary-pool free at rocket.py line 1038 is therefore
+        not needed.
+        """
+        return
 
     # ===================================================================== #
     # Helpers — proxy attention layer params via kv_cache_manager.            #

@@ -208,7 +208,8 @@ class TestRocketKVClass:
         assert RocketKV.physically_evicts_kv is True
         # KT cache + Stage I-b keep-set are both request-specific.
         assert RocketKV.supports_kv_cache_reuse is False
-        # Pattern 1+2: uses default plain V2 (no Pattern 3 subclass)
+        # Pattern 2: uses default plain V2 with KT_CACHE BufferConfig
+        # added via multi-pool extension (no Pattern 3 subclass).
         assert RocketKV.kv_cache_manager_class is None
 
     def test_construct_with_minimal_args(self):
@@ -379,17 +380,22 @@ class TestRocketKVAlgorithmBodyPort:
 
     def test_kt_pool_ownership_helpers_exist(self):
         """V1 RocketKVCacheManager.get_kt_buffers + copy_kt_block_offsets
-        ported to executor instance methods (Pattern 1: executor owns
-        KT_CACHE pool, replaces V1 cache-manager subclass-as-owner pattern)."""
+        ported to executor instance methods (Pattern 2: V2's KT_CACHE
+        BufferConfig owns the pool; executor delegates via thin shim).
+
+        Replaces V1's cache-manager-subclass-as-owner pattern and the
+        earlier Pattern 1 (executor-owned standalone pool which didn't
+        sync with V2 page lifecycle)."""
         mgr = RocketKV(kv_cache_manager=MagicMock())
         assert hasattr(mgr, "get_kt_buffers"), (
-            "RocketKV must expose get_kt_buffers(layer_idx) — V1 helper "
-            "moved from RocketKVCacheManager onto the executor.")
+            "RocketKV must expose get_kt_buffers(layer_idx) — delegates "
+            "to V2 KT_CACHE BufferConfig pool (Pattern 2).")
         assert hasattr(mgr, "copy_kt_block_offsets"), (
-            "RocketKV must expose copy_kt_block_offsets(...) — V1 helper "
-            "moved from RocketKVCacheManager onto the executor.")
-        assert hasattr(mgr, "kt_cache_pool_per_layer"), (
-            "RocketKV must own the per-layer KT cache pool (Pattern 1).")
+            "RocketKV must expose copy_kt_block_offsets(...) — delegates "
+            "to V2 KEY-role block offsets (shared block IDs).")
+        assert hasattr(mgr, "_kt_supported"), (
+            "RocketKV must expose _kt_supported flag indicating whether "
+            "V2 cache manager has KT_CACHE BufferConfig wired (Pattern 2).")
 
     def test_kt_pool_carries_v1_compatible_params(self):
         """V1 RocketKVCacheManager.__init__ stores prompt_budget /
@@ -516,11 +522,18 @@ class TestRocketKVAlgorithmBodyKernelCalls:
 
     def test_on_context_end_does_physical_evict(self):
         """V17 HOOK 3 ports V1's update_resources rewind logic — must
-        invoke rewind_kv_cache + kt_cache rewind."""
+        invoke rewind_kv_cache.
+
+        Note: Pattern 2 drops V1's separate kt_cache_manager.rewind_cache
+        call — KT slots live inside the same V2 logical blocks as KEY/VALUE
+        (shared block IDs via multi-pool BufferConfig), so V2's
+        rewind_kv_cache frees them in one shot."""
         src = self._get_hook_source("on_context_end")
         assert "rewind_kv_cache" in src, (
             "V17 on_context_end must call rewind_kv_cache (Stage I-b "
             "SnapKV physical evict, ported from V1 update_resources).")
-        assert "rewind_cache" in src, (
-            "V17 on_context_end must call kt_cache_manager.rewind_cache "
-            "(KT cache rewind synced with KV rewind, V1 line 1031).")
+        assert "kt_cache_manager.rewind_cache" not in src, (
+            "Pattern 2 must NOT call kt_cache_manager.rewind_cache — "
+            "KT shares block IDs with KEY/VALUE via V2 multi-pool "
+            "BufferConfig, so V2's rewind_kv_cache frees KT slots "
+            "automatically (Pattern 2 drops V1 line 1031).")
