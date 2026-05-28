@@ -1587,16 +1587,37 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 # Behavior-layer methods (TriAttention, future H2O / SnapKV /
                 # V2-migrated RocketKV) drive their algorithm via the v17
                 # KVCacheBehaviorCoordinator (Path A — see
-                # attention_backend/sparse/coordinator.py docstring). HOOK 2/4
-                # (on_*_attention) will fire here through
-                # ``metadata.coordinator.on_*_attention(...)`` once the LLM init
-                # plumbs the coordinator reference into AttentionMetadata
-                # (Phase 4 wiring). Until that wire-up lands, behavior-layer
-                # methods skip the legacy sparse_kv_predict /
-                # sparse_attn_predict path (which raises NotImplementedError on
-                # the base TrtllmAttention) and run the attention forward on
-                # the dense (possibly compacted) cache.
-                pass
+                # attention_backend/sparse/coordinator.py docstring).
+                # HOOK 2 (``on_context_attention``) + HOOK 4
+                # (``on_generation_attention``) fire here via
+                # ``metadata.coordinator.on_*_attention(...)``. Coordinator
+                # dispatches to the registered executor (TriAttention /
+                # RocketKV V17 / future H2O / SnapKV); the executor's
+                # callback body either:
+                #   - Returns ``(indices, offsets)`` sparse mask tuple →
+                #     consumed by kernel as input-side sparse mask (Quest /
+                #     RocketKV Stage II HSA / DSA),
+                #   - Returns ``None`` → kernel runs dense attention over
+                #     (possibly compacted) cache (TriAttention, H2O,
+                #     skip_softmax),
+                #   - Or writes side-effect state to aux pool (RocketKV
+                #     Stage I-a KT_CACHE build) and returns ``None``.
+                # When ``metadata.coordinator is None`` (no behavior-layer
+                # method configured), skip the dispatch — attention falls
+                # back to dense compute over the cache.
+                if metadata.coordinator is not None:
+                    layer_idx = self.get_local_layer_idx(metadata)
+                    ctx_result = metadata.coordinator.on_context_attention(
+                        layer_idx, q, k, None, metadata)
+                    if ctx_result is not None:
+                        sparse_kv_indices, sparse_kv_offsets = ctx_result
+                    gen_result = metadata.coordinator.on_generation_attention(
+                        layer_idx, q, k, None, metadata)
+                    if gen_result is not None:
+                        sparse_attn_indices, sparse_attn_offsets = gen_result
+                        sparse_attn_indices_block_size = (
+                            self.sparse_attention_config.get_indices_block_size(
+                            ))
 
             else:
                 sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(

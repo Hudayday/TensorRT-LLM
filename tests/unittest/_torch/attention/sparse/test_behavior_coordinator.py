@@ -1048,18 +1048,154 @@ class TestAttentionMetadataCoordinatorField:
 
     def test_attention_metadata_coordinator_settable(
             self, fake_kv_cache_manager):
-        """model_engine wire pattern: ``attn_metadata.coordinator = rm.
-        get_resource_manager(KV_CACHE_BEHAVIOR_COORDINATOR)``. The
-        attribute must be writable on an existing AttentionMetadata
-        instance."""
+        """The ``coordinator`` field must be assignable on an
+        AttentionMetadata instance. (Production wire passes coordinator at
+        construction time — see TestModelEngineCoordinatorSetup — but the
+        field still needs to be settable for tests + special cases.)"""
         from tensorrt_llm._torch.attention_backend.interface import (
             AttentionMetadata)
-        # We don't instantiate AttentionMetadata directly (it has many
-        # required fields); instead verify the field is in the dataclass
-        # definition and can be set via __setattr__ on a mock.
         coord = KVCacheBehaviorCoordinator(executors=[])
-        # Use a Mock with spec to enforce the attribute exists in the
-        # dataclass; setting it should succeed.
         m = MagicMock(spec=AttentionMetadata)
         m.coordinator = coord
         assert m.coordinator is coord
+
+
+class TestModelEngineCoordinatorSetup:
+    """Production wire pattern (Path A finalization 2026-05-28): the
+    coordinator is passed to AttentionMetadata **at construction time**
+    inside ``model_engine._set_up_attn_metadata``, not via
+    post-construction mutation. This avoids the per-iter mutate-after-
+    cached-build pattern and keeps the setup single-step.
+
+    These source-level assertions lock the wire pattern.
+    """
+
+    def _get_set_up_attn_metadata_source(self):
+        import inspect
+        from tensorrt_llm._torch.pyexecutor.model_engine import (
+            PyTorchModelEngine)
+        return inspect.getsource(PyTorchModelEngine._set_up_attn_metadata)
+
+    def test_set_up_attn_metadata_accepts_resource_manager_kwarg(self):
+        import inspect
+        from tensorrt_llm._torch.pyexecutor.model_engine import (
+            PyTorchModelEngine)
+        sig = inspect.signature(PyTorchModelEngine._set_up_attn_metadata)
+        assert "resource_manager" in sig.parameters, (
+            "_set_up_attn_metadata must accept ``resource_manager`` so the "
+            "coordinator can be fetched once at construction time, instead "
+            "of having callers do post-construction mutation per iter.")
+
+    def test_resource_manager_kwarg_defaults_to_none(self):
+        import inspect
+        from tensorrt_llm._torch.pyexecutor.model_engine import (
+            PyTorchModelEngine)
+        sig = inspect.signature(PyTorchModelEngine._set_up_attn_metadata)
+        param = sig.parameters["resource_manager"]
+        assert param.default is None, (
+            "``resource_manager`` must default to None so the dummy/init "
+            "code path (which calls without resource_manager) continues to "
+            "work — coordinator stays None there.")
+
+    def test_set_up_attn_metadata_extracts_coordinator_from_resource_manager(
+            self):
+        """_set_up_attn_metadata must call
+        ``resource_manager.get_resource_manager(KV_CACHE_BEHAVIOR_COORDINATOR)``
+        to fetch the coordinator and pass it to AttentionMetadata
+        construction."""
+        src = self._get_set_up_attn_metadata_source()
+        assert "KV_CACHE_BEHAVIOR_COORDINATOR" in src, (
+            "_set_up_attn_metadata must reference "
+            "ResourceManagerType.KV_CACHE_BEHAVIOR_COORDINATOR to fetch the "
+            "coordinator from resource_manager.")
+        assert "coordinator=" in src, (
+            "_set_up_attn_metadata must pass ``coordinator=coordinator`` "
+            "kwarg to AttentionMetadata constructor (single-step setup).")
+
+    def test_no_post_construction_coordinator_mutation_at_callsite(self):
+        """The model_engine call site that builds attn_metadata MUST NOT
+        do ``attn_metadata.coordinator = ...`` after construction —
+        coordinator is passed at construction time via the new
+        resource_manager kwarg."""
+        import inspect
+        from tensorrt_llm._torch.pyexecutor.model_engine import (
+            PyTorchModelEngine)
+        # Get the full model_engine source to scan for stale wire pattern.
+        # We do this on the module since the callsite isn't in
+        # _set_up_attn_metadata itself.
+        import tensorrt_llm._torch.pyexecutor.model_engine as me_module
+        full_src = inspect.getsource(me_module)
+        # The bad pattern would be: ``attn_metadata.coordinator =``
+        # (post-construction mutation). It should NOT appear anywhere.
+        assert "attn_metadata.coordinator =" not in full_src, (
+            "model_engine.py must NOT do post-construction "
+            "``attn_metadata.coordinator = ...`` mutation. Pass "
+            "``coordinator=`` via resource_manager kwarg to "
+            "_set_up_attn_metadata instead — single-step setup.")
+
+
+
+# ---------------------------------------------------------------------- #
+# 13. TrtllmAttention.forward HOOK 2/4 callsite wiring                    #
+# (2026-05-28 — final piece of Path A pipeline: TrtllmAttention reads     #
+#  metadata.coordinator and fires on_*_attention for behavior-layer      #
+#  sparse methods. Source-level assertions lock the wire pattern.)        #
+# ---------------------------------------------------------------------- #
+
+
+class TestTrtllmAttentionForwardCallsiteWiring:
+    """The TrtllmAttention.forward path now invokes
+    ``metadata.coordinator.on_context_attention`` and
+    ``metadata.coordinator.on_generation_attention`` for behavior-layer
+    methods. These source-level assertions lock the wire pattern so future
+    refactors of TrtllmAttention don't silently drop the coordinator path.
+    """
+
+    def _get_forward_source(self):
+        import inspect
+        from tensorrt_llm._torch.attention_backend.trtllm import (
+            TrtllmAttention)
+        return inspect.getsource(TrtllmAttention.forward)
+
+    def test_callsite_invokes_on_context_attention(self):
+        src = self._get_forward_source()
+        assert "metadata.coordinator.on_context_attention(" in src, (
+            "TrtllmAttention.forward must invoke "
+            "``metadata.coordinator.on_context_attention(...)`` for "
+            "behavior-layer methods — this is HOOK 2 of the 6-hook "
+            "framework. Without this callsite the Coordinator dispatch "
+            "method exists but never gets called from production code.")
+
+    def test_callsite_invokes_on_generation_attention(self):
+        src = self._get_forward_source()
+        assert "metadata.coordinator.on_generation_attention(" in src, (
+            "TrtllmAttention.forward must invoke "
+            "``metadata.coordinator.on_generation_attention(...)`` — HOOK 4.")
+
+    def test_callsite_guards_for_none_coordinator(self):
+        """When no behavior-layer sparse method is configured,
+        metadata.coordinator is None; the callsite must skip dispatch
+        instead of raising AttributeError."""
+        src = self._get_forward_source()
+        assert "metadata.coordinator is not None" in src, (
+            "TrtllmAttention.forward must guard the coordinator dispatch "
+            "with ``if metadata.coordinator is not None:`` — models without "
+            "behavior-layer sparse method leave coordinator at None and "
+            "must keep working unchanged.")
+
+    def test_callsite_inside_behavior_layer_branch(self):
+        """The coordinator dispatch should live inside the
+        ``elif self.sparse_attention_config.is_behavior_layer_method:``
+        branch — legacy memory-layer methods (rocket / dsa / skip_softmax)
+        keep using ``sparse_kv_predict`` / ``sparse_attn_predict``."""
+        src = self._get_forward_source()
+        # Locate the is_behavior_layer_method branch and check coordinator
+        # call lives somewhere after it but before the legacy ``else``.
+        behavior_idx = src.find("is_behavior_layer_method")
+        legacy_idx = src.find("self.sparse_kv_predict(")
+        coord_idx = src.find("metadata.coordinator.on_context_attention(")
+        assert behavior_idx >= 0 and legacy_idx >= 0 and coord_idx >= 0, (
+            "Expected branches not found in TrtllmAttention.forward source")
+        assert behavior_idx < coord_idx < legacy_idx, (
+            "Coordinator dispatch must be inside the behavior-layer branch, "
+            "not in the legacy memory-layer path.")

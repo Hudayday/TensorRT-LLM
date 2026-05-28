@@ -1436,7 +1436,8 @@ class PyTorchModelEngine(ModelEngine):
         self,
         kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
         draft_kv_cache_manager: Optional[Union[KVCacheManager,
-                                               KVCacheManagerV2]] = None):
+                                               KVCacheManagerV2]] = None,
+        resource_manager: Optional[ResourceManager] = None):
         enable_context_mla_with_cached_kv = is_mla(
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
@@ -1459,6 +1460,18 @@ class PyTorchModelEngine(ModelEngine):
         else:
             num_heads_per_kv = 1
 
+        # Path A (v17, 2026-05-28): retrieve KVCacheBehaviorCoordinator from
+        # resource_manager so it can be passed to AttentionMetadata at
+        # construction time (single-step setup; no post-construction
+        # mutation). TrtllmAttention.forward reads metadata.coordinator
+        # to fire HOOK 2/4 (on_*_attention). Coordinator is None when no
+        # behavior-layer sparse method is configured, or when caller did
+        # not pass resource_manager (e.g. the dummy/init path).
+        # See attention_backend/sparse/coordinator.py docstring + doc 30 §5.
+        coordinator = (resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_BEHAVIOR_COORDINATOR)
+                       if resource_manager is not None else None)
+
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
@@ -1472,7 +1485,8 @@ class PyTorchModelEngine(ModelEngine):
                 enable_context_mla_with_cached_kv,
                 cache_indirection=cache_indirection,
                 sparse_attention_config=self.sparse_attention_config,
-                num_heads_per_kv=num_heads_per_kv)
+                num_heads_per_kv=num_heads_per_kv,
+                coordinator=coordinator)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -1493,6 +1507,7 @@ class PyTorchModelEngine(ModelEngine):
             cache_indirection=cache_indirection,
             sparse_attention_config=self.sparse_attention_config,
             num_heads_per_kv=num_heads_per_kv,
+            coordinator=coordinator,
         )
 
         return self.attn_metadata
@@ -3904,15 +3919,10 @@ class PyTorchModelEngine(ModelEngine):
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
             resource_manager)
 
-        attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
-                                                   draft_kv_cache_manager)
-        # Path A (v17, 2026-05-28): inject KVCacheBehaviorCoordinator into
-        # attn_metadata so TrtllmAttention.forward can fire HOOK 2/4
-        # (on_*_attention) via ``metadata.coordinator.on_*_attention(...)``.
-        # Coordinator is None when no behavior-layer sparse method is configured.
-        # See attention_backend/sparse/coordinator.py docstring + doc 30 §5.
-        attn_metadata.coordinator = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_BEHAVIOR_COORDINATOR)
+        attn_metadata = self._set_up_attn_metadata(
+            kv_cache_manager,
+            draft_kv_cache_manager,
+            resource_manager=resource_manager)
         if self.enable_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
