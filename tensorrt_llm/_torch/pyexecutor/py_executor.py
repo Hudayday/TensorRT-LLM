@@ -8,8 +8,7 @@ import traceback
 from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
-from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
-                    Tuple, Union)
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -76,10 +75,6 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter
-
-if TYPE_CHECKING:
-    from ..attention_backend.sparse.kv_cache_compression_executor import \
-        SparseAttentionManager
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -424,17 +419,6 @@ class PyExecutor:
         self.max_num_active_requests = model_engine.get_max_num_sequences()
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
-        # Sparse attention behavior manager (decoupled from the cache mgr; see
-        # tensorrt_llm/_torch/attention_backend/sparse/sparse_attention_manager.py).
-        # ``None`` when no sparse-attention method is configured (legacy path).
-        # When non-None, hooks are dispatched at six wire points: request_init /
-        # request_finish (this file), context_end (this file), generation_step_end
-        # (this file, every ``resource_manager.update_resources`` call site), and
-        # context_attention / generation_attention (attention_backend/trtllm.py;
-        # not wired yet -- requires kernel ``RETURN_SCORES`` template work).
-        # TODO(sparse-attention): wire factory `create_sparse_attention_manager` from
-        # `sparse_attention_config` in py_executor_creator and inject here.
-        self.kv_cache_compression_executor: Optional["SparseAttentionManager"] = None
         # TODO: Remove PP size == 1 gate for disagg + block reuse with PP > 1.
         # Buffer for responses generated inside _end_transfer_and_maybe_terminate.
         # With ADP, _enqueue_responses does a tp_gather collective.  When called
@@ -1729,20 +1713,6 @@ class PyExecutor:
 
                 # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
-                # Sparse attention hook: on_request_init — fire once per
-                # newly-activated request so subclasses can allocate per-request
-                # accumulators (e.g., H2O cumulative attention sums).
-                #
-                # Methods that use this hook (BaseKVCacheCompressionExecutor
-                # subclasses, see attention_backend/sparse/):
-                #   - TriAttention use here: allocate per-req scoring buffer
-                #     (deferred; M3.1 algorithm body待)
-                #   - RocketKV use here: initialize per-req KT-build tracking
-                #     (deferred; sparse/rocketkv.py Phase 7 skeleton)
-                #   - Future CRCL executors use here: cross-request pool lookup
-                if self.kv_cache_compression_executor is not None:
-                    for _req in new_requests:
-                        self.kv_cache_compression_executor.on_request_init(_req)
                 if self.should_stop_processing:
                     break
 
@@ -2128,22 +2098,6 @@ class PyExecutor:
                 self.resource_manager.update_resources(
                     sample_state_scheduled_requests, attn_metadata,
                     kv_cache_dtype_byte_size)
-                # Sparse attention hook: on_generation_step_end (call site 1/3).
-                # Fires after all layers' forward completes for this iteration;
-                # subclasses do periodic eviction (TriAttention beta=128),
-                # budget-triggered eviction (H2O), or runtime cleanup here.
-                #
-                # Methods that use this hook:
-                #   - TriAttention use here: beta=128 step trigger → score per
-                #     layer + cross-layer aggregate + topk + compact via V2
-                #     compact_request_cache API (M3.1 algorithm body待)
-                #   - RocketKV use here: typically NO (Stage I/II fire in
-                #     attention hooks not step_end; per sparse/rocketkv.py)
-                #   - Future H2O use here: cumulative attention sum threshold
-                #     check + per-token evict
-                if self.kv_cache_compression_executor is not None:
-                    self.kv_cache_compression_executor.on_generation_step_end(
-                        sample_state_scheduled_requests, attn_metadata)
 
                 self._remove_inflight_ids(scheduled_requests)
 
@@ -2682,13 +2636,6 @@ class PyExecutor:
                     self.resource_manager.update_resources(
                         scheduled_batch, attn_metadata,
                         kv_cache_dtype_byte_size)
-                    # Sparse attention hook: on_generation_step_end (call site 2/3).
-                    # See call site 1/3 (above) for per-method use:
-                    # TriAttention beta=128 evict / RocketKV typically no-op /
-                    # H2O cumulative-sum evict / etc.
-                    if self.kv_cache_compression_executor is not None:
-                        self.kv_cache_compression_executor.on_generation_step_end(
-                            scheduled_batch, attn_metadata)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
@@ -3143,13 +3090,6 @@ class PyExecutor:
         self.resource_manager.update_resources(scheduled_requests,
                                                attn_metadata,
                                                kv_cache_dtype_byte_size)
-        # Sparse attention hook: on_generation_step_end (call site 3/3,
-        # _process_previous_batch overlap-scheduler path).
-        # See call site 1/3 for per-method use (TriAttention beta=128 evict /
-        # RocketKV typically no-op / H2O cumulative-sum evict).
-        if self.kv_cache_compression_executor is not None:
-            self.kv_cache_compression_executor.on_generation_step_end(
-                scheduled_requests, attn_metadata)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 
@@ -4087,32 +4027,12 @@ class PyExecutor:
                     request.state = LlmRequestState.GENERATION_TO_COMPLETE
                 else:
                     request.state = LlmRequestState.GENERATION_IN_PROGRESS
-                # Sparse attention hook: on_context_end — fires once per request
-                # at prefill -> generation transition, after the last context chunk
-                # has been consumed across all layers. Subclasses do one-shot
-                # prefill-end eviction here (SnapKV, RocketKV Stage I).
-                #
-                # Methods that use this hook:
-                #   - TriAttention use here: typically NO (beta=128 fires in
-                #     step_end not context_end)
-                #   - RocketKV use here: NO (Stage I builds KT_CACHE in
-                #     on_context_attention per layer, not at phase boundary;
-                #     per sparse/rocketkv.py docstring)
-                #   - Future KVTC (storage axis, Phase 4) use here: PCA encode
-                #     of finalized prompt cache → compressed_pool[req.id]
-                #   - SnapKV would use here: one-shot prefill-end token select
-                if self.kv_cache_compression_executor is not None:
-                    self.kv_cache_compression_executor.on_context_end(request, None)
 
     def _update_request_states_star_attention(
             self, scheduled_requests: ScheduledRequests):
         for request in scheduled_requests.context_requests:
             if request.ctx_iters >= len(request.ctx_blocks) - 2:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
-                # Sparse attention hook: on_context_end (star-attention path).
-                # See main on_context_end call site above for per-method use.
-                if self.kv_cache_compression_executor is not None:
-                    self.kv_cache_compression_executor.on_context_end(request, None)
             request.ctx_iters += 1
 
         for request in scheduled_requests.generation_requests:
@@ -4311,19 +4231,6 @@ class PyExecutor:
             self.executor_request_queue.enqueue_shutdown_request()
 
     def _terminate_request(self, request: LlmRequest):
-        # Sparse attention hook: on_request_finish — fires once per request
-        # at terminate / abort, before resources are freed. Subclasses release
-        # per-request state allocated in on_request_init here. KV blocks are
-        # still freed downstream by the KVCacheManager; do not free them here.
-        #
-        # Methods that use this hook:
-        #   - TriAttention use here: release per-req scoring buffer
-        #   - RocketKV use here: release KT-build tracking state
-        #   - Future KVTC (storage axis) use here: final compress + insert into
-        #     own idle_pool for cross-request reuse (per CRCL stacking)
-        #   - Future CRCL use here: promote to cross-request pool with TTL
-        if self.kv_cache_compression_executor is not None:
-            self.kv_cache_compression_executor.on_request_finish(request)
         # Dummy requests don't participate in disagg KV cache transfers,
         # so they must bypass the PP termination handler to avoid stale
         # sequences in the KV cache manager (the handler delays removal,

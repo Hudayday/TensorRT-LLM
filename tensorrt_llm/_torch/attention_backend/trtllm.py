@@ -1584,12 +1584,18 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 skip_softmax_threshold_scale_factor_decode = self.sparse_attention_config.threshold_scale_factor_decode
 
             elif self.sparse_attention_config.is_behavior_layer_method:
-                # Behavior-layer methods (TriAttention, future H2O / SnapKV)
-                # dispatch through SparseAttentionManager hooks wired in
-                # PyExecutor and run the attention forward on the dense
-                # (possibly compacted) cache. Skip the legacy
-                # sparse_kv_predict / sparse_attn_predict path which on the
-                # base TrtllmAttention is ``raise NotImplementedError``.
+                # Behavior-layer methods (TriAttention, future H2O / SnapKV /
+                # V2-migrated RocketKV) drive their algorithm via the v17
+                # KVCacheBehaviorCoordinator (Path A — see
+                # attention_backend/sparse/coordinator.py docstring). HOOK 2/4
+                # (on_*_attention) will fire here through
+                # ``metadata.coordinator.on_*_attention(...)`` once the LLM init
+                # plumbs the coordinator reference into AttentionMetadata
+                # (Phase 4 wiring). Until that wire-up lands, behavior-layer
+                # methods skip the legacy sparse_kv_predict /
+                # sparse_attn_predict path (which raises NotImplementedError on
+                # the base TrtllmAttention) and run the attention forward on
+                # the dense (possibly compacted) cache.
                 pass
 
             else:
@@ -1599,37 +1605,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     q, k, metadata, forward_args)
                 sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
                 )
-
-        # TODO(sparse-attention): wire on_context_attention / on_generation_attention
-        # hooks of SparseAttentionManager here. Both fire after the attention forward
-        # for the corresponding phase (context vs generation) and may either return an
-        # input-side ``(indices, offsets)`` sparse mask (Quest / RocketKV Stage II HSA)
-        # or accumulate output-side ``attn_scores`` (H2O / Scissorhands). Exposing
-        # ``attn_scores`` to the hook requires a kernel ``RETURN_SCORES`` compile-time
-        # template flag (``false`` instantiation is byte-identical to the current path,
-        # 0 overhead); see sparse_attention_manager.py docstring and design doc 15
-        # §3.4.1 / §5.7.2. The legacy ``sparse_kv_predict`` / ``sparse_attn_predict``
-        # dispatch above (RocketKV / DSA) stays in place during the migration.
-        #
-        # Methods that use these hooks (once wired):
-        #   - on_context_attention:
-        #       * RocketKV use here: Stage I builds per-page KT summary from K
-        #         and writes to KT_CACHE pool via V2 generic write_kt_cache API
-        #         (see sparse/rocketkv.py docstring; Phase 7 algorithm body)
-        #       * H2O / Scissorhands use here: accumulate per-token attn_scores
-        #         into cumulative-sum buffer (requires RETURN_SCORES kernel flag)
-        #       * TriAttention use here: typically NO (M3.1 algorithm uses
-        #         step_end trigger, not per-attention)
-        #   - on_generation_attention:
-        #       * RocketKV use here: Stage II reads KT_CACHE + computes HSA mask
-        #         within prompt_budget, returns (indices, offsets) tuple
-        #       * Quest use here: per-page summary lookup + top-K page select
-        #       * TriAttention use here: typically NO
-        #
-        # When BOTH legacy plugin path (sparse_kv_predict / sparse_attn_predict
-        # above) AND v17 hook path are active, framework guarantees at most one
-        # writer per attention call via single-source invariant in coordinator
-        # (see attention_backend/sparse/coordinator.py on_*_attention dispatch).
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger

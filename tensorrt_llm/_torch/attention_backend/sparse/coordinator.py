@@ -1,33 +1,72 @@
-"""Multi-manager runtime coordinator for the L2 behavior layer.
+"""Multi-manager runtime coordinator — Path A (inherits BaseResourceManager).
 
-A :class:`KVCacheBehaviorCoordinator` owns a list of
+A :class:`KVCacheBehaviorCoordinator` owns N
 :class:`BaseKVCacheCompressionExecutor` instances (typically 1–3: one per axis
-from ``sparse`` / ``storage`` / ``crcl``) and dispatches each lifecycle hook
-to all managers in deterministic order. PyExecutor sees only the
-coordinator; the coordinator handles per-axis dispatch + mutex validation +
-cross-axis dependency wiring.
+``sparse`` / ``storage`` / ``crcl``) and is registered with PyExecutor as a
+:class:`BaseResourceManager`. PyExecutor's main loop already invokes
+``prepare_resources / update_resources / free_resources`` on every registered
+resource manager — the Coordinator's overrides translate those 3 callbacks
+into the 6 semantic hooks on the executors.
+
+Two-tier API:
+
+- **Low-level direct dispatch** (`on_*` methods) — fan out to executors in
+  ``HOOK_ORDER`` for a given hook. Used by tests + future direct callers.
+- **PyExecutor auto-invoke** (`prepare_resources` / `update_resources` /
+  `free_resources` from BaseResourceManager) — internal filter/dedupe
+  logic + call the low-level dispatch.
+
+Architecture (Path A, 2026-05-27 design + V1 RocketKV evidence):
+
+- **HOOK 1** ``on_request_init`` ← fan-out from ``prepare_resources`` (first-
+  seen request via internal ``_seen_req_ids`` dedupe).
+- **HOOK 2** ``on_context_attention`` ← direct fire from
+  ``TrtllmAttention.forward`` (prefill path), via ``metadata.coordinator``.
+- **HOOK 3** ``on_context_end`` ← fan-out from ``update_resources`` (detected
+  via ``CONTEXT_INIT → GENERATION_IN_PROGRESS`` state transition).
+- **HOOK 4** ``on_generation_attention`` ← direct fire from
+  ``TrtllmAttention.forward`` (decode path).
+- **HOOK 5** ``on_generation_step_end`` ← fan-out from ``update_resources``.
+- **HOOK 6** ``on_request_finish`` ← fan-out from ``free_resources``.
+
+Why Path A:
+
+- Zero PyExecutor changes — uses ``BaseResourceManager`` interface already in
+  trunk (V1 ``RocketKVCacheManager`` is the precedent: it inherits
+  ``KVCacheManager`` -> ``BaseResourceManager`` and its Stage I-b physical
+  evict via ``rewind_kv_cache`` runs in ``update_resources``).
+- Aligns with Fanrong PR #12733 (per-method ``cache_manager.py`` is also a
+  ``BaseResourceManager`` subclass — no conflict between his pattern and ours).
+- Multi-axis composition still supported by Coordinator (V1's flat resource-
+  manager registration doesn't enforce axis order; Coordinator does).
 
 Currently (Phase 3 ship) only axis ``"sparse"`` has a concrete subclass
-(:class:`SparseAttentionExecutor`). Phase 4 adds axis ``"storage"``
-(``KVCacheStorageExecutor`` + KVTC); Phase 5 may add axis ``"crcl"``
-(``CRCLExecutor`` + Continuum or chosen candidate). The :data:`HOOK_ORDER`
-table is already set up for all three axes — no changes needed at
-coordinator level when new axes ship.
+(:class:`SparseAttentionExecutor`). Phase 4 adds axis ``"storage"`` (KVTC);
+Phase 5 may add axis ``"crcl"`` (Continuum or chosen candidate).
 
-This module is part of the planned v17 multi-manager runtime evolution
-(see ``~/docs/kv-reduction/23-multi-manager-runtime-refactor-plan.md`` and
-``24-l2-behavior-layer-concrete-design.md``). **PyExecutor is NOT yet wired
-to use the coordinator** — the existing single-SparseAttentionExecutor path
-stays active. The coordinator class is shipped now (Phase 3) so the
-framework scaffolding is in place for Phase 4 KVTC integration to slot
-into.
+PyExecutor wiring (Phase 3 NOT YET wired — coordinator class is shipped so
+the framework scaffolding is in place; LLM init factory + attention metadata
+builder integration are Phase 4+):
+
+- Step 1: ``py_executor.resource_manager.add(coordinator)`` at LLM init
+  → PyExecutor automatically calls ``prepare/update/free_resources`` each
+  iteration without further PyExecutor code changes.
+- Step 2: ``attention_metadata_builder.coordinator = coordinator``
+  → ``TrtllmAttention.forward`` calls ``metadata.coordinator.on_*_attention``
+  for HOOK 2/4 in the attention forward path.
+
+See ``~/docs/kv-reduction/30-hook-analysis-v1-rocketkv-grounded.md`` §5 for
+the full Path A design discussion + V1 evidence + migration plan.
 """
 
-import warnings
-from typing import Dict, Iterable, List, Optional, TYPE_CHECKING
+from itertools import chain
+from typing import Dict, Iterable, List, Optional, Set, TYPE_CHECKING
+
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.resource_manager import BaseResourceManager
 
 from .kv_cache_compression_executor import (BaseKVCacheCompressionExecutor,
-                                       SparseAttentionExecutor)
+                                            SparseAttentionExecutor)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
@@ -38,14 +77,14 @@ if TYPE_CHECKING:
 
 
 # Hook execution order across axes. Each hook name maps to a list of axis
-# identifiers in dispatch order. A manager whose axis is not in the list for
-# a given hook is silently skipped for that hook.
+# identifiers in dispatch order. An executor whose axis is not in the list
+# for a given hook is silently skipped for that hook.
 _HOOK_ORDER: Dict[str, List[str]] = {
     # Request lifecycle: cross-request first (pool lookup) -> sparse (init
     # state) -> storage (may decompress on pool hit).
     "on_request_init":         ["crcl", "sparse", "storage"],
     # Final cleanup: sparse (final evict) -> storage (final encode) ->
-    # cross-request (promote compressed bytes to cross-request pool).
+    # cross-request (promote compressed bytes to pool).
     "on_request_finish":       ["sparse", "storage", "crcl"],
     # Attention hooks: only sparse-attention executors write attention
     # metadata; storage and cross-request executors stay out of the
@@ -55,141 +94,97 @@ _HOOK_ORDER: Dict[str, List[str]] = {
     # Phase boundary: sparse evict first -> storage compresses remaining
     # cache -> cross-request marks eligible for retention.
     "on_context_end":          ["sparse", "storage", "crcl"],
-    # Per-step: sparse periodic evict (e.g., TriAttention beta=128) ->
-    # storage invalidate active compressed copy -> cross-request TTL GC.
+    # Per-step: sparse periodic evict -> storage invalidate active
+    # compressed copy -> cross-request TTL GC.
     "on_generation_step_end":  ["sparse", "storage", "crcl"],
 }
 
 
-class KVCacheBehaviorCoordinator:
-    """Multi-manager runtime coordinator.
-
-    Owns ``managers: List[BaseKVCacheCompressionExecutor]`` and dispatches each
-    of the 6 lifecycle hooks to all managers in deterministic order.
-
-    Mutex rules (enforced in ``__init__``):
-
-    - At most one manager per axis (intra-axis stacking not supported, see
-      ``~/docs/kv-reduction/21-framework-architecture-rationale.md`` §6).
-    - Soft warnings for some cross-axis combos (e.g., sparse-evicted cache
-      in a cross-request pool) — emitted via ``warnings.warn`` at init time.
-
-    Dependency wiring (in ``__init__``):
-
-    - If both a ``"crcl"`` and a ``"storage"`` manager are present, the
-      cross-request manager's ``storage_delegate`` attribute (if it exists)
-      is automatically set to the storage manager, so cross-request pool
-      entries are stored as storage-compressed bytes.
+class KVCacheBehaviorCoordinator(BaseResourceManager):
+    """Path A coordinator — inherits :class:`BaseResourceManager` so PyExecutor
+    automatically invokes lifecycle callbacks each iteration without any
+    PyExecutor code changes.
     """
 
     #: Public alias of the module-level hook order table. Subclasses may
     #: override on the class to customize per-deployment ordering.
     HOOK_ORDER: Dict[str, List[str]] = _HOOK_ORDER
 
-    def __init__(self, managers: List[BaseKVCacheCompressionExecutor]):
-        self.managers: List[BaseKVCacheCompressionExecutor] = list(managers)
+    def __init__(self,
+                 executors: List[BaseKVCacheCompressionExecutor]) -> None:
+        self.executors: List[BaseKVCacheCompressionExecutor] = list(executors)
         self._by_axis: Dict[str, List[BaseKVCacheCompressionExecutor]] = {}
-        for mgr in self.managers:
-            self._by_axis.setdefault(mgr.axis, []).append(mgr)
+        for e in self.executors:
+            self._by_axis.setdefault(e.axis, []).append(e)
+        # Lifecycle state needed for fan-out logic:
+        # - `_seen_req_ids` dedupes on_request_init across iterations.
+        # - `_prev_req_state` detects CONTEXT_INIT->GENERATION_IN_PROGRESS
+        #   transition for on_context_end.
+        self._seen_req_ids: Set[int] = set()
+        self._prev_req_state: Dict[int, LlmRequestState] = {}
         self._validate()
         self._wire_dependencies()
 
     # ------------------------------------------------------------------ #
-    # Init helpers                                                        #
+    # Backward-compat alias for previous attribute name (Phase 3 tests + #
+    # external code that pre-dates Path A reference ``managers``).        #
     # ------------------------------------------------------------------ #
 
-    def _validate(self) -> None:
-        """Enforce mutex rules at init time."""
-        # Hard mutex: intra-axis stacking not supported.
-        for axis, mgrs in self._by_axis.items():
-            if len(mgrs) > 1:
-                raise ValueError(
-                    f"Intra-axis stacking not supported: {len(mgrs)} "
-                    f"managers found for axis={axis!r}. Most sparse / "
-                    f"storage / cross-request methods assume sole arbiter; "
-                    f"stacking two of the same axis would invalidate "
-                    f"per-method correctness assumptions. For intra-axis "
-                    f"composition, write a hybrid algorithm subclass "
-                    f"instead.")
+    @property
+    def managers(self) -> List[BaseKVCacheCompressionExecutor]:
+        """Alias for :attr:`executors` — retained for backward compatibility
+        with code written before the Path A rename. Use :attr:`executors`."""
+        return self.executors
 
-    def _wire_dependencies(self) -> None:
-        """Wire optional cross-axis delegate attributes.
-
-        Cross-request managers (Phase 5+) may use a storage manager for
-        their cross-request compressed pool. Auto-wire if both are present
-        and the cross-request manager exposes a ``storage_delegate``
-        attribute.
-        """
-        crcl_list = self._by_axis.get("crcl", [])
-        storage_list = self._by_axis.get("storage", [])
-        if crcl_list and storage_list:
-            crcl_mgr = crcl_list[0]
-            storage_mgr = storage_list[0]
-            if hasattr(crcl_mgr, "storage_delegate"):
-                crcl_mgr.storage_delegate = storage_mgr
-
-    # ------------------------------------------------------------------ #
-    # Introspection                                                       #
-    # ------------------------------------------------------------------ #
-
-    def has_axis(self, axis: str) -> bool:
-        """Return ``True`` if a manager of the given axis is registered."""
-        return axis in self._by_axis and bool(self._by_axis[axis])
-
-    def get_manager(
-            self, axis: str) -> Optional[BaseKVCacheCompressionExecutor]:
-        """Return the single manager for the given axis (or ``None``)."""
-        mgrs = self._by_axis.get(axis, [])
-        return mgrs[0] if mgrs else None
-
-    def get_sparse_manager(self) -> Optional[SparseAttentionExecutor]:
-        """Convenience accessor — returns the sparse-attention manager if
-        present.
-
-        Used by code that historically accessed
-        ``PyExecutor.kv_cache_compression_executor`` directly. Returns the
-        ``SparseAttentionExecutor`` instance, narrowed for type hinting;
-        falls back to ``None`` if no sparse-attention manager registered.
-        """
-        return self.get_manager("sparse")  # type: ignore[return-value]
-
-    # ------------------------------------------------------------------ #
-    # Hook dispatch — 6 methods, all sequential per HOOK_ORDER            #
-    # ------------------------------------------------------------------ #
-
-    def _iter_for_hook(
-            self,
-            hook_name: str) -> Iterable[BaseKVCacheCompressionExecutor]:
-        """Yield managers in dispatch order for the given hook."""
-        order = self.HOOK_ORDER.get(
-            hook_name,
-            ["sparse", "storage", "crcl"],  # default fallback order
-        )
-        for axis in order:
-            for mgr in self._by_axis.get(axis, []):
-                yield mgr
+    # ================================================================== #
+    # Tier 1 — low-level direct dispatch (6 hooks).                       #
+    # Tests + future direct callers use these.                            #
+    # ================================================================== #
 
     def on_request_init(self, request: "LlmRequest") -> None:
-        for mgr in self._iter_for_hook("on_request_init"):
-            mgr.on_request_init(request)
+        """HOOK 1 direct fan-out. The production path goes through
+        :meth:`prepare_resources` which calls this after dedupe."""
+        for e in self._iter_for_hook("on_request_init"):
+            e.on_request_init(request)
 
     def on_request_finish(self, request: "LlmRequest") -> None:
-        for mgr in self._iter_for_hook("on_request_finish"):
-            mgr.on_request_finish(request)
+        """HOOK 6 direct fan-out. The production path goes through
+        :meth:`free_resources` which calls this."""
+        for e in self._iter_for_hook("on_request_finish"):
+            e.on_request_finish(request)
+
+    def on_context_end(self, request: "LlmRequest",
+                       metadata: Optional["AttentionMetadata"]) -> None:
+        """HOOK 3 direct fan-out. The production path goes through
+        :meth:`update_resources` which calls this after detecting the
+        ``CONTEXT_INIT → GENERATION_IN_PROGRESS`` state transition."""
+        for e in self._iter_for_hook("on_context_end"):
+            e.on_context_end(request, metadata)
+
+    def on_generation_step_end(
+            self, scheduled_batch: "ScheduledRequests",
+            attn_metadata: Optional["AttentionMetadata"]) -> None:
+        """HOOK 5 direct fan-out. The production path goes through
+        :meth:`update_resources` which calls this once per iteration."""
+        for e in self._iter_for_hook("on_generation_step_end"):
+            e.on_generation_step_end(scheduled_batch, attn_metadata)
 
     def on_context_attention(
         self,
-        layer_idx,
+        layer_idx: int,
         q,
         k,
         attn_scores,
         metadata: "AttentionMetadata",
     ):
-        # Single-source invariant: at most one manager may return non-None.
+        """HOOK 2 direct fan-out (called from ``TrtllmAttention.forward``
+        prefill path via ``metadata.coordinator``).
+
+        Single-source attention metadata invariant: at most one executor may
+        return non-None per call."""
         result = None
-        for mgr in self._iter_for_hook("on_context_attention"):
-            r = mgr.on_context_attention(layer_idx, q, k, attn_scores,
-                                         metadata)
+        for e in self._iter_for_hook("on_context_attention"):
+            r = e.on_context_attention(layer_idx, q, k, attn_scores, metadata)
             if r is not None:
                 if result is not None:
                     raise RuntimeError(
@@ -199,23 +194,22 @@ class KVCacheBehaviorCoordinator:
                 result = r
         return result
 
-    def on_context_end(self, request: "LlmRequest",
-                       metadata: "AttentionMetadata") -> None:
-        for mgr in self._iter_for_hook("on_context_end"):
-            mgr.on_context_end(request, metadata)
-
     def on_generation_attention(
         self,
-        layer_idx,
+        layer_idx: int,
         q,
         k,
         attn_scores,
         metadata: "AttentionMetadata",
     ):
+        """HOOK 4 direct fan-out (called from ``TrtllmAttention.forward``
+        decode path via ``metadata.coordinator``).
+
+        Same single-source invariant as :meth:`on_context_attention`."""
         result = None
-        for mgr in self._iter_for_hook("on_generation_attention"):
-            r = mgr.on_generation_attention(layer_idx, q, k, attn_scores,
-                                            metadata)
+        for e in self._iter_for_hook("on_generation_attention"):
+            r = e.on_generation_attention(layer_idx, q, k, attn_scores,
+                                          metadata)
             if r is not None:
                 if result is not None:
                     raise RuntimeError(
@@ -225,8 +219,143 @@ class KVCacheBehaviorCoordinator:
                 result = r
         return result
 
-    def on_generation_step_end(
-            self, scheduled_batch: "ScheduledRequests",
-            attn_metadata: "AttentionMetadata") -> None:
-        for mgr in self._iter_for_hook("on_generation_step_end"):
-            mgr.on_generation_step_end(scheduled_batch, attn_metadata)
+    # ================================================================== #
+    # Tier 2 — BaseResourceManager required interface.                    #
+    # PyExecutor auto-invokes these each iteration.                       #
+    # Internally calls Tier 1 direct dispatch.                            #
+    # ================================================================== #
+
+    def get_max_resource_count(self) -> int:
+        """Coordinator does not own physical resources (the V2 cache manager
+        does). Returns 0 so PyExecutor's scheduler does not gate on us."""
+        return 0
+
+    def get_needed_resource_to_completion(self,
+                                          request: "LlmRequest") -> int:
+        """Coordinator does not own physical resources (the V2 cache manager
+        does). Returns 0 so PyExecutor's scheduler does not block on us."""
+        return 0
+
+    def prepare_resources(self,
+                          scheduled_batch: "ScheduledRequests") -> None:
+        """Fan-out to HOOK 1 (``on_request_init``) for newly-seen requests.
+
+        Dedupes via :attr:`_seen_req_ids` so init fires exactly once per
+        request, regardless of how many iterations the request stays in
+        ``scheduled_batch``.
+        """
+        for req in chain(scheduled_batch.context_requests,
+                         scheduled_batch.generation_requests):
+            rid = req.py_request_id
+            if rid not in self._seen_req_ids:
+                self.on_request_init(req)
+                self._seen_req_ids.add(rid)
+
+    def update_resources(
+        self,
+        scheduled_batch: "ScheduledRequests",
+        attn_metadata: Optional["AttentionMetadata"] = None,
+        kv_cache_dtype_byte_size: Optional[float] = None,
+    ) -> None:
+        """Fan-out:
+        - HOOK 3 (``on_context_end``) for each request that just transitioned
+          from ``CONTEXT_INIT`` to ``GENERATION_IN_PROGRESS``.
+        - HOOK 5 (``on_generation_step_end``) once per iteration.
+
+        Signature matches V1 ``RocketKVCacheManager.update_resources`` so
+        PyExecutor's call site (``py_executor.py:2128`` etc.) passes the
+        optional ``attn_metadata`` argument through transparently.
+        """
+        # HOOK 3 — detect prefill→decode transition.
+        for req in chain(scheduled_batch.context_requests,
+                         scheduled_batch.generation_requests):
+            rid = req.py_request_id
+            prev = self._prev_req_state.get(rid)
+            curr = req.state
+            if (prev == LlmRequestState.CONTEXT_INIT
+                    and curr == LlmRequestState.GENERATION_IN_PROGRESS):
+                self.on_context_end(req, attn_metadata)
+            self._prev_req_state[rid] = curr
+        # HOOK 5 — once per iteration.
+        self.on_generation_step_end(scheduled_batch, attn_metadata)
+
+    def free_resources(self, request: "LlmRequest") -> None:
+        """Fan-out to HOOK 6 (``on_request_finish``). Same-iteration with
+        PyExecutor's ``_collect_finished_or_aborted`` — no abort race."""
+        rid = request.py_request_id
+        self._seen_req_ids.discard(rid)
+        self._prev_req_state.pop(rid, None)
+        self.on_request_finish(request)
+
+    # ================================================================== #
+    # Init helpers                                                        #
+    # ================================================================== #
+
+    def _validate(self) -> None:
+        """Enforce mutex rules at init time."""
+        for axis, exs in self._by_axis.items():
+            if len(exs) > 1:
+                raise ValueError(
+                    f"Intra-axis stacking not supported: {len(exs)} "
+                    f"executors found for axis={axis!r}. Most sparse / "
+                    f"storage / cross-request methods assume sole arbiter; "
+                    f"stacking two of the same axis would invalidate "
+                    f"per-method correctness assumptions. For intra-axis "
+                    f"composition, write a hybrid algorithm subclass "
+                    f"instead.")
+
+    def _wire_dependencies(self) -> None:
+        """Wire optional cross-axis delegate attributes.
+
+        Cross-request executors (Phase 5+) may use a storage executor for
+        their cross-request compressed pool. Auto-wire if both are present
+        and the cross-request executor exposes a ``storage_delegate`` attr.
+        """
+        crcl_list = self._by_axis.get("crcl", [])
+        storage_list = self._by_axis.get("storage", [])
+        if crcl_list and storage_list:
+            crcl_exec = crcl_list[0]
+            storage_exec = storage_list[0]
+            if hasattr(crcl_exec, "storage_delegate"):
+                crcl_exec.storage_delegate = storage_exec
+
+    # ================================================================== #
+    # Introspection                                                       #
+    # ================================================================== #
+
+    def has_axis(self, axis: str) -> bool:
+        """Return ``True`` if an executor of the given axis is registered."""
+        return axis in self._by_axis and bool(self._by_axis[axis])
+
+    def get_executor(
+            self, axis: str) -> Optional[BaseKVCacheCompressionExecutor]:
+        """Return the single executor for the given axis (or ``None``)."""
+        exs = self._by_axis.get(axis, [])
+        return exs[0] if exs else None
+
+    # Backward-compat alias (old method name was ``get_manager``).
+    def get_manager(
+            self, axis: str) -> Optional[BaseKVCacheCompressionExecutor]:
+        """Alias for :meth:`get_executor` — kept for backward compatibility."""
+        return self.get_executor(axis)
+
+    def get_sparse_manager(self) -> Optional[SparseAttentionExecutor]:
+        """Convenience accessor — returns the sparse-attention executor if
+        present."""
+        return self.get_executor("sparse")  # type: ignore[return-value]
+
+    # ================================================================== #
+    # Dispatch order helper                                               #
+    # ================================================================== #
+
+    def _iter_for_hook(
+            self,
+            hook_name: str) -> Iterable[BaseKVCacheCompressionExecutor]:
+        """Yield executors in dispatch order for the given hook."""
+        order = self.HOOK_ORDER.get(
+            hook_name,
+            ["sparse", "storage", "crcl"],  # default fallback order
+        )
+        for axis in order:
+            for e in self._by_axis.get(axis, []):
+                yield e

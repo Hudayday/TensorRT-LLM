@@ -29,6 +29,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
+                                                        LlmRequestState)
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import \
+    ScheduledRequests
+
 from tensorrt_llm._torch.attention_backend.sparse import (
     BaseKVCacheCompressionExecutor,
     KVCacheBehaviorCoordinator,
@@ -212,7 +217,7 @@ class TestSparseAttentionExecutorSubclass:
 class TestCoordinatorConstruction:
 
     def test_empty_coordinator(self):
-        coord = KVCacheBehaviorCoordinator(managers=[])
+        coord = KVCacheBehaviorCoordinator(executors=[])
         assert coord.managers == []
         assert coord.has_axis("sparse") is False
         assert coord.get_manager("sparse") is None
@@ -221,7 +226,7 @@ class TestCoordinatorConstruction:
     def test_single_sparse_manager(self, fake_kv_cache_manager):
         record = []
         sparse = _MockSparseManager(fake_kv_cache_manager, record, "sparse1")
-        coord = KVCacheBehaviorCoordinator(managers=[sparse])
+        coord = KVCacheBehaviorCoordinator(executors=[sparse])
         assert coord.has_axis("sparse") is True
         assert coord.has_axis("storage") is False
         assert coord.get_manager("sparse") is sparse
@@ -234,7 +239,7 @@ class TestCoordinatorConstruction:
         storage = _MockStorageManager(fake_kv_cache_manager, record, "st")
         crcl = _MockCRCLManager(fake_kv_cache_manager, record, "cr")
         coord = KVCacheBehaviorCoordinator(
-            managers=[sparse, storage, crcl])
+            executors=[sparse, storage, crcl])
         assert coord.has_axis("sparse") is True
         assert coord.has_axis("storage") is True
         assert coord.has_axis("crcl") is True
@@ -246,7 +251,7 @@ class TestCoordinatorConstruction:
         m2 = _MockSparseManager(fake_kv_cache_manager, record, "sp2")
         with pytest.raises(ValueError,
                            match="Intra-axis stacking not supported"):
-            KVCacheBehaviorCoordinator(managers=[m1, m2])
+            KVCacheBehaviorCoordinator(executors=[m1, m2])
 
     def test_crcl_storage_dependency_auto_wired(self,
                                                  fake_kv_cache_manager):
@@ -257,7 +262,7 @@ class TestCoordinatorConstruction:
         storage = _MockStorageManager(fake_kv_cache_manager, record, "st")
         crcl = _MockCRCLManager(fake_kv_cache_manager, record, "cr")
         assert crcl.storage_delegate is None
-        KVCacheBehaviorCoordinator(managers=[storage, crcl])
+        KVCacheBehaviorCoordinator(executors=[storage, crcl])
         assert crcl.storage_delegate is storage
 
 
@@ -274,7 +279,7 @@ class TestHookDispatchOrder:
         storage = _MockStorageManager(fake_kv_cache_manager, record, "st")
         crcl = _MockCRCLManager(fake_kv_cache_manager, record, "cr")
         coord = KVCacheBehaviorCoordinator(
-            managers=[sparse, storage, crcl])
+            executors=[sparse, storage, crcl])
         return coord, record
 
     def test_on_request_init_order_crcl_sparse_storage(
@@ -353,7 +358,7 @@ class TestAttentionMetadataSingleSource:
 
         sparse = TrackingSparse(fake_kv_cache_manager)
         storage = TrackingStorage(fake_kv_cache_manager)
-        coord = KVCacheBehaviorCoordinator(managers=[sparse, storage])
+        coord = KVCacheBehaviorCoordinator(executors=[sparse, storage])
         coord.on_context_attention(0, None, None, None, MagicMock())
         assert called_axes == ["sparse"]
 
@@ -373,7 +378,7 @@ class TestAttentionMetadataSingleSource:
                 return ("indices", "offsets")
 
         sparse = WritingSparse(fake_kv_cache_manager)
-        coord = KVCacheBehaviorCoordinator(managers=[sparse])
+        coord = KVCacheBehaviorCoordinator(executors=[sparse])
         # Manually inject a second writing manager bypassing __init__'s
         # mutex check, to exercise the single-source runtime backstop.
         sparse2 = WritingSparse(fake_kv_cache_manager)
@@ -637,3 +642,275 @@ class TestRocketKVSkeleton:
         assert issubclass(RocketKVVanillaAttention, VanillaAttention)
         assert issubclass(RocketKVVanillaAttentionMetadata,
                           VanillaAttentionMetadata)
+
+
+# ---------------------------------------------------------------------- #
+# 11. Path A — Coordinator inherits BaseResourceManager + fan-out tests   #
+# (2026-05-27 design — see doc 30 §5)                                     #
+# ---------------------------------------------------------------------- #
+
+
+class TestCoordinatorInheritsBaseResourceManager:
+    """Path A core property: Coordinator IS a BaseResourceManager so
+    PyExecutor's main loop auto-invokes prepare/update/free_resources
+    without any new PyExecutor hook call sites."""
+
+    def test_is_base_resource_manager_subclass(self):
+        from tensorrt_llm._torch.pyexecutor.resource_manager import \
+            BaseResourceManager
+        assert issubclass(KVCacheBehaviorCoordinator, BaseResourceManager)
+
+    def test_get_needed_resource_to_completion_returns_zero(
+            self, fake_kv_cache_manager):
+        """Coordinator doesn't allocate resources (V2 cache mgr does);
+        must return 0 so PyExecutor scheduler doesn't gate on it."""
+        coord = KVCacheBehaviorCoordinator(executors=[])
+        assert coord.get_needed_resource_to_completion(MagicMock()) == 0
+
+    def test_has_required_base_resource_manager_methods(self):
+        for method_name in ("prepare_resources", "update_resources",
+                            "free_resources", "get_max_resource_count",
+                            "get_needed_resource_to_completion"):
+            assert hasattr(KVCacheBehaviorCoordinator, method_name), (
+                f"Coordinator missing BaseResourceManager method "
+                f"{method_name!r}; PyExecutor won't be able to call it.")
+
+    def test_get_max_resource_count_returns_zero(self,
+                                                  fake_kv_cache_manager):
+        coord = KVCacheBehaviorCoordinator(executors=[])
+        assert coord.get_max_resource_count() == 0
+
+
+class TestPrepareResourcesFansOutToInit:
+    """``prepare_resources(scheduled_batch)`` should call
+    ``on_request_init`` exactly once per newly-seen request (dedupe via
+    _seen_req_ids), across all registered executors in HOOK_ORDER."""
+
+    def _make_req(self, req_id: int,
+                  state: LlmRequestState = LlmRequestState.CONTEXT_INIT):
+        req = MagicMock(spec=LlmRequest)
+        req.py_request_id = req_id
+        req.state = state
+        return req
+
+    def _make_batch(self, context_reqs, generation_reqs):
+        batch = MagicMock(spec=ScheduledRequests)
+        batch.context_requests = context_reqs
+        batch.generation_requests = generation_reqs
+        return batch
+
+    def test_fires_init_for_new_request(self, fake_kv_cache_manager):
+        record = []
+        sparse = _MockSparseManager(fake_kv_cache_manager, record, "sp")
+        coord = KVCacheBehaviorCoordinator(executors=[sparse])
+        req = self._make_req(req_id=42)
+        coord.prepare_resources(self._make_batch([req], []))
+        assert record == ["sp:on_request_init"]
+        assert 42 in coord._seen_req_ids
+
+    def test_dedupes_init_across_iterations(self, fake_kv_cache_manager):
+        record = []
+        sparse = _MockSparseManager(fake_kv_cache_manager, record, "sp")
+        coord = KVCacheBehaviorCoordinator(executors=[sparse])
+        req = self._make_req(req_id=42)
+        coord.prepare_resources(self._make_batch([req], []))
+        # Same request appears again in next iteration (still in batch)
+        coord.prepare_resources(self._make_batch([], [req]))
+        # init must fire only once
+        assert record == ["sp:on_request_init"]
+
+    def test_fires_init_for_each_distinct_request(self,
+                                                   fake_kv_cache_manager):
+        record = []
+        sparse = _MockSparseManager(fake_kv_cache_manager, record, "sp")
+        coord = KVCacheBehaviorCoordinator(executors=[sparse])
+        coord.prepare_resources(
+            self._make_batch([self._make_req(1), self._make_req(2)],
+                             [self._make_req(3)]))
+        assert record == [
+            "sp:on_request_init",
+            "sp:on_request_init",
+            "sp:on_request_init",
+        ]
+        assert coord._seen_req_ids == {1, 2, 3}
+
+    def test_axis_order_in_init_fan_out(self, fake_kv_cache_manager):
+        """HOOK_ORDER for on_request_init is ['crcl', 'sparse', 'storage'];
+        prepare_resources fan-out must respect this."""
+        record = []
+        sparse = _MockSparseManager(fake_kv_cache_manager, record, "sp")
+        storage = _MockStorageManager(fake_kv_cache_manager, record, "st")
+        crcl = _MockCRCLManager(fake_kv_cache_manager, record, "cr")
+        coord = KVCacheBehaviorCoordinator(executors=[sparse, storage, crcl])
+        coord.prepare_resources(self._make_batch([self._make_req(7)], []))
+        assert record == [
+            "cr:on_request_init",
+            "sp:on_request_init",
+            "st:on_request_init",
+        ]
+
+
+class TestUpdateResourcesFansOutToContextEndAndStepEnd:
+    """``update_resources`` fans out to:
+    - HOOK 3 on_context_end for requests transitioning CONTEXT→GENERATION
+    - HOOK 5 on_generation_step_end once per iteration"""
+
+    def _make_req(self, req_id, state):
+        req = MagicMock(spec=LlmRequest)
+        req.py_request_id = req_id
+        req.state = state
+        return req
+
+    def _make_batch(self, context_reqs, generation_reqs):
+        batch = MagicMock(spec=ScheduledRequests)
+        batch.context_requests = context_reqs
+        batch.generation_requests = generation_reqs
+        return batch
+
+    def test_step_end_fires_once_per_iteration(self, fake_kv_cache_manager):
+        record = []
+        sparse = _MockSparseManager(fake_kv_cache_manager, record, "sp")
+        coord = KVCacheBehaviorCoordinator(executors=[sparse])
+        coord.update_resources(self._make_batch([], []), MagicMock())
+        assert record == ["sp:on_generation_step_end"]
+
+    def test_context_end_fires_on_state_transition(self,
+                                                    fake_kv_cache_manager):
+        """When a request was CONTEXT_INIT in the previous
+        prepare/update and is GENERATION_IN_PROGRESS now → on_context_end."""
+        record = []
+        sparse = _MockSparseManager(fake_kv_cache_manager, record, "sp")
+        coord = KVCacheBehaviorCoordinator(executors=[sparse])
+        # Seed previous state via a first update with CONTEXT_INIT.
+        req_v1 = self._make_req(42, LlmRequestState.CONTEXT_INIT)
+        coord.update_resources(self._make_batch([req_v1], []), MagicMock())
+        record.clear()
+        # Now the same request is GENERATION_IN_PROGRESS.
+        req_v2 = self._make_req(42, LlmRequestState.GENERATION_IN_PROGRESS)
+        coord.update_resources(self._make_batch([], [req_v2]), MagicMock())
+        # on_context_end fires for the transition; on_generation_step_end
+        # also fires once.
+        assert record == [
+            "sp:on_context_end",
+            "sp:on_generation_step_end",
+        ]
+
+    def test_context_end_NOT_fired_if_no_transition(self,
+                                                     fake_kv_cache_manager):
+        """A request that stays CONTEXT_INIT across iterations
+        (chunked prefill) does NOT fire on_context_end."""
+        record = []
+        sparse = _MockSparseManager(fake_kv_cache_manager, record, "sp")
+        coord = KVCacheBehaviorCoordinator(executors=[sparse])
+        req = self._make_req(42, LlmRequestState.CONTEXT_INIT)
+        coord.update_resources(self._make_batch([req], []), MagicMock())
+        record.clear()
+        # Same state in next iter — no transition.
+        coord.update_resources(self._make_batch([req], []), MagicMock())
+        # Only step_end fires.
+        assert record == ["sp:on_generation_step_end"]
+
+    def test_attn_metadata_passed_through(self, fake_kv_cache_manager):
+        """The optional ``attn_metadata`` parameter is forwarded to both
+        on_context_end and on_generation_step_end."""
+        sparse = MagicMock(spec=SparseAttentionExecutor)
+        sparse.axis = "sparse"
+        sparse_meta = MagicMock(name="attn_metadata")
+        coord = KVCacheBehaviorCoordinator(executors=[sparse])
+        req_v1 = self._make_req(7, LlmRequestState.CONTEXT_INIT)
+        coord.update_resources(self._make_batch([req_v1], []), sparse_meta)
+        req_v2 = self._make_req(7, LlmRequestState.GENERATION_IN_PROGRESS)
+        coord.update_resources(self._make_batch([], [req_v2]), sparse_meta)
+        # on_context_end was called once with the metadata.
+        sparse.on_context_end.assert_called_with(req_v2, sparse_meta)
+        # on_generation_step_end was called both iterations with metadata.
+        assert sparse.on_generation_step_end.call_count == 2
+
+
+class TestFreeResourcesFansOutToFinish:
+    """``free_resources(request)`` fans out to HOOK 6 on_request_finish
+    same-iteration (no abort race) and clears the dedup state."""
+
+    def _make_req(self, req_id):
+        req = MagicMock(spec=LlmRequest)
+        req.py_request_id = req_id
+        req.state = LlmRequestState.GENERATION_COMPLETE
+        return req
+
+    def test_fires_finish_for_request(self, fake_kv_cache_manager):
+        record = []
+        sparse = _MockSparseManager(fake_kv_cache_manager, record, "sp")
+        coord = KVCacheBehaviorCoordinator(executors=[sparse])
+        req = self._make_req(42)
+        coord.free_resources(req)
+        assert record == ["sp:on_request_finish"]
+
+    def test_clears_seen_req_ids_on_free(self, fake_kv_cache_manager):
+        record = []
+        sparse = _MockSparseManager(fake_kv_cache_manager, record, "sp")
+        coord = KVCacheBehaviorCoordinator(executors=[sparse])
+        coord._seen_req_ids.add(42)
+        coord._prev_req_state[42] = LlmRequestState.GENERATION_IN_PROGRESS
+        coord.free_resources(self._make_req(42))
+        # state cleared so a new request reusing the ID would init again
+        assert 42 not in coord._seen_req_ids
+        assert 42 not in coord._prev_req_state
+
+    def test_axis_order_in_finish_fan_out(self, fake_kv_cache_manager):
+        """HOOK_ORDER for on_request_finish is ['sparse', 'storage', 'crcl']."""
+        record = []
+        sparse = _MockSparseManager(fake_kv_cache_manager, record, "sp")
+        storage = _MockStorageManager(fake_kv_cache_manager, record, "st")
+        crcl = _MockCRCLManager(fake_kv_cache_manager, record, "cr")
+        coord = KVCacheBehaviorCoordinator(executors=[sparse, storage, crcl])
+        coord.free_resources(self._make_req(7))
+        assert record == [
+            "sp:on_request_finish",
+            "st:on_request_finish",
+            "cr:on_request_finish",
+        ]
+
+
+class TestCoordinatorIntegrationEndToEnd:
+    """End-to-end test simulating a full request lifecycle through
+    PyExecutor's resource_manager interface. Verifies all 6 hooks fire
+    in the right order via the BaseResourceManager 3 callbacks."""
+
+    def test_full_lifecycle(self, fake_kv_cache_manager):
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import \
+            ScheduledRequests
+        record = []
+        sparse = _MockSparseManager(fake_kv_cache_manager, record, "e")
+        coord = KVCacheBehaviorCoordinator(executors=[sparse])
+
+        def req(rid, state):
+            r = MagicMock(spec=LlmRequest)
+            r.py_request_id = rid
+            r.state = state
+            return r
+
+        def batch(ctx, gen):
+            b = MagicMock(spec=ScheduledRequests)
+            b.context_requests = ctx
+            b.generation_requests = gen
+            return b
+
+        # Iter 1: new request enters as CONTEXT_INIT
+        r_ctx = req(1, LlmRequestState.CONTEXT_INIT)
+        coord.prepare_resources(batch([r_ctx], []))
+        coord.update_resources(batch([r_ctx], []), MagicMock())
+        # Iter 2: same request transitions to GENERATION_IN_PROGRESS
+        r_gen = req(1, LlmRequestState.GENERATION_IN_PROGRESS)
+        coord.prepare_resources(batch([], [r_gen]))
+        coord.update_resources(batch([], [r_gen]), MagicMock())
+        # Iter 3: request finishes
+        coord.free_resources(req(1, LlmRequestState.GENERATION_COMPLETE))
+
+        assert record == [
+            "e:on_request_init",          # iter 1 prepare
+            "e:on_generation_step_end",   # iter 1 update (no context_end yet)
+            # iter 2 prepare: req already seen, no init
+            "e:on_context_end",           # iter 2 update (transition!)
+            "e:on_generation_step_end",   # iter 2 update
+            "e:on_request_finish",        # iter 3 free
+        ]
