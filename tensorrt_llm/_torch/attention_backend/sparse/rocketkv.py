@@ -624,19 +624,26 @@ class RocketKV(SparseAttentionExecutor):
 
     def copy_kt_block_offsets(self, request_ids: List[int],
                               block_offsets: torch.Tensor) -> torch.Tensor:
-        """Copy per-request block offsets into the provided host-side tensor.
-        Pattern 2: KT shares block IDs with KEY/VALUE (same logical block
-        in V2 multi-pool layout), so we delegate to V2's standard
-        ``copy_block_offsets`` for the KEY role. V1 used a separate
-        BlockManager for KT; V2 unifies via shared block IDs."""
+        """Fill ``block_offsets[i, :]`` with the per-request block IDs for
+        request ``request_ids[i]``. Pattern 2: KT shares block IDs with
+        KEY/VALUE (same logical block in V2 multi-pool layout), so we
+        read block IDs once from V2's ``get_block_ids_per_seq`` and copy
+        into the KT-side tensor.
+
+        V1 line 1004 parity: V1's separate ``BlockManager.copy_block_offsets``
+        wrote KT block IDs into the destination tensor.
+        """
         if not self._kt_supported:
             return block_offsets
-        # V2 exposes block offset copy via the standard API; KT block IDs
-        # are the same as KEY block IDs in Pattern 2 multi-pool layout.
-        copy_fn = getattr(self.kv_cache_manager, "copy_block_offsets", None)
-        if copy_fn is None:
-            return block_offsets
-        return copy_fn(request_ids, block_offsets)
+        # V2 returns padded (B, max_blocks_for_any_req) tensor of block IDs.
+        block_ids = self.kv_cache_manager.get_block_ids_per_seq(request_ids)
+        B, blocks_in_req = block_ids.shape
+        # block_offsets has shape (max_num_sequences, max_kt_blocks_per_seq);
+        # write the same block ID into KT slot (KT shares block IDs with KEY
+        # — V2 multi-pool layout puts both into the same physical block).
+        target = block_offsets[:B, :blocks_in_req]
+        target.copy_(block_ids)
+        return block_offsets
 
     # ===================================================================== #
     # HOOK 1 — on_request_init (V1 RocketKVCacheManager.prepare_resources    #
@@ -644,12 +651,20 @@ class RocketKV(SparseAttentionExecutor):
     # ===================================================================== #
 
     def on_request_init(self, request: "LlmRequest") -> None:
-        """V1 used to call ``self.kt_cache_manager.add_tokens(...)`` to grow
-        KT pages per request (V1 line 1015). Pattern 2 (Path A v17): V2's
-        KT_CACHE BufferConfig shares block IDs with KEY, so KT pages are
-        allocated implicitly when V2 allocates KEY pages — no explicit
-        call needed. This hook stays no-op for now (per-request init
-        accumulators can be added by future methods)."""
+        """V1 line 1008-1020 parity. V1 RocketKVCacheManager.prepare_resources:
+            for ctx req:  self.kt_cache_manager.add_tokens(req_id, ceil(prompt_len/page_size))
+            for gen req:  if (max_beam_num_tokens + 1) % page_size == 1: add 1 KT slot
+
+        Pattern 2 (Path A v17): KT lives in the same V2 multi-pool block
+        as KEY/VALUE (shared block IDs via BufferConfig). When V2 allocates
+        a new physical block (because KV crossed a tokens_per_block
+        boundary), the corresponding KT slot inside that block is part
+        of the same allocation — no separate KT bookkeeping needed.
+
+        V1 add_tokens grew V1's *separate* BlockManager state; Pattern 2's
+        KT block-IDs are read from V2 (``get_block_ids_per_seq``) at
+        prepare-time. Init is therefore a no-op.
+        """
         return
 
     # ===================================================================== #
@@ -681,7 +696,7 @@ class RocketKV(SparseAttentionExecutor):
         """
         if not isinstance(metadata, RocketKVTrtllmAttentionMetadata):
             return None
-        if self.kt_cache_manager is None:
+        if not self._kt_supported:
             return None
         num_ctx_tokens = metadata.num_ctx_tokens
         if num_ctx_tokens == 0:
@@ -839,10 +854,14 @@ class RocketKV(SparseAttentionExecutor):
         if rewind_len <= 0:
             return
 
-        # V2 cache manager rewind — shrinks the physical pages; KT slots
-        # in the freed pages go with them (shared block IDs).
-        if hasattr(self.kv_cache_manager, "rewind_kv_cache"):
-            self.kv_cache_manager.rewind_kv_cache(request, rewind_len)
+        # V2 path: KVCacheManagerV2.compact_request_cache trims to
+        # ``target_history_length`` tokens. V1 rewind_len semantics:
+        # cache ends with seq_len - rewind_len = prompt_budget + 1 tokens.
+        target_history = seq_len - rewind_len
+        compact_fn = getattr(self.kv_cache_manager, "compact_request_cache",
+                             None)
+        if compact_fn is not None:
+            compact_fn(request, target_history)
 
     # ===================================================================== #
     # HOOK 4 — on_generation_attention (V1 sparse_attn_predict port,         #
@@ -893,7 +912,7 @@ class RocketKV(SparseAttentionExecutor):
         """
         if not isinstance(metadata, RocketKVTrtllmAttentionMetadata):
             return None
-        if self.kt_cache_manager is None:
+        if not self._kt_supported:
             return None
         if metadata.num_generations == 0:
             return None
@@ -963,12 +982,17 @@ class RocketKV(SparseAttentionExecutor):
     # ===================================================================== #
 
     def on_request_finish(self, request: "LlmRequest") -> None:
-        """Free hook. Pattern 2 (Path A v17): KT pool shares block IDs with
-        KEY/VALUE in V2's multi-pool BufferConfig, so when V2's
-        ``free_resources`` releases the request's blocks the KT slots
-        living inside those blocks are released automatically. V1's
-        explicit auxiliary-pool free at rocket.py line 1038 is therefore
-        not needed.
+        """V1 line 1038-1040 parity. V1 RocketKVCacheManager.free_resources:
+            super().free_resources(request)
+            self.kt_cache_manager.free_resources(request)
+
+        Pattern 2 (Path A v17): KT shares block IDs with KEY/VALUE in V2's
+        multi-pool BufferConfig, so when V2's ``free_resources``
+        releases the request's blocks the KT slots inside those blocks
+        are released alongside. V1's separate ``kt_cache_manager``
+        existed because V1 had an *independent* BlockManager for KT;
+        Pattern 2 unifies KT bookkeeping into V2's per-block tracking,
+        so this hook is a no-op.
         """
         return
 

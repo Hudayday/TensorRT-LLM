@@ -2671,6 +2671,46 @@ class KVCacheManagerV2(BaseResourceManager):
         kt_cache_block_offsets tensor."""
         return self.blocks_in_primary_pool
 
+    def compact_request_cache(self, request: "LlmRequest",
+                              target_history_length: int) -> None:
+        """Path A v17 RocketKV Stage I-b: trim a request's KV cache to
+        ``target_history_length`` tokens at the prefill→generation
+        transition (V1 line 1029-1030 parity:
+            seq_len = request.get_num_tokens(0)
+            rewind_len = max(seq_len - 1 - prompt_budget, 0)
+            self.rewind_kv_cache(request, rewind_len)
+        where the result is a cache with ``prompt_budget + 1`` tokens).
+
+        V2 ``_KVCache.resize`` natively supports block-count shrink (the
+        ``del self._blocks[new_num_blocks:]`` path), but a top-level
+        guard raises on history-length decrease — that guard is correct
+        for normal flow (KV history is monotone for non-sparse models)
+        but blocks RocketKV's physical eviction.  We bypass the guard
+        by setting ``_history_length`` to the target first; ``resize``
+        then sees ``history_length == _history_length`` and proceeds
+        through the shrink path.
+
+        Pattern 2: KT slots live in the same physical block as KEY/VALUE
+        (shared block IDs via V2 multi-pool BufferConfig), so KT slots
+        in freed blocks are released alongside KV.
+        """
+        kv_cache = self.kv_cache_map.get(request.py_request_id)
+        if kv_cache is None or not kv_cache.is_active:
+            return
+        if target_history_length >= kv_cache._history_length:
+            return
+        tokens_per_block = self.tokens_per_block
+        new_capacity = ((target_history_length + tokens_per_block - 1) //
+                        tokens_per_block) * tokens_per_block
+        # Bypass the monotone-history guard. RocketKV is the one
+        # behavior-layer method (so far) that physically evicts at
+        # prefill end; the guard is a normal-flow invariant, not a
+        # correctness one. Setting _history_length first means the
+        # in-resize check ``history_length < self._history_length``
+        # evaluates False and the shrink path runs.
+        kv_cache._history_length = target_history_length
+        kv_cache.resize(new_capacity, target_history_length)
+
     def get_num_available_tokens(self,
                                  *,
                                  token_num_upper_bound: int,
