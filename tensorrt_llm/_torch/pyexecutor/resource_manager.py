@@ -82,6 +82,12 @@ class ResourceManagerType(enum.Enum):
     PEFT_CACHE_MANAGER = "PEFT_CACHE_MANAGER"
     SEQ_SLOT_MANAGER = "SEQ_SLOT_MANAGER"
     SPEC_RESOURCE_MANAGER = "SPEC_RESOURCE_MANAGER"
+    # Path A (v17, 2026-05-28): KVCacheBehaviorCoordinator owns N
+    # BaseKVCacheCompressionExecutor instances (one per axis: sparse /
+    # storage / cross_request) and fans out PyExecutor's BaseResourceManager
+    # callbacks (prepare/update/free_resources) to the 6 semantic hooks on
+    # the executors. See ~/docs/kv-reduction/30-hook-analysis-v1-rocketkv-grounded.md §5.
+    KV_CACHE_BEHAVIOR_COORDINATOR = "KV_CACHE_BEHAVIOR_COORDINATOR"
 
 
 class Role:

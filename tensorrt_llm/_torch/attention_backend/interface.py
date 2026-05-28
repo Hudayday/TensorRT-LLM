@@ -12,6 +12,7 @@ from typing_extensions import Self
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
+    from .sparse.coordinator import KVCacheBehaviorCoordinator
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
@@ -70,6 +71,16 @@ class AttentionMetadata:
     kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
     # Draft KV cache manager for one-model speculative decoding with separate KV cache layouts
     draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
+    # Path A (v17, 2026-05-28): KVCacheBehaviorCoordinator wraps N
+    # BaseKVCacheCompressionExecutor instances (one per axis: sparse /
+    # storage / cross_request). When non-None, ``TrtllmAttention.forward``
+    # fires HOOK 2/4 (``on_context_attention`` / ``on_generation_attention``)
+    # via ``metadata.coordinator.on_*_attention(...)``. The coordinator's
+    # 4 lifecycle hooks (HOOK 1/3/5/6) fire independently from PyExecutor
+    # via ``BaseResourceManager.{prepare,update,free}_resources``; they do
+    # not need the coordinator on this metadata.
+    # See coordinator.py docstring + doc 30 §5.
+    coordinator: Optional["KVCacheBehaviorCoordinator"] = None
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False

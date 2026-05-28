@@ -910,3 +910,156 @@ class TestCoordinatorIntegrationEndToEnd:
             "e:on_generation_step_end",   # iter 2 update
             "e:on_request_finish",        # iter 3 free
         ]
+
+
+
+# ---------------------------------------------------------------------- #
+# 12. End-to-end pipeline wire — ResourceManagerType + AttentionMetadata  #
+# (2026-05-28 — coordinator registered into resource_manager + injected   #
+#  into attn_metadata; locks the wire contract so future refactors keep   #
+#  the pipeline connected.)                                               #
+# ---------------------------------------------------------------------- #
+
+
+class TestResourceManagerTypeEnum:
+    """The KVCacheBehaviorCoordinator is registered as a new resource
+    manager type in ``ResourceManagerType`` — PyExecutor's
+    ``resource_manager.{prepare,update,free}_resources`` iteration
+    auto-invokes it without any new call site."""
+
+    def test_kv_cache_behavior_coordinator_enum_exists(self):
+        from tensorrt_llm._torch.pyexecutor.resource_manager import (
+            ResourceManagerType)
+        assert hasattr(ResourceManagerType,
+                       "KV_CACHE_BEHAVIOR_COORDINATOR"), (
+            "Path A wires KVCacheBehaviorCoordinator into PyExecutor via the "
+            "ResourceManagerType enum; the new entry must exist so the "
+            "coordinator can be registered alongside the V2 cache manager.")
+
+    def test_enum_value_is_unique(self):
+        from tensorrt_llm._torch.pyexecutor.resource_manager import (
+            ResourceManagerType)
+        values = [m.value for m in ResourceManagerType]
+        assert len(values) == len(set(values)), (
+            "ResourceManagerType enum values must be unique; new "
+            "KV_CACHE_BEHAVIOR_COORDINATOR entry must not collide.")
+
+
+class TestResourceManagerRegistration:
+    """Coordinator can be registered into ``ResourceManager`` dict and
+    retrieved via ``get_resource_manager`` — simulating the pattern from
+    ``_util.py`` LLM init."""
+
+    def test_coordinator_registers_and_round_trips(self, fake_kv_cache_manager):
+        from tensorrt_llm._torch.pyexecutor.resource_manager import (
+            ResourceManager, ResourceManagerType)
+        coord = KVCacheBehaviorCoordinator(executors=[])
+        rm = ResourceManager(
+            {ResourceManagerType.KV_CACHE_BEHAVIOR_COORDINATOR: coord})
+        # PyExecutor reads the coordinator back from the dict via
+        # ``get_resource_manager`` — this is what model_engine does to
+        # inject coordinator into attn_metadata.
+        retrieved = rm.get_resource_manager(
+            ResourceManagerType.KV_CACHE_BEHAVIOR_COORDINATOR)
+        assert retrieved is coord
+
+    def test_get_resource_manager_returns_none_when_not_registered(
+            self, fake_kv_cache_manager):
+        """Methods that don't configure sparse-attention leave coordinator
+        unregistered. ``model_engine`` then sets
+        ``attn_metadata.coordinator = None`` — pipeline still works,
+        TrtllmAttention.forward just skips the on_*_attention hook fire."""
+        from tensorrt_llm._torch.pyexecutor.resource_manager import (
+            ResourceManager, ResourceManagerType)
+        rm = ResourceManager({})  # nothing registered
+        retrieved = rm.get_resource_manager(
+            ResourceManagerType.KV_CACHE_BEHAVIOR_COORDINATOR)
+        assert retrieved is None
+
+    def test_resource_manager_iteration_calls_coordinator_callbacks(
+            self, fake_kv_cache_manager):
+        """ResourceManager.{prepare,update,free}_resources iterates over
+        all registered resource managers and calls their callbacks. This
+        test asserts Coordinator's BaseResourceManager interface is
+        invokable via this generic iteration — the core Path A property."""
+        from tensorrt_llm._torch.pyexecutor.resource_manager import (
+            ResourceManager, ResourceManagerType)
+        record = []
+        sparse = _MockSparseManager(fake_kv_cache_manager, record, "sp")
+        coord = KVCacheBehaviorCoordinator(executors=[sparse])
+        rm = ResourceManager(
+            {ResourceManagerType.KV_CACHE_BEHAVIOR_COORDINATOR: coord})
+
+        # Build a fake scheduled_batch
+        req = MagicMock(spec=LlmRequest)
+        req.py_request_id = 7
+        req.state = LlmRequestState.CONTEXT_INIT
+        batch = MagicMock(spec=ScheduledRequests)
+        batch.context_requests = [req]
+        batch.generation_requests = []
+
+        # ResourceManager.prepare_resources iterates registered managers
+        # and calls each one's prepare_resources — Coordinator gets
+        # auto-invoked without any explicit hook call in PyExecutor.
+        rm.prepare_resources(batch)
+        assert "sp:on_request_init" in record, (
+            "Coordinator registered as resource_manager should fire HOOK 1 "
+            "via prepare_resources when PyExecutor iterates resource_managers.")
+
+        rm.update_resources(batch)
+        assert "sp:on_generation_step_end" in record, (
+            "Coordinator should fire HOOK 5 via update_resources iteration.")
+
+        rm.free_resources(req)
+        assert "sp:on_request_finish" in record, (
+            "Coordinator should fire HOOK 6 via free_resources iteration.")
+
+
+class TestAttentionMetadataCoordinatorField:
+    """AttentionMetadata holds a ``coordinator`` reference so
+    TrtllmAttention.forward can fire HOOK 2/4 via ``metadata.coordinator``.
+    The field has default None so models without behavior-layer sparse
+    methods continue to work."""
+
+    def test_attention_metadata_has_coordinator_field(self):
+        from tensorrt_llm._torch.attention_backend.interface import (
+            AttentionMetadata)
+        # dataclass introspection
+        import dataclasses
+        fields = {f.name: f for f in dataclasses.fields(AttentionMetadata)}
+        assert "coordinator" in fields, (
+            "AttentionMetadata must expose ``coordinator`` field so "
+            "TrtllmAttention.forward can fire HOOK 2/4 via metadata.coordinator.")
+
+    def test_attention_metadata_coordinator_default_none(self):
+        """Models without behavior-layer sparse config: coordinator stays
+        None and TrtllmAttention.forward skips the HOOK 2/4 fire."""
+        from tensorrt_llm._torch.attention_backend.interface import (
+            AttentionMetadata)
+        import dataclasses
+        for f in dataclasses.fields(AttentionMetadata):
+            if f.name == "coordinator":
+                assert f.default is None, (
+                    "coordinator field must default to None so existing "
+                    "models that don't configure sparse-attention are not "
+                    "affected by Path A.")
+                return
+        pytest.fail("coordinator field not found")
+
+    def test_attention_metadata_coordinator_settable(
+            self, fake_kv_cache_manager):
+        """model_engine wire pattern: ``attn_metadata.coordinator = rm.
+        get_resource_manager(KV_CACHE_BEHAVIOR_COORDINATOR)``. The
+        attribute must be writable on an existing AttentionMetadata
+        instance."""
+        from tensorrt_llm._torch.attention_backend.interface import (
+            AttentionMetadata)
+        # We don't instantiate AttentionMetadata directly (it has many
+        # required fields); instead verify the field is in the dataclass
+        # definition and can be set via __setattr__ on a mock.
+        coord = KVCacheBehaviorCoordinator(executors=[])
+        # Use a Mock with spec to enforce the attribute exists in the
+        # dataclass; setting it should succeed.
+        m = MagicMock(spec=AttentionMetadata)
+        m.coordinator = coord
+        assert m.coordinator is coord

@@ -1761,15 +1761,31 @@ def create_py_executor_instance(
         dwdp_manager=dwdp_manager,
     )
 
-    # Wire SparseAttentionExecutor for behavior-layer sparse methods
-    # (TriAttention, future H2O / SnapKV). Legacy memory-layer methods
-    # (RocketKV / DSA / skip_softmax) leave ``sparse_attention_manager`` at the
-    # default ``None`` and continue to use their cache-manager subclass.
-    if (llm_args.sparse_attention_config is not None and
-            llm_args.sparse_attention_config.is_behavior_layer_method):
-        from ..attention_backend.sparse import create_sparse_attention_manager
-        py_executor.kv_cache_compression_executor = create_sparse_attention_manager(
+    # Wire Path A (v17, 2026-05-28): build a KVCacheBehaviorCoordinator
+    # wrapping the per-axis BaseKVCacheCompressionExecutor instances and
+    # register it as a BaseResourceManager on the PyExecutor's
+    # resource_manager. PyExecutor's main loop automatically calls
+    # prepare/update/free_resources on every registered resource manager
+    # each iteration — the Coordinator's overrides fan out to the executors'
+    # 4 lifecycle hooks (HOOK 1/3/5/6). HOOK 2/4 (on_*_attention) fire from
+    # TrtllmAttention.forward via ``metadata.coordinator`` (wired in
+    # model_engine._set_up_attn_metadata).
+    #
+    # Only behavior-layer methods (TriAttention, future H2O / SnapKV /
+    # RocketKV V17-migrated) participate in the coordinator path. Legacy
+    # memory-layer methods (RocketKV V1 / DSA / skip_softmax) keep using
+    # their cache-manager subclass — no coordinator registered for them.
+    if (llm_args.sparse_attention_config is not None
+            and llm_args.sparse_attention_config.is_behavior_layer_method):
+        from ..attention_backend.sparse import (
+            KVCacheBehaviorCoordinator, create_sparse_attention_manager)
+        sparse_executor = create_sparse_attention_manager(
             llm_args.sparse_attention_config, kv_cache_manager)
+        if sparse_executor is not None:
+            coordinator = KVCacheBehaviorCoordinator(
+                executors=[sparse_executor])
+            py_executor.resource_manager.resource_managers[
+                ResourceManagerType.KV_CACHE_BEHAVIOR_COORDINATOR] = coordinator
 
     return py_executor
 
