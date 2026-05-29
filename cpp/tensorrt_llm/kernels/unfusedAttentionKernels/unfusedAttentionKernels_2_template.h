@@ -1850,6 +1850,9 @@ void invokeUpdateSparseKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
         return;
     }
 
+    TLLM_LOG_INFO("RocketKV compaction kernel fire: batch=%d kv_heads=%d size_per_head=%d",
+        params.batch_size, params.kv_head_num, params.size_per_head);
+
     switch (params.size_per_head)
     {
     case 16: kernelSparseDispatchHeadSize<16, T, TCache, KVCacheBuffer>(params, stream); break;
