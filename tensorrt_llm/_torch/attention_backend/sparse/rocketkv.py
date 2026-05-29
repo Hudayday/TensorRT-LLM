@@ -693,12 +693,12 @@ class RocketKV(SparseAttentionExecutor):
     # KT_CACHE is request-specific → cross-request reuse breaks.
     supports_kv_cache_reuse: ClassVar[bool] = False
 
-    # Pattern 3 (V2 subclass) standby — RocketKVCacheManagerV2 above adds
-    # rewind_kv_cache, but verifying the C++ kernel's selective-KV-write
-    # path first (via sparse_attn_indices_block_size always-set fix in
-    # trtllm.py forward).  If that alone gives V1-acc parity without
-    # rewind, Pattern 3 isn't strictly needed.
-    kv_cache_manager_class: ClassVar[Optional[type]] = None
+    # Pattern 3 V2 subclass active — per agent root-cause: V17 needs
+    # rewind_kv_cache (V1 line 1022) to shrink V2 ``_history_length`` so
+    # decode reads only [0, prompt_budget) compacted by the kernel.
+    # Without this V17 cache stays at full prompt_len and decode reads
+    # stale tokens past the compaction front.
+    kv_cache_manager_class: ClassVar[Optional[type]] = RocketKVCacheManagerV2
 
     # Access type for different dtype sizes (V1 rocket.py:322).
     _access_type = {
