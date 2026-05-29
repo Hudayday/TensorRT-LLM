@@ -2537,11 +2537,13 @@ class KVCacheManagerV2(BaseResourceManager):
 
         def _build_buffer_config(layer_id: int, role: Role) -> "BufferConfig":
             if role == Role.KT_CACHE:
-                # KT pool layout (V1 line 962 reference):
+                # KT pool layout matches V1 (rocket.py:962):
                 #   (num_blocks, kt_tokens_per_block, num_kv_heads,
                 #    head_dim * 2)
-                # Per "KT-token slot" size = num_kv_heads * head_dim * 2 *
-                # kt_dtype_bytes. tokens_per_block_override = kt_tokens_per_block.
+                # Per "KT slot" size = num_kv_heads * head_dim * 2 *
+                # kt_dtype_bytes. tokens_per_block_override =
+                # kt_tokens_per_block (V1 stores fewer slots per block —
+                # each slot summarizes ``page_size`` real KV tokens).
                 bytes_per_kt_slot = self.get_layer_bytes_per_token(
                     local_layer_idx=layer_id, data_role=role)
                 return BufferConfig(
@@ -2673,26 +2675,13 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def compact_request_cache(self, request: "LlmRequest",
                               target_history_length: int) -> None:
-        """Path A v17 RocketKV Stage I-b: trim a request's KV cache to
-        ``target_history_length`` tokens at the prefill→generation
-        transition (V1 line 1029-1030 parity:
-            seq_len = request.get_num_tokens(0)
-            rewind_len = max(seq_len - 1 - prompt_budget, 0)
-            self.rewind_kv_cache(request, rewind_len)
-        where the result is a cache with ``prompt_budget + 1`` tokens).
+        """V17 RocketKV Stage I-b: trim cache to target_history_length.
 
-        V2 ``_KVCache.resize`` natively supports block-count shrink (the
-        ``del self._blocks[new_num_blocks:]`` path), but a top-level
-        guard raises on history-length decrease — that guard is correct
-        for normal flow (KV history is monotone for non-sparse models)
-        but blocks RocketKV's physical eviction.  We bypass the guard
-        by setting ``_history_length`` to the target first; ``resize``
-        then sees ``history_length == _history_length`` and proceeds
-        through the shrink path.
-
-        Pattern 2: KT slots live in the same physical block as KEY/VALUE
-        (shared block IDs via V2 multi-pool BufferConfig), so KT slots
-        in freed blocks are released alongside KV.
+        After this, V2's update_resources for the request would try
+        ``kv_cache.resize(new_cap, max_beam_num_tokens-1)`` which raises
+        because ``max_beam_num_tokens-1`` > ``new_cap``. We set
+        ``request.py_kt_truncated=True`` so update_resources can skip the
+        offending resize for this request (one-shot — cleared after).
         """
         kv_cache = self.kv_cache_map.get(request.py_request_id)
         if kv_cache is None or not kv_cache.is_active:
@@ -2702,14 +2691,17 @@ class KVCacheManagerV2(BaseResourceManager):
         tokens_per_block = self.tokens_per_block
         new_capacity = ((target_history_length + tokens_per_block - 1) //
                         tokens_per_block) * tokens_per_block
-        # Bypass the monotone-history guard. RocketKV is the one
-        # behavior-layer method (so far) that physically evicts at
-        # prefill end; the guard is a normal-flow invariant, not a
-        # correctness one. Setting _history_length first means the
-        # in-resize check ``history_length < self._history_length``
-        # evaluates False and the shrink path runs.
         kv_cache._history_length = target_history_length
         kv_cache.resize(new_capacity, target_history_length)
+        # Sentinel for V2 update_resources gen branch — skip the
+        # max_beam_num_tokens-aware resize for this request because
+        # max_beam_num_tokens is C++-read-only and stays at the
+        # pre-truncation value; running V2's standard resize would
+        # raise "History length cannot be greater than capacity".
+        try:
+            request.py_kt_truncated = True
+        except Exception:
+            pass
 
     def get_num_available_tokens(self,
                                  *,
@@ -3550,6 +3542,16 @@ class KVCacheManagerV2(BaseResourceManager):
             # needs to process it. Skip suspended caches — the request
             # will be resumed by the scheduler on the next iteration.
             if not kv_cache.is_active:
+                continue
+            # Path A v17 RocketKV Stage I-b: cache was physically rewound to
+            # ``prompt_budget+1`` tokens by ``compact_request_cache``, but
+            # ``req.max_beam_num_tokens`` (read-only C++ binding) still
+            # reflects the pre-rewind seq_len. Running V2's normal resize
+            # here would raise "History length cannot be greater than
+            # capacity". The compact set ``req.py_kt_truncated=True`` as a
+            # one-shot sentinel; honor it and skip this resize.
+            if getattr(req, "py_kt_truncated", False):
+                req.py_kt_truncated = False
                 continue
             new_capacity = None if req.state in (
                 LlmRequestState.GENERATION_COMPLETE,

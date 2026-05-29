@@ -22,8 +22,18 @@ def get_attention_backend(
     # the base attention class for the chosen backend is used unchanged, and
     # any cache mutation happens through KVCacheManagerV2 API calls from the
     # manager. Short-circuit the per-method dispatch below for these configs.
+    #
+    # Exception: ``rocketkv`` is a behavior-layer method but ships its own
+    # attention shim (``RocketKVTrtllmAttention`` in sparse/rocketkv.py)
+    # carrying the rocketkv-specific ``Metadata`` class. Without that
+    # Metadata, HOOK 2/4 fire but the
+    # ``isinstance(metadata, RocketKVTrtllmAttentionMetadata)`` check in
+    # the executor returns None silently — running dense attention
+    # instead of the V1-ported algorithm body. So keep sparse_attn_config
+    # in scope for rocketkv to route through the sparse dispatch.
     if (sparse_attn_config is not None
-            and sparse_attn_config.is_behavior_layer_method):
+            and sparse_attn_config.is_behavior_layer_method
+            and getattr(sparse_attn_config, "algorithm", None) != "rocketkv"):
         sparse_attn_config = None
 
     if backend_name == "VANILLA":

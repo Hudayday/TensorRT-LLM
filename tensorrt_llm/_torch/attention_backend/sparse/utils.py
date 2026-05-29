@@ -101,6 +101,10 @@ def create_sparse_attention_manager(
             prompt_budget=sparse_attn_config.prompt_budget,
             kt_cache_dtype=sparse_attn_config.kt_cache_dtype,
             kt_tokens_per_block=sparse_attn_config.kt_tokens_per_block,
+            window_size=sparse_attn_config.window_size,
+            kernel_size=sparse_attn_config.kernel_size,
+            topk=sparse_attn_config.topk,
+            topr=sparse_attn_config.topr,
         )
     raise ValueError(
         f"Unsupported behavior-layer sparse attention algorithm: "

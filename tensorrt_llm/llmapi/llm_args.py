@@ -559,6 +559,19 @@ class RocketKVSparseAttentionConfig(BaseSparseAttentionConfig):
         default=None,
         description="Tokens per KT_CACHE block (page-aligned auxiliary pool); "
                     "None lets the framework compute from page_size.")
+    # V1-apple-to-apple hyperparams (2026-05-28). RocketSparseAttentionConfig
+    # carries these; mirror exactly so V17 ports the same SnapKV / Stage II
+    # decision surface as V1.
+    window_size: Optional[int] = Field(
+        default=32, description="RocketKV observation window size.")
+    kernel_size: Optional[int] = Field(
+        default=63,
+        description="SnapKV max-pool1d smoothing kernel size.")
+    topk: Optional[int] = Field(
+        default=64,
+        description="Stage II top-k page selection per generation step.")
+    topr: Optional[int] = Field(
+        default=128, description="Top-r filter dim for query projection.")
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"

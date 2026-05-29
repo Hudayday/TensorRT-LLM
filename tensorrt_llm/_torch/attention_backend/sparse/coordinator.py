@@ -116,6 +116,12 @@ class KVCacheBehaviorCoordinator(BaseResourceManager):
         self._by_axis: Dict[str, List[BaseKVCacheCompressionExecutor]] = {}
         for e in self.executors:
             self._by_axis.setdefault(e.axis, []).append(e)
+        import os as _os
+        if _os.environ.get("ROCKETKV_DEBUG_HOOKS") == "1":
+            print(f"[Coordinator.__init__] n_executors={len(self.executors)} "
+                  f"executor_types={[type(e).__name__ for e in self.executors]} "
+                  f"axes={list(self._by_axis.keys())}",
+                  flush=True)
         # Lifecycle state needed for fan-out logic:
         # - `_seen_req_ids` dedupes on_request_init across iterations.
         # - `_prev_req_state` detects CONTEXT_INIT->GENERATION_IN_PROGRESS
@@ -171,6 +177,11 @@ class KVCacheBehaviorCoordinator(BaseResourceManager):
 
         Single-source attention metadata invariant: at most one executor may
         return non-None per call."""
+        import os as _os
+        if _os.environ.get("ROCKETKV_DEBUG_HOOKS") == "1":
+            print(f"[Coordinator.on_context_attention] layer={layer_idx} "
+                  f"n_executors_for_hook={len(list(self._iter_for_hook('on_context_attention')))}",
+                  flush=True)
         result = None
         for e in self._iter_for_hook("on_context_attention"):
             r = e.on_context_attention(layer_idx, q, k, attn_scores, metadata)
@@ -256,13 +267,31 @@ class KVCacheBehaviorCoordinator(BaseResourceManager):
         optional ``attn_metadata`` argument through transparently.
         """
         # HOOK 3 — detect prefill→decode transition.
+        #
+        # 2026-05-28 fix: PyExecutor updates the request state to
+        # GENERATION_IN_PROGRESS *before* dispatching update_resources
+        # iteration on the registered resource managers, so by the time
+        # the Coordinator first sees a request the state is already
+        # GENERATION_IN_PROGRESS — the strict ``CONTEXT_INIT →
+        # GENERATION_IN_PROGRESS`` check would miss every transition.
+        # Detect "first time seen in GEN_IN_PROGRESS" (prev is None) OR
+        # explicit CONTEXT_INIT → GEN_IN_PROGRESS transition (in case
+        # we get an earlier callback path).
+        import os as _os
+        _debug = _os.environ.get("ROCKETKV_DEBUG_HOOKS") == "1"
         for req in chain(scheduled_batch.context_requests,
                          scheduled_batch.generation_requests):
             rid = req.py_request_id
             prev = self._prev_req_state.get(rid)
             curr = req.state
-            if (prev == LlmRequestState.CONTEXT_INIT
-                    and curr == LlmRequestState.GENERATION_IN_PROGRESS):
+            if _debug:
+                print(f"[Coordinator.update_resources] rid={rid} "
+                      f"prev={prev} curr={curr}", flush=True)
+            transition_to_gen = (
+                curr == LlmRequestState.GENERATION_IN_PROGRESS
+                and (prev is None
+                     or prev == LlmRequestState.CONTEXT_INIT))
+            if transition_to_gen:
                 self.on_context_end(req, attn_metadata)
             self._prev_req_state[rid] = curr
         # HOOK 5 — once per iteration.
