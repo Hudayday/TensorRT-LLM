@@ -2394,10 +2394,19 @@ class KVCacheManagerV2(BaseResourceManager):
         # / get_kt_buffers can derive sizing + layout consistently. V1
         # RocketKVCacheManager.__init__ computes the same kt_tokens_per_block;
         # we keep the formula identical for apple-to-apple migration.
-        self._kt_cache_enabled = (sparse_attn_config is not None
-                                  and getattr(sparse_attn_config,
-                                              "algorithm", None) == "rocketkv")
-        if self._kt_cache_enabled:
+        # Path A bypass (2026-05-29): when ROCKETKV_KT_BYPASS_V2=1, don't
+        # register KT_CACHE BufferConfig (avoids _build_pool_mapping_tensors
+        # exact_div assert from KT pool stride mismatch). Executor owns KT
+        # pool locally instead. Keep kt sizing fields populated either way
+        # so the executor can read them uniformly.
+        import os as _os_kt
+        _kt_bypass = (_os_kt.environ.get("ROCKETKV_KT_BYPASS_V2") == "1")
+        _is_rocketkv = (sparse_attn_config is not None
+                        and getattr(sparse_attn_config,
+                                    "algorithm", None) == "rocketkv")
+        self._kt_cache_enabled = _is_rocketkv and not _kt_bypass
+        self._kt_bypass_v2 = _is_rocketkv and _kt_bypass
+        if _is_rocketkv:
             import math as _math
             from triton import next_power_of_2 as _next_pow2
             rocketkv_page_size = sparse_attn_config.page_size

@@ -572,7 +572,7 @@ class Attention(nn.Module):
             logger.info_once(f"Using sparse attention: {algo} {cfg_dump}",
                              key="sparse_attention_config")
 
-            if config.sparse_attention_config.algorithm == "rocket":
+            if config.sparse_attention_config.algorithm in ("rocket", "rocketkv"):
                 logger.warning_once("disable rope_fusion for RocketKV.",
                                     key="disable_rope_fusion_for_rocketkv")
                 self.rope_fusion = False

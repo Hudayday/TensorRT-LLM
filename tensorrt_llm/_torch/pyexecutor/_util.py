@@ -90,10 +90,10 @@ def get_kv_cache_manager_cls(
     sparse_attn_config = model_config.sparse_attention_config
     if (sparse_attn_config is not None
             and not sparse_attn_config.is_behavior_layer_method):
-        # Legacy memory-layer dispatch (RocketKV / DSA / skip_softmax own a
+        # Legacy memory-layer dispatch (RocketKV V1 / DSA / skip_softmax own a
         # sparse-aware cache manager subclass). Behavior-layer methods
-        # (TriAttention, future H2O / SnapKV) fall through to the standard
-        # non-hybrid V2 manager below; their algorithm runs inside a
+        # (TriAttention, V2-migrated RocketKV, future H2O / SnapKV) fall
+        # through below; their algorithm runs inside a
         # ``SparseAttentionExecutor`` constructed via
         # ``create_sparse_attention_manager`` after PyExecutor instantiation.
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)

@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention_backend.sparse.rocket import (
     RocketVanillaAttention, RocketVanillaAttentionMetadata)
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig,
+                                 RocketKVSparseAttentionConfig,
                                  RocketSparseAttentionConfig)
 from tensorrt_llm.mapping import Mapping
 
@@ -24,21 +25,40 @@ from tensorrt_llm.mapping import Mapping
 @pytest.mark.parametrize("model_name",
                          ["llama-3.1-model/Llama-3.1-8B-Instruct"])
 @pytest.mark.parametrize("attention_backend", ["VANILLA", "TRTLLM"])
-def test_model(backend, model_name, attention_backend):
+@pytest.mark.parametrize("rocket_algo", ["rocket", "rocketkv"])
+def test_model(backend, model_name, attention_backend, rocket_algo):
+    """E2E NIAH accuracy for both V1 (algorithm="rocket") and V17
+    (algorithm="rocketkv", V2-migrated) sparse attention paths.
+
+    Catches the historical RoPE-fusion gotcha (modules/attention.py
+    must include "rocketkv" in the rope_fusion=False list) by exercising
+    the V17 path end-to-end; without that fix V17 drops to ~10-30% acc.
+    """
     model_dir = str(llm_models_root() / model_name)
     max_batch_size = 16
     max_output_tokens = 128
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
-                                    enable_block_reuse=False)
+    kv_cache_kwargs = dict(free_gpu_memory_fraction=0.7,
+                           enable_block_reuse=False)
+    if rocket_algo == "rocketkv":
+        kv_cache_kwargs["use_kv_cache_manager_v2"] = True
+    kv_cache_config = KvCacheConfig(**kv_cache_kwargs)
 
     kt_cache_dtype = 'float8_e5m2' if attention_backend == "TRTLLM" else 'bfloat16'
 
-    sparse_attention_config = RocketSparseAttentionConfig(
-        window_size=32,
-        kernel_size=63,
-        prompt_budget=2048,
-        kt_cache_dtype=kt_cache_dtype,
-    )
+    if rocket_algo == "rocketkv":
+        sparse_attention_config = RocketKVSparseAttentionConfig(
+            window_size=32,
+            kernel_size=63,
+            prompt_budget=2048,
+            kt_cache_dtype=kt_cache_dtype,
+        )
+    else:
+        sparse_attention_config = RocketSparseAttentionConfig(
+            window_size=32,
+            kernel_size=63,
+            prompt_budget=2048,
+            kt_cache_dtype=kt_cache_dtype,
+        )
 
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[1, 2, 4, 8, 16],

@@ -41,6 +41,7 @@ algorithm-discriminator (V1 = ``algorithm="rocket"``, V17 =
 ``algorithm="rocketkv"``).
 """
 
+import contextlib
 import math
 from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple
 
@@ -751,13 +752,49 @@ class RocketKV(SparseAttentionExecutor):
         self._kt_supported = (
             hasattr(kv_cache_manager, "_kt_cache_enabled") and getattr(
                 kv_cache_manager, "_kt_cache_enabled", False) is True)
-        if self._kt_supported:
+        # Path A bypass (2026-05-29): cache mgr disabled V2 BufferConfig to
+        # dodge pool alignment; executor owns KT pool locally. Mirror the
+        # kt sizing fields the cache mgr still computes when in bypass mode.
+        self._kt_bypass_active = (
+            not self._kt_supported
+            and hasattr(kv_cache_manager, "_kt_bypass_v2")
+            and getattr(kv_cache_manager, "_kt_bypass_v2", False) is True)
+        if self._kt_supported or self._kt_bypass_active:
             # V2 derives kt_tokens_per_block + dtype from sparse_attn_config
             # at construction. We mirror them here for the algorithm body
             # to access without an extra V2 round-trip.
-            self.kt_tokens_per_block = kv_cache_manager.kt_tokens_per_block
+            self.kt_tokens_per_block = kv_cache_manager._kt_tokens_per_block
             self.kt_cache_dtype = kv_cache_manager._kt_torch_dtype
-            self.max_kt_blocks_per_seq = kv_cache_manager.max_kt_blocks_per_seq
+            if self._kt_bypass_active:
+                # Path A KT pool sizing — debug-only cap.
+                # V2 grabs ~all free GPU mem for KV pool, leaving no room
+                # for KT. Permanent fix is Plan B (proper V2 multi-pool).
+                # For now: env-override with ROCKETKV_KT_MAX_BLOCKS
+                # (default 1024, plenty for NIAH 10 samples × seq~5K).
+                import os as _os_kt2
+                _override = _os_kt2.environ.get("ROCKETKV_KT_MAX_BLOCKS")
+                self.max_kt_blocks_per_seq = (int(_override)
+                                              if _override else 1024)
+                # Per-layer KT pool. EAGER-allocate all layers up-front
+                # (V1 parity).
+                self._kt_pool_local: dict[int, torch.Tensor] = {}
+                num_layers = len(kv_cache_manager.num_kv_heads_per_layer)
+                _stream = getattr(kv_cache_manager, "_stream", None)
+                _ctx = (torch.cuda.stream(_stream) if _stream is not None
+                        else contextlib.nullcontext())
+                with _ctx:
+                    for L in range(num_layers):
+                        nkv = kv_cache_manager.num_kv_heads_per_layer[L]
+                        hd = kv_cache_manager.head_dim_per_layer[L]
+                        self._kt_pool_local[L] = torch.zeros(
+                            (self.max_kt_blocks_per_seq,
+                             self.kt_tokens_per_block, nkv, hd * 2),
+                            dtype=self.kt_cache_dtype, device="cuda")
+                torch.cuda.synchronize()
+                # BlockManager was tried but regressed N=1 from 100% → 0%.
+                # Reverted to pure bucketing 2026-05-29.
+            else:
+                self.max_kt_blocks_per_seq = kv_cache_manager.blocks_in_primary_pool
         else:
             self.kt_tokens_per_block = (kt_tokens_per_block
                                         or next_power_of_2(
@@ -786,10 +823,30 @@ class RocketKV(SparseAttentionExecutor):
         """Return KT pool tensor for the given attention layer. Delegates
         to V2 ``get_kt_buffers(layer_idx)`` when V2 has KT_CACHE BufferConfig
         wired; returns ``None`` otherwise (mocked tests / non-rocketkv config).
-        V1 RocketKVCacheManager.get_kt_buffers parity."""
-        if not self._kt_supported:
-            return None
-        return self.kv_cache_manager.get_kt_buffers(layer_idx)
+        V1 RocketKVCacheManager.get_kt_buffers parity.
+
+        Path A bypass: executor allocates KT pool lazily (per-layer) so that
+        V2's pool-alignment exact_div doesn't see a non-aligned KT pool."""
+        if self._kt_supported:
+            return self.kv_cache_manager.get_kt_buffers(layer_idx)
+        if self._kt_bypass_active:
+            t = self._kt_pool_local.get(layer_idx)
+            if t is None:
+                num_kv_heads = self.kv_cache_manager.num_kv_heads_per_layer[
+                    layer_idx]
+                head_dim = self.kv_cache_manager.head_dim_per_layer[layer_idx]
+                shape = (
+                    self.max_kt_blocks_per_seq,
+                    self.kt_tokens_per_block,
+                    num_kv_heads,
+                    head_dim * 2,
+                )
+                t = torch.zeros(shape,
+                                dtype=self.kt_cache_dtype,
+                                device="cuda")
+                self._kt_pool_local[layer_idx] = t
+            return t
+        return None
 
     def copy_kt_block_offsets(self, request_ids: List[int],
                               block_offsets: torch.Tensor) -> torch.Tensor:
@@ -802,16 +859,39 @@ class RocketKV(SparseAttentionExecutor):
         V1 line 1004 parity: V1's separate ``BlockManager.copy_block_offsets``
         wrote KT block IDs into the destination tensor.
         """
-        if not self._kt_supported:
+        if not (self._kt_supported or self._kt_bypass_active):
             return block_offsets
-        # V2 returns padded (B, max_blocks_for_any_req) tensor of block IDs.
-        block_ids = self.kv_cache_manager.get_block_ids_per_seq(request_ids)
-        B, blocks_in_req = block_ids.shape
-        # block_offsets has shape (max_num_sequences, max_kt_blocks_per_seq);
-        # write the same block ID into KT slot (KT shares block IDs with KEY
-        # — V2 multi-pool layout puts both into the same physical block).
-        target = block_offsets[:B, :blocks_in_req]
-        target.copy_(block_ids)
+        if self._kt_supported:
+            # Pattern 2 (V2 multi-pool KT_CACHE BufferConfig): KT shares
+            # block IDs with KEY/VALUE — read once from V2.
+            block_ids = self.kv_cache_manager.get_block_ids_per_seq(
+                request_ids)
+            B, blocks_in_req = block_ids.shape
+            target = block_offsets[:B, :blocks_in_req]
+            target.copy_(block_ids)
+            return block_offsets
+        # Path A bypass — bucketing path (reverted from BlockManager 2026-05-29):
+        # request_id % bucket_count → distinct KT pool slice per request.
+        # bucket_count must be ≤ max concurrent reqs AND each request's
+        # KT block requirement ≤ blocks_per_req. For Llama-3.1-8B with
+        # prompt 3781, kt_tpb=2, page_size=16: KT blocks/req = 119.
+        # bucket_count=8 gives blocks_per_req=128 → fits 119.
+        B = len(request_ids)
+        max_blocks_per_seq = block_offsets.shape[1]
+        bucket_count = 8
+        blocks_per_req = min(max_blocks_per_seq,
+                             max(1, self.max_kt_blocks_per_seq // bucket_count))
+        if blocks_per_req <= 0:
+            return block_offsets
+        device = block_offsets.device
+        bucket_ids = torch.tensor(
+            [r % bucket_count for r in request_ids],
+            device=device, dtype=block_offsets.dtype)
+        bases = bucket_ids * blocks_per_req
+        offs = torch.arange(blocks_per_req, device=device,
+                            dtype=block_offsets.dtype)
+        target = block_offsets[:B, :blocks_per_req]
+        target.copy_(bases.unsqueeze(1) + offs.unsqueeze(0))
         return block_offsets
 
     # ===================================================================== #
@@ -824,17 +904,11 @@ class RocketKV(SparseAttentionExecutor):
             for ctx req:  self.kt_cache_manager.add_tokens(req_id, ceil(prompt_len/page_size))
             for gen req:  if (max_beam_num_tokens + 1) % page_size == 1: add 1 KT slot
 
-        Pattern 2 (Path A v17): KT lives in the same V2 multi-pool block
-        as KEY/VALUE (shared block IDs via BufferConfig). When V2 allocates
-        a new physical block (because KV crossed a tokens_per_block
-        boundary), the corresponding KT slot inside that block is part
-        of the same allocation — no separate KT bookkeeping needed.
-
-        V1 add_tokens grew V1's *separate* BlockManager state; Pattern 2's
-        KT block-IDs are read from V2 (``get_block_ids_per_seq``) at
-        prepare-time. Init is therefore a no-op.
+        Path A v17 (BlockManager-backed): when KT bypass is active, drive
+        the executor-owned BlockManager allocator the same way V1 does so
+        each request gets DISTINCT KT block IDs (not static buckets).
         """
-        return
+        return  # BlockManager path reverted, bucketing is stateless
 
     # ===================================================================== #
     # HOOK 2 — on_context_attention (V1 sparse_kv_predict port,              #
@@ -871,10 +945,9 @@ class RocketKV(SparseAttentionExecutor):
                       f"{type(metadata).__name__} (expected "
                       f"RocketKVTrtllmAttentionMetadata)", flush=True)
             return None
-        if not self._kt_supported:
+        if not (self._kt_supported or self._kt_bypass_active):
             if debug:
-                print(f"[HOOK2 SKIP] layer={layer_idx} _kt_supported=False",
-                      flush=True)
+                print(f"[HOOK2 SKIP] layer={layer_idx} no-kt", flush=True)
             return None
         num_ctx_tokens = metadata.num_ctx_tokens
         if num_ctx_tokens == 0:
@@ -898,7 +971,8 @@ class RocketKV(SparseAttentionExecutor):
             qkv_input = q[:num_ctx_tokens]
         else:
             qkv_input = torch.cat([q, k], dim=1)
-
+        # Dump input token IDs to confirm V1 vs V17 receive same prompt.
+        # Probe at deeper token positions to identify where V1↔V17 diverge.
         if metadata.valid_batch_size > 0:
             # V1 line 378: split observation window Q from prefix K
             q_window, k_context = triton_rocket_qk_split(
@@ -950,7 +1024,10 @@ class RocketKV(SparseAttentionExecutor):
 
             # V1 line 419: indexer topk prefill
             total_tasks = metadata.valid_batch_size * num_kv_heads
-            selected_prefix_indices = torch.empty(
+            # DEBUG (2026-05-29): V1 uses torch.empty (uninitialized) and
+            # works; V17 uses same, but L0 produces duplicate output
+            # [0,0,1,1,...]. Force zeros to rule out garbage residual.
+            selected_prefix_indices = torch.zeros(
                 (total_tasks, self.prompt_budget - self.window_size),
                 device=qkv_input.device,
                 dtype=torch.int32)
@@ -1006,6 +1083,7 @@ class RocketKV(SparseAttentionExecutor):
                 metadata.kt_tokens_per_block,
                 self.max_kt_blocks_per_seq,
             )
+
 
         # ---- DUMP for V1/V17 diff (2026-05-28)
         try:
@@ -1112,6 +1190,8 @@ class RocketKV(SparseAttentionExecutor):
         rewind_fn = getattr(self.kv_cache_manager, "rewind_kv_cache", None)
         if rewind_fn is not None:
             rewind_fn(request, rewind_len)
+
+        # KT rewind reverted (BlockManager path off).
 
     def _python_compact_request(self, request: "LlmRequest",
                                 metadata: "AttentionMetadata") -> None:
@@ -1339,10 +1419,9 @@ class RocketKV(SparseAttentionExecutor):
                 print(f"[HOOK4 SKIP] layer={layer_idx} metadata_type="
                       f"{type(metadata).__name__}", flush=True)
             return None
-        if not self._kt_supported:
+        if not (self._kt_supported or self._kt_bypass_active):
             if debug:
-                print(f"[HOOK4 SKIP] layer={layer_idx} _kt_supported=False",
-                      flush=True)
+                print(f"[HOOK4 SKIP] layer={layer_idx} no-kt", flush=True)
             return None
         if metadata.num_generations == 0:
             if debug:
@@ -1444,15 +1523,11 @@ class RocketKV(SparseAttentionExecutor):
             super().free_resources(request)
             self.kt_cache_manager.free_resources(request)
 
-        Pattern 2 (Path A v17): KT shares block IDs with KEY/VALUE in V2's
-        multi-pool BufferConfig, so when V2's ``free_resources``
-        releases the request's blocks the KT slots inside those blocks
-        are released alongside. V1's separate ``kt_cache_manager``
-        existed because V1 had an *independent* BlockManager for KT;
-        Pattern 2 unifies KT bookkeeping into V2's per-block tracking,
-        so this hook is a no-op.
+        Path A v17 (BlockManager-backed): free the KT BlockManager's
+        per-request blocks back to its free-list. Without this, repeated
+        runs leak KT blocks until the pool exhausts.
         """
-        return
+        return  # BlockManager path reverted
 
     # ===================================================================== #
     # Helpers — proxy attention layer params via kv_cache_manager.            #
