@@ -53,10 +53,8 @@ from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention_backend.vanilla import (
     VanillaAttention, VanillaAttentionMetadata)
-# Pattern 2: V2 KVCacheManagerV2 owns the KT_CACHE pool via Role.KT_CACHE
-# BufferConfig (resource_manager.py:Role.KT_CACHE). Executor delegates
-# allocation + lifecycle to V2 instead of holding its own BlockManager
-# (which was the Pattern 1 shortcut before 2026-05-28).
+# KT cache pool is EXECUTOR-OWNED (per-layer pool + free-list BlockManager
+# in RocketKV.__init__); V2 core has no KT pool. See docs/kv-reduction/41.
 from tensorrt_llm._utils import prefer_pinned
 
 from tensorrt_llm._torch.attention_backend.sparse.kv_cache_compression_executor import (
@@ -555,11 +553,8 @@ class RocketKV(SparseAttentionExecutor):
     # KT_CACHE is request-specific → cross-request reuse breaks.
     supports_kv_cache_reuse: ClassVar[bool] = False
 
-    # Pattern 3 V2 subclass standby — disabled while debugging Python
-    # compaction.  With ``None`` here, base V2 mgr is used and
-    # ``on_context_end`` rewind is a no-op (rewind_kv_cache attr missing).
-    # This effectively makes V17 a sparse-mask-only method (no physical
-    # evict). Use to isolate kernel/compaction issues from rewind.
+    # No V2 subclass: RocketKV uses plain KVCacheManagerV2; Stage I-b evict
+    # goes through V2's public rewind_kv_cache (= impl.rewind_kv_cache).
     kv_cache_manager_class: ClassVar[Optional[type]] = None
 
     # Access type for different dtype sizes (V1 rocket.py:322).
@@ -593,35 +588,15 @@ class RocketKV(SparseAttentionExecutor):
         self.topk = topk
         self.topr = topr
 
-        # Pattern 2 (V2 declarative BufferConfig, 2026-05-28): KT cache pool
-        # is owned by KVCacheManagerV2 via Role.KT_CACHE BufferConfig (added
-        # in resource_manager.py:_build_cache_config when
-        # sparse_attn_config.algorithm == "rocketkv"). The executor delegates
-        # to V2's get_kt_buffers / blocks_in_primary_pool / kt_tokens_per_block
-        # for sizing + access. This replaces the earlier Pattern 1
-        # (executor-owned pool) which didn't sync with V2 page lifecycle.
-        #
-        # When the V2 manager doesn't expose KT_CACHE (e.g., tests with
-        # MagicMock cache mgr or non-rocketkv configs), executor methods
-        # degrade gracefully (return None) — algorithm body skips KT-related
-        # work in that case.
-        # MagicMock-truthy gate trap [[feedback_mock_truthy_gate_trap]]:
-        # ``hasattr(MagicMock, "_kt_cache_enabled")`` is True (auto-attr) and
-        # ``getattr(MagicMock, "_kt_cache_enabled", False)`` returns a Mock
-        # which is truthy. Use ``is True`` (boolean identity) to short-circuit
-        # MagicMock test fixtures down the no-op path.
-        self._kt_supported = (
-            hasattr(kv_cache_manager, "_kt_cache_enabled") and getattr(
-                kv_cache_manager, "_kt_cache_enabled", False) is True)
-        # KT bypass (Path B): the cache mgr leaves the V2 KT_CACHE
-        # BufferConfig disabled; the executor owns the KT pool + a
-        # BlockManager free-list locally and never modifies V2. We mirror
-        # the kt sizing fields the cache mgr still computes in bypass mode.
+        # KT cache is EXECUTOR-OWNED (Path B): V2 only flags rocketkv via
+        # _kt_bypass_v2 + exposes the KT sizing fields; the executor owns the
+        # pool + BlockManager and never modifies V2. `is True` (boolean
+        # identity) short-circuits MagicMock test fixtures (a Mock attr is
+        # truthy) down the no-op path [[feedback_mock_truthy_gate_trap]].
         self._kt_bypass_active = (
-            not self._kt_supported
-            and hasattr(kv_cache_manager, "_kt_bypass_v2")
+            hasattr(kv_cache_manager, "_kt_bypass_v2")
             and getattr(kv_cache_manager, "_kt_bypass_v2", False) is True)
-        if self._kt_supported or self._kt_bypass_active:
+        if self._kt_bypass_active:
             # V2 derives kt_tokens_per_block + dtype from sparse_attn_config
             # at construction. We mirror them here for the algorithm body
             # to access without an extra V2 round-trip.
@@ -692,31 +667,19 @@ class RocketKV(SparseAttentionExecutor):
                                    torch.float8_e5m2)
             self.max_kt_blocks_per_seq = 0
 
-        import os as _os
-        if _os.environ.get("ROCKETKV_DEBUG_HOOKS") == "1":
-            print(f"[RocketKV.__init__] _kt_supported={self._kt_supported} "
-                  f"kt_tokens_per_block={self.kt_tokens_per_block} "
-                  f"kt_cache_dtype={self.kt_cache_dtype} "
-                  f"max_kt_blocks_per_seq={self.max_kt_blocks_per_seq} "
-                  f"kv_cache_manager_type={type(kv_cache_manager).__name__}",
-                  flush=True)
 
     # ===================================================================== #
-    # Pool access helpers — delegate to V2's KT_CACHE BufferConfig pool      #
-    # (Pattern 2). V2 inner manages allocation + lifecycle; executor just    #
-    # exposes the V1-compatible API surface for algorithm body to call.     #
+    # Pool access helpers — the executor owns the KT pool (per-layer        #
+    # _kt_pool_local + BlockManager); V2 is not involved.                   #
     # ===================================================================== #
 
     def get_kt_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
-        """Return KT pool tensor for the given attention layer. Delegates
-        to V2 ``get_kt_buffers(layer_idx)`` when V2 has KT_CACHE BufferConfig
-        wired; returns ``None`` otherwise (mocked tests / non-rocketkv config).
+        """Return this executor's KT pool tensor for the given layer
+        (lazily allocated). Returns ``None`` for mocked tests / non-rocketkv.
         V1 RocketKVCacheManager.get_kt_buffers parity.
 
         KT bypass (Path B): the executor owns the KT pool (per-layer) so
         V2's pool-mapping never sees an unaligned auxiliary KT pool."""
-        if self._kt_supported:
-            return self.kv_cache_manager.get_kt_buffers(layer_idx)
         if self._kt_bypass_active:
             t = self._kt_pool_local.get(layer_idx)
             if t is None:
@@ -741,24 +704,13 @@ class RocketKV(SparseAttentionExecutor):
                               kt_token_counts: Optional[List[int]] = None
                               ) -> torch.Tensor:
         """Fill ``block_offsets[i, :]`` with the per-request block IDs for
-        request ``request_ids[i]``. Pattern 2: KT shares block IDs with
-        KEY/VALUE (same logical block in V2 multi-pool layout), so we
-        read block IDs once from V2's ``get_block_ids_per_seq`` and copy
-        into the KT-side tensor.
+        request ``request_ids[i]`` from the executor-owned BlockManager
+        free-list (allocated lazily in this method).
 
         V1 line 1004 parity: V1's separate ``BlockManager.copy_block_offsets``
         wrote KT block IDs into the destination tensor.
         """
-        if not (self._kt_supported or self._kt_bypass_active):
-            return block_offsets
-        if self._kt_supported:
-            # Pattern 2 (V2 multi-pool KT_CACHE BufferConfig): KT shares
-            # block IDs with KEY/VALUE — read once from V2.
-            block_ids = self.kv_cache_manager.get_block_ids_per_seq(
-                request_ids)
-            B, blocks_in_req = block_ids.shape
-            target = block_offsets[:B, :blocks_in_req]
-            target.copy_(block_ids)
+        if not self._kt_bypass_active:
             return block_offsets
         # Path B bypass — executor-owned BlockManager free-list allocator.
         # Idempotently ensure each request has enough KT blocks for its
@@ -779,12 +731,6 @@ class RocketKV(SparseAttentionExecutor):
             have = mgr.num_sequences.get(r, 0)
             if need > have:
                 mgr.add_tokens(r, need - have)
-        import os as _os_dbg
-        if _os_dbg.environ.get('ROCKETKV_DEBUG_HOOKS') == '1':
-            dbg = [(r, len(mgr.block_ids.get(r, [])),
-                    mgr.num_sequences.get(r, 0)) for r in request_ids]
-            print(f'[copy_kt_block_offsets] (rid,nblocks,kt_tok)={dbg} '
-                  f'free={len(mgr.free_blocks)}', flush=True)
         mgr.copy_block_offsets(list(request_ids), block_offsets)
         return block_offsets
 
@@ -851,34 +797,17 @@ class RocketKV(SparseAttentionExecutor):
         to consume as input-side sparse mask; ``None`` if no valid context
         sequences this iter.
         """
-        import os
-        debug = os.environ.get("ROCKETKV_DEBUG_HOOKS") == "1"
         if not isinstance(metadata, RocketKVTrtllmAttentionMetadata):
-            if debug:
-                print(f"[HOOK2 SKIP] layer={layer_idx} metadata_type="
-                      f"{type(metadata).__name__} (expected "
-                      f"RocketKVTrtllmAttentionMetadata)", flush=True)
             return None
-        if not (self._kt_supported or self._kt_bypass_active):
-            if debug:
-                print(f"[HOOK2 SKIP] layer={layer_idx} no-kt", flush=True)
+        if not self._kt_bypass_active:
             return None
         num_ctx_tokens = metadata.num_ctx_tokens
         if num_ctx_tokens == 0:
-            if debug:
-                print(f"[HOOK2 SKIP] layer={layer_idx} num_ctx_tokens=0",
-                      flush=True)
             return None
         # Cache num_heads_per_kv on first call so non-metadata-scope
         # helpers (algorithm-body internals) can recover num_heads.
         self._cached_num_heads_per_kv = int(
             getattr(metadata, "num_heads_per_kv", 1) or 1)
-        if debug:
-            print(f"[HOOK2 FIRE] layer={layer_idx} "
-                  f"num_ctx_tokens={num_ctx_tokens} "
-                  f"valid_batch_size={metadata.valid_batch_size} "
-                  f"num_heads_per_kv={self._cached_num_heads_per_kv}",
-                  flush=True)
 
         # V1 line 368: prepare qkv input
         if k is None:
@@ -1085,14 +1014,11 @@ class RocketKV(SparseAttentionExecutor):
         if os.environ.get("ROCKETKV_DISABLE_PY_COMPACT") != "1":
             try:
                 self._python_compact_request(request, metadata)
-            except Exception as _ce:
-                if os.environ.get("ROCKETKV_DEBUG_HOOKS") == "1":
-                    import traceback as _tb
-                    print(f"[on_context_end] python compact FAILED: {_ce}\n"
-                          f"{_tb.format_exc()}", flush=True)
+            except Exception:
+                pass
 
-        # Now shrink V2 cache to prompt_budget+1 tokens via Pattern 3
-        # subclass rewind_kv_cache (mutates _history_length, frees tail
+        # Now shrink V2 cache to prompt_budget+1 tokens via V2's public
+        # rewind_kv_cache (= self.impl.rewind_kv_cache; frees tail
         # blocks, sets per-request sticky py_kt_target_history so V2
         # update_resources gen branch honors the truncation).
         rewind_fn = getattr(self.kv_cache_manager, "rewind_kv_cache", None)
@@ -1220,15 +1146,6 @@ class RocketKV(SparseAttentionExecutor):
             n_selected = indices.shape[-1]
             req_capacity = len(block_ids) * tpb
 
-            import os as _os
-            if _os.environ.get("ROCKETKV_DEBUG_HOOKS") == "1" and layer_idx == 0:
-                print(f"[py_compact] layer={layer_idx} "
-                      f"buf.shape={tuple(buf.shape)} "
-                      f"n_blocks_req={len(block_ids)} "
-                      f"req_capacity={req_capacity} "
-                      f"n_selected={n_selected} "
-                      f"indices.shape={tuple(indices.shape)}",
-                      flush=True)
 
             # Build per-token (block, slot) lookup tables for the
             # request's logical token range [0, req_capacity).
@@ -1333,27 +1250,14 @@ class RocketKV(SparseAttentionExecutor):
         attention mask over the (already-shrunk by Stage I-b) cache using
         KT page summaries as a coarse-grained lookup.
         """
-        import os
-        debug = os.environ.get("ROCKETKV_DEBUG_HOOKS") == "1"
         if not isinstance(metadata, RocketKVTrtllmAttentionMetadata):
-            if debug:
-                print(f"[HOOK4 SKIP] layer={layer_idx} metadata_type="
-                      f"{type(metadata).__name__}", flush=True)
             return None
-        if not (self._kt_supported or self._kt_bypass_active):
-            if debug:
-                print(f"[HOOK4 SKIP] layer={layer_idx} no-kt", flush=True)
+        if not self._kt_bypass_active:
             return None
         if metadata.num_generations == 0:
-            if debug:
-                print(f"[HOOK4 SKIP] layer={layer_idx} num_generations=0",
-                      flush=True)
             return None
         self._cached_num_heads_per_kv = int(
             getattr(metadata, "num_heads_per_kv", 1) or 1)
-        if debug:
-            print(f"[HOOK4 FIRE] layer={layer_idx} "
-                  f"num_generations={metadata.num_generations}", flush=True)
 
         q, k = self._preprocess_for_gen(q, k, metadata)
 
@@ -1476,14 +1380,6 @@ class RocketKV(SparseAttentionExecutor):
         if per_layer:
             return int(per_layer[0])
         return 0
-
-    def _num_heads_from_metadata(self, metadata) -> int:
-        """V1 stored num_heads on the attention class instance; V2's cache
-        manager doesn't carry it. We read it via metadata.num_heads_per_kv
-        (set by model_engine at attn_metadata construction): num_heads =
-        num_kv_heads * num_heads_per_kv."""
-        nhpkv = getattr(metadata, "num_heads_per_kv", 1) or 1
-        return self._num_kv_heads_from_kv_cache_manager() * int(nhpkv)
 
     # Backward-compat alias for sites that don't have metadata in scope.
     def _num_heads_from_kv_cache_manager(self) -> int:

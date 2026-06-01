@@ -113,14 +113,6 @@ class Role:
     VALUE = DataRole("value")
     KEY_BLOCK_SCALE = DataRole("key_block_scale")
     VALUE_BLOCK_SCALE = DataRole("value_block_scale")
-    # KT_CACHE (RocketKV Pattern 2 auxiliary pool, 2026-05-28).
-    # Per-page K summary (concat of max+min along head_dim), used by
-    # RocketKV Stage I-a (build) + Stage II HSA mask compute. Shares
-    # block IDs with KEY/VALUE via V2 multi-pool BufferConfig; physical
-    # layout is (num_blocks, kt_tokens_per_block, num_kv_heads, head_dim*2)
-    # where kt_tokens_per_block = next_pow2(ceil(tokens_per_block /
-    # rocketkv_page_size)). See attention_backend/sparse/rocketkv.py.
-    KT_CACHE = DataRole("kt_cache")
     ALL = DataRole("all")
 
 
@@ -2343,15 +2335,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
         self.is_disagg = is_disagg
-        # Path A v17 (2026-05-28): sparse_attn_config plumbed into V2 so
-        # behavior-layer sparse methods (RocketKV) can declare auxiliary KV
-        # pools via Pattern 2 (declarative BufferConfig, like NVFP4
-        # KEY_BLOCK_SCALE). KT_CACHE BufferConfig is added in
-        # _build_cache_config when sparse_attn_config.algorithm ==
-        # "rocketkv". Default None means no behavior-layer sparse method
-        # configured — V2 behaves identically to pre-Path-A trunk.
-        # Param name matches V1 RocketKVCacheManager for factory dispatch
-        # plumbing parity (see _util.py:786).
+        # sparse_attn_config plumbed into V2 only to compute RocketKV KT
+        # sizing fields (kt_tokens_per_block + dtype) below; the KT pool
+        # itself is executor-owned (Path B), V2 does not allocate it.
+        # (Stage-B TODO #123: move this into the executor so V2 needs no
+        # sparse_attn_config.)
         self.sparse_attention_config = sparse_attn_config
 
         assert kv_connector_manager is None, "kv_connector_manager is not supported for KVCacheManagerV2"
@@ -2388,24 +2376,14 @@ class KVCacheManagerV2(BaseResourceManager):
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
-        # Path A v17 KT_CACHE Pattern 2 (2026-05-28): pre-compute kt
-        # parameters when sparse_attn_config indicates rocketkv. Stored
-        # on the instance so _build_cache_config / get_layer_bytes_per_token
-        # / get_kt_buffers can derive sizing + layout consistently. V1
-        # RocketKVCacheManager.__init__ computes the same kt_tokens_per_block;
-        # we keep the formula identical for apple-to-apple migration.
-        # Path A bypass (2026-05-29): when ROCKETKV_KT_BYPASS_V2=1, don't
-        # register KT_CACHE BufferConfig (avoids _build_pool_mapping_tensors
-        # exact_div assert from KT pool stride mismatch). Executor owns KT
-        # pool locally instead. Keep kt sizing fields populated either way
-        # so the executor can read them uniformly.
-        import os as _os_kt
-        _kt_bypass = (_os_kt.environ.get("ROCKETKV_KT_BYPASS_V2") == "1")
+        # RocketKV KT cache is EXECUTOR-OWNED (Path B); V2 does NOT own a
+        # KT pool. We only compute the KT sizing fields here so the
+        # RocketKV executor can read them uniformly (kt_tokens_per_block +
+        # dtype). V1 RocketKVCacheManager.__init__ uses the same formula.
         _is_rocketkv = (sparse_attn_config is not None
                         and getattr(sparse_attn_config,
                                     "algorithm", None) == "rocketkv")
-        self._kt_cache_enabled = _is_rocketkv and not _kt_bypass
-        self._kt_bypass_v2 = _is_rocketkv and _kt_bypass
+        self._kt_bypass_v2 = _is_rocketkv
         if _is_rocketkv:
             import math as _math
             from triton import next_power_of_2 as _next_pow2
@@ -2763,32 +2741,7 @@ class KVCacheManagerV2(BaseResourceManager):
             buffer_type.append(Role.KEY_BLOCK_SCALE)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 buffer_type.append(Role.VALUE_BLOCK_SCALE)
-        # Path A v17 KT_CACHE Pattern 2 (2026-05-28): augment buffer_type
-        # with Role.KT_CACHE when sparse_attention_config indicates
-        # rocketkv. KT BufferConfig uses tokens_per_block_override so it
-        # has fewer "tokens" per block than main KEY/VALUE (each KT slot
-        # summarizes ``page_size`` real tokens). Same pattern as NVFP4
-        # KEY_BLOCK_SCALE above (auxiliary multi-pool sub-page).
-        kt_cache_enabled = self._kt_cache_enabled
-        if kt_cache_enabled:
-            buffer_type.append(Role.KT_CACHE)
-
         def _build_buffer_config(layer_id: int, role: Role) -> "BufferConfig":
-            if role == Role.KT_CACHE:
-                # KT pool layout matches V1 (rocket.py:962):
-                #   (num_blocks, kt_tokens_per_block, num_kv_heads,
-                #    head_dim * 2)
-                # Per "KT slot" size = num_kv_heads * head_dim * 2 *
-                # kt_dtype_bytes. tokens_per_block_override =
-                # kt_tokens_per_block (V1 stores fewer slots per block —
-                # each slot summarizes ``page_size`` real KV tokens).
-                bytes_per_kt_slot = self.get_layer_bytes_per_token(
-                    local_layer_idx=layer_id, data_role=role)
-                return BufferConfig(
-                    role=role,
-                    size=bytes_per_kt_slot * self._kt_tokens_per_block,
-                    tokens_per_block_override=self._kt_tokens_per_block,
-                )
             return BufferConfig(
                 role=role,
                 size=self.get_layer_bytes_per_token(
@@ -2871,45 +2824,6 @@ class KVCacheManagerV2(BaseResourceManager):
             dtype,
             shape,
         ))
-
-    def get_kt_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
-        """Path A v17 KT_CACHE Pattern 2: return the KT_CACHE pool tensor
-        for the given attention layer. Layout matches V1 RocketKVCacheManager.get_kt_buffers:
-            (num_blocks, kt_tokens_per_block, num_kv_heads, head_dim * 2)
-        Returns ``None`` if sparse_attention_config does not indicate
-        rocketkv (no KT pool allocated)."""
-        if not self._kt_cache_enabled:
-            return None
-        layer_offset = self.layer_offsets[layer_idx]
-        addr_kt = self.impl.get_mem_pool_base_address(layer_offset,
-                                                      Role.KT_CACHE)
-        num_blocks = self.impl.get_page_index_upper_bound(
-            layer_offset, Role.KT_CACHE)
-        num_kv_heads = self.num_kv_heads_per_layer[layer_offset]
-        head_dim = self.head_dim_per_layer[layer_offset]
-        shape = [
-            num_blocks,
-            self._kt_tokens_per_block,
-            num_kv_heads,
-            head_dim * 2,  # min + max concat per dimension
-        ]
-        return convert_to_torch_tensor(
-            TensorWrapper(addr_kt, self._kt_torch_dtype, shape))
-
-    @property
-    def kt_tokens_per_block(self) -> Optional[int]:
-        """Path A v17 KT_CACHE: exposes the KT block sizing for the
-        attention metadata + executor (used by triton kernel args).
-        Returns ``None`` if KT_CACHE not enabled."""
-        return self._kt_tokens_per_block
-
-    @property
-    def max_kt_blocks_per_seq(self) -> int:
-        """Path A v17 KT_CACHE: max KT blocks per sequence. Shares block
-        IDs with main KEY pool, so this is identical to
-        ``blocks_in_primary_pool``. Used by metadata for sizing the
-        kt_cache_block_offsets tensor."""
-        return self.blocks_in_primary_pool
 
     def compact_request_cache(self, request: "LlmRequest",
                               target_history_length: int) -> None:
@@ -3539,23 +3453,6 @@ class KVCacheManagerV2(BaseResourceManager):
             data_roles.append(Role.KEY_BLOCK_SCALE)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 data_roles.append(Role.VALUE_BLOCK_SCALE)
-        # Path A v17 KT_CACHE: include KT pool bytes-per-token in the
-        # total budget when rocketkv is configured. Each "real" token
-        # contributes 1/page_size of a KT slot's worth of bytes (since
-        # one KT slot summarizes ``page_size`` real tokens). Scale by
-        # 1/page_size for accurate budgeting.
-        if self._kt_cache_enabled:
-            page_size = self.sparse_attention_config.page_size
-            return sum(
-                self.get_layer_bytes_per_token(local_layer_idx=local_layer_idx,
-                                               data_role=data_role)
-                for local_layer_idx in range(self.num_local_layers)
-                for data_role in data_roles) + sum(
-                    self.get_layer_bytes_per_token(
-                        local_layer_idx=local_layer_idx,
-                        data_role=Role.KT_CACHE) // page_size
-                    for local_layer_idx in range(self.num_local_layers))
-
         return sum(
             self.get_layer_bytes_per_token(local_layer_idx=local_layer_idx,
                                            data_role=data_role)
@@ -3571,24 +3468,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 DataType.NVFP4,
         ):
             raise ValueError(f"Cannot support {self.dtype} KV cache.")
-
-        # Path A v17 KT_CACHE (Pattern 2): per "KT-token slot" size =
-        # num_kv_heads * head_dim * 2 * kt_dtype_bytes. The factor of 2 is
-        # because each KT slot stores concat(min(K), max(K)) over a page of
-        # ``page_size`` real K tokens; see V1 RocketKVCacheManager.__init__
-        # for the parallel sizing.
-        if data_role == Role.KT_CACHE:
-            assert self._kt_cache_enabled, (
-                "Role.KT_CACHE requested but sparse_attention_config does "
-                "not indicate rocketkv. Plumb sparse_attention_config to "
-                "KVCacheManagerV2 to enable.")
-            num_kv_heads = self.num_kv_heads_per_layer[local_layer_idx]
-            head_dim = self.head_dim_per_layer[local_layer_idx]
-            kt_elements_per_slot = num_kv_heads * head_dim * 2
-            # KT dtype is independent of main KV dtype (sparse_attn_config
-            # controls). Use torch dtype's itemsize for bytes.
-            kt_dtype_bytes = self._kt_torch_dtype.itemsize
-            return kt_elements_per_slot * kt_dtype_bytes
 
         if data_role == Role.ALL:
             kv_factor = self.kv_factor
