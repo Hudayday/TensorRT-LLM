@@ -317,49 +317,29 @@ class RocketKVTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             num_generations = self.num_generations
             num_requests = num_contexts + num_generations
 
-            # V1 line 198: rewind num_cached_tokens_per_seq. This block
-            # assumes the cache has been physically rewound to
-            # prompt_budget+1 tokens (V1's update_resources path). Under
-            # V2 we may not have done that physical evict yet — skip the
-            # adjustment when ROCKETKV_DISABLE_CACHED_TOKENS_ADJ=1.
-            import os as _osm0
-            skip_adj = _osm0.environ.get(
-                "ROCKETKV_DISABLE_CACHED_TOKENS_ADJ") == "1"
-            if not skip_adj:
-                for i in range(num_requests):
-                    if i < num_contexts:
-                        self.kv_cache_params.num_cached_tokens_per_seq[i] = 0
-                    else:
-                        if self.prompt_lens[i] > self.prompt_budget:
-                            self.kv_cache_params.num_cached_tokens_per_seq[
-                                i] += (self.prompt_budget -
-                                       self.prompt_lens[i])
+            # V1 line 198: rewind num_cached_tokens_per_seq to match the
+            # Stage I-b physical evict (cache shrunk to prompt_budget+1).
+            for i in range(num_requests):
+                if i < num_contexts:
+                    self.kv_cache_params.num_cached_tokens_per_seq[i] = 0
+                elif self.prompt_lens[i] > self.prompt_budget:
+                    self.kv_cache_params.num_cached_tokens_per_seq[i] += (
+                        self.prompt_budget - self.prompt_lens[i])
 
         super().prepare()
 
         if self.kv_cache_manager is not None:
-            # V1 line 209: clamp prompt_lens for gen requests.
-            #
-            # 2026-05-28 ISOLATION: skip the clamp when
-            # ROCKETKV_DISABLE_PROMPT_LENS_CLAMP=1. V1 clamp is paired
-            # with V1's update_resources cache rewind to prompt_budget+1;
-            # under V2 we can't easily do the same physical evict, so
-            # toggling this lets us test acc parity without the clamp.
-            import os as _osm
-            skip_clamp = _osm.environ.get(
-                "ROCKETKV_DISABLE_PROMPT_LENS_CLAMP") == "1"
-            if not skip_clamp:
-                _prompt_lens = self.prompt_lens.copy()
-                for i in range(num_requests):
-                    if i >= num_contexts:
-                        _prompt_lens[i] = min(_prompt_lens[i],
-                                              self.prompt_budget)
-                _prompt_lens = torch.tensor(_prompt_lens,
-                                            dtype=torch.int,
-                                            device='cpu')
-                self.prompt_lens_cpu[:self.num_seqs].copy_(_prompt_lens)
-                self.prompt_lens_cuda[:self.num_seqs].copy_(
-                    self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+            # V1 line 209: clamp gen-request prompt_lens to prompt_budget
+            # (paired with the Stage I-b cache rewind to prompt_budget+1).
+            _prompt_lens = self.prompt_lens.copy()
+            for i in range(num_requests):
+                if i >= num_contexts:
+                    _prompt_lens[i] = min(_prompt_lens[i], self.prompt_budget)
+            _prompt_lens = torch.tensor(_prompt_lens, dtype=torch.int,
+                                        device='cpu')
+            self.prompt_lens_cpu[:self.num_seqs].copy_(_prompt_lens)
+            self.prompt_lens_cuda[:self.num_seqs].copy_(
+                self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
             self.prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.
                                                                   num_seqs]
             self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
@@ -533,141 +513,13 @@ RocketKVTrtllmAttention.Metadata = RocketKVTrtllmAttentionMetadata
 RocketKVVanillaAttention.Metadata = RocketKVVanillaAttentionMetadata
 
 
-# =========================================================================
-# L1 cache manager — V2 subclass with rewind_kv_cache (V1 line 1022 parity) #
-#                                                                          #
-# V2's _KVCache.resize enforces ``history_length`` monotone-grow, blocking #
-# RocketKV's Stage I-b physical evict.  Subclassing V2 (Pattern 3) lets    #
-# us:                                                                      #
-#   1. Mutate V2's private ``_history_length`` to allow shrink             #
-#   2. Override ``update_resources`` so the standard gen-branch resize     #
-#      doesn't try ``capacity >= max_beam_num_tokens-1`` (max_beam_num is  #
-#      C++-read-only, doesn't shrink with our cache trim).                 #
-#                                                                          #
-# This was the user's original fallback ("能不subclass最好但...") when    #
-# Pattern 2 (declarative BufferConfig) hit V2's invariants.                #
-# =========================================================================
-
-
-from tensorrt_llm._torch.pyexecutor.resource_manager import (  # noqa: E501
-    BlockManager, KVCacheManagerV2 as _KVCacheManagerV2Base)
-
-
-class RocketKVCacheManagerV2(_KVCacheManagerV2Base):
-    """V17 RocketKV cache manager: V2 subclass that adds physical
-    Stage I-b rewind support.
-
-    V1 parity: see V1 ``RocketKVCacheManager.rewind_kv_cache`` →
-    ``self.impl.rewind_kv_cache(req_id, rewind_len)`` (C++ binding).
-    We replicate the semantics in pure Python because V2's _kv_cache.py
-    asserts ``history_length`` monotone — but we own the subclass so
-    we can mutate the private state.
-    """
-
-    def rewind_kv_cache(self, request: "LlmRequest", rewind_len: int) -> None:
-        """V1 line 1022 byte-exact API: shrink request's cache by
-        ``rewind_len`` tokens from the tail.
-
-        After this call:
-        - kv_cache.capacity → aligned-up to remaining tokens
-        - kv_cache._history_length → reduced by rewind_len
-        - request.py_kt_target_history → set, signal for update_resources
-          override to keep history pinned to the truncated value across
-          subsequent gen iters (max_beam_num_tokens grows, but cache
-          history follows our target + gen-since-rewind).
-        """
-        import os as _os
-        _dbg = _os.environ.get("ROCKETKV_DEBUG_HOOKS") == "1"
-        if _dbg:
-            print(f"[V2sub.rewind_kv_cache] req={request.py_request_id} "
-                  f"rewind_len={rewind_len}", flush=True)
-        if rewind_len <= 0:
-            return
-        kv_cache = self.kv_cache_map.get(request.py_request_id)
-        if kv_cache is None or not kv_cache.is_active:
-            if _dbg:
-                print(f"[V2sub.rewind_kv_cache] SKIP no kv_cache", flush=True)
-            return
-        new_history = max(0, kv_cache._history_length - rewind_len)
-        if _dbg:
-            print(f"[V2sub.rewind_kv_cache] FIRE old_hist="
-                  f"{kv_cache._history_length} new_hist={new_history} "
-                  f"old_cap={kv_cache.capacity}", flush=True)
-        tokens_per_block = self.tokens_per_block
-        new_capacity = ((new_history + tokens_per_block - 1) //
-                        tokens_per_block) * tokens_per_block
-        # Mutate the monotone-history guard variable first; V2 resize
-        # then sees history_length == self._history_length and the
-        # "decrease" check passes.
-        kv_cache._history_length = new_history
-        kv_cache.resize(new_capacity, new_history)
-        # Sticky flag: future update_resources iters use this to
-        # compute effective history (target + new gen tokens since
-        # rewind) instead of max_beam_num_tokens-1 (pre-rewind).
-        request.py_kt_target_history = new_history
-        # Snapshot max_beam_num_tokens at rewind moment — used to
-        # compute "tokens generated since rewind".
-        request.py_kt_max_beam_at_rewind = request.max_beam_num_tokens
-
-    def update_resources(
-        self,
-        scheduled_batch: "ScheduledRequests",
-        attn_metadata=None,
-        kv_cache_dtype_byte_size=None,
-    ) -> None:
-        """Override V2's gen-branch resize for rocketkv-truncated requests.
-
-        Standard V2 path: ``resize(capacity - py_rewind_len,
-        max_beam_num_tokens - 1)``.  Fails for rocketkv-truncated requests
-        because max_beam_num_tokens still reflects pre-rewind seq_len,
-        which is > our shrunken capacity.
-
-        Override: for requests where ``py_kt_target_history`` is set,
-        compute history as ``target + (current_max_beam_num - snapshot)``
-        and capacity to fit that.  All other requests fall through to
-        standard V2 logic via super().
-        """
-        # Borrow LlmRequestState lazily — same import the base class does
-        # at runtime.
-        from tensorrt_llm._torch.pyexecutor.llm_request import (  # noqa
-            LlmRequestState)
-        import os as _os
-        _dbg = _os.environ.get("ROCKETKV_DEBUG_HOOKS") == "1"
-        # Handle truncated gen requests ourselves; defer the rest to base.
-        handled = set()
-        for req in scheduled_batch.generation_requests:
-            if not hasattr(req, "py_kt_target_history"):
-                continue
-            if _dbg:
-                print(f"[V2sub.update_resources] req={req.py_request_id} "
-                      f"target_hist={req.py_kt_target_history} "
-                      f"max_beam={req.max_beam_num_tokens} "
-                      f"snap={getattr(req, 'py_kt_max_beam_at_rewind', None)}",
-                      flush=True)
-            kv_cache = self.kv_cache_map.get(req.py_request_id)
-            if kv_cache is None or not kv_cache.is_active:
-                continue
-            gen_since_rewind = (req.max_beam_num_tokens -
-                                req.py_kt_max_beam_at_rewind)
-            effective_history = req.py_kt_target_history + gen_since_rewind
-            tpb = self.tokens_per_block
-            new_capacity = ((effective_history + tpb - 1) // tpb) * tpb
-            # Bypass monotone-history guard.
-            kv_cache._history_length = effective_history
-            kv_cache.resize(new_capacity, effective_history)
-            handled.add(req.py_request_id)
-        # Drop handled gen requests from the batch for super's call to
-        # avoid double-processing. We mutate scheduled_batch's list
-        # in-place (it's owned by py_executor and only read in this call).
-        original_gen = list(scheduled_batch.generation_requests)
-        try:
-            scheduled_batch.generation_requests = [
-                r for r in original_gen if r.py_request_id not in handled
-            ]
-            super().update_resources(scheduled_batch, attn_metadata,
-                                     kv_cache_dtype_byte_size)
-        finally:
-            scheduled_batch.generation_requests = original_gen
+# RocketKV V17 uses V2's KVCacheManagerV2 DIRECTLY (no subclass). Stage I-b
+# physical evict goes through V2's PUBLIC ``rewind_kv_cache`` (=
+# ``self.impl.rewind_kv_cache``, the same C++ binding V1 used). The KT cache
+# pool is executor-owned (Path B, demand-sized); V2 core is untouched.
+# (The old V2 subclass poked V2's private _history_length — removed: it
+# was unnecessary and a multi-req IMA suspect.)
+from tensorrt_llm._torch.pyexecutor.resource_manager import BlockManager
 
 
 # =========================================================================
@@ -1124,9 +976,6 @@ class RocketKV(SparseAttentionExecutor):
             self.window_size, self.prompt_budget,
             self._num_kv_heads_from_kv_cache_manager())
 
-        # ISOLATION: return None to skip sparse mask + KT side effect.
-        if os.environ.get("ROCKETKV_HOOK2_RETURN_NONE") == "1":
-            return None
         # V1 line 458: Stage I-a side-effect — update KT cache pool
         kt_cache_tensor = self.get_kt_buffers(layer_idx)
         if kt_cache_tensor is not None:
@@ -1201,12 +1050,9 @@ class RocketKV(SparseAttentionExecutor):
             self.rewind_kv_cache(request, rewind_len)
         Fires once per request at prefill→decode state transition.
 
-        Pattern 3 (V2 subclass): ``kv_cache_manager`` is
-        :class:`RocketKVCacheManagerV2` which adds back the V1-style
-        rewind_kv_cache by mutating V2's private _history_length +
-        overriding update_resources so subsequent gen iters honor the
-        truncated history (instead of max_beam_num_tokens-1 which is
-        C++-read-only and doesn't shrink).
+        Uses V2's PUBLIC ``rewind_kv_cache`` (= ``self.impl.rewind_kv_cache``,
+        the same C++ binding V1 used) to shrink the cache to
+        prompt_budget+1. No V2 subclass / private-state poke.
         """
         # V1 filter: skip terminated mid-prefill
         try:
@@ -1508,10 +1354,6 @@ class RocketKV(SparseAttentionExecutor):
         if debug:
             print(f"[HOOK4 FIRE] layer={layer_idx} "
                   f"num_generations={metadata.num_generations}", flush=True)
-
-        # ISOLATION: return None to skip Stage II HSA + KT_gen update.
-        if os.environ.get("ROCKETKV_HOOK4_RETURN_NONE") == "1":
-            return None
 
         q, k = self._preprocess_for_gen(q, k, metadata)
 

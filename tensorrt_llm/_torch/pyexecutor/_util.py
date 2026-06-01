@@ -97,16 +97,9 @@ def get_kv_cache_manager_cls(
         # ``SparseAttentionExecutor`` constructed via
         # ``create_sparse_attention_manager`` after PyExecutor instantiation.
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-    # Behavior-layer methods that need a V2 subclass (Pattern 3): RocketKV
-    # V17 specifically requires ``rewind_kv_cache`` for Stage I-b physical
-    # evict, which V2's Python ``_KVCache`` monotone-history invariant
-    # blocks. The executor's ``kv_cache_manager_class`` ClassVar names the
-    # subclass; we dispatch by algorithm here to avoid a cross-import.
-    if (sparse_attn_config is not None
-            and sparse_attn_config.is_behavior_layer_method
-            and getattr(sparse_attn_config, "algorithm", None) == "rocketkv"):
-        from ..attention_backend.sparse.rocketkv import RocketKVCacheManagerV2
-        return RocketKVCacheManagerV2
+    # RocketKV V17 uses V2's KVCacheManagerV2 directly (no subclass): Stage
+    # I-b evict goes through V2's public rewind_kv_cache. Falls through to
+    # the standard non-hybrid manager (KVCacheManagerV2 when v2 is enabled).
     if is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid manager.
