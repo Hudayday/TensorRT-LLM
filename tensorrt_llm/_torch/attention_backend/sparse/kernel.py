@@ -821,7 +821,7 @@ def rocket_update_kt_cache_gen_kernel(
                         batch_idx * max_kt_blocks_per_seq + block_offset_in_seq)
     token_idx_in_block = last_kt_token_idx % tokens_per_block
 
-    cache_base = ((block_idx * tokens_per_block + token_idx_in_block) *
+    cache_base = ((block_idx.to(tl.int64) * tokens_per_block + token_idx_in_block) *
                   num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
 
     cache_min_indices = cache_base + dim_indices
@@ -979,7 +979,7 @@ def rocket_update_kt_cache_ctx_kernel(
         tokens_in_block = kt_offsets % tokens_per_block
 
         # Calculate cache base addresses [BLOCK_SIZE_KT]
-        cache_bases = ((block_indices * tokens_per_block + tokens_in_block) *
+        cache_bases = ((block_indices.to(tl.int64) * tokens_per_block + tokens_in_block) *
                        num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
 
         cache_min_addrs = cache_bases[None, :] + dim_indices[:, None]
@@ -1131,7 +1131,7 @@ def rocket_paged_kt_cache_bmm_kernel(
         token_indices_in_block = kt_token_indices % tokens_per_block
 
         cache_bases = (
-            (block_indices * tokens_per_block + token_indices_in_block) *
+            (block_indices.to(tl.int64) * tokens_per_block + token_indices_in_block) *
             num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
 
         combined_mask = dim_mask[
