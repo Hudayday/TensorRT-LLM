@@ -1678,34 +1678,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if (self.sparse_attention_config is not None and not isinstance(
                 self.sparse_attention_config, SkipSoftmaxAttentionConfig)):
             kv_idx, kv_off, at_idx, at_off = None, None, None, None
-            if self.sparse_attention_config.is_behavior_layer_method:
-                # Behavior-layer methods (TriAttention, V2-migrated RocketKV,
-                # future H2O / SnapKV) drive their algorithm via the
-                # KVCacheBehaviorCoordinator (Path A — see
-                # attention_backend/sparse/coordinator.py docstring).
-                # HOOK 2 (``on_context_attention``) + HOOK 4
-                # (``on_generation_attention``) fire here via
-                # ``metadata.coordinator.on_*_attention(...)``. Coordinator
-                # dispatches to the registered executor. The executor's
-                # callback body either:
-                #   - Returns ``(indices, offsets)`` sparse mask tuple →
-                #     consumed by kernel as input-side sparse mask (Quest /
-                #     RocketKV Stage II HSA / DSA),
-                #   - Returns ``None`` → kernel runs dense attention over
-                #     (possibly compacted) cache (TriAttention, H2O,
-                #     skip_softmax),
-                #   - Or writes side-effect state to aux pool (RocketKV
-                #     Stage I-a KT_CACHE build) and returns ``None``.
-                if metadata.coordinator is not None:
-                    layer_idx = self.get_local_layer_idx(metadata)
-                    ctx_result = metadata.coordinator.on_context_attention(
-                        layer_idx, q, k, None, metadata)
-                    if ctx_result is not None:
-                        kv_idx, kv_off = ctx_result
-                    gen_result = metadata.coordinator.on_generation_attention(
-                        layer_idx, q, k, None, metadata)
-                    if gen_result is not None:
-                        at_idx, at_off = gen_result
+            if metadata.coordinator is not None:
+                # Methods driving their algorithm via the KVCacheBehaviorCoordinator
+                # (rocketkv, triattention, future H2O / SnapKV): HOOK 2/4 fire here;
+                # the coordinator dispatches to the registered executor (returns a
+                # sparse-mask tuple, None for dense-over-compacted, or writes aux state).
+                layer_idx = self.get_local_layer_idx(metadata)
+                ctx_result = metadata.coordinator.on_context_attention(
+                    layer_idx, q, k, None, metadata)
+                if ctx_result is not None:
+                    kv_idx, kv_off = ctx_result
+                gen_result = metadata.coordinator.on_generation_attention(
+                    layer_idx, q, k, None, metadata)
+                if gen_result is not None:
+                    at_idx, at_off = gen_result
             else:
                 kv_idx, kv_off = self.sparse_kv_predict(q, k, metadata,
                                                         forward_args)

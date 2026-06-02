@@ -8,7 +8,8 @@ from .rocket import (RocketKVCacheManager, RocketTrtllmAttention,
                      RocketVanillaAttention)
 from .kv_cache_compression_executor import (BaseKVCacheCompressionExecutor,
                                             SparseAttentionExecutor)
-from .rocketkv import (RocketKV, RocketKVTrtllmAttention,
+from .rocketkv import (RocketKV, RocketKVCacheManagerV2,
+                       RocketKVTrtllmAttention,
                        RocketKVVanillaAttention)
 from .triattention import TriAttention
 
@@ -37,6 +38,8 @@ def get_sparse_attn_kv_cache_manager(
         return None
     if sparse_attn_config.algorithm == "rocket":
         return RocketKVCacheManager
+    elif sparse_attn_config.algorithm == "rocketkv":
+        return RocketKVCacheManagerV2
     elif sparse_attn_config.algorithm == "dsa":
         return DSACacheManager
     elif sparse_attn_config.algorithm == "skip_softmax":
@@ -68,10 +71,10 @@ def create_sparse_attention_manager(
     depends on; passing it raises ``TypeError`` here so the misconfiguration
     is caught at LLM init rather than at the first eviction.
     """
-    if not sparse_attn_config.is_behavior_layer_method:
-        # Legacy memory-layer methods are not handled by this factory; the
-        # caller's ``is_behavior_layer_method`` guard normally prevents reaching
-        # here. Returning ``None`` keeps the contract symmetric and defensive.
+    if sparse_attn_config.algorithm not in ("triattention", "rocketkv"):
+        # Only methods with a SparseAttentionExecutor use the hook framework.
+        # Legacy memory-layer methods (rocket V1 / dsa / skip_softmax) have no
+        # executor -> return None (caller skips coordinator creation).
         return None
 
     # Local import to avoid circular dependency at module load time.

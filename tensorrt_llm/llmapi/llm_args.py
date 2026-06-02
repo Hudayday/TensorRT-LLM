@@ -581,7 +581,13 @@ class RocketKVSparseAttentionConfig(BaseSparseAttentionConfig):
 
     @property
     def is_behavior_layer_method(self) -> bool:
-        return True
+        # MEMORY-LAYER method: rocketkv owns a cache-manager subclass
+        # (RocketKVCacheManagerV2, registers the KT pool) + a per-method
+        # attention shim (RocketKVTrtllmAttention). It also uses the
+        # executor/coordinator hook framework, but that is gated on
+        # coordinator presence, NOT on this flag -> False (no dispatch
+        # special-casing).
+        return False
 
 
 

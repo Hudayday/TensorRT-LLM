@@ -35,8 +35,9 @@ def get_attention_backend(
     # instead of the V1-ported algorithm body. So keep sparse_attn_config
     # in scope for rocketkv to route through the sparse dispatch.
     if (sparse_attn_config is not None
-            and sparse_attn_config.is_behavior_layer_method
-            and getattr(sparse_attn_config, "algorithm", None) != "rocketkv"):
+            and sparse_attn_config.is_behavior_layer_method):
+        # Behavior-layer methods use the base attention class (no per-method
+        # shim). Memory-layer methods (incl. rocketkv) keep their shim.
         sparse_attn_config = None
 
     if backend_name == "VANILLA":

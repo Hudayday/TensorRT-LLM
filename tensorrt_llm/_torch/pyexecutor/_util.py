@@ -97,12 +97,6 @@ def get_kv_cache_manager_cls(
         # ``SparseAttentionExecutor`` constructed via
         # ``create_sparse_attention_manager`` after PyExecutor instantiation.
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-    if (sparse_attn_config is not None
-            and getattr(sparse_attn_config, "algorithm", None) == "rocketkv"):
-        # RocketKV V17: KT pool registered via a thin V2 subclass (Path A),
-        # mirroring V1's RocketKVCacheManager. V2 core is untouched.
-        from ..attention_backend.sparse.rocketkv import RocketKVCacheManagerV2
-        return RocketKVCacheManagerV2
     if is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid manager.
@@ -1674,8 +1668,10 @@ def create_py_executor_instance(
     # are absent from the replay. Registering Coordinator here ensures
     # warmup sees it (model_engine._set_up_attn_metadata resolves
     # coordinator from resource_manager at metadata construction).
-    if (llm_args.sparse_attention_config is not None
-            and llm_args.sparse_attention_config.is_behavior_layer_method):
+    if llm_args.sparse_attention_config is not None:
+        # Create the coordinator iff this method provides a compression
+        # executor (rocketkv / triattention); create_sparse_attention_manager
+        # returns None otherwise. Independent of memory/behavior layer.
         from ..attention_backend.sparse import (
             KVCacheBehaviorCoordinator,
             create_sparse_attention_manager,
