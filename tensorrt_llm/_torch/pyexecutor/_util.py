@@ -97,9 +97,12 @@ def get_kv_cache_manager_cls(
         # ``SparseAttentionExecutor`` constructed via
         # ``create_sparse_attention_manager`` after PyExecutor instantiation.
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-    # RocketKV V17 uses V2's KVCacheManagerV2 directly (no subclass): Stage
-    # I-b evict goes through V2's public rewind_kv_cache. Falls through to
-    # the standard non-hybrid manager (KVCacheManagerV2 when v2 is enabled).
+    if (sparse_attn_config is not None
+            and getattr(sparse_attn_config, "algorithm", None) == "rocketkv"):
+        # RocketKV V17: KT pool registered via a thin V2 subclass (Path A),
+        # mirroring V1's RocketKVCacheManager. V2 core is untouched.
+        from ..attention_backend.sparse.rocketkv import RocketKVCacheManagerV2
+        return RocketKVCacheManagerV2
     if is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid manager.

@@ -2035,9 +2035,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         if (!mIsMLAEnabled) // Only for non-MLA attention
         {
-            TLLM_LOG_INFO("RocketKV postproc fire-check: layer=%d sparse_kv_indices=%p sparse_kv_offsets=%p is_last_chunk=%d input_seq_len=%d max_past_kv=%d",
-                mLayerIdx, (void const*) preprocessingParams.sparse_kv_indices, (void const*) preprocessingParams.sparse_kv_offsets,
-                (int) preprocessingParams.is_last_chunk, params.input_seq_length, preprocessingParams.max_kv_seq_len);
             invokeKvCachePostprocessing(preprocessingParams, stream);
             sync_check_cuda_error(stream);
         }

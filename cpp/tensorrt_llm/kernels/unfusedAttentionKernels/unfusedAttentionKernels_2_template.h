@@ -1854,37 +1854,6 @@ void invokeUpdateSparseKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
         return;
     }
 
-    TLLM_LOG_INFO("RocketKV compaction kernel fire: batch=%d kv_heads=%d size_per_head=%d",
-        params.batch_size, params.kv_head_num, params.size_per_head);
-
-    // Buffer-side probe: log pool addrs + offset-table addrs the kernel will write through.
-    // NOTE: getKBlockPtr/getVBlockPtr dereference params.kv_cache_buffer.data (device memory)
-    // and are NOT host-callable. Instead we log host-callable fields + offset row pointers
-    // (pure arithmetic on `data`, no device-side deref). RocketKV uses paged KV cache, so
-    // only KVBlockArray is the real target; KVLinearBuffer instantiation logs a stub.
-    if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
-    {
-        auto const& kvb = params.kv_cache_buffer;
-        void const* kRow = static_cast<void const*>(kvb.getRowPtr(KVIdxType::K_IDX, 0));
-        void const* vRow = static_cast<void const*>(kvb.getRowPtr(KVIdxType::V_IDX, 0));
-        TLLM_LOG_INFO(
-            "RocketKV buffer-probe (paged): primary=%p secondary=%p tpb=%d max_blocks_per_seq=%d "
-            "offset_table=%p kRow(b=0)=%p vRow(b=0)=%p sparse_kv_indices=%p",
-            kvb.mPrimaryPoolPtr, kvb.mSecondaryPoolPtr, kvb.mTokensPerBlock, kvb.mMaxBlocksPerSeq,
-            static_cast<void const*>(kvb.data), kRow, vRow,
-            static_cast<void const*>(params.sparse_kv_indices));
-    }
-    else
-    {
-        // KVLinearBuffer (contiguous) — log what fields exist for completeness.
-        auto const& kvb = params.kv_cache_buffer;
-        TLLM_LOG_INFO(
-            "RocketKV buffer-probe (linear): data=%p mBytesPerSeq=%d mMaxAttentionWindow=%d "
-            "sparse_kv_indices=%p",
-            static_cast<void const*>(kvb.data), kvb.mBytesPerSeq, kvb.mMaxAttentionWindow,
-            static_cast<void const*>(params.sparse_kv_indices));
-    }
-
     switch (params.size_per_head)
     {
     case 16: kernelSparseDispatchHeadSize<16, T, TCache, KVCacheBuffer>(params, stream); break;

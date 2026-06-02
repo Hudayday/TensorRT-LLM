@@ -2329,18 +2329,11 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
         execution_stream: Optional[torch.cuda.Stream] = None,
         is_disagg: bool = False,
-        sparse_attn_config=None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
         self.is_disagg = is_disagg
-        # sparse_attn_config plumbed into V2 only to compute RocketKV KT
-        # sizing fields (kt_tokens_per_block + dtype) below; the KT pool
-        # itself is executor-owned (Path B), V2 does not allocate it.
-        # (Stage-B TODO #123: move this into the executor so V2 needs no
-        # sparse_attn_config.)
-        self.sparse_attention_config = sparse_attn_config
 
         assert kv_connector_manager is None, "kv_connector_manager is not supported for KVCacheManagerV2"
         assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
@@ -2375,29 +2368,6 @@ class KVCacheManagerV2(BaseResourceManager):
         from ..speculative import get_num_extra_kv_tokens
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
-
-        # RocketKV KT cache is EXECUTOR-OWNED (Path B); V2 does NOT own a
-        # KT pool. We only compute the KT sizing fields here so the
-        # RocketKV executor can read them uniformly (kt_tokens_per_block +
-        # dtype). V1 RocketKVCacheManager.__init__ uses the same formula.
-        _is_rocketkv = (sparse_attn_config is not None
-                        and getattr(sparse_attn_config,
-                                    "algorithm", None) == "rocketkv")
-        self._kt_bypass_v2 = _is_rocketkv
-        if _is_rocketkv:
-            import math as _math
-            from triton import next_power_of_2 as _next_pow2
-            rocketkv_page_size = sparse_attn_config.page_size
-            self._kt_tokens_per_block = _next_pow2(
-                _math.ceil(tokens_per_block / rocketkv_page_size))
-            kt_dtype_str = getattr(sparse_attn_config, "kt_cache_dtype",
-                                   "bfloat16")
-            self._kt_torch_dtype = (torch.bfloat16
-                                    if kt_dtype_str == "bfloat16" else
-                                    torch.float8_e5m2)
-        else:
-            self._kt_tokens_per_block = None
-            self._kt_torch_dtype = None
 
         # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
         self._kv_reserve_draft_tokens = self.max_total_draft_tokens
@@ -2741,14 +2711,6 @@ class KVCacheManagerV2(BaseResourceManager):
             buffer_type.append(Role.KEY_BLOCK_SCALE)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 buffer_type.append(Role.VALUE_BLOCK_SCALE)
-        def _build_buffer_config(layer_id: int, role: Role) -> "BufferConfig":
-            return BufferConfig(
-                role=role,
-                size=self.get_layer_bytes_per_token(
-                    local_layer_idx=layer_id, data_role=role) *
-                tokens_per_block,
-            )
-
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
             vocab_size=vocab_size,
@@ -2758,8 +2720,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 AttentionLayerConfig(
                     layer_id=layer_id,
                     buffers=[
-                        _build_buffer_config(layer_id, role)
-                        for role in buffer_type
+                        BufferConfig(
+                            role=role,
+                            size=self.get_layer_bytes_per_token(
+                                local_layer_idx=layer_id, data_role=role) *
+                            tokens_per_block,
+                        ) for role in buffer_type
                     ],
                     sliding_window_size=self.max_attention_window_vec[
                         self.pp_layers[layer_id] %
@@ -2824,37 +2790,6 @@ class KVCacheManagerV2(BaseResourceManager):
             dtype,
             shape,
         ))
-
-    def compact_request_cache(self, request: "LlmRequest",
-                              target_history_length: int) -> None:
-        """V17 RocketKV Stage I-b: trim cache to target_history_length.
-
-        After this, V2's update_resources for the request would try
-        ``kv_cache.resize(new_cap, max_beam_num_tokens-1)`` which raises
-        because ``max_beam_num_tokens-1`` > ``new_cap``. We set
-        ``request.py_kt_truncated=True`` so update_resources can skip the
-        offending resize for this request (one-shot — cleared after).
-        """
-        kv_cache = self.kv_cache_map.get(request.py_request_id)
-        if kv_cache is None or not kv_cache.is_active:
-            return
-        if target_history_length >= kv_cache._history_length:
-            return
-        tokens_per_block = self.tokens_per_block
-        new_capacity = ((target_history_length + tokens_per_block - 1) //
-                        tokens_per_block) * tokens_per_block
-        kv_cache._history_length = target_history_length
-        kv_cache.resize(new_capacity, target_history_length)
-        # Sentinel for V2 update_resources gen branch — skip the
-        # max_beam_num_tokens-aware resize for this request because
-        # max_beam_num_tokens is C++-read-only and stays at the
-        # pre-truncation value; running V2's standard resize would
-        # raise "History length cannot be greater than capacity".
-        try:
-            request.py_kt_truncated = True
-        except Exception:
-            pass
-
     def get_num_available_tokens(self,
                                  *,
                                  token_num_upper_bound: int,
@@ -3659,16 +3594,6 @@ class KVCacheManagerV2(BaseResourceManager):
             # needs to process it. Skip suspended caches — the request
             # will be resumed by the scheduler on the next iteration.
             if not kv_cache.is_active:
-                continue
-            # Path A v17 RocketKV Stage I-b: cache was physically rewound to
-            # ``prompt_budget+1`` tokens by ``compact_request_cache``, but
-            # ``req.max_beam_num_tokens`` (read-only C++ binding) still
-            # reflects the pre-rewind seq_len. Running V2's normal resize
-            # here would raise "History length cannot be greater than
-            # capacity". The compact set ``req.py_kt_truncated=True`` as a
-            # one-shot sentinel; honor it and skip this resize.
-            if getattr(req, "py_kt_truncated", False):
-                req.py_kt_truncated = False
                 continue
             new_capacity = None if req.state in (
                 LlmRequestState.GENERATION_COMPLETE,
