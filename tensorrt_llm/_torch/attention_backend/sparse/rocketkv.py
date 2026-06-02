@@ -310,50 +310,50 @@ class RocketKVTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         cu-seqlen / sparse-offset / valid-mask CUDA buffers used by the
         triton kernels in HOOK 2/4.
         """
-        if self.kv_cache_manager is not None:
-            num_contexts = self.num_contexts
-            num_generations = self.num_generations
-            num_requests = num_contexts + num_generations
 
-            # V1 line 198: rewind num_cached_tokens_per_seq to match the
-            # Stage I-b physical evict (cache shrunk to prompt_budget+1).
-            for i in range(num_requests):
-                if i < num_contexts:
-                    self.kv_cache_params.num_cached_tokens_per_seq[i] = 0
-                elif self.prompt_lens[i] > self.prompt_budget:
-                    self.kv_cache_params.num_cached_tokens_per_seq[i] += (
-                        self.prompt_budget - self.prompt_lens[i])
+        assert self.kv_cache_manager is not None, \
+            "RocketKV always runs with a KV cache manager"
+        num_contexts = self.num_contexts
+        num_generations = self.num_generations
+        num_requests = num_contexts + num_generations
+
+        # V1 line 198: rewind num_cached_tokens_per_seq to match the
+        # Stage I-b physical evict (cache shrunk to prompt_budget+1).
+        for i in range(num_requests):
+            if i < num_contexts:
+                self.kv_cache_params.num_cached_tokens_per_seq[i] = 0
+            elif self.prompt_lens[i] > self.prompt_budget:
+                self.kv_cache_params.num_cached_tokens_per_seq[i] += (
+                    self.prompt_budget - self.prompt_lens[i])
 
         super().prepare()
+        # V1 line 209: clamp gen-request prompt_lens to prompt_budget
+        # (paired with the Stage I-b cache rewind to prompt_budget+1).
+        _prompt_lens = self.prompt_lens.copy()
+        for i in range(num_requests):
+            if i >= num_contexts:
+                _prompt_lens[i] = min(_prompt_lens[i], self.prompt_budget)
+        _prompt_lens = torch.tensor(_prompt_lens, dtype=torch.int,
+                                    device='cpu')
+        self.prompt_lens_cpu[:self.num_seqs].copy_(_prompt_lens)
+        self.prompt_lens_cuda[:self.num_seqs].copy_(
+            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+        self.prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.
+                                                              num_seqs]
+        self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
 
-        if self.kv_cache_manager is not None:
-            # V1 line 209: clamp gen-request prompt_lens to prompt_budget
-            # (paired with the Stage I-b cache rewind to prompt_budget+1).
-            _prompt_lens = self.prompt_lens.copy()
-            for i in range(num_requests):
-                if i >= num_contexts:
-                    _prompt_lens[i] = min(_prompt_lens[i], self.prompt_budget)
-            _prompt_lens = torch.tensor(_prompt_lens, dtype=torch.int,
-                                        device='cpu')
-            self.prompt_lens_cpu[:self.num_seqs].copy_(_prompt_lens)
-            self.prompt_lens_cuda[:self.num_seqs].copy_(
-                self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
-            self.prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.
-                                                                  num_seqs]
-            self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
-
-            # V1 line 224: copy KT block offsets from executor (was V1 cache mgr)
-            e = self._rocket_executor
-            if e is not None and self.host_kt_cache_block_offsets is not None:
-                _kt_counts = [
-                    math.ceil(int(self.kv_lens[i]) / self.page_size)
-                    for i in range(self.num_seqs)]
-                e.copy_kt_block_offsets(self.request_ids,
-                                        self.host_kt_cache_block_offsets,
-                                        _kt_counts)
-                self.kt_cache_block_offsets[:self.num_seqs].copy_(
-                    self.host_kt_cache_block_offsets[:self.num_seqs],
-                    non_blocking=True)
+        # V1 line 224: copy KT block offsets from executor (was V1 cache mgr)
+        e = self._rocket_executor
+        if e is not None and self.host_kt_cache_block_offsets is not None:
+            _kt_counts = [
+                math.ceil(int(self.kv_lens[i]) / self.page_size)
+                for i in range(self.num_seqs)]
+            e.copy_kt_block_offsets(self.request_ids,
+                                    self.host_kt_cache_block_offsets,
+                                    _kt_counts)
+            self.kt_cache_block_offsets[:self.num_seqs].copy_(
+                self.host_kt_cache_block_offsets[:self.num_seqs],
+                non_blocking=True)
 
         # ---- Context phase setup (V1 line 231)
         self.context_cumsum[1:self.num_contexts + 1] = torch.cumsum(
@@ -492,19 +492,19 @@ class RocketKVVanillaAttentionMetadata(VanillaAttentionMetadata):
                     self.kv_cache_params.num_cached_tokens_per_seq[
                         i] += self.prompt_budget - self.prompt_lens[i]
 
-        if self.kv_cache_manager is not None:
-            e = self._rocket_executor
-            if e is not None and self.host_kt_cache_block_offsets is not None:
-                _kt_counts = [
-                    math.ceil(int(self.kv_lens[i]) / self.page_size)
-                    for i in range(self.num_seqs)]
-                e.copy_kt_block_offsets(self.request_ids,
-                                        self.host_kt_cache_block_offsets,
-                                        _kt_counts)
-                self.kt_cache_block_offsets[:self.num_seqs].copy_(
-                    self.host_kt_cache_block_offsets[:self.num_seqs],
-                    non_blocking=True)
-
+        assert self.kv_cache_manager is not None, \
+            "RocketKV always runs with a KV cache manager"
+        e = self._rocket_executor
+        if e is not None and self.host_kt_cache_block_offsets is not None:
+            _kt_counts = [
+                math.ceil(int(self.kv_lens[i]) / self.page_size)
+                for i in range(self.num_seqs)]
+            e.copy_kt_block_offsets(self.request_ids,
+                                    self.host_kt_cache_block_offsets,
+                                    _kt_counts)
+            self.kt_cache_block_offsets[:self.num_seqs].copy_(
+                self.host_kt_cache_block_offsets[:self.num_seqs],
+                non_blocking=True)
 
 # Wire Metadata class refs (set after Metadata classes are defined).
 RocketKVTrtllmAttention.Metadata = RocketKVTrtllmAttentionMetadata
@@ -752,9 +752,8 @@ class RocketKV(SparseAttentionExecutor):
 
             # V1 line 419: indexer topk prefill
             total_tasks = metadata.valid_batch_size * num_kv_heads
-            # DEBUG (2026-05-29): V1 uses torch.empty (uninitialized) and
-            # works; V17 uses same, but L0 produces duplicate output
-            # [0,0,1,1,...]. Force zeros to rule out garbage residual.
+            # Zero-init (V1 used torch.empty; empty left duplicate-output
+            # garbage under V17, so force zeros).
             selected_prefix_indices = torch.zeros(
                 (total_tasks, self.prompt_budget - self.window_size),
                 device=qkv_input.device,
@@ -815,24 +814,6 @@ class RocketKV(SparseAttentionExecutor):
         if metadata.valid_batch_size == 0:
             return None
 
-        # V17 Python compaction prep: stash per-(request, layer)
-        # sparse_kv_indices + sparse_kv_offsets so HOOK 3 can read them
-        # back to physically compact V2's KV cache (replaces V1's
-        # reliance on the C++ ``invokeUpdateSparseKvCacheAfterFmha``
-        # kernel that empirically does not fire under V2).
-        try:
-            store = getattr(self, "_layer_sparse_kv_store", None)
-            if store is None:
-                store = {}
-                self._layer_sparse_kv_store = store
-            store[layer_idx] = {
-                "indices": sparse_kv_indices.detach().clone(),
-                "offsets": sparse_kv_offsets.detach().clone(),
-                "request_ids": list(metadata.request_ids),
-            }
-        except Exception:
-            pass
-
         return sparse_kv_indices, sparse_kv_offsets
 
     # ===================================================================== #
@@ -867,24 +848,6 @@ class RocketKV(SparseAttentionExecutor):
         if rewind_len <= 0:
             return
 
-        # V17 Python compaction (replaces V1's reliance on C++
-        # ``invokeUpdateSparseKvCacheAfterFmha`` kernel that empirically
-        # does not fire / compact correctly under V2 — likely because
-        # ``is_last_chunk`` doesn't satisfy or V2 pool-pointer layout
-        # confuses the kernel).
-        #
-        # We do the compaction in pure Python via PyTorch tensor ops:
-        # for each layer, for each (kv_head, dst_idx) we copy
-        # K_pool[block(src_idx), slot(src_idx), kv_head, :] →
-        # K_pool[block(dst_idx), slot(dst_idx), kv_head, :] (V matching).
-        # ``src_idx = sparse_kv_indices[layer][kv_head, dst_idx]`` stashed
-        # by HOOK 2 above.
-        import os
-        if os.environ.get("ROCKETKV_DISABLE_PY_COMPACT") != "1":
-            try:
-                self._python_compact_request(request, metadata)
-            except Exception:
-                pass
 
         # Now shrink V2 cache to prompt_budget+1 tokens via V2's public
         # rewind_kv_cache (= self.impl.rewind_kv_cache; frees tail
@@ -897,175 +860,6 @@ class RocketKV(SparseAttentionExecutor):
         # KT rewind: not needed in Path A -- V2 frees the tail blocks
         # (incl. their KT sub-pages) when rewind_kv_cache shrinks the cache.
 
-    def _python_compact_request(self, request: "LlmRequest",
-                                metadata: "AttentionMetadata") -> None:
-        """Per-layer Python compaction of V2 KV cache.
-
-        Replaces C++ ``invokeUpdateSparseKvCacheAfterFmha`` (paged
-        kernel that doesn't seem to fire for V17 path). Logic mirrors
-        the C++ kernel but in PyTorch tensor ops:
-
-        For each layer L for which HOOK 2 stashed sparse_kv_indices:
-          1. Get K_pool, V_pool tensors via V2 ``get_buffers(L)`` —
-             shape ``(num_blocks, tokens_per_block, num_kv_heads,
-             head_dim)``.
-          2. Materialize this request's K/V along the request's
-             logical block list (via ``get_block_ids_per_seq``).
-          3. Read selected positions per kv_head from stashed
-             ``sparse_kv_indices[L]`` (shape ``(num_kv_heads,
-             total_sparse_kv_tokens)``).
-          4. Write selected K/V into front-aligned positions
-             ``[0, total_sparse_kv_tokens)`` of the same blocks.
-
-        Edge cases (mirrors C++ kernel):
-          - ``src_token_idx == dst_token_idx`` → skip
-          - ``src_token_idx < 0`` (BAD_PAGE_INDEX sentinel) → skip
-        """
-        import torch as _torch
-        store = getattr(self, "_layer_sparse_kv_store", None)
-        if not store:
-            return
-        mgr = self.kv_cache_manager
-        if mgr is None:
-            return
-        req_id = request.py_request_id
-
-        # Block ID list for this request: V2 returns padded
-        # ``(B, max_blocks)`` where B is request count.
-        try:
-            block_ids = mgr.get_block_ids_per_seq([req_id])
-        except Exception:
-            return
-        if block_ids is None or block_ids.numel() == 0:
-            return
-        block_ids_raw = block_ids[0].cpu().tolist()  # → list[int]
-        # V2 ``get_block_ids_per_seq`` pads with 0 (mapped from
-        # BAD_PAGE_INDEX) for short requests + max-blocks padding.
-        # Restrict to the FIRST ``num_real_blocks`` entries based on
-        # request.prompt_len. Past that, block_ids[i] = 0 = pool
-        # block 0 (reserved/dummy) which my compaction would CORRUPT
-        # by index_copy_ scattering over it many times.
-        tpb_global = mgr.tokens_per_block
-        prompt_len_req = request.prompt_len if hasattr(
-            request, "prompt_len") else (
-                request.get_num_tokens(0)
-                if hasattr(request, "get_num_tokens") else 0)
-        if prompt_len_req <= 0:
-            return
-        num_real_blocks = (prompt_len_req + tpb_global -
-                           1) // tpb_global
-        block_ids = block_ids_raw[:num_real_blocks]
-        if not block_ids:
-            return
-
-        # Iterate the layers HOOK 2 has data for; if data missing for
-        # some layer, skip (degraded but safe).
-        for layer_idx, snap in list(store.items()):
-            indices_full = snap["indices"]  # (num_kv_heads, total_sparse_kv_tokens) — CONCATENATED across batched ctx requests
-            offsets_full = snap.get("offsets")  # (num_contexts + 1,) on CUDA
-            req_ids_at_stash = snap.get("request_ids", [])
-            # Slice to THIS request's range — stored indices are
-            # batched across ctx requests. ``sparse_kv_offsets`` gives
-            # cumulative-sum boundaries: range [offsets[i]:offsets[i+1]]
-            # = request i's selected indices.
-            try:
-                pos = req_ids_at_stash.index(req_id)
-            except ValueError:
-                # request not in this batch's stash — happens if HOOK 2
-                # didn't fire for this request (e.g., short prompt
-                # falling out of valid_batch). Skip safely.
-                continue
-            if offsets_full is None:
-                indices = indices_full
-            else:
-                offs_cpu = offsets_full.cpu().tolist()
-                if pos + 1 >= len(offs_cpu):
-                    continue
-                start, end = int(offs_cpu[pos]), int(offs_cpu[pos + 1])
-                if end <= start:
-                    continue
-                indices = indices_full[:, start:end]
-            if indices is None or indices.numel() == 0:
-                continue
-
-            # V2 ``get_buffers(layer_idx)`` returns one tensor of shape
-            # ``(num_blocks, kv_factor=2, tokens_per_block, num_kv_heads,
-            # head_dim)`` — kv_factor dim splits K (idx 0) vs V (idx 1).
-            buf = mgr.get_buffers(layer_idx) if hasattr(
-                mgr, "get_buffers") else None
-            if buf is None or buf.ndim != 5 or buf.shape[1] < 2:
-                continue
-            tpb = mgr.tokens_per_block
-            num_blocks_pool, kv_factor, tpb_check, num_kv_heads, head_dim = (
-                buf.shape)
-            if tpb_check != tpb:
-                continue
-            n_selected = indices.shape[-1]
-            req_capacity = len(block_ids) * tpb
-
-
-            # Build per-token (block, slot) lookup tables for the
-            # request's logical token range [0, req_capacity).
-            block_idx_tensor = _torch.tensor(
-                block_ids, dtype=_torch.long, device=buf.device)
-            positions = _torch.arange(req_capacity,
-                                      device=buf.device,
-                                      dtype=_torch.long)
-            block_per_pos = block_idx_tensor[positions // tpb]
-            slot_per_pos = positions % tpb
-
-            # Per-head sparse_kv_indices.  Each row [h] is a list of
-            # source token positions (0-indexed in the request's
-            # logical prompt) for head h.  Clamp to [0, req_capacity)
-            # to avoid OOB into the pool.
-            idx_long = indices.to(_torch.long).to(buf.device)
-            if idx_long.shape[0] != num_kv_heads:
-                continue
-            idx_long = idx_long.clamp(min=0, max=req_capacity - 1)
-            n_write = min(n_selected, req_capacity)
-            if n_write <= 0:
-                continue
-            idx_long_w = idx_long[:, :n_write]  # (num_kv_heads, n_write)
-
-            # READ: gather K/V at SELECTED token positions for the
-            # request.  For each (h, i): src_pos = idx_long_w[h, i];
-            # K = buf[block_per_pos[src_pos], 0, slot_per_pos[src_pos],
-            #        h, :].
-            src_block = block_per_pos[idx_long_w]  # (kv, n_write)
-            src_slot = slot_per_pos[idx_long_w]
-            head_idx_grid = _torch.arange(
-                num_kv_heads, device=buf.device,
-                dtype=_torch.long).unsqueeze(1).expand(-1, n_write)
-            # buf indexing: dim0=block dim1=kv_factor dim2=slot
-            # dim3=kv_head dim4=head_dim
-            # K_sel[h, i, :] = buf[src_block[h,i], 0, src_slot[h,i],
-            #                       head_idx_grid[h,i], :]
-            k_sel = buf[src_block, 0, src_slot, head_idx_grid]  # (kv, n_write, hd)
-            v_sel = buf[src_block, 1, src_slot, head_idx_grid]
-
-            # WRITE: scatter K/V at the destination front-aligned
-            # positions [0, n_write) for the request.  Per head h:
-            #   buf[block_per_pos[i], 0, slot_per_pos[i], h, :] =
-            #     k_sel[h, i, :]
-            dst_block = block_per_pos[:n_write]  # (n_write,)
-            dst_slot = slot_per_pos[:n_write]
-            dst_block_grid = dst_block.unsqueeze(0).expand(
-                num_kv_heads, -1)  # (kv, n_write)
-            dst_slot_grid = dst_slot.unsqueeze(0).expand(num_kv_heads, -1)
-            buf[dst_block_grid, 0, dst_slot_grid, head_idx_grid] = k_sel
-            buf[dst_block_grid, 1, dst_slot_grid, head_idx_grid] = v_sel
-
-        # One-shot per request — clear store entries we used so a
-        # subsequent prefill on the same executor instance won't reuse
-        # stale per-layer indices.
-        store.clear()
-
-    # ===================================================================== #
-    # HOOK 4 — on_generation_attention (V1 sparse_attn_predict port,         #
-    # rocket.py:512)                                                          #
-    # ===================================================================== #
-
-    @torch.compile(dynamic=True, disable=True)  # disable during framework dev
     def _preprocess_for_gen(self, q, k, metadata):
         """V1 line 485 port."""
         num_heads = self._num_heads_from_kv_cache_manager()
