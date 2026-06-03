@@ -24,7 +24,7 @@ from tensorrt_llm.mapping import Mapping
 @pytest.mark.parametrize("backend", ["pytorch"])
 @pytest.mark.parametrize("model_name",
                          ["llama-3.1-model/Llama-3.1-8B-Instruct"])
-@pytest.mark.parametrize("attention_backend", ["VANILLA", "TRTLLM"])
+@pytest.mark.parametrize("attention_backend", ["TRTLLM"])
 @pytest.mark.parametrize("rocket_algo", ["rocket", "rocketkv"])
 def test_model(backend, model_name, attention_backend, rocket_algo):
     """E2E NIAH accuracy for both V1 (algorithm="rocket") and V17

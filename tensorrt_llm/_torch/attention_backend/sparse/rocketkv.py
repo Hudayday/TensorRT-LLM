@@ -113,6 +113,11 @@ class RocketKVVanillaAttention(VanillaAttention):
 
     Metadata: ClassVar[type] = None  # set below
 
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError(
+            "RocketKV does not support the VANILLA attention backend yet; "
+            "use attn_backend='TRTLLM'.")
+
 
 # =========================================================================
 # L0 metadata — direct port of V1 RocketTrtllmAttentionMetadata             #
@@ -478,33 +483,9 @@ class RocketKVVanillaAttentionMetadata(VanillaAttentionMetadata):
             self.host_kt_cache_block_offsets = None
 
     def prepare(self) -> None:
-        """Port of V1 ``RocketVanillaAttentionMetadata.prepare`` (line 601)."""
-        super().prepare()
-        num_contexts = self.num_contexts
-        num_generations = self.num_generations
-        num_requests = num_contexts + num_generations
-
-        for i in range(num_requests):
-            if i < num_contexts:
-                self.kv_cache_params.num_cached_tokens_per_seq[i] = 0
-            else:
-                if self.prompt_lens[i] > self.prompt_budget:
-                    self.kv_cache_params.num_cached_tokens_per_seq[
-                        i] += self.prompt_budget - self.prompt_lens[i]
-
-        assert self.kv_cache_manager is not None, \
-            "RocketKV always runs with a KV cache manager"
-        e = self._rocket_executor
-        if e is not None and self.host_kt_cache_block_offsets is not None:
-            _kt_counts = [
-                math.ceil(int(self.kv_lens[i]) / self.page_size)
-                for i in range(self.num_seqs)]
-            e.copy_kt_block_offsets(self.request_ids,
-                                    self.host_kt_cache_block_offsets,
-                                    _kt_counts)
-            self.kt_cache_block_offsets[:self.num_seqs].copy_(
-                self.host_kt_cache_block_offsets[:self.num_seqs],
-                non_blocking=True)
+        raise NotImplementedError(
+            "RocketKV does not support the VANILLA attention backend yet; "
+            "use attn_backend='TRTLLM'.")
 
 # Wire Metadata class refs (set after Metadata classes are defined).
 RocketKVTrtllmAttention.Metadata = RocketKVTrtllmAttentionMetadata
