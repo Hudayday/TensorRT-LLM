@@ -1759,7 +1759,7 @@ def create_py_executor_instance(
                             if scheduler_config is not None else
                             WaitingQueuePolicy.FCFS)
 
-    py_executor = PyExecutor(
+    return PyExecutor(
         resource_manager,
         scheduler,
         model_engine=model_engine,
@@ -1789,14 +1789,6 @@ def create_py_executor_instance(
         waiting_queue_policy=waiting_queue_policy,
         dwdp_manager=dwdp_manager,
     )
-
-    # Path A v17: KVCacheBehaviorCoordinator wire moved BEFORE PyExecutor
-    # instantiation (2026-05-28; see comment above resource_manager init).
-    # That earlier wire is required so that PyExecutor.warmup CUDA-graph
-    # capture sees ``metadata.coordinator`` set; capturing with coordinator
-    # = None would freeze the replay graph into pure dense attention.
-
-    return py_executor
 
 
 def create_torch_sampler_args(

@@ -2711,6 +2711,7 @@ class KVCacheManagerV2(BaseResourceManager):
             buffer_type.append(Role.KEY_BLOCK_SCALE)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 buffer_type.append(Role.VALUE_BLOCK_SCALE)
+
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
             vocab_size=vocab_size,
@@ -2790,6 +2791,7 @@ class KVCacheManagerV2(BaseResourceManager):
             dtype,
             shape,
         ))
+
     def get_num_available_tokens(self,
                                  *,
                                  token_num_upper_bound: int,
@@ -3388,6 +3390,7 @@ class KVCacheManagerV2(BaseResourceManager):
             data_roles.append(Role.KEY_BLOCK_SCALE)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 data_roles.append(Role.VALUE_BLOCK_SCALE)
+
         return sum(
             self.get_layer_bytes_per_token(local_layer_idx=local_layer_idx,
                                            data_role=data_role)
