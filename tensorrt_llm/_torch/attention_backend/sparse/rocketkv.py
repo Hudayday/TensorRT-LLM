@@ -322,12 +322,15 @@ class RocketKVTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         num_generations = self.num_generations
         num_requests = num_contexts + num_generations
 
-        # V1 line 198: rewind num_cached_tokens_per_seq to match the
-        # Stage I-b physical evict (cache shrunk to prompt_budget+1).
+        # V1 line 198: rewind gen-request num_cached to match the Stage I-b
+        # physical evict (cache shrunk to prompt_budget+1). Context requests
+        # keep their real num_cached: under chunked prefill a continuation
+        # chunk's K/V must land at the correct cache offset (num_cached>0); for
+        # non-chunked / first-chunk prefill it is already 0, so this is a no-op.
+        # No env toggle -- this runs in the executor worker process, which would
+        # not see a runtime-set environment variable.
         for i in range(num_requests):
-            if i < num_contexts:
-                self.kv_cache_params.num_cached_tokens_per_seq[i] = 0
-            elif self.prompt_lens[i] > self.prompt_budget:
+            if i >= num_contexts and self.prompt_lens[i] > self.prompt_budget:
                 self.kv_cache_params.num_cached_tokens_per_seq[i] += (
                     self.prompt_budget - self.prompt_lens[i])
 
@@ -574,6 +577,16 @@ class RocketKV(SparseAttentionExecutor):
         self.topk = topk
         self.topr = topr
 
+        # Chunked-prefill: per-request full prompt_len (HOOK1) + per-(rid,layer)
+        # chunk accumulation so HOOK2 can score the full prefix at the true
+        # last chunk. Activated automatically when chunking is in effect.
+        self._cp_prompt_len: dict = {}   # rid -> full prompt len
+        self._cp_k_accum: dict = {}      # (rid, layer) -> [qkv_chunk]
+        self._cp_seen: dict = {}         # (rid, layer) -> ctx tokens seen
+        self._cp_cc: list = []           # per-forward chunk-local ctx cumsum
+                                         # (captured at layer 0, reused 1..N-1;
+                                         # layer-0 override clobbers metadata)
+
         # Path A: KT pool is V2-MANAGED (Role.KT_CACHE BufferConfig). The
         # executor owns NO KT pool/BlockManager -- it reads the KT pool tensor
         # (get_kt_buffers) + KT block offsets (fill_kt_block_offsets) from the
@@ -631,9 +644,14 @@ class RocketKV(SparseAttentionExecutor):
     # ===================================================================== #
 
     def on_request_init(self, request: "LlmRequest") -> None:
-        """HOOK 1. Path A: KT is V2-managed (KT shares the K/V page
-        allocation), so V2 handles KT alloc/evict/free automatically and
-        there is no executor-side per-request initialization to do."""
+        """HOOK 1. Path A: KT is V2-managed, so there is no executor-side KT
+        init. Chunked-prefill: record the full prompt_len per request so HOOK 2
+        can detect the true last chunk (accumulated ctx tokens == prompt_len)
+        and run full-prefix scoring there."""
+        rid = request.py_request_id
+        pl = (request.prompt_len if hasattr(request, "prompt_len")
+              else request.get_num_tokens(0))
+        self._cp_prompt_len[rid] = int(pl)
         return
 
     # ===================================================================== #
@@ -670,6 +688,62 @@ class RocketKV(SparseAttentionExecutor):
         num_ctx_tokens = metadata.num_ctx_tokens
         if num_ctx_tokens == 0:
             return None
+
+        # Chunked-prefill: RocketKV metadata is chunk-local
+        # (each chunk looks like a standalone prompt). Accumulate every context
+        # request's qkv per (rid, layer). When >=1 request finishes its prefill
+        # (accumulated tokens >= prompt_len) this forward, rebuild a full-prefix
+        # scoring batch over ALL ctx requests (each at its accumulated length):
+        # finished + long-enough requests are scored and compacted to budget;
+        # the rest (mid-chunk / too-short) are kept whole -- the same
+        # valid/invalid machinery the non-chunked path already uses. Supports
+        # num_contexts > 1 (concurrent chunked requests batched in one forward).
+        cp_score_rid = None
+        _saved_prompt_lens = None
+        _nctx = metadata.num_contexts
+        if (_nctx >= 1
+                and len(getattr(metadata, "request_ids", []) or []) >= _nctx):
+            _rids = [int(metadata.request_ids[i]) for i in range(_nctx)]
+            _pls = [self._cp_prompt_len.get(r) for r in _rids]
+            if all(p is not None for p in _pls):
+                # chunk-local per-request offsets in this forward's ctx
+                # qkv. Capture at layer 0 (pristine, set by prepare); reuse for
+                # layers 1..N-1 -- layer 0's _chunked_override_metadata clobbers
+                # metadata.context_cumsum_cuda in-place for the rest of this fwd.
+                if layer_idx == 0 or len(self._cp_cc) != _nctx + 1:
+                    self._cp_cc = metadata.context_cumsum_cuda[
+                        :_nctx + 1].tolist()
+                _cc = self._cp_cc
+                _qkv_comb = (q[:num_ctx_tokens] if k is None
+                             else torch.cat([q, k], dim=1))
+                _seen = []
+                for _i in range(_nctx):
+                    _key = (_rids[_i], layer_idx)
+                    self._cp_k_accum.setdefault(_key, []).append(
+                        _qkv_comb[_cc[_i]:_cc[_i + 1]].detach())
+                    _s = self._cp_seen.get(_key, 0) + (_cc[_i + 1] - _cc[_i])
+                    self._cp_seen[_key] = _s
+                    _seen.append(_s)
+                _finished = [_seen[_i] >= _pls[_i] for _i in range(_nctx)]
+                if not any(_finished):
+                    return None  # no request finished prefill this forward
+                # rebuild full-prefix qkv over ALL ctx requests (accumulated)
+                _full = [
+                    torch.cat(self._cp_k_accum[(_rids[_i], layer_idx)], dim=0)
+                    for _i in range(_nctx)
+                ]
+                full_qkv = torch.cat(_full, dim=0)
+                _saved_prompt_lens = metadata.prompt_lens_cuda[
+                    :metadata.num_seqs].clone()
+                self._chunked_override_metadata(metadata, _seen, _pls)
+                q, k, num_ctx_tokens = full_qkv, None, int(sum(_seen))
+                # drop finished requests' accumulation (prefill complete)
+                for _i in range(_nctx):
+                    if _finished[_i]:
+                        self._cp_k_accum.pop((_rids[_i], layer_idx), None)
+                        self._cp_seen.pop((_rids[_i], layer_idx), None)
+                cp_score_rid = [_rids[_i] for _i in range(_nctx) if _finished[_i]]
+
         # Cache num_heads_per_kv on first call so non-metadata-scope
         # helpers (algorithm-body internals) can recover num_heads.
         self._cached_num_heads_per_kv = int(
@@ -790,6 +864,13 @@ class RocketKV(SparseAttentionExecutor):
             )
 
 
+
+        # Chunked-prefill: restore the FMHA-shared prompt_lens clobbered for
+        # scoring BEFORE any return, so the main attention sees the real
+        # chunk-local context length.
+        if _saved_prompt_lens is not None:
+            metadata.prompt_lens_cuda[:metadata.num_seqs].copy_(
+                _saved_prompt_lens)
 
         # V1 line 478: reduce post-processing
         if metadata.valid_batch_size == 0:
@@ -966,6 +1047,13 @@ class RocketKV(SparseAttentionExecutor):
         runs leak KT blocks until the pool exhausts.
         """
         # Path A: V2 frees KT sub-pages with the block (shared allocation).
+        # Chunked-prefill: drop this request accumulation state (the last
+        # chunk pops it; safety net for early-finished requests).
+        rid = request.py_request_id
+        for _d in (self._cp_k_accum, self._cp_seen):
+            for _k in [k for k in _d if k[0] == rid]:
+                _d.pop(_k, None)
+        self._cp_prompt_len.pop(rid, None)
         return
 
     # ===================================================================== #
@@ -1005,6 +1093,65 @@ class RocketKV(SparseAttentionExecutor):
             return int(v1)
         return self._num_kv_heads_from_kv_cache_manager() * int(
             getattr(self, "_cached_num_heads_per_kv", 1))
+
+    def _num_heads_from_metadata(self, metadata) -> int:
+        """num_heads = num_kv_heads * num_heads_per_kv (read from metadata)."""
+        nhpkv = getattr(metadata, "num_heads_per_kv", 1) or 1
+        return self._num_kv_heads_from_kv_cache_manager() * int(nhpkv)
+
+    def _chunked_override_metadata(self, metadata, seen, pls) -> None:
+        """Chunked-prefill scoring: override metadata ctx tensors in-place to a
+        full-prefix batch built from each context request's accumulated length
+        ``seen[i]`` (cached so far) vs full prompt ``pls[i]``. A request is
+        'valid' (scored + compacted to budget) iff it finished prefill
+        (seen >= pl) AND is long enough (pl >= budget); the rest are kept whole.
+        Mirrors prepare()'s context-phase setup for a batch of ``len(seen)``
+        requests. Reduces to the single-request case when len(seen) == 1."""
+        w = self.window_size
+        B = self.prompt_budget
+        n = len(seen)
+        dev = metadata.prompt_lens_cuda.device
+        L = torch.tensor(seen, dtype=torch.int32)
+        P = torch.tensor(pls, dtype=torch.int32)
+        valid_mask = (L >= P) & (P >= B)
+        valid_idx = torch.where(valid_mask)[0].to(torch.int32)
+        invalid_idx = torch.where(~valid_mask)[0].to(torch.int32)
+        vbs = int(valid_idx.numel())
+        # context_cumsum over cached lengths; prompt_lens := cached lengths
+        cum = torch.zeros(n + 1, dtype=torch.int32)
+        cum[1:] = torch.cumsum(L, 0)
+        metadata.context_cumsum_cuda[:n + 1].copy_(cum.to(dev), non_blocking=True)
+        metadata.prompt_lens_cuda[:n].copy_(L.to(dev), non_blocking=True)
+        # sparse counts: valid -> budget; invalid -> keep all cached
+        sc = torch.zeros(n, dtype=torch.int32)
+        sc[valid_idx.long()] = B
+        sc[invalid_idx.long()] = L[invalid_idx.long()]
+        soff = torch.zeros(n + 1, dtype=torch.int32)
+        soff[1:] = torch.cumsum(sc, 0)
+        metadata.sparse_offsets_ctx_cuda[:n + 1].copy_(soff.to(dev),
+                                                       non_blocking=True)
+        metadata.total_sparse_ctx_indices = int(soff[n].item())
+        metadata.valid_batch_size = vbs
+        if vbs:
+            metadata.valid_seq_indices_cuda[:vbs].copy_(valid_idx.to(dev),
+                                                        non_blocking=True)
+            kcl = L[valid_idx.long()] - w
+            metadata.k_context_lens_cuda[:vbs].copy_(kcl.to(dev),
+                                                     non_blocking=True)
+            metadata.k_context_start_cuda[:vbs].copy_(
+                torch.zeros(vbs, dtype=torch.int32).to(dev), non_blocking=True)
+            qcu = torch.arange(vbs + 1, dtype=torch.int32) * w
+            metadata.q_cu_seqlens_cuda[:vbs + 1].copy_(qcu.to(dev),
+                                                       non_blocking=True)
+            kcu = torch.zeros(vbs + 1, dtype=torch.int32)
+            kcu[1:] = torch.cumsum(kcl, 0)
+            metadata.k_cu_seqlens_cuda[:vbs + 1].copy_(kcu.to(dev),
+                                                       non_blocking=True)
+            metadata.max_rocket_k_ctx_len = int(kcl.max().item())
+            metadata.total_rocket_k_ctx_tokens = int(kcu[vbs].item())
+        else:
+            metadata.max_rocket_k_ctx_len = 0
+            metadata.total_rocket_k_ctx_tokens = 0
 
 
 _KT_ROLE = _DataRole("kt_cache")

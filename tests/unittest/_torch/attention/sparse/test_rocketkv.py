@@ -3,6 +3,13 @@ import os
 
 import pytest
 import torch
+import sys as _sys
+# Make tests/unittest (utils.*) and tests/ (test_common.*) importable when
+# run without the repo conftest on sys.path (minimal CI/sbatch harness).
+_sys.path.insert(
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..')))
+_sys.path.insert(
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..')))
 from utils.llm_data import llm_models_root
 from utils.util import getSMVersion
 
@@ -26,17 +33,56 @@ from tensorrt_llm.mapping import Mapping
                          ["llama-3.1-model/Llama-3.1-8B-Instruct"])
 @pytest.mark.parametrize("attention_backend", ["TRTLLM"])
 @pytest.mark.parametrize("rocket_algo", ["rocket", "rocketkv"])
-def test_model(backend, model_name, attention_backend, rocket_algo):
+@pytest.mark.parametrize("chunked", [
+    False,
+    True,
+    "multi_request",        # num_contexts>1 batched chunked (fixed in 9e249e6670)
+    "multi_request_cs512",  # small chunk => most num_contexts>1 forwards (stress)
+    "multi_request_cs2048",
+])
+def test_model(backend, model_name, attention_backend, rocket_algo, chunked):
     """E2E NIAH accuracy for both V1 (algorithm="rocket") and V17
     (algorithm="rocketkv", V2-migrated) sparse attention paths.
 
     Catches the historical RoPE-fusion gotcha (modules/attention.py
     must include "rocketkv" in the rope_fusion=False list) by exercising
     the V17 path end-to-end; without that fix V17 drops to ~10-30% acc.
+
+    ``chunked=True`` exercises chunked-prefill (V17 only; V1 does not
+    support it). It is a single regression net for the whole chunked
+    pipeline — if any of the 2026-05-31 bugs regress, acc drops < 0.9:
+      * KT pool must be bypassed out of the main V2 pool (else init
+        crashes in _build_pool_mapping_tensors with an exact_div assert);
+      * num_cached must be preserved per chunk (else chunk2+ K/V land at
+        the wrong cache offset);
+      * the last-chunk scoring override must NOT clobber the FMHA-shared
+        metadata.prompt_lens_cuda (its _runtime view is the base attention
+        context_lengths — clobbering corrupts the last chunk's attention
+        and the answer);
+      * accumulation/compaction path must actually engage (silent except
+        / missing import would no-op → prompt-tail truncated → garbage).
     """
+    # "multi_request*" exercises chunked prefill at max_batch_size>1
+    # (num_contexts>1 per forward); "_cs<N>" suffix sets the chunk size.
+    # chunked True is the single-context path.
+    multi_req = isinstance(chunked, str) and chunked.startswith("multi_request")
+    chunk_size = 1024
+    if isinstance(chunked, str) and "_cs" in chunked:
+        chunk_size = int(chunked.rsplit("_cs", 1)[1])
+    chunked = (chunked is True) or multi_req
+    if chunked and rocket_algo != "rocketkv":
+        pytest.skip("chunked prefill is V17 (rocketkv) only; V1 unsupported")
+
     model_dir = str(llm_models_root() / model_name)
-    max_batch_size = 16
+    # Multi-request batched chunked (bs>1, num_contexts>1) is now supported
+    # (9e249e6670: per-forward full-prefix scoring over all ctx requests +
+    # layer-0 context_cumsum capture). Single-context uses bs=1.
+    max_batch_size = (8 if multi_req else 1) if chunked else 16
     max_output_tokens = 128
+
+    # Chunked prefill is driven entirely by enable_chunked_prefill + the chunk
+    # size (max_num_tokens) below; the RocketKV chunked path auto-activates in
+    # the executor worker (no env toggles).
     kv_cache_kwargs = dict(free_gpu_memory_fraction=0.7,
                            enable_block_reuse=False)
     if rocket_algo == "rocketkv":
@@ -73,7 +119,8 @@ def test_model(backend, model_name, attention_backend, rocket_algo):
         sparse_attention_config=sparse_attention_config,
         max_batch_size=max_batch_size,
         max_seq_len=20480,
-        max_num_tokens=81920,
+        max_num_tokens=chunk_size if chunked else 81920,
+        enable_chunked_prefill=chunked,
         cuda_graph_config=None
         if attention_backend == "VANILLA" else cuda_graph_config,
     )
@@ -98,8 +145,8 @@ def test_model(backend, model_name, attention_backend, rocket_algo):
             use_tqdm=True,
             sampling_params=SamplingParams(add_special_tokens=False,
                                            max_tokens=max_output_tokens,
-                                           temperature=0.8,
-                                           top_p=0.95),
+                                           temperature=0.0,
+                                           top_p=1.0),
         )
 
     count = 0
@@ -112,7 +159,10 @@ def test_model(backend, model_name, attention_backend, rocket_algo):
             count = count + 1
     acc = count / len(outputs)
 
-    assert acc >= 0.9, 'accuracy test of rocketkv sparse attention failed'
+    tag = "chunked" if chunked else "non-chunked"
+    assert acc >= 0.9, (
+        f'accuracy test of rocketkv sparse attention failed ({tag}, '
+        f'algo={rocket_algo}, backend={attention_backend}): acc={acc:.2f}')
 
 
 def create_rocket_kv_cache_manager(num_layers, num_kv_heads, head_dim,
@@ -663,6 +713,64 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         assert len(
             vanilla_sparse_attn_indices_list
         ) == 0, "Both should return None when no sparse attention is needed"
+
+
+def test_kt_blockmanager_allocator():
+    """Path B (executor-owned KT BlockManager, V17) core contract --- GPU-free.
+
+    The KT pool migrated from a static ``req_id % 8`` bucketing (which
+    collided past 8 concurrent requests and capped one request at
+    ``max_kt_blocks // 8`` blocks) to a free-list ``BlockManager``. This
+    locks the allocator guarantees the executor relies on:
+      * concurrent requests get DISTINCT blocks (no collision);
+      * growth across decode steps is idempotent + monotonic (extend, not
+        realloc) so ``copy_kt_block_offsets``' ``ensure()`` never double-counts;
+      * ``copy_block_offsets`` writes the per-request block IDs;
+      * ``rewind_cache`` shrinks to the post-eviction history (HOOK 3);
+      * ``free_resources`` returns all blocks to the pool (HOOK 6).
+    """
+    from tensorrt_llm._torch.pyexecutor.resource_manager import BlockManager
+
+    class _Req:
+
+        def __init__(self, rid):
+            self.py_request_id = rid
+
+    tpb = 8  # kt_tokens_per_block
+    mgr = BlockManager(num_blocks=64, tokens_per_block=tpb)
+
+    # 1) distinct blocks for two concurrent requests (no collision)
+    mgr.add_tokens(1, 20)  # ceil(20/8) = 3 blocks
+    mgr.add_tokens(2, 20)
+    b1, b2 = mgr.block_ids[1], mgr.block_ids[2]
+    assert len(b1) == 3 and len(b2) == 3
+    assert set(b1).isdisjoint(b2), "concurrent requests must get distinct blocks"
+
+    # 2) idempotent + monotonic growth (decode adds KT tokens incrementally)
+    before = list(mgr.block_ids[1])
+    mgr.add_tokens(1, 1)  # 21 tokens -> still ceil(21/8)=3 blocks
+    assert mgr.block_ids[1] == before, "no realloc when block count unchanged"
+    mgr.add_tokens(1, 4)  # 25 tokens -> ceil(25/8)=4 blocks (+1)
+    assert len(mgr.block_ids[1]) == 4
+    assert set(before).issubset(mgr.block_ids[1]), "growth extends, not reallocs"
+
+    # 3) copy_block_offsets writes each request's block IDs into the dest
+    dest = torch.zeros((2, 64), dtype=torch.int32)
+    mgr.copy_block_offsets([1, 2], dest)
+    assert dest[0, :4].tolist() == mgr.block_ids[1]
+    assert dest[1, :3].tolist() == mgr.block_ids[2]
+
+    # 4) rewind shrinks to the post-eviction history + frees the tail blocks
+    free_before = len(mgr.free_blocks)
+    mgr.rewind_cache(_Req(1), rewind_len=20)  # 25-20=5 tokens -> 1 block
+    assert len(mgr.block_ids[1]) == 1
+    assert len(mgr.free_blocks) == free_before + 3
+
+    # 5) free returns all of a request's blocks to the pool
+    free_before = len(mgr.free_blocks)
+    mgr.free_resources(_Req(2))
+    assert 2 not in mgr.block_ids
+    assert len(mgr.free_blocks) == free_before + 3
 
 
 if __name__ == '__main__':
