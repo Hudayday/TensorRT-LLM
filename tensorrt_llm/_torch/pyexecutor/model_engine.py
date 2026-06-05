@@ -1611,6 +1611,11 @@ class PyTorchModelEngine(ModelEngine):
         coordinator = (resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_BEHAVIOR_COORDINATOR)
                        if resource_manager is not None else None)
+        # The registered object is the thin KVCacheBehaviorResourceManagerAdapter;
+        # unwrap to the standalone coordinator so the attention path fires HOOK
+        # 2/4 on it directly. ``getattr`` keeps this None-safe and also works if
+        # a bare coordinator was registered (tests / future paths).
+        coordinator = getattr(coordinator, "behavior_coordinator", coordinator)
 
         if kv_cache_manager is None:
             # Cache the no-cache metadata.

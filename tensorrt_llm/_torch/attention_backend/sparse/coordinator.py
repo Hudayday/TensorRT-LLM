@@ -68,10 +68,21 @@ _HOOK_ORDER: Dict[str, List[str]] = {
 }
 
 
-class KVCacheBehaviorCoordinator(BaseResourceManager):
-    """Path A coordinator — inherits :class:`BaseResourceManager` so PyExecutor
-    automatically invokes lifecycle callbacks each iteration without any
-    PyExecutor code changes.
+class KVCacheBehaviorCoordinator:
+    """Standalone behavior coordinator (does NOT inherit ``BaseResourceManager``).
+
+    Problem ① of the Yuhang review (2026-06-05): the coordinator is a pure
+    *compute-behavior* object — it owns the executors and exposes the 6
+    semantic hooks plus an explicit lifecycle API (``prepare_resources`` /
+    ``update_resources`` / ``free_resources``, kept under those names so the
+    existing tests + duck-typed callers keep working). It is framework-agnostic
+    and is NOT registered with PyExecutor directly.
+
+    The only PyExecutor-coupled piece is the thin
+    :class:`KVCacheBehaviorResourceManagerAdapter` below, which IS a
+    ``BaseResourceManager`` and forwards the 3 callbacks here. The model engine
+    sets ``metadata.coordinator`` to this standalone object so the attention
+    path fires HOOK 2/4 on it directly.
     """
 
     #: Public alias of the module-level hook order table. Subclasses may
@@ -297,3 +308,46 @@ class KVCacheBehaviorCoordinator(BaseResourceManager):
         for axis in order:
             for e in self._by_axis.get(axis, []):
                 yield e
+
+
+class KVCacheBehaviorResourceManagerAdapter(BaseResourceManager):
+    """Thin ``BaseResourceManager`` shim bridging PyExecutor's resource-manager
+    protocol to a standalone :class:`KVCacheBehaviorCoordinator`.
+
+    This is the ONLY piece coupled to the resource-manager interface. It owns
+    no physical resources (the V2 cache manager does); PyExecutor auto-invokes
+    ``prepare_resources / update_resources / free_resources`` here each
+    iteration and they are forwarded verbatim to the coordinator. Keeping the
+    coupling in this shim lets the coordinator stay framework-agnostic and lets
+    the HOOK-3 (context-end) / HOOK-5 (step-end) drivers be split to distinct
+    call sites later without touching the coordinator.
+
+    ``behavior_coordinator`` is exposed so the model engine can unwrap the
+    standalone coordinator and set it as ``metadata.coordinator`` — the
+    attention path (HOOK 2/4) talks to the coordinator directly, not this shim.
+    """
+
+    def __init__(self, coordinator: KVCacheBehaviorCoordinator) -> None:
+        self.behavior_coordinator = coordinator
+
+    def get_max_resource_count(self) -> int:
+        return self.behavior_coordinator.get_max_resource_count()
+
+    def get_needed_resource_to_completion(self, request: "LlmRequest") -> int:
+        return self.behavior_coordinator.get_needed_resource_to_completion(request)
+
+    def prepare_resources(self, scheduled_batch: "ScheduledRequests") -> None:
+        self.behavior_coordinator.prepare_resources(scheduled_batch)
+
+    def update_resources(
+        self,
+        scheduled_batch: "ScheduledRequests",
+        attn_metadata: Optional["AttentionMetadata"] = None,
+        kv_cache_dtype_byte_size: Optional[float] = None,
+    ) -> None:
+        self.behavior_coordinator.update_resources(
+            scheduled_batch, attn_metadata, kv_cache_dtype_byte_size
+        )
+
+    def free_resources(self, request: "LlmRequest") -> None:
+        self.behavior_coordinator.free_resources(request)

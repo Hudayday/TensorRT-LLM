@@ -1677,16 +1677,21 @@ def create_py_executor_instance(
         # Create the coordinator iff this method provides a compression
         # executor; create_sparse_attention_manager returns None otherwise.
         # Independent of memory/behavior layer.
-        from ..attention_backend.sparse import (KVCacheBehaviorCoordinator,
-                                                create_sparse_attention_manager)
+        from ..attention_backend.sparse import (
+            KVCacheBehaviorCoordinator, KVCacheBehaviorResourceManagerAdapter,
+            create_sparse_attention_manager)
         sparse_executor = create_sparse_attention_manager(
             llm_args.sparse_attention_config, kv_cache_manager)
         if sparse_executor is not None:
             coordinator = KVCacheBehaviorCoordinator(
                 executors=[sparse_executor])
+            # Register the thin RM adapter (the coordinator itself is now a
+            # standalone, framework-agnostic class — see coordinator.py). The
+            # model engine unwraps ``.behavior_coordinator`` for the attention
+            # path's metadata.coordinator.
             resource_manager.resource_managers[
                 ResourceManagerType.KV_CACHE_BEHAVIOR_COORDINATOR] = (
-                    coordinator)
+                    KVCacheBehaviorResourceManagerAdapter(coordinator))
 
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
