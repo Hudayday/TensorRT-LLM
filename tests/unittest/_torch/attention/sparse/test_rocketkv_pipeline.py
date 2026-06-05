@@ -503,8 +503,10 @@ class TestRocketKVAlgorithmBodyKernelCalls:
         return inspect.getsource(getattr(RocketKV, hook_name))
 
     def test_on_context_attention_kernel_sequence(self):
-        src = self._get_hook_source("on_context_attention")
-        # The 6 triton kernels of Stage I-a sparse-kv prediction.
+        # Branch-A-hook7: the Stage I-a sparse-kv kernels live in the shared helper
+        # _compute_ctx_sparse_and_update_kt, driven from ``on_context_attention_end``
+        # (post-attention). on_context_attention now skips -> dense prefill.
+        helper_src = self._get_hook_source("_compute_ctx_sparse_and_update_kt")
         for kernel_name in (
             "triton_rocket_qk_split",
             "triton_bmm",
@@ -513,10 +515,16 @@ class TestRocketKVAlgorithmBodyKernelCalls:
             "triton_rocket_batch_to_flatten",
             "triton_rocket_update_kt_cache_ctx",
         ):
-            assert kernel_name in src, (
-                f"on_context_attention must call ``{kernel_name}`` "
+            assert kernel_name in helper_src, (
+                f"_compute_ctx_sparse_and_update_kt must call ``{kernel_name}`` "
                 f"(Stage I-a sparse-kv prediction sequence)."
             )
+        assert "_compute_ctx_sparse_and_update_kt" in self._get_hook_source(
+            "on_context_attention_end"
+        ), "on_context_attention_end must drive the scoring helper (Branch-A-hook7)."
+        assert "_compute_ctx_sparse_and_update_kt" not in self._get_hook_source(
+            "on_context_attention"
+        ), "on_context_attention must NOT score (dense prefill; Branch-A-hook7)."
 
     def test_on_generation_attention_kernel_sequence(self):
         src = self._get_hook_source("on_generation_attention")
