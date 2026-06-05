@@ -327,12 +327,14 @@ class TestBehaviorCoordinatorFactory:
 
 
 class TestHookOrderTable:
-    def test_all_6_hooks_have_order_entry(self):
+    def test_all_8_hooks_have_order_entry(self):
         expected_hooks = {
             "on_request_init",
             "on_request_finish",
             "on_context_attention",
+            "on_context_attention_end",
             "on_generation_attention",
+            "on_generation_attention_end",
             "on_context_end",
             "on_generation_step_end",
         }
@@ -558,15 +560,25 @@ class TestRocketKV:
 # ---------------------------------------------------------------------- #
 
 
-class TestCoordinatorInheritsBaseResourceManager:
-    """Path A core property: Coordinator IS a BaseResourceManager so
-    PyExecutor's main loop auto-invokes prepare/update/free_resources
-    without any new PyExecutor hook call sites."""
+class TestCoordinatorStandaloneAdapterIsResourceManager:
+    """① redesign: the coordinator is STANDALONE (it concerns compute
+    behavior, not resource allocation), and a thin
+    KVCacheBehaviorResourceManagerAdapter is the BaseResourceManager that
+    PyExecutor's main loop drives, forwarding to the coordinator. This keeps
+    the behavior lifecycle separate from resource management."""
 
-    def test_is_base_resource_manager_subclass(self):
+    def test_coordinator_is_not_base_resource_manager_subclass(self):
         from tensorrt_llm._torch.pyexecutor.resource_manager import BaseResourceManager
 
-        assert issubclass(KVCacheBehaviorCoordinator, BaseResourceManager)
+        assert not issubclass(KVCacheBehaviorCoordinator, BaseResourceManager)
+
+    def test_adapter_is_base_resource_manager_subclass(self):
+        from tensorrt_llm._torch.attention_backend.sparse import (
+            KVCacheBehaviorResourceManagerAdapter,
+        )
+        from tensorrt_llm._torch.pyexecutor.resource_manager import BaseResourceManager
+
+        assert issubclass(KVCacheBehaviorResourceManagerAdapter, BaseResourceManager)
 
     def test_get_needed_resource_to_completion_returns_zero(self, fake_kv_cache_manager):
         """Coordinator doesn't allocate resources (V2 cache mgr does);
