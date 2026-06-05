@@ -1783,6 +1783,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self._run(q, k, v, metadata, forward_args)
 
+        # HOOK 7/8 — post-attention: fire AFTER the attention output is
+        # computed so executors that conceptually run after attention (e.g. a
+        # RocketKV unified-update path that stashes per-layer q/k/output and
+        # evicts in on_context_end) can act on the result. Side-effect only;
+        # mirrors the HOOK 2/4 gate above. Both phases fire and the executor
+        # self-gates on metadata (num_ctx_tokens / num_generations).
+        if (self.sparse_attention_config is not None and not isinstance(
+                self.sparse_attention_config, SkipSoftmaxAttentionConfig)
+                and metadata.coordinator is not None):
+            _post_layer_idx = self.get_local_layer_idx(metadata)
+            metadata.coordinator.on_context_attention_end(
+                _post_layer_idx, q, k, forward_args.output, metadata)
+            metadata.coordinator.on_generation_attention_end(
+                _post_layer_idx, q, k, forward_args.output, metadata)
+
         if forward_args.output_sf is None:
             return forward_args.output
         else:

@@ -61,6 +61,10 @@ _HOOK_ORDER: Dict[str, List[str]] = {
     # metadata; storage executors stay out of the attention path.
     "on_context_attention": ["sparse"],
     "on_generation_attention": ["sparse"],
+    # Post-attention (HOOK 7/8): side-effect only (no mask returned); sparse
+    # first (e.g. stash q/k/output for unified eviction) then storage.
+    "on_context_attention_end": ["sparse", "storage"],
+    "on_generation_attention_end": ["sparse", "storage"],
     # Phase boundary: sparse evict first -> storage compresses remaining cache.
     "on_context_end": ["sparse", "storage"],
     # Per-step: sparse periodic evict -> storage invalidate active copy.
@@ -187,10 +191,27 @@ class KVCacheBehaviorCoordinator:
                 result = r
         return result
 
+    def on_context_attention_end(
+        self, layer_idx: int, q, k, attn_output, metadata: "AttentionMetadata"
+    ) -> None:
+        """HOOK 7 fan-out — post-context-attention (called from
+        ``TrtllmAttention.forward`` after the attention output is computed).
+        Side-effect only; no single-source constraint."""
+        for e in self._iter_for_hook("on_context_attention_end"):
+            e.on_context_attention_end(layer_idx, q, k, attn_output, metadata)
+
+    def on_generation_attention_end(
+        self, layer_idx: int, q, k, attn_output, metadata: "AttentionMetadata"
+    ) -> None:
+        """HOOK 8 fan-out — post-generation-attention (side-effect only)."""
+        for e in self._iter_for_hook("on_generation_attention_end"):
+            e.on_generation_attention_end(layer_idx, q, k, attn_output, metadata)
+
     # ================================================================== #
-    # Tier 2 — BaseResourceManager required interface.                    #
-    # PyExecutor auto-invokes these each iteration.                       #
-    # Internally calls Tier 1 direct dispatch.                            #
+    # Tier 2 — explicit lifecycle API.                                    #
+    # Driven by KVCacheBehaviorResourceManagerAdapter (which PyExecutor   #
+    # auto-invokes), NOT by PyExecutor directly. Internally calls the     #
+    # Tier-1 hooks.                                                        #
     # ================================================================== #
 
     def get_max_resource_count(self) -> int:

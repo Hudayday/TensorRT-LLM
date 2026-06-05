@@ -198,6 +198,26 @@ class BaseKVCacheCompressionExecutor:
         """
         pass
 
+    def on_context_attention_end(
+        self,
+        layer_idx: int,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        attn_output: torch.Tensor,
+        metadata: "AttentionMetadata",
+    ) -> None:
+        """HOOK 7 — per-layer, fired AFTER the context-phase attention output
+        is computed (post-kernel), unlike :meth:`on_context_attention` which
+        fires before/at the kernel to supply an input-side sparse mask.
+
+        Side-effect only (returns ``None``): the sparse mask, if any, was
+        already applied. Use this when the algorithm conceptually runs *after*
+        attention — e.g. stash per-layer ``q``/``k``/``attn_output`` so a
+        unified eviction can be computed in :meth:`on_context_end` (HOOK 3),
+        rather than per-layer during attention.
+        """
+        pass
+
     # ------------------------------------------------------------------ #
     # Generation (decode) phase hooks                                    #
     # ------------------------------------------------------------------ #
@@ -218,6 +238,20 @@ class BaseKVCacheCompressionExecutor:
         physical-evict and non-sparse executors return ``None``.
         """
         return None
+
+    def on_generation_attention_end(
+        self,
+        layer_idx: int,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        attn_output: torch.Tensor,
+        metadata: "AttentionMetadata",
+    ) -> None:
+        """HOOK 8 — per-layer, fired AFTER the generation-phase attention
+        output is computed (post-kernel). Side-effect only (returns ``None``);
+        the decode-phase analogue of :meth:`on_context_attention_end`.
+        """
+        pass
 
     def on_generation_step_end(
         self,
