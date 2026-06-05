@@ -660,62 +660,25 @@ class RocketKV(SparseAttentionExecutor):
         num_ctx_tokens = metadata.num_ctx_tokens
         if num_ctx_tokens == 0:
             return None
+        # ③ v1: defer eviction to post-attention (HOOK7). Skip the per-layer
+        # scoring here so context attention runs DENSE; on_context_attention_end
+        # runs the SAME helper after attention (selection math identical).
+        # Branch B (hook3): skip -> prefill runs DENSE; ALL eviction
+        # (scoring + select + KT update + rewind) is deferred to HOOK3
+        # (on_context_end). HOOK7 only stashes q/k for it.
+        return None
 
-        # Chunked-prefill: RocketKV metadata is chunk-local
-        # (each chunk looks like a standalone prompt). Accumulate every context
-        # request's qkv per (rid, layer). When >=1 request finishes its prefill
-        # (accumulated tokens >= prompt_len) this forward, rebuild a full-prefix
-        # scoring batch over ALL ctx requests (each at its accumulated length):
-        # finished + long-enough requests are scored and compacted to budget;
-        # the rest (mid-chunk / too-short) are kept whole -- the same
-        # valid/invalid machinery the non-chunked path already uses. Supports
-        # num_contexts > 1 (concurrent chunked requests batched in one forward).
-        _saved_prompt_lens = None
-        _nctx = metadata.num_contexts
-        if _nctx >= 1 and len(getattr(metadata, "request_ids", []) or []) >= _nctx:
-            _rids = [int(metadata.request_ids[i]) for i in range(_nctx)]
-            _pls = [self._cp_prompt_len.get(r) for r in _rids]
-            if all(p is not None for p in _pls):
-                # chunk-local per-request offsets in this forward's ctx
-                # qkv. Capture at layer 0 (pristine, set by prepare); reuse for
-                # layers 1..N-1 -- layer 0's _chunked_override_metadata clobbers
-                # metadata.context_cumsum_cuda in-place for the rest of this fwd.
-                if layer_idx == 0 or len(self._cp_cc) != _nctx + 1:
-                    self._cp_cc = metadata.context_cumsum_cuda[: _nctx + 1].tolist()
-                _cc = self._cp_cc
-                _qkv_comb = q[:num_ctx_tokens] if k is None else torch.cat([q, k], dim=1)
-                _seen = []
-                for _i in range(_nctx):
-                    _key = (_rids[_i], layer_idx)
-                    self._cp_k_accum.setdefault(_key, []).append(
-                        _qkv_comb[_cc[_i] : _cc[_i + 1]].detach()
-                    )
-                    _s = self._cp_seen.get(_key, 0) + (_cc[_i + 1] - _cc[_i])
-                    self._cp_seen[_key] = _s
-                    _seen.append(_s)
-                _finished = [_seen[_i] >= _pls[_i] for _i in range(_nctx)]
-                if not any(_finished):
-                    return None  # no request finished prefill this forward
-                # rebuild full-prefix qkv over ALL ctx requests (accumulated)
-                _full = [
-                    torch.cat(self._cp_k_accum[(_rids[_i], layer_idx)], dim=0)
-                    for _i in range(_nctx)
-                ]
-                full_qkv = torch.cat(_full, dim=0)
-                _saved_prompt_lens = metadata.prompt_lens_cuda[: metadata.num_seqs].clone()
-                self._chunked_override_metadata(metadata, _seen, _pls)
-                q, k, num_ctx_tokens = full_qkv, None, int(sum(_seen))
-                # drop finished requests' accumulation (prefill complete)
-                for _i in range(_nctx):
-                    if _finished[_i]:
-                        self._cp_k_accum.pop((_rids[_i], layer_idx), None)
-                        self._cp_seen.pop((_rids[_i], layer_idx), None)
+    # ===================================================================== #
+    # HOOK 3 — on_context_end (Stage I-b physical-evict rewind)              #
+    # ===================================================================== #
 
-        # Cache num_heads_per_kv on first call so non-metadata-scope
-        # helpers (algorithm-body internals) can recover num_heads.
-        self._cached_num_heads_per_kv = int(getattr(metadata, "num_heads_per_kv", 1) or 1)
-
-        # Prepare qkv input
+    def _compute_ctx_sparse_and_update_kt(
+        self, layer_idx, q, k, num_ctx_tokens, metadata, _saved_prompt_lens
+    ):
+        """Shared SnapKV scoring core, factored out of on_context_attention so
+        the HOOK3 per-request path reuses the EXACT same math. Computes
+        sparse_kv_indices/offsets + updates the KT cache pool; returns
+        (indices, offsets) or None when valid_batch_size==0."""
         if k is None:
             qkv_input = q[:num_ctx_tokens]
         else:
@@ -851,9 +814,37 @@ class RocketKV(SparseAttentionExecutor):
 
         return sparse_kv_indices, sparse_kv_offsets
 
-    # ===================================================================== #
-    # HOOK 3 — on_context_end (Stage I-b physical-evict rewind)              #
-    # ===================================================================== #
+    def _snapshot_scoring_md(self, metadata):
+        """Clone the per-forward scoring metadata the SnapKV helper reads,
+        so the HOOK3 (context-end) unified scoring can run after the live
+        metadata is gone. Tensors cloned; scalars copied. (Branch B.)"""
+        from types import SimpleNamespace
+
+        _fields = (
+            "valid_batch_size",
+            "num_contexts",
+            "k_cu_seqlens_cuda",
+            "prompt_lens_cuda",
+            "valid_seq_indices_cuda",
+            "context_cumsum_cuda",
+            "total_sparse_ctx_indices",
+            "total_rocket_k_ctx_tokens",
+            "sparse_offsets_ctx_cuda",
+            "q_cu_seqlens_cuda",
+            "num_seqs",
+            "max_rocket_k_ctx_len",
+            "kt_tokens_per_block",
+            "kt_cache_block_offsets",
+            "k_context_start_cuda",
+            "k_context_lens_cuda",
+            "num_ctx_tokens",
+            "num_heads_per_kv",
+        )
+        _snap = {}
+        for _f in _fields:
+            _v = getattr(metadata, _f, None)
+            _snap[_f] = _v.clone() if torch.is_tensor(_v) else _v
+        return SimpleNamespace(**_snap)
 
     def on_context_end(self, request: "LlmRequest", metadata: "AttentionMetadata") -> None:
         """Stage I-b SnapKV physical eviction:
@@ -866,6 +857,25 @@ class RocketKV(SparseAttentionExecutor):
         ``self.impl.rewind_kv_cache``) to shrink the cache to
         prompt_budget+1.
         """
+        # --- HOOK3 unified eviction (Branch B) ---------------------------- #
+        # ALL eviction compute is here. HOOK7 only stashed per-layer q/k + a
+        # snapshot of the scoring metadata. On the first context-end of this
+        # prefill round, run SnapKV scoring across ALL stashed layers
+        # (post-attention, batched over the context requests) via the SAME
+        # helper hook2 uses -> selection math identical -> then clear the stash.
+        # Later context-ends in the round just do their physical rewind.
+        _stash = getattr(self, "_ctx_stash", None)
+        if _stash and getattr(self, "_ctx_md_snap", None) is not None:
+            _md = self._ctx_md_snap
+            _nct = self._ctx_nct
+            for _li in sorted(_stash.keys()):
+                _ql, _kl = _stash[_li]
+                self._compute_ctx_sparse_and_update_kt(_li, _ql, _kl, _nct, _md, None)
+            self._ctx_stash = {}
+            self._ctx_md_snap = None
+
+        # --- context-end physical eviction (Stage I-b, per request) -------- #
+
         # Skip terminated mid-prefill
         try:
             from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -890,6 +900,39 @@ class RocketKV(SparseAttentionExecutor):
 
         # KT rewind: not needed in Path A -- V2 frees the tail blocks
         # (incl. their KT sub-pages) when rewind_kv_cache shrinks the cache.
+
+    # ===================================================================== #
+    # HOOK 7 — on_context_attention_end (③ WIP: post-attention stash)        #
+    # ===================================================================== #
+
+    # ③: when set, RocketKV computes its SnapKV eviction at context-end
+    # (HOOK 3) over all layers' stashed qkv, instead of per-layer during
+    # attention (HOOK 2). Default OFF -> shipped hook2 path is unchanged.
+
+    def on_context_attention_end(self, layer_idx, q, k, attn_output, metadata):
+        """HOOK 7. Branch B (rocketkv-hook3): PURE STASH, no eviction
+        compute. Stash this layer's q/k (the scoring inputs; attention does
+        not modify q/k) + snapshot the per-forward scoring metadata ONCE, so
+        on_context_end (HOOK3) can run the unified SnapKV scoring across all
+        layers post-attention. Context attention ran DENSE
+        (on_context_attention skipped) -> faithful SnapKV / v1-aligned.
+        """
+        if not isinstance(metadata, RocketKVTrtllmAttentionMetadata):
+            return
+        if not self._kt_v2:
+            return
+        num_ctx_tokens = getattr(metadata, "num_ctx_tokens", 0)
+        if num_ctx_tokens <= 0:
+            return
+        if not hasattr(self, "_ctx_stash"):
+            self._ctx_stash = {}
+        self._ctx_stash[int(layer_idx)] = (q.detach(), None if k is None else k.detach())
+        # snapshot the shared per-forward scoring metadata once (valid here;
+        # stale by context-end).
+        if getattr(self, "_ctx_md_snap", None) is None:
+            self._ctx_md_snap = self._snapshot_scoring_md(metadata)
+            self._ctx_nct = int(num_ctx_tokens)
+            self._cached_num_heads_per_kv = int(getattr(metadata, "num_heads_per_kv", 1) or 1)
 
     def _preprocess_for_gen(self, q, k, metadata):
         """Split and reshape qkv for the generation phase."""
