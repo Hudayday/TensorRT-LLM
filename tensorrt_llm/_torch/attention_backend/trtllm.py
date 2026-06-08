@@ -552,7 +552,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             # Also prepare draft KV cache block offsets if draft_kv_cache_manager exists
             if self.draft_kv_cache_manager is not None:
-                # Use the wrapper method which works for both KVCacheManager and KVCacheManagerV2
+                # Use the wrapper method which works for both V1 and V2
                 self.draft_kv_cache_manager.copy_batch_block_offsets(
                     self.draft_kv_cache_block_offsets, self.request_ids,
                     self.beam_width, self.num_contexts, self.num_seqs)
@@ -1738,7 +1738,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_idx, kv_off, at_idx, at_off = None, None, None, None
             if metadata.coordinator is not None:
                 # Methods driving their algorithm via the KVCacheBehaviorCoordinator
-                # (e.g. rocketkv): HOOK 2/4 fire here; the
+                # (e.g. rocketkv): the on_*_attention hooks fire here; the
                 # coordinator dispatches to the registered executor (returns a
                 # sparse-mask tuple, None for dense-over-compacted, or writes aux state).
                 layer_idx = self.get_local_layer_idx(metadata)
@@ -1783,11 +1783,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self._run(q, k, v, metadata, forward_args)
 
-        # HOOK 7/8 — post-attention: fire AFTER the attention output is
+        # post-attention hooks fire AFTER the attention output is
         # computed so executors that conceptually run after attention (e.g. a
         # RocketKV unified-update path that stashes per-layer q/k/output and
         # evicts in on_context_end) can act on the result. Side-effect only;
-        # mirrors the HOOK 2/4 gate above. Both phases fire and the executor
+        # mirrors the attention-hooks gate above. Both phases fire and the executor
         # self-gates on metadata (num_ctx_tokens / num_generations).
         if (self.sparse_attention_config is not None and not isinstance(
                 self.sparse_attention_config, SkipSoftmaxAttentionConfig)

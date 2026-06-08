@@ -1979,6 +1979,9 @@ class PyExecutor:
                     self._handle_dynamic_draft_len(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    if self.model_engine.kv_behavior_coordinator is not None:
+                        self.model_engine.kv_behavior_coordinator.on_batch_scheduled(
+                            scheduled_batch)
 
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
@@ -2284,6 +2287,9 @@ class PyExecutor:
                 kv_cache_dtype_byte_size = getattr(self.model_engine,
                                                    'kv_cache_dtype_byte_size',
                                                    None)
+                if self.model_engine.kv_behavior_coordinator is not None:
+                    self.model_engine.kv_behavior_coordinator.on_iteration_end(
+                        sample_state_scheduled_requests, attn_metadata)
                 self.resource_manager.update_resources(
                     sample_state_scheduled_requests, attn_metadata,
                     kv_cache_dtype_byte_size)
@@ -2733,6 +2739,9 @@ class PyExecutor:
                     self._handle_dynamic_draft_len(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    if self.model_engine.kv_behavior_coordinator is not None:
+                        self.model_engine.kv_behavior_coordinator.on_batch_scheduled(
+                            scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -2841,6 +2850,9 @@ class PyExecutor:
                                             None)
                     kv_cache_dtype_byte_size = getattr(
                         self.model_engine, 'kv_cache_dtype_byte_size', None)
+                    if self.model_engine.kv_behavior_coordinator is not None:
+                        self.model_engine.kv_behavior_coordinator.on_iteration_end(
+                            scheduled_batch, attn_metadata)
                     self.resource_manager.update_resources(
                         scheduled_batch, attn_metadata,
                         kv_cache_dtype_byte_size)
@@ -3024,6 +3036,9 @@ class PyExecutor:
                     self._handle_dynamic_draft_len(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    if self.model_engine.kv_behavior_coordinator is not None:
+                        self.model_engine.kv_behavior_coordinator.on_batch_scheduled(
+                            scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -3295,6 +3310,9 @@ class PyExecutor:
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
                                            'kv_cache_dtype_byte_size', None)
+        if self.model_engine.kv_behavior_coordinator is not None:
+            self.model_engine.kv_behavior_coordinator.on_iteration_end(
+                scheduled_requests, attn_metadata)
         self.resource_manager.update_resources(scheduled_requests,
                                                attn_metadata,
                                                kv_cache_dtype_byte_size)
@@ -4456,6 +4474,9 @@ class PyExecutor:
             self._do_terminate_request(request)
 
     def _do_terminate_request(self, request: LlmRequest):
+        if self.model_engine.kv_behavior_coordinator is not None:
+            self.model_engine.kv_behavior_coordinator.on_request_finished(
+                request)
         self.resource_manager.free_resources(request)
 
         if self.gather_all_responses or self.dist.rank == 0:

@@ -538,6 +538,11 @@ class PyTorchModelEngine(ModelEngine):
         # the model engine.
         self.attn_metadata = None
         self.encoder_attn_metadata = None
+        # Standalone KV-cache behavior coordinator (sparse-attention behavior
+        # layer). Set by create_py_executor_instance when a sparse method is
+        # configured; None otherwise. First-class member, NOT in the
+        # resource-manager registry.
+        self.kv_behavior_coordinator = None
         self.iter_states = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
 
@@ -1575,11 +1580,10 @@ class PyTorchModelEngine(ModelEngine):
                     req.py_draft_tokens = []
 
     def _set_up_attn_metadata(
-            self,
-            kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
-            draft_kv_cache_manager: Optional[Union[KVCacheManager,
-                                                   KVCacheManagerV2]] = None,
-            resource_manager: Optional[ResourceManager] = None):
+        self,
+        kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
+        draft_kv_cache_manager: Optional[Union[KVCacheManager,
+                                               KVCacheManagerV2]] = None):
         enable_context_mla_with_cached_kv = is_mla(
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
@@ -1602,20 +1606,12 @@ class PyTorchModelEngine(ModelEngine):
         else:
             num_heads_per_kv = 1
 
-        # Retrieve the KVCacheBehaviorCoordinator from resource_manager so it
-        # can be passed to AttentionMetadata at construction time (no
-        # post-construction mutation). TrtllmAttention.forward reads
-        # metadata.coordinator to fire HOOK 2/4 (on_*_attention). Coordinator
-        # is None when no behavior-layer sparse method is configured, or when
-        # the caller did not pass resource_manager (e.g. the dummy/init path).
-        coordinator = (resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_BEHAVIOR_COORDINATOR)
-                       if resource_manager is not None else None)
-        # The registered object is the thin KVCacheBehaviorResourceManagerAdapter;
-        # unwrap to the standalone coordinator so the attention path fires HOOK
-        # 2/4 on it directly. ``getattr`` keeps this None-safe and also works if
-        # a bare coordinator was registered (tests / future paths).
-        coordinator = getattr(coordinator, "behavior_coordinator", coordinator)
+        # The standalone KVCacheBehaviorCoordinator is a first-class member
+        # (set by create_py_executor_instance). It is passed to
+        # AttentionMetadata at construction; TrtllmAttention.forward reads
+        # metadata.coordinator to fire the attention events. None when no
+        # behavior-layer sparse method is configured.
+        coordinator = self.kv_behavior_coordinator
 
         if kv_cache_manager is None:
             # Cache the no-cache metadata.
@@ -4419,10 +4415,8 @@ class PyTorchModelEngine(ModelEngine):
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
             resource_manager)
 
-        attn_metadata = self._set_up_attn_metadata(
-            kv_cache_manager,
-            draft_kv_cache_manager,
-            resource_manager=resource_manager)
+        attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
+                                                   draft_kv_cache_manager)
         if self.enable_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)

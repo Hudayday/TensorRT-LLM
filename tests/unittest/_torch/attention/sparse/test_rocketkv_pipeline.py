@@ -335,8 +335,8 @@ class TestRocketKVAlgorithmBodyPort:
     field names, and hook fire timing."""
 
     def test_executor_overrides_all_three_algorithm_hooks(self):
-        """RocketKV must override HOOK 2 (Stage I-a / KT build +
-        SnapKV mask) + HOOK 3 (Stage I-b physical evict) + HOOK 4
+        """RocketKV must override the hook (Stage I-a / KT build +
+        SnapKV mask) + the hook (Stage I-b physical evict) + the hook
         (Stage II HSA mask)."""
         from tensorrt_llm._torch.attention_backend.sparse.kv_cache_compression_executor import (
             BaseKVCacheCompressionExecutor,
@@ -352,8 +352,8 @@ class TestRocketKVAlgorithmBodyPort:
             )
 
     def test_executor_overrides_request_lifecycle_hooks(self):
-        """Request lifecycle (prepare/free resources) lives in HOOK 1 /
-        HOOK 6 on the executor."""
+        """Request lifecycle (prepare/free resources) lives in the hook /
+        the hook on the executor."""
         from tensorrt_llm._torch.attention_backend.sparse.kv_cache_compression_executor import (
             BaseKVCacheCompressionExecutor,
         )
@@ -493,7 +493,7 @@ class TestRocketKVAttentionShimsCarryMetadata:
 
 
 class TestRocketKVAlgorithmBodyKernelCalls:
-    """Source-level assertion that the HOOK 2/4 callback bodies invoke the
+    """Source-level assertion that the attention-hook callback bodies invoke the
     expected triton kernels in the expected order. Locks the algorithm body
     against accidental drift."""
 
@@ -503,10 +503,10 @@ class TestRocketKVAlgorithmBodyKernelCalls:
         return inspect.getsource(getattr(RocketKV, hook_name))
 
     def test_on_context_attention_kernel_sequence(self):
-        # Branch-A-hook7: the Stage I-a sparse-kv kernels live in the shared helper
-        # _compute_ctx_sparse_and_update_kt, driven from ``on_context_attention_end``
-        # (post-attention). on_context_attention now skips -> dense prefill.
-        helper_src = self._get_hook_source("_compute_ctx_sparse_and_update_kt")
+        # hook7 (v1-aligned, write-time): on_context_attention runs the FULL
+        # Stage I-a sequence inline -- sparse-kv scoring AND the KT-cache update
+        # (write-time, no deferral). on_context_end only rewinds the main cache.
+        ctx_src = self._get_hook_source("on_context_attention")
         for kernel_name in (
             "triton_rocket_qk_split",
             "triton_bmm",
@@ -515,16 +515,15 @@ class TestRocketKVAlgorithmBodyKernelCalls:
             "triton_rocket_batch_to_flatten",
             "triton_rocket_update_kt_cache_ctx",
         ):
-            assert kernel_name in helper_src, (
-                f"_compute_ctx_sparse_and_update_kt must call ``{kernel_name}`` "
-                f"(Stage I-a sparse-kv prediction sequence)."
+            assert kernel_name in ctx_src, (
+                f"on_context_attention must call ``{kernel_name}`` "
+                f"(Stage I-a sparse-kv prediction + write-time KT update)."
             )
-        assert "_compute_ctx_sparse_and_update_kt" in self._get_hook_source(
-            "on_context_attention_end"
-        ), "on_context_attention_end must drive the scoring helper (Branch-A-hook7)."
-        assert "_compute_ctx_sparse_and_update_kt" not in self._get_hook_source(
-            "on_context_attention"
-        ), "on_context_attention must NOT score (dense prefill; Branch-A-hook7)."
+        # write-time: the KT update is inline here, NOT deferred to on_context_end
+        assert "triton_rocket_update_kt_cache_ctx" not in self._get_hook_source("on_context_end"), (
+            "hook7 updates the KT cache write-time in on_context_attention; "
+            "on_context_end only rewinds the main cache (no KT update)."
+        )
 
     def test_on_generation_attention_kernel_sequence(self):
         src = self._get_hook_source("on_generation_attention")
@@ -541,7 +540,7 @@ class TestRocketKVAlgorithmBodyKernelCalls:
             )
 
     def test_on_context_end_does_physical_evict(self):
-        """HOOK 3 performs the Stage I-b rewind — must invoke
+        """the hook performs the Stage I-b rewind — must invoke
         rewind_kv_cache.
 
         Note: Pattern 2 has no separate kt_cache_manager.rewind_cache

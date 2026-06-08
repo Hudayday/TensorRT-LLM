@@ -4,8 +4,7 @@
 # subclass from the Pydantic discriminator in ``SparseAttentionConfig``. Users
 # configure via Config objects in LLM(...); production code goes through the
 # dispatcher, not direct class imports.
-from .coordinator import (KVCacheBehaviorCoordinator,
-                          KVCacheBehaviorResourceManagerAdapter)
+from .coordinator import KVCacheBehaviorCoordinator
 from .kv_cache_compression_executor import (BaseKVCacheCompressionExecutor,
                                             SparseAttentionExecutor)
 from .utils import (create_behavior_coordinator,
@@ -19,7 +18,6 @@ __all__ = [
     "BaseKVCacheCompressionExecutor",
     "SparseAttentionExecutor",
     "KVCacheBehaviorCoordinator",
-    "KVCacheBehaviorResourceManagerAdapter",
     "create_sparse_attention_manager",
     "create_behavior_coordinator",
     "get_sparse_attn_kv_cache_manager",

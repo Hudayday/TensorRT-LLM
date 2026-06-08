@@ -17,10 +17,10 @@ Structure:
 
 | Algorithm step                                         | Location                                     |
 |--------------------------------------------------------|----------------------------------------------|
-| Stage I-a SnapKV sparse-kv prediction + KT build       | ``RocketKV.on_context_attention`` (HOOK 2)   |
-| Stage II query-aware HSA mask                          | ``RocketKV.on_generation_attention`` (HOOK 4)|
-| Stage I-b physical-evict rewind                        | ``RocketKV.on_context_end`` (HOOK 3)         |
-| per-request init                                       | ``RocketKV.on_request_init`` (HOOK 1)        |
+| Stage I-a SnapKV sparse-kv prediction + KT build       | ``RocketKV.on_context_attention``   |
+| Stage II query-aware HSA mask                          | ``RocketKV.on_generation_attention``|
+| Stage I-b physical-evict rewind                        | ``RocketKV.on_context_end``         |
+| per-request init                                       | ``RocketKV.on_request_init``        |
 | KT pool wiring                                          | ``RocketKV.__init__``                        |
 | metadata buffer setup / per-iter prepare               | ``RocketKVTrtllmAttentionMetadata`` (KT-     |
 |                                                        | related fields access the executor via       |
@@ -75,7 +75,7 @@ if TYPE_CHECKING:
 # =========================================================================
 # L0 attention shim — minimal subclasses for backend routing                #
 #                                                                          #
-# These are intentionally thin: the framework HOOK 2/4 callbacks fire from #
+# These are intentionally thin: the framework the attention hooks callbacks fire from #
 # the base ``TrtllmAttention.forward`` / ``VanillaAttention.forward`` via  #
 # ``metadata.coordinator.on_*_attention(...)``. The shim's only job is to  #
 # carry the RocketKV-specific Metadata class (which holds prompt_budget,   #
@@ -87,7 +87,7 @@ class RocketKVTrtllmAttention(TrtllmAttention):
     """RocketKV attention shim — TRT-LLM backend.
 
     - No ``sparse_kv_predict`` / ``sparse_attn_predict`` method overrides;
-      those algorithm bodies live in :class:`RocketKV` executor's HOOK 2/4
+      those algorithm bodies live in :class:`RocketKV` executor's the attention hooks
       callbacks (fired by base ``TrtllmAttention.forward`` via
       ``metadata.coordinator``).
     - Holds :class:`RocketKVTrtllmAttentionMetadata` for backend routing.
@@ -99,7 +99,7 @@ class RocketKVTrtllmAttention(TrtllmAttention):
 class RocketKVVanillaAttention(VanillaAttention):
     """RocketKV attention shim — vanilla backend (used in tests).
 
-    Algorithm body (HOOK 2/4 in :class:`RocketKV`) is the single source
+    Algorithm body (the attention hooks in :class:`RocketKV`) is the single source
     of truth; vanilla path uses Python/torch kernels instead of triton.
     """
 
@@ -292,6 +292,52 @@ class RocketKVTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         e = self._rocket_executor
         return e.kt_tokens_per_block if e else None
 
+    def _fill_context_scoring_metadata(self, lens_cpu, valid_mask_cpu) -> None:
+        """Build the context-phase SnapKV scoring metadata in-place from
+        per-request context lengths ``lens_cpu`` (int32 CPU, len n) and
+        ``valid_mask_cpu`` (bool CPU, len n) marking which requests are scored +
+        compacted to budget (vs kept whole). Shared by :meth:`prepare` (full
+        prefix, non-chunked) and the chunked-prefill reconstruction
+        (``RocketKV._chunked_override_metadata``) -- the only difference between
+        the two callers is the length source and the validity condition, so the
+        tensor build lives here once."""
+        n = int(lens_cpu.numel())
+        w = self.window_size
+        valid_idx = torch.where(valid_mask_cpu)[0].to(torch.int32)
+        invalid_idx = torch.where(~valid_mask_cpu)[0]
+        vbs = int(valid_idx.numel())
+        # context_cumsum + prompt_lens := the per-request context lengths
+        self.context_cumsum[1 : n + 1] = torch.cumsum(lens_cpu, dim=0)
+        self.context_cumsum_cuda[: n + 1].copy_(self.context_cumsum[: n + 1], non_blocking=True)
+        self.prompt_lens_cuda[:n].copy_(lens_cpu, non_blocking=True)
+        # sparse counts: valid -> budget; invalid -> keep the full context len
+        sparse_counts_ctx = torch.zeros(n, dtype=torch.int32, device="cpu")
+        sparse_counts_ctx[valid_idx.long()] = self.prompt_budget
+        sparse_counts_ctx[invalid_idx] = lens_cpu[invalid_idx]
+        self.sparse_offsets_ctx[1 : n + 1] = torch.cumsum(sparse_counts_ctx, dim=0)
+        self.sparse_offsets_ctx_cuda[: n + 1].copy_(
+            self.sparse_offsets_ctx[: n + 1], non_blocking=True
+        )
+        # observation-window scoring geometry (valid requests only)
+        self.valid_seq_indices_cuda[:vbs].copy_(valid_idx, non_blocking=True)
+        self.k_context_lens[:vbs] = lens_cpu[valid_idx.long()] - w
+        self.k_context_lens_cuda[:vbs].copy_(self.k_context_lens[:vbs], non_blocking=True)
+        self.k_context_start_cuda[:vbs].zero_()
+        self.q_cu_seqlens[: vbs + 1] = torch.arange(vbs + 1, device="cpu", dtype=torch.int32) * w
+        self.q_cu_seqlens_cuda[: vbs + 1].copy_(self.q_cu_seqlens[: vbs + 1], non_blocking=True)
+        self.k_cu_seqlens[0] = 0
+        self.k_cu_seqlens[1 : vbs + 1] = torch.cumsum(self.k_context_lens[:vbs], dim=0)
+        self.k_cu_seqlens_cuda[: vbs + 1].copy_(self.k_cu_seqlens[: vbs + 1], non_blocking=True)
+        # derived scalars
+        self.valid_batch_size = vbs
+        self.total_sparse_ctx_indices = int(self.sparse_offsets_ctx[n].item())
+        if vbs > 0:
+            self.max_rocket_k_ctx_len = int(self.k_context_lens[:vbs].max().item())
+            self.total_rocket_k_ctx_tokens = int(self.k_cu_seqlens[vbs].item())
+        else:
+            self.max_rocket_k_ctx_len = 0
+            self.total_rocket_k_ctx_tokens = 0
+
     def prepare(self):
         """Per-iteration metadata setup.
 
@@ -299,7 +345,7 @@ class RocketKVTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         sequences whose prompt exceeded ``prompt_budget``, clamp prompt_lens
         to prompt_budget for generation requests, and build the various
         cu-seqlen / sparse-offset / valid-mask CUDA buffers used by the
-        triton kernels in HOOK 2/4.
+        triton kernels in the attention hooks.
         """
 
         assert self.kv_cache_manager is not None, "RocketKV always runs with a KV cache manager"
@@ -346,62 +392,10 @@ class RocketKVTrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.host_kt_cache_block_offsets[: self.num_seqs], non_blocking=True
             )
 
-        # ---- Context phase setup
-        self.context_cumsum[1 : self.num_contexts + 1] = torch.cumsum(
-            self.prompt_lens_cpu[: self.num_contexts], dim=0
-        )
-        self.context_cumsum_cuda[: self.num_contexts + 1].copy_(
-            self.context_cumsum[: self.num_contexts + 1], non_blocking=True
-        )
-
-        # Filter sequences too short for sparse kv prediction
-        valid_mask = self.prompt_lens_cpu[: self.num_contexts] >= self.prompt_budget
-        valid_seq_indices = torch.where(valid_mask)[0]
-        invalid_seq_indices = torch.where(~valid_mask)[0]
-        valid_batch_size = len(valid_seq_indices)
-        self.valid_seq_indices_cuda[:valid_batch_size].copy_(valid_seq_indices, non_blocking=True)
-
-        # k_context_lens for valid sequences
-        self.k_context_lens[:valid_batch_size] = (
-            self.prompt_lens_cpu[valid_seq_indices] - self.window_size
-        )
-        self.k_context_lens_cuda[:valid_batch_size].copy_(
-            self.k_context_lens[:valid_batch_size], non_blocking=True
-        )
-
-        sparse_counts_ctx = torch.zeros(self.num_contexts, dtype=torch.int32, device="cpu")
-        sparse_counts_ctx[valid_seq_indices] = self.prompt_budget
-        sparse_counts_ctx[invalid_seq_indices] = self.prompt_lens_cpu[invalid_seq_indices]
-
-        self.sparse_offsets_ctx[1 : self.num_contexts + 1] = torch.cumsum(sparse_counts_ctx, dim=0)
-        self.sparse_offsets_ctx_cuda[: self.num_contexts + 1].copy_(
-            self.sparse_offsets_ctx[: self.num_contexts + 1], non_blocking=True
-        )
-
-        # q_cu_seqlens
-        self.q_cu_seqlens[: valid_batch_size + 1] = (
-            torch.arange(valid_batch_size + 1, device="cpu", dtype=torch.int32) * self.window_size
-        )
-        self.q_cu_seqlens_cuda[: valid_batch_size + 1].copy_(
-            self.q_cu_seqlens[: valid_batch_size + 1], non_blocking=True
-        )
-
-        self.k_cu_seqlens[1 : valid_batch_size + 1] = torch.cumsum(
-            self.k_context_lens[:valid_batch_size], dim=0
-        )
-        self.k_cu_seqlens_cuda[: valid_batch_size + 1].copy_(
-            self.k_cu_seqlens[: valid_batch_size + 1], non_blocking=True
-        )
-
-        if valid_batch_size > 0:
-            self.max_rocket_k_ctx_len = self.k_context_lens[:valid_batch_size].max().item()
-            self.total_rocket_k_ctx_tokens = self.k_cu_seqlens[valid_batch_size].item()
-        else:
-            self.max_rocket_k_ctx_len = 0
-            self.total_rocket_k_ctx_tokens = 0
-
-        self.valid_batch_size = valid_batch_size
-        self.total_sparse_ctx_indices = self.sparse_offsets_ctx[self.num_contexts].item()
+        # ---- Context phase setup (full-prefix; the build is shared with the
+        # chunked-prefill reconstruction via _fill_context_scoring_metadata).
+        _ctx_lens = self.prompt_lens_cpu[: self.num_contexts]
+        self._fill_context_scoring_metadata(_ctx_lens, _ctx_lens >= self.prompt_budget)
 
         # ---- Generation phase setup
         self.num_kt_tokens[: self.num_generations] = (
@@ -503,11 +497,11 @@ class RocketKV(SparseAttentionExecutor):
     structure table.
 
     RocketKV is a 2-stage hybrid sparse attention method:
-    - Stage I (prefill): SnapKV-style top-pB physical eviction (HOOK 3)
+    - Stage I (prefill): SnapKV-style top-pB physical eviction
       + per-page KT summary build streaming through every attention layer
-      (HOOK 2 side-effect).
+      (the hook side-effect).
     - Stage II (decode): query-aware HSA mask over the shrunk cache,
-      using KT summaries as the page-level lookup table (HOOK 4).
+      using KT summaries as the page-level lookup table.
     """
 
     axis: ClassVar[str] = "sparse"
@@ -554,8 +548,8 @@ class RocketKV(SparseAttentionExecutor):
         self.topk = topk
         self.topr = topr
 
-        # Chunked-prefill: per-request full prompt_len (HOOK1) + per-(rid,layer)
-        # chunk accumulation so HOOK2 can score the full prefix at the true
+        # Chunked-prefill: per-request full prompt_len (the hook) + per-(rid,layer)
+        # chunk accumulation so the hook can score the full prefix at the true
         # last chunk. Activated automatically when chunking is in effect.
         self._cp_prompt_len: dict = {}  # rid -> full prompt len
         self._cp_k_accum: dict = {}  # (rid, layer) -> [qkv_chunk]
@@ -617,12 +611,12 @@ class RocketKV(SparseAttentionExecutor):
         return self.kv_cache_manager.fill_kt_block_offsets(list(request_ids), block_offsets)
 
     # ===================================================================== #
-    # HOOK 1 — on_request_init (per-request init).                           #
+    # on_request_init (per-request init).                           #
     # ===================================================================== #
 
     def on_request_init(self, request: "LlmRequest") -> None:
-        """HOOK 1. Path A: KT is V2-managed, so there is no executor-side KT
-        init. Chunked-prefill: record the full prompt_len per request so HOOK 2
+        """the hook. Path A: KT is V2-managed, so there is no executor-side KT
+        init. Chunked-prefill: record the full prompt_len per request so the hook
         can detect the true last chunk (accumulated ctx tokens == prompt_len)
         and run full-prefix scoring there."""
         rid = request.py_request_id
@@ -631,7 +625,7 @@ class RocketKV(SparseAttentionExecutor):
         return
 
     # ===================================================================== #
-    # HOOK 2 — on_context_attention (Stage I-a sparse-kv prediction)         #
+    # on_context_attention (Stage I-a sparse-kv prediction)         #
     # ===================================================================== #
 
     def on_context_attention(
@@ -853,7 +847,7 @@ class RocketKV(SparseAttentionExecutor):
         return sparse_kv_indices, sparse_kv_offsets
 
     # ===================================================================== #
-    # HOOK 3 — on_context_end (Stage I-b physical-evict rewind)              #
+    # on_context_end (Stage I-b physical-evict rewind)              #
     # ===================================================================== #
 
     def on_context_end(self, request: "LlmRequest", metadata: "AttentionMetadata") -> None:
@@ -998,7 +992,7 @@ class RocketKV(SparseAttentionExecutor):
         return selected_indices, sparse_attn_offsets
 
     # ===================================================================== #
-    # HOOK 6 — on_request_finish (per-request cleanup)                       #
+    # on_request_finish (per-request cleanup)                       #
     # ===================================================================== #
 
     def on_request_finish(self, request: "LlmRequest") -> None:
@@ -1047,7 +1041,7 @@ class RocketKV(SparseAttentionExecutor):
     # Backward-compat alias for sites that don't have metadata in scope.
     def _num_heads_from_kv_cache_manager(self) -> int:
         # ``KVCacheManager`` scalar shortcut; ``KVCacheManagerV2`` fallback
-        # uses cached num_heads_per_kv set at the first HOOK 2/4 call.
+        # uses cached num_heads_per_kv set at the first the attention hooks call.
         v1 = getattr(self.kv_cache_manager, "num_heads", None)
         if v1:
             return int(v1)
@@ -1068,47 +1062,14 @@ class RocketKV(SparseAttentionExecutor):
         (seen >= pl) AND is long enough (pl >= budget); the rest are kept whole.
         Mirrors prepare()'s context-phase setup for a batch of ``len(seen)``
         requests. Reduces to the single-request case when len(seen) == 1."""
-        w = self.window_size
-        B = self.prompt_budget
-        n = len(seen)
-        dev = metadata.prompt_lens_cuda.device
         L = torch.tensor(seen, dtype=torch.int32)
         P = torch.tensor(pls, dtype=torch.int32)
-        valid_mask = (L >= P) & (P >= B)
-        valid_idx = torch.where(valid_mask)[0].to(torch.int32)
-        invalid_idx = torch.where(~valid_mask)[0].to(torch.int32)
-        vbs = int(valid_idx.numel())
-        # context_cumsum over cached lengths; prompt_lens := cached lengths
-        cum = torch.zeros(n + 1, dtype=torch.int32)
-        cum[1:] = torch.cumsum(L, 0)
-        metadata.context_cumsum_cuda[: n + 1].copy_(cum.to(dev), non_blocking=True)
-        metadata.prompt_lens_cuda[:n].copy_(L.to(dev), non_blocking=True)
-        # sparse counts: valid -> budget; invalid -> keep all cached
-        sc = torch.zeros(n, dtype=torch.int32)
-        sc[valid_idx.long()] = B
-        sc[invalid_idx.long()] = L[invalid_idx.long()]
-        soff = torch.zeros(n + 1, dtype=torch.int32)
-        soff[1:] = torch.cumsum(sc, 0)
-        metadata.sparse_offsets_ctx_cuda[: n + 1].copy_(soff.to(dev), non_blocking=True)
-        metadata.total_sparse_ctx_indices = int(soff[n].item())
-        metadata.valid_batch_size = vbs
-        if vbs:
-            metadata.valid_seq_indices_cuda[:vbs].copy_(valid_idx.to(dev), non_blocking=True)
-            kcl = L[valid_idx.long()] - w
-            metadata.k_context_lens_cuda[:vbs].copy_(kcl.to(dev), non_blocking=True)
-            metadata.k_context_start_cuda[:vbs].copy_(
-                torch.zeros(vbs, dtype=torch.int32).to(dev), non_blocking=True
-            )
-            qcu = torch.arange(vbs + 1, dtype=torch.int32) * w
-            metadata.q_cu_seqlens_cuda[: vbs + 1].copy_(qcu.to(dev), non_blocking=True)
-            kcu = torch.zeros(vbs + 1, dtype=torch.int32)
-            kcu[1:] = torch.cumsum(kcl, 0)
-            metadata.k_cu_seqlens_cuda[: vbs + 1].copy_(kcu.to(dev), non_blocking=True)
-            metadata.max_rocket_k_ctx_len = int(kcl.max().item())
-            metadata.total_rocket_k_ctx_tokens = int(kcu[vbs].item())
-        else:
-            metadata.max_rocket_k_ctx_len = 0
-            metadata.total_rocket_k_ctx_tokens = 0
+        # A request is scored+compacted iff it finished prefill (seen >= pl) AND
+        # is long enough (pl >= budget); the rest are kept whole. The actual
+        # tensor build is delegated to the same metadata helper prepare() uses
+        # -- only the length source (cached `L`) and this validity condition
+        # differ.
+        metadata._fill_context_scoring_metadata(L, (L >= P) & (P >= self.prompt_budget))
 
 
 _KT_ROLE = _DataRole("kt_cache")
