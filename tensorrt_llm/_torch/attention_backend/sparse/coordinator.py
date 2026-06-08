@@ -1,45 +1,52 @@
-"""Multi-manager runtime coordinator (inherits BaseResourceManager).
+"""Standalone KV-cache behavior coordinator.
 
 A :class:`KVCacheBehaviorCoordinator` owns N
-:class:`BaseKVCacheCompressionExecutor` instances (typically 1–2: one per axis
-``sparse`` / ``storage``) and is registered with PyExecutor as a
-:class:`BaseResourceManager`. PyExecutor's main loop already invokes
-``prepare_resources / update_resources / free_resources`` on every registered
-resource manager — the Coordinator's overrides translate those 3 callbacks
-into the 6 semantic hooks on the executors.
+:class:`BaseKVCacheCompressionExecutor` instances (typically 1-2: one per axis
+``sparse`` / ``storage``) and fans the runtime's lifecycle + attention events
+out to them in deterministic axis order. It is a pure *compute-behavior* object:
+it owns no physical KV memory (the V2 cache manager does) and is
+framework-agnostic.
 
-Two-tier API:
+**Independent registration.** The coordinator is held as a first-class member on
+PyExecutor (``py_executor.kv_behavior_coordinator``) and driven by the main loop
+directly. It is deliberately NOT a ``BaseResourceManager`` and is NOT placed in
+the resource-manager registry -- its lifecycle is its own concern, not mixed in
+with physical-resource management.
 
-- **Low-level direct dispatch** (`on_*` methods) — fan out to executors in
-  ``HOOK_ORDER`` for a given hook. Used by tests + direct callers.
-- **PyExecutor auto-invoke** (`prepare_resources` / `update_resources` /
-  `free_resources` from BaseResourceManager) — internal filter/dedupe
-  logic + call the low-level dispatch.
+Eight semantic events, fired from two places:
 
-Hook fan-out:
+* **Lifecycle events** -- driven by PyExecutor's main loop through the three
+  entry points :meth:`on_batch_scheduled` / :meth:`on_iteration_end` /
+  :meth:`on_request_finished`. These derive the four per-request lifecycle
+  events and fan them out:
 
-- **HOOK 1** ``on_request_init`` ← from ``prepare_resources`` (first-seen
-  request via internal ``_seen_req_ids`` dedupe).
-- **HOOK 2** ``on_context_attention`` ← direct fire from
-  ``TrtllmAttention.forward`` (prefill path), via ``metadata.coordinator``.
-- **HOOK 3** ``on_context_end`` ← from ``update_resources`` (detected via the
-  ``CONTEXT_INIT → GENERATION_IN_PROGRESS`` state transition).
-- **HOOK 4** ``on_generation_attention`` ← direct fire from
-  ``TrtllmAttention.forward`` (decode path).
-- **HOOK 5** ``on_generation_step_end`` ← from ``update_resources``.
-- **HOOK 6** ``on_request_finish`` ← from ``free_resources``.
+  ===========================  ====================================================
+  event                        meaning
+  ===========================  ====================================================
+  ``on_request_init``          request admitted (first time scheduled)
+  ``on_context_end``           request finished its context (prefill) phase
+  ``on_generation_step_end``   once per generation (decode) iteration
+  ``on_request_finish``        request completed / aborted
+  ===========================  ====================================================
 
-Using the ``BaseResourceManager`` interface keeps PyExecutor unchanged. The
-Coordinator also enforces deterministic axis order across executors. Today
-only the ``"sparse"`` axis has a concrete executor
-(:class:`SparseAttentionExecutor`).
+* **Attention events** -- fired directly from ``TrtllmAttention.forward`` via
+  ``metadata.coordinator``, per layer:
+
+  - ``on_context_attention`` / ``on_generation_attention`` may return
+    sparse-attention metadata (single-source: at most one executor may return
+    non-None per call).
+  - ``on_context_attention_end`` / ``on_generation_attention_end`` are
+    side-effect only (e.g. stash q/k/output for unified eviction).
+
+The coordinator enforces a single executor per axis (intra-axis stacking is
+rejected at init) and a deterministic cross-axis dispatch order. Today only the
+``"sparse"`` axis has a concrete executor (:class:`SparseAttentionExecutor`).
 """
 
 from itertools import chain
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Set
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.resource_manager import BaseResourceManager
 
 from .kv_cache_compression_executor import BaseKVCacheCompressionExecutor, SparseAttentionExecutor
 
@@ -49,216 +56,157 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 
 
-# Hook execution order across axes. Each hook name maps to a list of axis
-# identifiers in dispatch order. An executor whose axis is not in the list
-# for a given hook is silently skipped for that hook.
-_HOOK_ORDER: Dict[str, List[str]] = {
-    # Request lifecycle: sparse (init state) -> storage (may decompress).
+# Cross-axis dispatch order per event. Each event name maps to a list of axis
+# identifiers in dispatch order; an executor whose axis is absent for a given
+# event is silently skipped for that event.
+_EVENT_AXIS_ORDER: Dict[str, List[str]] = {
     "on_request_init": ["sparse", "storage"],
-    # Final cleanup: sparse (final evict) -> storage (final encode).
-    "on_request_finish": ["sparse", "storage"],
-    # Attention hooks: only sparse-attention executors write attention
-    # metadata; storage executors stay out of the attention path.
     "on_context_attention": ["sparse"],
-    "on_generation_attention": ["sparse"],
-    # Post-attention (HOOK 7/8): side-effect only (no mask returned); sparse
-    # first (e.g. stash q/k/output for unified eviction) then storage.
     "on_context_attention_end": ["sparse", "storage"],
-    "on_generation_attention_end": ["sparse", "storage"],
-    # Phase boundary: sparse evict first -> storage compresses remaining cache.
     "on_context_end": ["sparse", "storage"],
-    # Per-step: sparse periodic evict -> storage invalidate active copy.
+    "on_generation_attention": ["sparse"],
+    "on_generation_attention_end": ["sparse", "storage"],
     "on_generation_step_end": ["sparse", "storage"],
+    "on_request_finish": ["sparse", "storage"],
 }
 
 
 class KVCacheBehaviorCoordinator:
-    """Standalone behavior coordinator (does NOT inherit ``BaseResourceManager``).
+    """Owns the per-axis executors and fans events out to them.
 
-    Problem ① of the Yuhang review (2026-06-05): the coordinator is a pure
-    *compute-behavior* object — it owns the executors and exposes the 6
-    semantic hooks plus an explicit lifecycle API (``prepare_resources`` /
-    ``update_resources`` / ``free_resources``, kept under those names so the
-    existing tests + duck-typed callers keep working). It is framework-agnostic
-    and is NOT registered with PyExecutor directly.
+    Two layers of API:
 
-    The only PyExecutor-coupled piece is the thin
-    :class:`KVCacheBehaviorResourceManagerAdapter` below, which IS a
-    ``BaseResourceManager`` and forwards the 3 callbacks here. The model engine
-    sets ``metadata.coordinator`` to this standalone object so the attention
-    path fires HOOK 2/4 on it directly.
+    * **Event fan-out** (``on_*`` methods) -- dispatch one event to the
+      executors registered for it, in :attr:`EVENT_AXIS_ORDER`. The attention
+      path calls these directly; tests call them directly too.
+    * **Lifecycle driving** (:meth:`on_batch_scheduled` /
+      :meth:`on_iteration_end` / :meth:`on_request_finished`) -- the three
+      entry points PyExecutor's main loop invokes each iteration. They derive
+      the four per-request lifecycle events (init / context-end / step-end /
+      finish) from the per-iteration batch view and fan them out.
     """
 
-    #: Public alias of the module-level hook order table. Subclasses may
+    #: Public alias of the module-level dispatch-order table. Subclasses may
     #: override on the class to customize per-deployment ordering.
-    HOOK_ORDER: Dict[str, List[str]] = _HOOK_ORDER
+    EVENT_AXIS_ORDER: Dict[str, List[str]] = _EVENT_AXIS_ORDER
 
     def __init__(self, executors: List[BaseKVCacheCompressionExecutor]) -> None:
         self.executors: List[BaseKVCacheCompressionExecutor] = list(executors)
         self._by_axis: Dict[str, List[BaseKVCacheCompressionExecutor]] = {}
         for e in self.executors:
             self._by_axis.setdefault(e.axis, []).append(e)
-        # Lifecycle state needed for fan-out logic:
-        # - `_seen_req_ids` dedupes on_request_init across iterations.
-        # - `_prev_req_state` detects CONTEXT_INIT->GENERATION_IN_PROGRESS
-        #   transition for on_context_end.
+        # Bookkeeping to derive per-request lifecycle events from the coarse
+        # per-iteration batch views PyExecutor hands us:
+        #  - `_seen_req_ids` dedupes on_request_init across iterations.
+        #  - `_prev_req_state` detects the context->generation transition that
+        #    drives on_context_end.
         self._seen_req_ids: Set[int] = set()
         self._prev_req_state: Dict[int, LlmRequestState] = {}
         self._validate()
 
     # ================================================================== #
-    # Tier 1 — low-level direct dispatch (6 hooks).                       #
-    # Tests + direct callers use these.                            #
+    # Event fan-out -- one dispatch per event.                           #
     # ================================================================== #
 
     def on_request_init(self, request: "LlmRequest") -> None:
-        """HOOK 1 direct fan-out. The production path goes through
-        :meth:`prepare_resources` which calls this after dedupe."""
-        for e in self._iter_for_hook("on_request_init"):
+        for e in self._iter_for_event("on_request_init"):
             e.on_request_init(request)
 
-    def on_request_finish(self, request: "LlmRequest") -> None:
-        """HOOK 6 direct fan-out. The production path goes through
-        :meth:`free_resources` which calls this."""
-        for e in self._iter_for_hook("on_request_finish"):
-            e.on_request_finish(request)
-
-    def on_context_end(
-        self, request: "LlmRequest", metadata: Optional["AttentionMetadata"]
-    ) -> None:
-        """HOOK 3 direct fan-out. The production path goes through
-        :meth:`update_resources` which calls this after detecting the
-        ``CONTEXT_INIT → GENERATION_IN_PROGRESS`` state transition."""
-        for e in self._iter_for_hook("on_context_end"):
-            e.on_context_end(request, metadata)
-
-    def on_generation_step_end(
-        self, scheduled_batch: "ScheduledRequests", attn_metadata: Optional["AttentionMetadata"]
-    ) -> None:
-        """HOOK 5 direct fan-out. The production path goes through
-        :meth:`update_resources` which calls this once per iteration."""
-        for e in self._iter_for_hook("on_generation_step_end"):
-            e.on_generation_step_end(scheduled_batch, attn_metadata)
-
     def on_context_attention(
-        self,
-        layer_idx: int,
-        q,
-        k,
-        attn_scores,
-        metadata: "AttentionMetadata",
+        self, layer_idx: int, q, k, attn_scores, metadata: "AttentionMetadata"
     ):
-        """HOOK 2 direct fan-out (called from ``TrtllmAttention.forward``
-        prefill path via ``metadata.coordinator``).
-
-        Single-source attention metadata invariant: at most one executor may
+        """Prefill-attention event (fired from ``TrtllmAttention.forward`` via
+        ``metadata.coordinator``). Single-source: at most one executor may
         return non-None per call."""
-        result = None
-        for e in self._iter_for_hook("on_context_attention"):
-            r = e.on_context_attention(layer_idx, q, k, attn_scores, metadata)
-            if r is not None:
-                if result is not None:
-                    raise RuntimeError(
-                        "Multiple executors returned attention metadata "
-                        "from on_context_attention; sparse-attention "
-                        "metadata writes must be single-source."
-                    )
-                result = r
-        return result
-
-    def on_generation_attention(
-        self,
-        layer_idx: int,
-        q,
-        k,
-        attn_scores,
-        metadata: "AttentionMetadata",
-    ):
-        """HOOK 4 direct fan-out (called from ``TrtllmAttention.forward``
-        decode path via ``metadata.coordinator``).
-
-        Same single-source invariant as :meth:`on_context_attention`."""
-        result = None
-        for e in self._iter_for_hook("on_generation_attention"):
-            r = e.on_generation_attention(layer_idx, q, k, attn_scores, metadata)
-            if r is not None:
-                if result is not None:
-                    raise RuntimeError(
-                        "Multiple executors returned attention metadata "
-                        "from on_generation_attention; sparse-attention "
-                        "metadata writes must be single-source."
-                    )
-                result = r
-        return result
+        return self._dispatch_single_source(
+            "on_context_attention", layer_idx, q, k, attn_scores, metadata
+        )
 
     def on_context_attention_end(
         self, layer_idx: int, q, k, attn_output, metadata: "AttentionMetadata"
     ) -> None:
-        """HOOK 7 fan-out — post-context-attention (called from
-        ``TrtllmAttention.forward`` after the attention output is computed).
-        Side-effect only; no single-source constraint."""
-        for e in self._iter_for_hook("on_context_attention_end"):
+        """Post-prefill-attention event (after the attention output is
+        computed). Side-effect only; no single-source constraint."""
+        for e in self._iter_for_event("on_context_attention_end"):
             e.on_context_attention_end(layer_idx, q, k, attn_output, metadata)
+
+    def on_context_end(
+        self, request: "LlmRequest", metadata: Optional["AttentionMetadata"]
+    ) -> None:
+        for e in self._iter_for_event("on_context_end"):
+            e.on_context_end(request, metadata)
+
+    def on_generation_attention(
+        self, layer_idx: int, q, k, attn_scores, metadata: "AttentionMetadata"
+    ):
+        """Decode-attention event. Same single-source invariant as
+        :meth:`on_context_attention`."""
+        return self._dispatch_single_source(
+            "on_generation_attention", layer_idx, q, k, attn_scores, metadata
+        )
 
     def on_generation_attention_end(
         self, layer_idx: int, q, k, attn_output, metadata: "AttentionMetadata"
     ) -> None:
-        """HOOK 8 fan-out — post-generation-attention (side-effect only)."""
-        for e in self._iter_for_hook("on_generation_attention_end"):
+        """Post-decode-attention event (side-effect only)."""
+        for e in self._iter_for_event("on_generation_attention_end"):
             e.on_generation_attention_end(layer_idx, q, k, attn_output, metadata)
 
+    def on_generation_step_end(
+        self, scheduled_batch: "ScheduledRequests", attn_metadata: Optional["AttentionMetadata"]
+    ) -> None:
+        for e in self._iter_for_event("on_generation_step_end"):
+            e.on_generation_step_end(scheduled_batch, attn_metadata)
+
+    def on_request_finish(self, request: "LlmRequest") -> None:
+        for e in self._iter_for_event("on_request_finish"):
+            e.on_request_finish(request)
+
+    def _dispatch_single_source(self, event: str, layer_idx, q, k, attn_scores, metadata):
+        result = None
+        for e in self._iter_for_event(event):
+            r = getattr(e, event)(layer_idx, q, k, attn_scores, metadata)
+            if r is not None:
+                if result is not None:
+                    raise RuntimeError(
+                        f"Multiple executors returned attention metadata from "
+                        f"{event}; sparse-attention metadata writes must be "
+                        f"single-source."
+                    )
+                result = r
+        return result
+
     # ================================================================== #
-    # Tier 2 — explicit lifecycle API.                                    #
-    # Driven by KVCacheBehaviorResourceManagerAdapter (which PyExecutor   #
-    # auto-invokes), NOT by PyExecutor directly. Internally calls the     #
-    # Tier-1 hooks.                                                        #
+    # Lifecycle driving -- the three entry points PyExecutor calls each   #
+    # iteration on ``py_executor.kv_behavior_coordinator``.               #
     # ================================================================== #
 
-    def get_max_resource_count(self) -> int:
-        """Coordinator does not own physical resources (the V2 cache manager
-        does). Returns 0 so PyExecutor's scheduler does not gate on us."""
-        return 0
-
-    def get_needed_resource_to_completion(self, request: "LlmRequest") -> int:
-        """Coordinator does not own physical resources (the V2 cache manager
-        does). Returns 0 so PyExecutor's scheduler does not block on us."""
-        return 0
-
-    def prepare_resources(self, scheduled_batch: "ScheduledRequests") -> None:
-        """Fan-out to HOOK 1 (``on_request_init``) for newly-seen requests.
-
-        Dedupes via :attr:`_seen_req_ids` so init fires exactly once per
-        request, regardless of how many iterations the request stays in
-        ``scheduled_batch``.
-        """
+    def on_batch_scheduled(self, scheduled_batch: "ScheduledRequests") -> None:
+        """Called when a batch is scheduled, before it runs. Fires
+        ``on_request_init`` exactly once per request (deduped via
+        :attr:`_seen_req_ids`), regardless of how many iterations the request
+        stays scheduled."""
         for req in chain(scheduled_batch.context_requests, scheduled_batch.generation_requests):
             rid = req.py_request_id
             if rid not in self._seen_req_ids:
                 self.on_request_init(req)
                 self._seen_req_ids.add(rid)
 
-    def update_resources(
+    def on_iteration_end(
         self,
         scheduled_batch: "ScheduledRequests",
         attn_metadata: Optional["AttentionMetadata"] = None,
-        kv_cache_dtype_byte_size: Optional[float] = None,
     ) -> None:
-        """Fan-out:
-        - HOOK 3 (``on_context_end``) for each request that just transitioned
-          from ``CONTEXT_INIT`` to ``GENERATION_IN_PROGRESS``.
-        - HOOK 5 (``on_generation_step_end``) once per iteration.
+        """Called once after each executor iteration. Fires:
+        * ``on_context_end`` for each request that just transitioned out of its
+          context (prefill) phase, and
+        * ``on_generation_step_end`` once for the iteration.
 
-        Signature matches the legacy ``RocketKVCacheManager.update_resources``
-        so PyExecutor's call site (``py_executor.py:2128`` etc.) passes the
-        optional ``attn_metadata`` argument through transparently.
+        PyExecutor flips the request state to ``GENERATION_IN_PROGRESS`` before
+        this runs, so the transition is detected as "first time seen in
+        GENERATION_IN_PROGRESS" (``prev is None``) OR an explicit
+        ``CONTEXT_INIT -> GENERATION_IN_PROGRESS`` edge.
         """
-        # HOOK 3 — detect prefill→decode transition.
-        #
-        # PyExecutor flips the request state to GENERATION_IN_PROGRESS before
-        # dispatching update_resources, so a strict CONTEXT_INIT →
-        # GENERATION_IN_PROGRESS check would miss every transition. Detect
-        # "first time seen in GEN_IN_PROGRESS" (prev is None) OR an explicit
-        # CONTEXT_INIT → GEN_IN_PROGRESS transition.
         for req in chain(scheduled_batch.context_requests, scheduled_batch.generation_requests):
             rid = req.py_request_id
             prev = self._prev_req_state.get(rid)
@@ -269,106 +217,43 @@ class KVCacheBehaviorCoordinator:
             if transition_to_gen:
                 self.on_context_end(req, attn_metadata)
             self._prev_req_state[rid] = curr
-        # HOOK 5 — once per iteration.
         self.on_generation_step_end(scheduled_batch, attn_metadata)
 
-    def free_resources(self, request: "LlmRequest") -> None:
-        """Fan-out to HOOK 6 (``on_request_finish``). Same-iteration with
-        PyExecutor's ``_collect_finished_or_aborted`` — no abort race."""
+    def on_request_finished(self, request: "LlmRequest") -> None:
+        """Called when a request completes or is aborted. Drops its
+        bookkeeping and fires ``on_request_finish``."""
         rid = request.py_request_id
         self._seen_req_ids.discard(rid)
         self._prev_req_state.pop(rid, None)
         self.on_request_finish(request)
 
     # ================================================================== #
-    # Init helpers                                                        #
+    # Init / introspection                                                #
     # ================================================================== #
 
     def _validate(self) -> None:
-        """Enforce mutex rules at init time."""
         for axis, exs in self._by_axis.items():
             if len(exs) > 1:
                 raise ValueError(
-                    f"Intra-axis stacking not supported: {len(exs)} "
-                    f"executors found for axis={axis!r}. Most sparse / "
-                    f"storage methods assume sole arbiter; "
-                    f"stacking two of the same axis would invalidate "
-                    f"per-method correctness assumptions. For intra-axis "
-                    f"composition, write a hybrid algorithm subclass "
-                    f"instead."
+                    f"Intra-axis stacking not supported: {len(exs)} executors "
+                    f"found for axis={axis!r}. Most sparse / storage methods "
+                    f"assume sole arbiter; stacking two of the same axis would "
+                    f"invalidate per-method correctness assumptions. For "
+                    f"intra-axis composition, write a hybrid algorithm subclass."
                 )
 
-    # ================================================================== #
-    # Introspection                                                       #
-    # ================================================================== #
-
     def has_axis(self, axis: str) -> bool:
-        """Return ``True`` if an executor of the given axis is registered."""
         return axis in self._by_axis and bool(self._by_axis[axis])
 
     def get_executor(self, axis: str) -> Optional[BaseKVCacheCompressionExecutor]:
-        """Return the single executor for the given axis (or ``None``)."""
         exs = self._by_axis.get(axis, [])
         return exs[0] if exs else None
 
     def get_sparse_executor(self) -> Optional[SparseAttentionExecutor]:
-        """Convenience accessor — returns the sparse-attention executor if
-        present."""
         return self.get_executor("sparse")  # type: ignore[return-value]
 
-    # ================================================================== #
-    # Dispatch order helper                                               #
-    # ================================================================== #
-
-    def _iter_for_hook(self, hook_name: str) -> Iterable[BaseKVCacheCompressionExecutor]:
-        """Yield executors in dispatch order for the given hook."""
-        order = self.HOOK_ORDER.get(
-            hook_name,
-            ["sparse", "storage"],  # default fallback order
-        )
+    def _iter_for_event(self, event: str) -> Iterable[BaseKVCacheCompressionExecutor]:
+        order = self.EVENT_AXIS_ORDER.get(event, ["sparse", "storage"])
         for axis in order:
             for e in self._by_axis.get(axis, []):
                 yield e
-
-
-class KVCacheBehaviorResourceManagerAdapter(BaseResourceManager):
-    """Thin ``BaseResourceManager`` shim bridging PyExecutor's resource-manager
-    protocol to a standalone :class:`KVCacheBehaviorCoordinator`.
-
-    This is the ONLY piece coupled to the resource-manager interface. It owns
-    no physical resources (the V2 cache manager does); PyExecutor auto-invokes
-    ``prepare_resources / update_resources / free_resources`` here each
-    iteration and they are forwarded verbatim to the coordinator. Keeping the
-    coupling in this shim lets the coordinator stay framework-agnostic and lets
-    the HOOK-3 (context-end) / HOOK-5 (step-end) drivers be split to distinct
-    call sites later without touching the coordinator.
-
-    ``behavior_coordinator`` is exposed so the model engine can unwrap the
-    standalone coordinator and set it as ``metadata.coordinator`` — the
-    attention path (HOOK 2/4) talks to the coordinator directly, not this shim.
-    """
-
-    def __init__(self, coordinator: KVCacheBehaviorCoordinator) -> None:
-        self.behavior_coordinator = coordinator
-
-    def get_max_resource_count(self) -> int:
-        return self.behavior_coordinator.get_max_resource_count()
-
-    def get_needed_resource_to_completion(self, request: "LlmRequest") -> int:
-        return self.behavior_coordinator.get_needed_resource_to_completion(request)
-
-    def prepare_resources(self, scheduled_batch: "ScheduledRequests") -> None:
-        self.behavior_coordinator.prepare_resources(scheduled_batch)
-
-    def update_resources(
-        self,
-        scheduled_batch: "ScheduledRequests",
-        attn_metadata: Optional["AttentionMetadata"] = None,
-        kv_cache_dtype_byte_size: Optional[float] = None,
-    ) -> None:
-        self.behavior_coordinator.update_resources(
-            scheduled_batch, attn_metadata, kv_cache_dtype_byte_size
-        )
-
-    def free_resources(self, request: "LlmRequest") -> None:
-        self.behavior_coordinator.free_resources(request)
