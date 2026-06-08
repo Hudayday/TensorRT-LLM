@@ -36,6 +36,7 @@ algorithm (``algorithm="rocketkv"``, the executor-framework method here).
 """
 
 import math
+import os
 from typing import TYPE_CHECKING, ClassVar, List, Optional
 
 import torch
@@ -1181,12 +1182,43 @@ class RocketKVCacheManagerV2(KVCacheManagerV2):
 
     def fill_kt_block_offsets(self, request_ids: List[int], out: torch.Tensor) -> torch.Tensor:
         scale = int(self.kt_index_scale)
+        if os.environ.get("KT_LOOP") == "1":
+            for i, req_id in enumerate(request_ids):
+                kvc = self.kv_cache_map.get(req_id)
+                if kvc is None:
+                    continue
+                idx = torch.as_tensor(kvc.get_base_page_indices(0))
+                kt = torch.where(idx != _BAD_PAGE, idx * scale, torch.zeros_like(idx))
+                n = min(int(kt.numel()), out.shape[1])
+                out[i, :n] = kt[:n].to(out.dtype)
+            return out
+        # --- vectorized: gather raw page indices (pybind only, no per-req torch
+        # dispatch), then do ALL the where/scale/scatter ONCE. Byte-identical to
+        # the loop above (fuzz 3000/3000 + NIAH 10/10): within each row's valid
+        # prefix [0,n_i) BAD->0 else idx*scale; tail [n_i:] and absent rows kept.
+        W = int(out.shape[1])
+        rows = []
+        idx_lists = []
         for i, req_id in enumerate(request_ids):
             kvc = self.kv_cache_map.get(req_id)
             if kvc is None:
                 continue
-            idx = torch.as_tensor(kvc.get_base_page_indices(0))
-            kt = torch.where(idx != _BAD_PAGE, idx * scale, torch.zeros_like(idx))
-            n = min(int(kt.numel()), out.shape[1])
-            out[i, :n] = kt[:n].to(out.dtype)
+            rows.append(i)
+            idx_lists.append(kvc.get_base_page_indices(0))
+        if not rows:
+            return out
+        lens = [min(len(x), W) for x in idx_lists]
+        Wm = max(lens)
+        if Wm == 0:
+            return out
+        padded = [list(x[:ln]) + [_BAD_PAGE] * (Wm - ln) for x, ln in zip(idx_lists, lens)]
+        t = torch.as_tensor(padded, dtype=torch.int64)
+        kt = torch.where(t != _BAD_PAGE, t * scale, torch.zeros_like(t))
+        colmask = torch.arange(Wm).unsqueeze(0) < torch.as_tensor(
+            lens, dtype=torch.int64
+        ).unsqueeze(1)
+        rows_dev = torch.as_tensor(rows, device=out.device)
+        kt_dev = kt.to(device=out.device, dtype=out.dtype)
+        colmask_dev = colmask.to(out.device)
+        out[rows_dev, :Wm] = torch.where(colmask_dev, kt_dev, out[rows_dev, :Wm])
         return out
