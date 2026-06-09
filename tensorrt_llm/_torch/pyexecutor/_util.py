@@ -89,6 +89,16 @@ def get_kv_cache_manager_cls(
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
     if (sparse_attn_config is not None
+            and sparse_attn_config.is_behavior_layer_method):
+        # Pattern 3: a behavior-layer method may declare a custom V2 subclass
+        # (e.g. TriAttention's resize-only manager). Consult the dispatcher; a
+        # None return means standard V2 (Patterns 1/2) -> fall through below.
+        from ..attention_backend.sparse.utils import (
+            get_compression_manager_kv_cache_manager_cls)
+        _p3_cls = get_compression_manager_kv_cache_manager_cls(sparse_attn_config)
+        if _p3_cls is not None:
+            return _p3_cls
+    if (sparse_attn_config is not None
             and not sparse_attn_config.is_behavior_layer_method):
         # Legacy memory-layer dispatch (legacy RocketKV / DSA / skip_softmax
         # own a sparse-aware cache manager subclass). Behavior-layer
@@ -1689,6 +1699,15 @@ def create_py_executor_instance(
                 ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
                     compression_manager)
             model_engine.compression_manager = compression_manager
+            # The compression manager (e.g. TriAttention eviction in
+            # on_generation_step_end) must run BEFORE the KV cache manager's
+            # resize each iteration. The earlier move_to_end(KV_CACHE_MANAGER,
+            # last=True) ran BEFORE this registration, so the freshly-appended
+            # compression manager would otherwise sit AFTER it; re-assert
+            # KV_CACHE_MANAGER as last now.
+            if kv_cache_manager is not None:
+                resource_manager.resource_managers.move_to_end(
+                    ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.

@@ -473,6 +473,18 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         """
         return False
 
+    @property
+    def ships_attention_backend(self) -> bool:
+        """
+        Whether this method ships its own attention backend (shim + Metadata)
+        even as a behavior-layer method. Default ``False`` (behavior-layer
+        methods use the base attention class). TriAttention overrides to
+        ``True``: physical eviction needs a Metadata shim to reconcile
+        ``num_cached_tokens_per_seq`` after compaction, so
+        ``get_attention_backend`` must NOT null its config.
+        """
+        return False
+
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for RocketKV sparse attention."""
@@ -2664,11 +2676,63 @@ SpeculativeConfig: TypeAlias = Annotated[
     Field(discriminator="decoding_type"),
 ]
 
+class TriAttentionConfig(BaseSparseAttentionConfig):
+    """Configuration for TriAttention sparse attention (periodic physical KV
+    eviction guided by offline-calibrated trigonometric importance scores;
+    arXiv:2604.04921, github.com/WeianMao/triattention).
+
+    Behavior-layer method (``is_behavior_layer_method=True``): the runtime
+    instance is built by ``create_sparse_attention_manager`` and registered as
+    the ``KV_CACHE_COMPRESSION_MANAGER`` resource manager. It ships its own
+    attention backend (``ships_attention_backend=True``) because physical
+    eviction needs a Metadata shim to reconcile ``num_cached`` after
+    compaction. Pattern 3: it declares a resize-only ``KVCacheManagerV2``
+    subclass. Consumes the offline ``.pt`` statistics produced by
+    ``tensorrt_llm._torch.attention_backend.sparse.triattention_calibration.
+    compute_triattention_calibration``.
+    """
+    algorithm: Literal["triattention"] = "triattention"
+    top_B: int = Field(
+        default=1024,
+        description="Tokens kept at each periodic eviction (upstream `budget`; "
+        "prompt tokens are always preserved on top).")
+    beta: int = Field(
+        default=128,
+        description="Eviction period in generation steps (upstream "
+        "`divide_length`): the eviction hook fires once every `beta` steps.")
+    calibration_path: str = Field(
+        description="Path to the offline calibration `.pt` produced by "
+        "`compute_triattention_calibration`. Required.")
+    window_size: int = Field(
+        default=128,
+        description="Most-recent tokens always preserved from eviction "
+        "(upstream TRIATTN_RUNTIME_WINDOW_SIZE). Prevents the scorer from "
+        "evicting freshly-generated tokens, which corrupts multi-round "
+        "eviction.")
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    @property
+    def is_behavior_layer_method(self) -> bool:
+        # Behavior-layer: registered as KV_CACHE_COMPRESSION_MANAGER; the
+        # framework drives on_generation_step_end. Pattern 3 supplies the
+        # resize-only V2 subclass; ships_attention_backend keeps the shim.
+        return True
+
+    @property
+    def ships_attention_backend(self) -> bool:
+        # Physical eviction needs the num_cached-reconcile Metadata shim, so
+        # get_attention_backend must NOT null this config.
+        return True
+
+
 SparseAttentionConfig: TypeAlias = Annotated[
     Union[
         RocketSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
+        TriAttentionConfig,
     ],
     Field(discriminator="algorithm"),
 ]

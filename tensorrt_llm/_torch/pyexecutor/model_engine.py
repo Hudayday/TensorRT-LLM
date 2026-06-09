@@ -2945,14 +2945,21 @@ class PyTorchModelEngine(ModelEngine):
                                     (start_idx, end_idx, slot_idx))
                             else:
                                 input_ids.append(request.get_last_tokens(beam))
-                    past_seen_token_num = request.max_beam_num_tokens - 1
+                    past_seen_token_num = request.max_beam_num_tokens - 1 - int(
+                        getattr(request, 'py_tri_evicted', 0) or 0)
+                    # TriAttention: query position tracks TRUE decode progress
+                    # while num_cached (past_seen_token_num) uses the compacted
+                    # length. py_tri_evicted is 0 for all non-TriAttention runs,
+                    # so this is a no-op there.
+                    _tri_pos = request.max_beam_num_tokens - 1
                 else:
                     # the request has previous tensor
                     # previous_batch_indices is per-request, not per-beam
                     previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
+                    _tri_pos = past_seen_token_num
 
-                position_id = past_seen_token_num
+                position_id = _tri_pos
                 if _has_cp_helix:
                     # We compute a global position_id because each helix rank has only a subset of
                     # tokens for a sequence.

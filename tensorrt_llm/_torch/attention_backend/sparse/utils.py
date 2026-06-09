@@ -59,6 +59,28 @@ def create_sparse_attention_manager(
     legacy ``KVCacheManager`` lacks the page-table / block-read API the
     behavior layer depends on).
     """
+    if sparse_attn_config.algorithm == "triattention":
+        from .triattention import TriAttention
+        return TriAttention(
+            kv_cache_manager,
+            top_B=sparse_attn_config.top_B,
+            beta=sparse_attn_config.beta,
+            calibration_path=sparse_attn_config.calibration_path,
+            window_size=sparse_attn_config.window_size,
+        )
+    return None
+
+
+def get_compression_manager_kv_cache_manager_cls(
+        sparse_attn_config: "SparseAttentionConfig"):
+    """Pattern 3: behavior-layer methods may declare a custom ``KVCacheManagerV2``
+    subclass (the framework factory consults this to instantiate the right V2
+    type). Returns the subclass *class* for such methods, else ``None`` (use
+    the standard V2 manager, Patterns 1/2). Maps from the algorithm so the V2
+    type is known before the compression manager instance is built."""
+    if sparse_attn_config.algorithm == "triattention":
+        from .triattention import TriAttentionKVCacheManagerV2
+        return TriAttentionKVCacheManagerV2
     return None
 
 
@@ -97,8 +119,13 @@ def get_vanilla_sparse_attn_attention_backend(
 
 def get_trtllm_sparse_attn_attention_backend(
         sparse_attn_config: "SparseAttentionConfig"):
-    # Only legacy memory-layer methods reach here (behavior-layer methods are
-    # short-circuited to the user-selected backend in get_attention_backend).
+    # Legacy memory-layer methods reach here, plus behavior-layer methods that
+    # ship their own backend (ships_attention_backend=True, e.g. TriAttention's
+    # num_cached-reconcile shim); other behavior-layer methods are short-
+    # circuited to the user-selected backend in get_attention_backend.
+    if sparse_attn_config.algorithm == "triattention":
+        from .triattention import TriAttentionTrtllmAttention
+        return TriAttentionTrtllmAttention
     if sparse_attn_config.algorithm == "rocket":
         return RocketTrtllmAttention
     elif sparse_attn_config.algorithm == "dsa":
