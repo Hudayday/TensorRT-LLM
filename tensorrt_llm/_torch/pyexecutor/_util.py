@@ -96,6 +96,14 @@ def get_kv_cache_manager_cls(
         # inside a ``SparseAttentionManager`` constructed via
         # ``create_sparse_attention_manager`` after PyExecutor instantiation.
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+    if (sparse_attn_config is not None
+            and sparse_attn_config.algorithm == "triattention"):
+        # TriAttention is a behavior-layer method but needs a V2 subclass
+        # that reconciles history_length after physical eviction (V2 _core
+        # is pure-Python; V1 C++ cannot shrink mid-decode). Pattern 3.
+        from ..attention_backend.sparse.triattention import \
+            TriAttentionKVCacheManagerV2
+        return TriAttentionKVCacheManagerV2
     elif is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid manager.

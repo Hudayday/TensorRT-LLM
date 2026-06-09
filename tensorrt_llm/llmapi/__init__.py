@@ -21,8 +21,8 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        RocketSparseAttentionConfig, SADecodingConfig,
                        SAEnhancerConfig, SaveHiddenStatesDecodingConfig,
                        SchedulerConfig, SkipSoftmaxAttentionConfig,
-                       TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
-                       UserProvidedDecodingConfig)
+                       TorchCompileConfig, TorchLlmArgs, TriAttentionConfig,
+                       TrtLlmArgs, UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mm_encoder import MultimodalEncoder
@@ -83,6 +83,7 @@ __all__ = [
     'RocketSparseAttentionConfig',
     'ReorderRequestPolicyConfig',
     'DeepSeekSparseAttentionConfig',
+    'TriAttentionConfig',
     'SchedulingParams',
     'SkipSoftmaxAttentionConfig',
     'PrometheusMetricsConfig',

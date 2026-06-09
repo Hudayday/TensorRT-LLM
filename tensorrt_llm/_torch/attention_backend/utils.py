@@ -25,9 +25,11 @@ def get_attention_backend(
     # Memory-layer methods keep their own attention shim + Metadata and
     # fall through to the per-method dispatch below.
     if (sparse_attn_config is not None
-            and sparse_attn_config.is_behavior_layer_method):
+            and sparse_attn_config.is_behavior_layer_method
+            and sparse_attn_config.algorithm != "triattention"):
         # Behavior-layer methods use the base attention class (no per-method
-        # shim). Memory-layer methods keep their shim.
+        # shim) -- EXCEPT TriAttention, which ships a shim (num_cached
+        # reconciliation after physical eviction) and keeps its config.
         sparse_attn_config = None
 
     if backend_name == "VANILLA":

@@ -59,6 +59,21 @@ def create_sparse_attention_manager(
     legacy ``KVCacheManager`` lacks the page-table / block-read API the
     behavior layer depends on).
     """
+    if sparse_attn_config.algorithm == "triattention":
+        from tensorrt_llm._torch.pyexecutor.resource_manager import \
+            KVCacheManagerV2
+        if not isinstance(kv_cache_manager, KVCacheManagerV2):
+            raise TypeError(
+                "TriAttention requires KVCacheManagerV2 (got "
+                f"{type(kv_cache_manager).__name__}); enable V2 via "
+                "KvCacheConfig.use_kv_cache_manager_v2=True.")
+        from .triattention import TriAttention
+        return TriAttention(
+            kv_cache_manager=kv_cache_manager,
+            top_B=sparse_attn_config.top_B,
+            beta=sparse_attn_config.beta,
+            calibration_path=sparse_attn_config.calibration_path,
+        )
     return None
 
 
@@ -97,8 +112,14 @@ def get_vanilla_sparse_attn_attention_backend(
 
 def get_trtllm_sparse_attn_attention_backend(
         sparse_attn_config: "SparseAttentionConfig"):
-    # Only legacy memory-layer methods reach here (behavior-layer methods are
-    # short-circuited to the user-selected backend in get_attention_backend).
+    # TriAttention is a behavior-layer method but DOES ship an attention shim
+    # (carries a metadata subclass reconciling num_cached after physical
+    # eviction), so it is NOT short-circuited in get_attention_backend.
+    if sparse_attn_config.algorithm == "triattention":
+        from .triattention import TriAttentionTrtllmAttention
+        return TriAttentionTrtllmAttention
+    # Other behavior-layer methods are short-circuited upstream; only legacy
+    # memory-layer methods reach the dispatch below.
     if sparse_attn_config.algorithm == "rocket":
         return RocketTrtllmAttention
     elif sparse_attn_config.algorithm == "dsa":
