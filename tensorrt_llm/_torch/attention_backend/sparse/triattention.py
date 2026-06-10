@@ -298,136 +298,239 @@ class TriAttention(SparseAttentionManager):
     # Selection + scoring                                                #
     # ------------------------------------------------------------------ #
 
-    def _select_with_recency(self, score: "torch.Tensor", seq_len: int) -> "torch.Tensor":
-        """Select keep indices for ONE layer: always retain the most recent
-        ``window_size`` slots (the just-generated tokens the trig scorer alone
-        would wrongly evict) and fill the remaining budget with the
-        highest-scoring OLDER tokens (topk). Returns SORTED long indices."""
-        device = score.device
+    def _select_with_recency(self, scores: "torch.Tensor", seq_len: int) -> "torch.Tensor":
+        """Decide which token slots THIS layer keeps, given per-token scores.
+
+        The keep budget is ``top_B`` tokens, split into two parts:
+
+          1. RECENCY window -- the most-recent ``window_size`` slots are ALWAYS
+             kept, regardless of score. The trigonometric importance score
+             systematically UNDER-rates freshly generated tokens, so without
+             this guarantee the model would evict its own recent output and
+             degenerate over repeated eviction rounds. (This is the single most
+             important correctness knob for multi-round eviction.)
+
+          2. TOP-K of the rest -- the remaining budget (``top_B - window_size``)
+             is spent on the highest-scoring tokens in the OLDER region. We use
+             top-k (not a threshold) because the budget is a fixed token count:
+             we keep exactly the K most "important" older tokens and drop the
+             rest. ``torch.topk`` returns those K indices.
+
+        Args:
+            scores:  per-token importance for one layer, shape ``[seq_len]``
+                     (already aggregated over heads in ``on_generation_step_end``).
+            seq_len: number of valid tokens currently cached for this request.
+
+        Returns:
+            kept slot indices in ``[0, seq_len)``, SORTED ascending (the kernel
+            expects ascending order). Length == ``min(top_B, seq_len)``.
+        """
+        device = scores.device
         keep_count = min(self.top_B, seq_len)
+
+        # Budget covers everything -> keep all tokens (this layer evicts nothing).
         if keep_count >= seq_len:
             return torch.arange(seq_len, device=device, dtype=torch.long)
-        window = min(self.window_size, seq_len)
-        if keep_count <= window:
-            return torch.arange(
-                seq_len - keep_count, seq_len, device=device, dtype=torch.long
-            )
-        recent = torch.arange(seq_len - window, seq_len, device=device, dtype=torch.long)
-        older_budget = keep_count - window
-        older_scores = score[: seq_len - window]
+
+        recency_window = min(self.window_size, seq_len)
+
+        # Budget is no bigger than the recency window -> no room to score older
+        # tokens; just keep the most-recent ``keep_count`` slots.
+        if keep_count <= recency_window:
+            return torch.arange(seq_len - keep_count, seq_len,
+                                device=device, dtype=torch.long)
+
+        # (1) the last ``recency_window`` slots, always kept.
+        recent_indices = torch.arange(seq_len - recency_window, seq_len,
+                                      device=device, dtype=torch.long)
+        # (2) top-K highest-scoring tokens from the OLDER region (everything
+        #     before the recency window), using the leftover budget.
+        older_budget = keep_count - recency_window
+        older_scores = scores[:seq_len - recency_window]
         older_keep = torch.topk(older_scores, older_budget).indices.to(torch.long)
-        return torch.sort(torch.cat([older_keep, recent])).values
+
+        # Merge the two kept sets and return ascending (kernel requirement).
+        return torch.sort(torch.cat([older_keep, recent_indices])).values
 
     def _score_layer(
         self,
-        k_layer: torch.Tensor,
-        key_positions: Optional[torch.Tensor],
+        cached_k: torch.Tensor,
+        key_positions: Optional[torch.Tensor],   # unused -- see note below
         layer_idx: int,
         round_start: int,
     ) -> Optional[torch.Tensor]:
-        """Official DIRECT Q*conj(K_rot) scoring (port of vllm
-        compute_scores_pytorch). K is used AS CACHED (post-RoPE): the token's
-        position lives in K's RoPE rotation, so there is NO inversion and NO
-        per-token position input (``round_start`` is the scalar current query
-        position; ``key_positions`` is ignored). Vectorized over heads.
-        Returns ``[num_q_heads, seq_len]`` per-head scores."""
+        """Compute a per-token IMPORTANCE score for one layer's cached keys.
+
+        We don't have the upcoming query vectors at eviction time, so instead of
+        the usual ``q . kᵀ`` we approximate the expected attention each key will
+        receive using OFFLINE-CALIBRATED statistics of the query distribution:
+          * ``E_q``      -- mean of the query's complex per-frequency form  [H, F]
+          * ``E_q_norm`` -- mean of the query's magnitude                   [H, F]
+        (port of the upstream vLLM ``compute_scores_pytorch``.)
+
+        K is used EXACTLY as stored in the cache (post-RoPE). The token's
+        absolute position is already baked into K's RoPE rotation, so there is
+        NO RoPE inversion and NO per-token position input. ``round_start`` is the
+        single current query position; ``key_positions`` is unused (kept only for
+        signature symmetry with other scorers).
+
+        Shapes use: H = num query heads, nkv = num KV heads, F = head_dim/2
+        (RoPE pairs the head dim into F complex frequencies). Vectorized over heads.
+
+        Args:
+            cached_k:  this layer's cached keys, ``[num_kv_heads, seq_len, head_dim]``.
+            layer_idx: selects this layer's calibration stats.
+            round_start: current query's absolute position.
+        Returns:
+            per-(query-head, token) scores, ``[num_q_heads, seq_len]``.
+        """
         device = self.calibration["E_q"].device
-        k = k_layer.to(device=device, dtype=torch.float32)  # [nkv, seq, hd]
-        nkv, seq, hd = k.shape
-        F = hd // 2
-        # "half" RoPE layout: first F = real, last F = imag.
-        k_real, k_imag = k[..., :F], k[..., F:]  # [nkv, seq, F]
-        E_q = self.calibration["E_q"][layer_idx].to(device)  # [H, F] complex
-        E_q_norm = self.calibration["E_q_norm"][layer_idx].to(
-            device=device, dtype=torch.float32)  # [H, F]
-        omega = self.calibration["omega"].to(device=device, dtype=torch.float32)  # [F]
-        fss = self._freq_scale_sq.to(device=device, dtype=torch.float32)  # [F]
-        H = self._H
-        # GQA: map each (calibrated) Q head onto its KV head, expand K per Q head.
-        idx = torch.arange(H, device=device)
-        q2kv = torch.clamp(idx * nkv // max(1, H), max=nkv - 1)  # [H]
-        kr = k_real[q2kv]  # [H, seq, F]
-        ki = k_imag[q2kv]
-        qr = E_q.real.unsqueeze(1)  # [H, 1, F]
-        qi = E_q.imag.unsqueeze(1)
-        # prod = Q * conj(K_rot)
-        prod_real = qr * kr + qi * ki  # [H, seq, F]
-        prod_imag = qi * kr - qr * ki
+        k = cached_k.to(device=device, dtype=torch.float32)        # [num_kv_heads, seq, head_dim]
+        num_kv_heads, seq_len, head_dim = k.shape
+        num_freqs = head_dim // 2
+
+        # "half" RoPE layout: first half of head_dim = REAL part, second = IMAG part.
+        k_real, k_imag = k[..., :num_freqs], k[..., num_freqs:]    # each [num_kv_heads, seq, num_freqs]
+
+        # Per-layer calibration stats (precomputed offline over a corpus):
+        q_mean_complex = self.calibration["E_q"][layer_idx].to(device)            # [H, F] complex: mean query
+        q_mean_norm    = self.calibration["E_q_norm"][layer_idx].to(device, torch.float32)  # [H, F]: mean |query|
+        rope_inv_freq  = self.calibration["omega"].to(device, torch.float32)      # [F]: RoPE inverse frequencies
+        freq_scale_sq  = self._freq_scale_sq.to(device, torch.float32)            # [F]: per-freq RoPE amplitude^2
+        num_q_heads = self._H
+
+        # GQA: several query heads share one KV head. Map each query head to its
+        # KV head, then gather that KV head's keys so everything below is
+        # per-QUERY-head.
+        q_head_ids      = torch.arange(num_q_heads, device=device)
+        qhead_to_kvhead = torch.clamp(q_head_ids * num_kv_heads // max(1, num_q_heads),
+                                      max=num_kv_heads - 1)         # [H]
+        k_real_q = k_real[qhead_to_kvhead]                          # [H, seq, F]
+        k_imag_q = k_imag[qhead_to_kvhead]
+        q_real = q_mean_complex.real.unsqueeze(1)                   # [H, 1, F]
+        q_imag = q_mean_complex.imag.unsqueeze(1)
+
+        # Complex product  Q . conj(K)  per (query-head, token, freq):
+        #   real = q_re*k_re + q_im*k_im ;  imag = q_im*k_re - q_re*k_im
+        prod_real = q_real * k_real_q + q_imag * k_imag_q           # [H, seq, F]
+        prod_imag = q_imag * k_real_q - q_real * k_imag_q
+
+        # ---- position-dependent term ----
+        # Rotate the product by the (query - key) relative distance. We don't
+        # know the exact future query position, so we average over a GEOMETRIC
+        # set of look-ahead offsets [1,2,4,...] -- a cheap proxy for "the next
+        # several decode steps". O = num offsets.
         if self._offsets is None:
             self._offsets = _build_geometric_offsets(self._offset_max_length, device)
-        offs = self._offsets.to(device=device, dtype=torch.float32)  # [O]
-        t = (float(round_start) + offs).view(-1, 1, 1, 1)  # [O,1,1,1]
-        phase = t * omega.view(1, 1, 1, -1)  # [O,1,1,F]
-        cos_v, sin_v = torch.cos(phase), torch.sin(phase)
-        # position_term = freq_scale * (prod_real*cos - prod_imag*sin)
-        pt = fss.view(1, 1, 1, -1) * (
-            prod_real.unsqueeze(0) * cos_v - prod_imag.unsqueeze(0) * sin_v)  # [O,H,seq,F]
-        score_off = pt.sum(dim=-1)  # [O, H, seq]
+        offsets = self._offsets.to(device, torch.float32)                       # [O]
+        query_positions = (float(round_start) + offsets).view(-1, 1, 1, 1)      # [O,1,1,1]
+        phase = query_positions * rope_inv_freq.view(1, 1, 1, -1)               # [O,1,1,F]
+        cos_phase, sin_phase = torch.cos(phase), torch.sin(phase)
+        # real part of (prod * e^{i*phase}), scaled per frequency:
+        position_term = freq_scale_sq.view(1, 1, 1, -1) * (
+            prod_real.unsqueeze(0) * cos_phase - prod_imag.unsqueeze(0) * sin_phase
+        )                                                                       # [O, H, seq, F]
+        score_per_offset = position_term.sum(dim=-1)                            # sum over freqs -> [O, H, seq]
         if self.score_aggregation == "max":
-            scores = score_off.max(dim=0).values  # [H, seq]
+            scores = score_per_offset.max(dim=0).values                         # [H, seq]
         else:
-            scores = score_off.mean(dim=0)
-        # position-independent MLR term: (q_abs_mean - |q_mean|) * |K| * freq_scale
-        k_abs = torch.sqrt(kr ** 2 + ki ** 2)  # [H, seq, F]
-        q_mean_abs = E_q.abs()  # [H, F]
-        extra_coef = (E_q_norm - q_mean_abs).unsqueeze(1)  # [H,1,F]
-        extra = (k_abs * extra_coef * fss.view(1, 1, -1)).sum(dim=-1)  # [H, seq]
-        return scores + extra  # [H, seq]
+            scores = score_per_offset.mean(dim=0)                               # average the look-ahead offsets
+
+        # ---- position-INDEPENDENT term (the MLR correction) ----
+        # (mean|q| - |mean q|) * |k| * freq_scale, summed over freqs. Captures the
+        # part of the expected attention that doesn't depend on relative position.
+        k_magnitude      = torch.sqrt(k_real_q ** 2 + k_imag_q ** 2)            # [H, seq, F]
+        q_mean_magnitude = q_mean_complex.abs()                                 # [H, F]
+        mlr_coef = (q_mean_norm - q_mean_magnitude).unsqueeze(1)               # [H, 1, F]
+        mlr_term = (k_magnitude * mlr_coef * freq_scale_sq.view(1, 1, -1)).sum(dim=-1)  # [H, seq]
+
+        return scores + mlr_term                                                # [H, seq]
 
     # ------------------------------------------------------------------ #
     # V2-manager cache access + physical eviction (HND physical layout)  #
     # ------------------------------------------------------------------ #
 
     def _resolve_page_ids(self, request: "LlmRequest", layer_idx: int) -> Optional[List[int]]:
-        """Resolve this request's paged-cache block indices via V2's public
-        ``get_batch_cache_indices(ids, layer_idx) -> List[List[int]]``, falling
-        back to V1 ``get_cache_indices(request)``; ``None`` when neither exists
-        (mocked tests). Indices already divide by kv_factor."""
+        """Return the page (block) ids that hold THIS request's KV for one layer.
+
+        The V2 KV cache is PAGED: a request's tokens live in several (possibly
+        non-contiguous) fixed-size pages inside one big shared pool. Before we
+        can read or compact a request's cache we must know WHICH pages are its
+        own. V2's ``get_batch_cache_indices([ids], layer_idx)`` returns one list
+        of block ids per requested id; we pass a single id and take ``[0]``.
+
+        These ids index the PAGE axis (dim 0) of the tensor ``get_buffers``
+        returns; the key/value split is a SEPARATE axis (kv_factor, dim 1) that
+        callers index on their own. We do NOT divide or rescale the ids here.
+
+        Falls back to the V1 ``get_cache_indices(request)`` signature, and returns
+        ``None`` when neither API exists (e.g. mocked unit tests). Negative ids
+        (unallocated slots) are filtered out.
+        """
         mgr = self.kv_cache_manager
-        get_batch = getattr(mgr, "get_batch_cache_indices", None)
+        get_batch = getattr(mgr, "get_batch_cache_indices", None)   # V2 API
         if get_batch is not None:
             try:
                 batch = get_batch([request.py_request_id], layer_idx)
             except Exception:
                 batch = None
             if batch:
-                ids = [int(p) for p in batch[0] if int(p) >= 0]
-                return ids or None
-        get_single = getattr(mgr, "get_cache_indices", None)
+                page_ids = [int(p) for p in batch[0] if int(p) >= 0]
+                return page_ids or None
+        get_single = getattr(mgr, "get_cache_indices", None)        # V1 fallback
         if get_single is not None:
             try:
-                ids = get_single(request)
+                page_ids = get_single(request)
             except Exception:
-                ids = None
-            if ids:
-                return [int(p) for p in ids if int(p) >= 0]
+                page_ids = None
+            if page_ids:
+                return [int(p) for p in page_ids if int(p) >= 0]
         return None
 
     def _read_request_k(
         self, request: "LlmRequest", layer_idx: int, seq_len: int
     ) -> Optional[torch.Tensor]:
-        """Read this request's K tokens for ``layer_idx`` out of the V2 paged
-        pool in HND layout. Returns ``[num_kv_heads, seq_len, head_dim]`` (K
-        only) or ``None`` when the manager doesn't expose a readable pool."""
+        """Read this request's KEY tensor for one layer out of the paged pool.
+
+        Steps: (1) get a VIEW of the layer's pool in HND layout, (2) slice out
+        this request's pages, (3) take the KEY half, (4) merge the (page, slot)
+        axes into one token axis and trim padding past ``seq_len``.
+
+        Returns ``[num_kv_heads, seq_len, head_dim]`` (keys only), or ``None``
+        when the manager exposes no readable pool (mocked tests).
+
+        WHY HND: ``get_buffers`` reinterprets the SAME raw bytes under a chosen
+        layout. The trtllm-gen / XQA attention kernel stores keys in HND
+        ``[num_pages, kv_factor, num_kv_heads, tokens_per_block, head_dim]``; we
+        MUST read with that same layout. ``get_buffers`` defaults to NHD (head
+        and token axes swapped) -- reading NHD here would silently transpose
+        heads and tokens and return scrambled keys.
+        """
         mgr = self.kv_cache_manager
         get_buffers = getattr(mgr, "get_buffers", None)
         if get_buffers is None:
             return None
-        pool = get_buffers(layer_idx, kv_layout="HND")  # [np, kv, nkv, tpb, hd]
+        # HND view: [num_pages, kv_factor, num_kv_heads, tokens_per_block, head_dim]
+        pool = get_buffers(layer_idx, kv_layout="HND")
         if pool is None:
             return None
         page_ids = self._resolve_page_ids(request, layer_idx)
         if not page_ids:
             return None
-        tpb = pool.shape[3]
-        k_index = 0  # KEY is index 0 along kv_factor; VALUE is 1.
-        pages = pool[page_ids][:, k_index]  # [num_pages, num_kv_heads, tpb, hd] (HND)
-        num_pages = pages.shape[0]
-        nkv = pages.shape[1]
-        # HND token axis = (np, tpb) with nkv first -> [nkv, np, tpb, hd] -> [nkv, np*tpb, hd]
-        flat = pages.permute(1, 0, 2, 3).reshape(nkv, num_pages * tpb, pages.shape[3])
-        flat = flat[:, :seq_len, :]
-        return flat.contiguous()  # [num_kv_heads, seq_len, head_dim]
+        tokens_per_block = pool.shape[3]                 # HND: dim 3 = slots per page
+        KEY = 0                                          # kv_factor index: 0 = key, 1 = value
+        # this request's pages, keys only:
+        #   [num_pages, num_kv_heads, tokens_per_block, head_dim]
+        pages = pool[page_ids][:, KEY]
+        num_pages, num_kv_heads = pages.shape[0], pages.shape[1]
+        # The logical token axis is (page, slot). Move num_kv_heads to the front,
+        # then merge (page, slot) into one contiguous token axis:
+        #   [num_kv_heads, num_pages, tokens_per_block, head_dim]
+        #     -> [num_kv_heads, num_pages * tokens_per_block, head_dim]
+        keys = pages.permute(1, 0, 2, 3).reshape(
+            num_kv_heads, num_pages * tokens_per_block, pages.shape[3])
+        keys = keys[:, :seq_len, :]                      # drop padding slots beyond seq_len
+        return keys.contiguous()                         # [num_kv_heads, seq_len, head_dim]
 
     def _evict_layer(
         self,
@@ -436,14 +539,26 @@ class TriAttention(SparseAttentionManager):
         keep: "torch.Tensor",
         seq_len: int,
     ) -> None:
-        """Compact ONE layer's cache in HND layout: gather kept tokens to the
-        front contiguous slots, NO re-RoPE (cached post-RoPE K used as-is;
-        design-A). ``keep`` is SORTED long indices in [0, seq_len).
+        """Physically compact ONE layer's cache in place: move the kept tokens
+        to the front contiguous slots of this request's pages.
 
-        HND physical layout is ``[num_pages, kv_factor, num_kv_heads,
-        tokens_per_block, head_dim]`` (confirmed: trtllm-gen/XQA reads HND). The
-        reorder MUST happen on the HND axes; an earlier NHD reorder transposed
-        tokens<->heads and silently scrambled the cache."""
+        ``keep`` is a SORTED list of slot indices in ``[0, seq_len)`` to retain.
+        We build the FULL permutation ``[kept..., dropped...]`` and apply it to
+        the (page, slot) token axis, so every slot in ``[0, seq_len)`` still holds
+        a real key/value afterwards (the kept ones up front, the dropped ones
+        after -- nothing is left stale). We do NOT re-apply RoPE: the kept keys
+        keep their ORIGINAL rotation (design choice A). The decode query rotates
+        at its true absolute position, which gives the correct relative distance
+        against those un-rotated kept keys, so no re-rotation is needed.
+
+        WHY HND (and why this was subtle): ``get_buffers`` is a VIEW over the raw
+        pool bytes. The kernel stores HND
+        ``[num_pages, kv_factor, num_kv_heads, tokens_per_block, head_dim]``, so
+        the reorder MUST be done on the HND axes. An earlier version reordered on
+        the NHD view, which transposed the token and head axes and silently
+        scrambled the cache (every probe looked fine; the kernel read garbage).
+        Both K and V are moved together (we reorder the whole kv_factor axis).
+        """
         mgr = self.kv_cache_manager
         get_buffers = getattr(mgr, "get_buffers", None)
         if get_buffers is None:
@@ -451,39 +566,44 @@ class TriAttention(SparseAttentionManager):
         keep = keep.to(dtype=torch.long)
         keep_count = int(keep.numel())
         if keep_count >= seq_len:
+            return                                       # nothing to drop
+        page_ids = self._resolve_page_ids(request, layer_idx)
+        if not page_ids:
             return
-        layer_page_ids = self._resolve_page_ids(request, layer_idx)
-        if not layer_page_ids:
-            return
-        pool = get_buffers(layer_idx, kv_layout="HND")  # [np, kv, num_kv_heads, tpb, hd]
+        # HND view: [num_pages, kv_factor, num_kv_heads, tokens_per_block, head_dim]
+        pool = get_buffers(layer_idx, kv_layout="HND")
         if pool is None:
             return
-        tpb = pool.shape[3]  # HND: tokens_per_block is dim 3 (nkv is dim 2)
-        page_idx_t = torch.as_tensor(layer_page_ids, device=pool.device, dtype=torch.long)
-        # COPY of this request's pages (HND): [num_pages, kv_factor, nkv, tpb, hd].
-        req_pages = pool[page_idx_t]
-        num_pages, kv_factor, nkv, _, hd = req_pages.shape
-        keep_dev = keep.to(req_pages.device)
-        # Permute to [kv, nkv, np, tpb, hd] then flatten (np, tpb) so the token
-        # axis (np*tpb) is one contiguous dim (dim 2).
-        perm = (
-            req_pages.permute(1, 2, 0, 3, 4)
-            .contiguous()
-            .reshape(kv_factor, nkv, num_pages * tpb, hd)
-        )
-        # vLLM compact_request_kv_in_place: FULL permutation [kept..., dropped...],
-        # NO re-RoPE, NO stale tail. Reorder the HND token axis (dim 2).
-        all_tok = torch.arange(seq_len, device=perm.device, dtype=torch.long)
-        drop_mask = torch.ones(seq_len, device=perm.device, dtype=torch.bool)
-        drop_mask[keep_dev] = False
-        perm_order = torch.cat([keep_dev, all_tok[drop_mask]])  # [seq_len]
-        reordered = perm[:, :, :seq_len].index_select(2, perm_order).clone()
-        perm[:, :, :seq_len] = reordered
-        num_seq_pages = (seq_len + tpb - 1) // tpb
-        back = (
-            perm.reshape(kv_factor, nkv, num_pages, tpb, hd).permute(2, 0, 1, 3, 4).contiguous()
-        )
-        pool[page_idx_t[:num_seq_pages]] = back[:num_seq_pages]
+        tokens_per_block = pool.shape[3]                 # HND: dim 3 = slots per page
+        page_ids_t = torch.as_tensor(page_ids, device=pool.device, dtype=torch.long)
+        # Advanced indexing returns a COPY of this request's pages:
+        #   [num_pages, kv_factor, num_kv_heads, tokens_per_block, head_dim]
+        request_pages = pool[page_ids_t]
+        num_pages, kv_factor, num_kv_heads, _, head_dim = request_pages.shape
+        keep = keep.to(request_pages.device)
+        # Bring the two NON-token axes (kv_factor, num_kv_heads) to the front and
+        # merge (page, slot) into a single token axis we can reorder (dim 2):
+        #   [kv_factor, num_kv_heads, num_pages * tokens_per_block, head_dim]
+        kv_by_token = (request_pages.permute(1, 2, 0, 3, 4)
+                       .contiguous()
+                       .reshape(kv_factor, num_kv_heads,
+                                num_pages * tokens_per_block, head_dim))
+        # Full reorder of the token axis: kept slots first (in their given
+        # order), then the dropped slots. Writing BOTH halves means no slot in
+        # [0, seq_len) is left holding stale data.
+        all_token_ids = torch.arange(seq_len, device=kv_by_token.device, dtype=torch.long)
+        is_dropped = torch.ones(seq_len, device=kv_by_token.device, dtype=torch.bool)
+        is_dropped[keep] = False
+        new_order = torch.cat([keep, all_token_ids[is_dropped]])         # [seq_len]
+        reordered = kv_by_token[:, :, :seq_len].index_select(2, new_order).clone()
+        kv_by_token[:, :, :seq_len] = reordered
+        # Reshape back to paged HND and write the touched pages into the live pool.
+        num_touched_pages = (seq_len + tokens_per_block - 1) // tokens_per_block
+        repaged = (kv_by_token
+                   .reshape(kv_factor, num_kv_heads, num_pages, tokens_per_block, head_dim)
+                   .permute(2, 0, 1, 3, 4)
+                   .contiguous())
+        pool[page_ids_t[:num_touched_pages]] = repaged[:num_touched_pages]
 
     def _num_layers_from_manager(self) -> int:
         mgr = self.kv_cache_manager
