@@ -73,9 +73,11 @@ class TestIsBehaviorLayerMethod:
     def test_skip_softmax_is_legacy(self):
         assert SkipSoftmaxAttentionConfig().is_behavior_layer_method is False
 
-    def test_triattention_is_behavior_layer(self):
+    def test_triattention_is_memory_layer(self):
+        # ships its own attn shim -> classified memory-layer (flag False); the
+        # eviction still runs in a SparseAttentionManager compression manager.
         cfg = TriAttentionConfig(calibration_path="/tmp/dummy.pt")
-        assert cfg.is_behavior_layer_method is True
+        assert cfg.is_behavior_layer_method is False
 
 
 # ---------------------------------------------------------------------------
@@ -184,10 +186,6 @@ class TestSparseAttentionManagerBase:
 class TestTriAttentionClass:
     def test_physically_evicts_kv_true(self):
         assert TriAttention.physically_evicts_kv is True
-
-    def test_ships_attention_backend_true(self):
-        cfg = TriAttentionConfig(calibration_path="x")
-        assert cfg.ships_attention_backend is True
 
     def test_pattern1_uses_base_v2(self):
         # Pattern 1: no V2 subclass; kv_cache_manager_class is the BASE V2 type

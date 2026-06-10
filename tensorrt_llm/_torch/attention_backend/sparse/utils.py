@@ -30,6 +30,12 @@ def get_sparse_attn_kv_cache_manager(
     """
     if sparse_attn_config.is_behavior_layer_method:
         return None
+    if sparse_attn_config.algorithm == "triattention":
+        # Memory-layer (ships its own attn shim) but uses the STANDARD cache
+        # manager, not a sparse-aware subclass. Return None so the caller falls
+        # through to the normal V2/V1 selection -- the choice is driven by
+        # use_kv_cache_manager_v2 (config), not by the algorithm/flag.
+        return None
     if sparse_attn_config.algorithm == "rocket":
         return RocketKVCacheManager
     elif sparse_attn_config.algorithm == "dsa":
@@ -106,10 +112,11 @@ def get_vanilla_sparse_attn_attention_backend(
 
 def get_trtllm_sparse_attn_attention_backend(
         sparse_attn_config: "SparseAttentionConfig"):
-    # Legacy memory-layer methods reach here, plus behavior-layer methods that
-    # ship their own backend (ships_attention_backend=True, e.g. TriAttention's
-    # num_cached-reconcile shim); other behavior-layer methods are short-
-    # circuited to the user-selected backend in get_attention_backend.
+    # Memory-layer methods reach here (RocketKV / DSA / skip_softmax, and
+    # TriAttention -- is_behavior_layer_method=False because it ships its own
+    # num_cached-reconcile attention shim). Behavior-layer methods
+    # (is_behavior_layer_method=True) are short-circuited to the user-selected
+    # backend in get_attention_backend.
     if sparse_attn_config.algorithm == "triattention":
         from .triattention import TriAttentionTrtllmAttention
         return TriAttentionTrtllmAttention

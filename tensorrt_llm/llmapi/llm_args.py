@@ -473,18 +473,6 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         """
         return False
 
-    @property
-    def ships_attention_backend(self) -> bool:
-        """
-        Whether this method ships its own attention backend (shim + Metadata)
-        even as a behavior-layer method. Default ``False`` (behavior-layer
-        methods use the base attention class). TriAttention overrides to
-        ``True``: physical eviction needs a Metadata shim to reconcile
-        ``num_cached_tokens_per_seq`` after compaction, so
-        ``get_attention_backend`` must NOT null its config.
-        """
-        return False
-
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for RocketKV sparse attention."""
@@ -2681,13 +2669,14 @@ class TriAttentionConfig(BaseSparseAttentionConfig):
     eviction guided by offline-calibrated trigonometric importance scores;
     arXiv:2604.04921, github.com/WeianMao/triattention).
 
-    Behavior-layer method (``is_behavior_layer_method=True``): the runtime
-    instance is built by ``create_sparse_attention_manager`` and registered as
-    the ``KV_CACHE_COMPRESSION_MANAGER`` resource manager. It ships its own
-    attention backend (``ships_attention_backend=True``) because physical
-    eviction needs a Metadata shim to reconcile ``num_cached`` after
-    compaction. Pattern 3: it declares a resize-only ``KVCacheManagerV2``
-    subclass. Consumes the offline ``.pt`` statistics produced by
+    Memory-layer (``is_behavior_layer_method=False``) because it ships its own
+    attention backend -- a Metadata shim that reconciles ``num_cached`` after
+    physical eviction. The periodic-eviction algorithm runs in a
+    ``SparseAttentionManager`` compression manager (built by
+    ``create_sparse_attention_manager``, registered as the
+    ``KV_CACHE_COMPRESSION_MANAGER`` resource manager); the cache manager itself
+    is the plain ``KVCacheManagerV2`` (chosen by ``use_kv_cache_manager_v2``,
+    not by this flag). Consumes the offline ``.pt`` statistics produced by
     ``tensorrt_llm._torch.attention_backend.sparse.triattention_calibration.
     compute_triattention_calibration``.
     """
@@ -2715,16 +2704,15 @@ class TriAttentionConfig(BaseSparseAttentionConfig):
 
     @property
     def is_behavior_layer_method(self) -> bool:
-        # Behavior-layer: registered as KV_CACHE_COMPRESSION_MANAGER; the
-        # framework drives on_generation_step_end. Pattern 3 supplies the
-        # resize-only V2 subclass; ships_attention_backend keeps the shim.
-        return True
-
-    @property
-    def ships_attention_backend(self) -> bool:
-        # Physical eviction needs the num_cached-reconcile Metadata shim, so
-        # get_attention_backend must NOT null this config.
-        return True
+        # Memory-layer: TriAttention ships its OWN attention backend (the
+        # num_cached-reconcile Metadata shim for physical eviction), so it is
+        # not a pure behavior-layer method -- get_attention_backend must keep
+        # the shim, and the cache manager is the plain V2
+        # (get_sparse_attn_kv_cache_manager returns KVCacheManagerV2). The
+        # periodic-eviction algorithm still runs in a SparseAttentionManager
+        # compression manager, registered separately by
+        # create_sparse_attention_manager (independent of this flag).
+        return False
 
 
 SparseAttentionConfig: TypeAlias = Annotated[

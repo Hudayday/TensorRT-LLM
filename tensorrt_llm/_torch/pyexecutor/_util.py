@@ -90,13 +90,17 @@ def get_kv_cache_manager_cls(
     sparse_attn_config = model_config.sparse_attention_config
     if (sparse_attn_config is not None
             and not sparse_attn_config.is_behavior_layer_method):
-        # Legacy memory-layer dispatch (legacy RocketKV / DSA / skip_softmax
-        # own a sparse-aware cache manager subclass). Behavior-layer
-        # compression methods fall through below; their algorithm runs
-        # inside a ``SparseAttentionManager`` constructed via
-        # ``create_sparse_attention_manager`` after PyExecutor instantiation.
-        return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-    elif is_hybrid_linear(config):
+        # Legacy memory-layer dispatch: methods that OWN a sparse-aware cache
+        # manager subclass (RocketKV / DSA / skip_softmax). TriAttention is
+        # memory-layer (ships its own attn shim) but does NOT own a sparse cache
+        # manager -- get_sparse_attn returns None and we fall through to the
+        # standard selection below, which picks V2 iff use_kv_cache_manager_v2
+        # (the choice is driven by the config, not by this flag). Behavior-layer
+        # compression methods (is_behavior_layer_method=True) also fall through.
+        _sparse_cls = get_sparse_attn_kv_cache_manager(sparse_attn_config)
+        if _sparse_cls is not None:
+            return _sparse_cls
+    if is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid manager.
         if model_config.get_num_mamba_layers() == 0:

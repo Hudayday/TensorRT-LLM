@@ -103,14 +103,12 @@ class TriAttention(SparseAttentionManager):
     # Physically deletes tokens from cache (vs RocketKV-style sparse mask).
     physically_evicts_kv: ClassVar[bool] = True
 
-    # TriAttention ships its own attention shim + Metadata (num_cached
-    # reconciliation after physical eviction), so the framework must NOT null
-    # its sparse config in get_attention_backend (see get_attention_backend's
-    # ``ships_attention_backend`` check).
-    ships_attention_backend: ClassVar[bool] = True
-
-    # Pattern 3: the resize-only V2 subclass that shrinks history_length to the
-    # compacted length. Set below the class body (forward reference).
+    # Pattern 1: TriAttention uses the plain KVCacheManagerV2 (no subclass).
+    # kv_cache_manager_class is the BASE V2 type, an isinstance sanity check
+    # only; set below the class body (forward reference). TriAttention is
+    # is_behavior_layer_method=False (it ships its own attention shim), so the
+    # framework keeps that shim and routes the cache manager via the standard
+    # use_kv_cache_manager_v2 selection.
     kv_cache_manager_class: ClassVar[Optional[type]] = None
 
     def __init__(
