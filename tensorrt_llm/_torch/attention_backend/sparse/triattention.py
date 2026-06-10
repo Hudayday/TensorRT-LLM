@@ -161,9 +161,19 @@ class TriAttention(SparseAttentionManager):
         self._freq_scale_sq = self.calibration["freq_scale_sq"].to(dtype=torch.float32)
         self._attention_scale = float(self.calibration.get("attention_scale", 1.0))
 
-    # ------------------------------------------------------------------ #
-    # Override: per-step end                                             #
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
+    # Lifecycle hooks (the framework drives all 8; we override 2).        #
+    #   on_request_init                  -- inherited no-op               #
+    #   on_context_attention / _end      -- inherited no-op               #
+    #   on_context_end                   -- inherited no-op               #
+    #   on_generation_attention / _end   -- inherited no-op               #
+    #   on_generation_step_end           -- OVERRIDDEN (periodic eviction)#
+    #   on_request_finish                -- OVERRIDDEN (per-request clean) #
+    # TriAttention scores from OFFLINE calibration (not live Q / attn),   #
+    # so it needs NO per-attention-layer hook: the entire eviction runs   #
+    # once in on_generation_step_end, looping layers and reading each     #
+    # layer's K directly from the V2 KV pool (get_buffers + page ids).    #
+    # ================================================================== #
 
     def on_generation_step_end(
         self,
@@ -211,6 +221,24 @@ class TriAttention(SparseAttentionManager):
                     if target_hist < kv_cache.history_length:
                         kv_cache._history_length = target_hist
                     kv_cache.resize(None, target_hist)
+
+    def on_request_finish(self, request: "LlmRequest") -> None:
+        """Drop this request's per-request step + evicted counters."""
+        self._gen_steps.pop(request.py_request_id, None)
+        self._evicted.pop(request.py_request_id, None)
+
+    # ------------------------------------------------------------------ #
+    # Public introspection (read by TriAttentionTrtllmAttentionMetadata) #
+    # ------------------------------------------------------------------ #
+
+    def evicted_count(self, request_id: int) -> int:
+        """Cumulative tokens physically evicted for ``request_id`` (read by the
+        metadata shim to reconcile num_cached after compaction)."""
+        return self._evicted.get(request_id, 0)
+
+    # ================================================================== #
+    # Helpers (eviction / scoring / V2 cache access / calibration)       #
+    # ================================================================== #
 
     def _maybe_evict(self, request: "LlmRequest", rid: int,
                      num_layers: int) -> None:
@@ -465,21 +493,7 @@ class TriAttention(SparseAttentionManager):
         return self._L  # fall back to the calibrated layer count
 
     # ------------------------------------------------------------------ #
-    # Request lifecycle + introspection                                  #
-    # ------------------------------------------------------------------ #
-
-    def on_request_finish(self, request: "LlmRequest") -> None:
-        """Drop this request's per-request step + evicted counters."""
-        self._gen_steps.pop(request.py_request_id, None)
-        self._evicted.pop(request.py_request_id, None)
-
-    def evicted_count(self, request_id: int) -> int:
-        """Cumulative tokens physically evicted for ``request_id`` (read by the
-        metadata shim to reconcile num_cached after compaction)."""
-        return self._evicted.get(request_id, 0)
-
-    # ------------------------------------------------------------------ #
-    # Calibration loading                                                #
+    # Helpers: calibration loading                                       #
     # ------------------------------------------------------------------ #
 
     def _load_calibration(self, path: str) -> Dict[str, torch.Tensor]:
