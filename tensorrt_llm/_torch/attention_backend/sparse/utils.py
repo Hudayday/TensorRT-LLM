@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 # Hardcoded (not derived from the config union) so adding a new algorithm
 # without registering it in the dispatch below trips the warning.
-_KNOWN_ALGORITHMS = frozenset({"rocket", "dsa", "skip_softmax"})
+_KNOWN_ALGORITHMS = frozenset({"rocket", "dsa", "skip_softmax", "triattention"})
 
 
 def _warn_if_unregistered(sparse_attn_config: "SparseAttentionConfig",
@@ -49,10 +49,26 @@ def get_sparse_attn_kv_cache_manager(
 def create_kv_cache_compression_manager(
     sparse_attn_config: "SparseAttentionConfig",
     kv_cache_manager: "KVCacheManagerV2",
+    model_path: Optional[str] = None,
 ) -> Optional[BaseKVCacheCompressionManager]:
     """Return the KV-cache compression manager for the configured algorithm,
     or ``None`` if the algorithm does not use the compression framework (e.g.
-    legacy rocket / dsa)."""
+    legacy rocket / dsa). ``model_path`` is the checkpoint, used by methods that
+    compute calibration on the first request (e.g. TriAttention)."""
+    if sparse_attn_config.algorithm == "triattention":
+        from .triattention import TriAttention
+        return TriAttention(
+            kv_cache_manager,
+            top_B=sparse_attn_config.top_B,
+            beta=sparse_attn_config.beta,
+            model_path=model_path,
+            calibration_path=sparse_attn_config.calibration_path,
+            calibration_cache_dir=sparse_attn_config.calibration_cache_dir,
+            calib_dataset=sparse_attn_config.calib_dataset,
+            calib_batches=sparse_attn_config.calib_batches,
+            calib_max_seq_length=sparse_attn_config.calib_max_seq_length,
+            window_size=sparse_attn_config.window_size,
+        )
     _warn_if_unregistered(sparse_attn_config,
                           "running without a compression manager")
     return None
@@ -69,6 +85,11 @@ def get_vanilla_sparse_attn_attention_backend(
 
 def get_trtllm_sparse_attn_attention_backend(
         sparse_attn_config: "SparseAttentionConfig"):
+    if sparse_attn_config.algorithm == "triattention":
+        # TriAttention ships a backend only to reconcile num_cached after
+        # physical eviction; decode otherwise runs the standard dense kernel.
+        from .triattention import TriAttentionTrtllmAttention
+        return TriAttentionTrtllmAttention
     if sparse_attn_config.algorithm == "rocket":
         return RocketTrtllmAttention
     elif sparse_attn_config.algorithm == "dsa":

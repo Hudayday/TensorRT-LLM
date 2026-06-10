@@ -1656,7 +1656,9 @@ def create_py_executor_instance(
         from ..attention_backend.sparse import \
             create_kv_cache_compression_manager
         compression_manager = create_kv_cache_compression_manager(
-            llm_args.sparse_attention_config, kv_cache_manager)
+            llm_args.sparse_attention_config,
+            kv_cache_manager,
+            model_path=str(llm_args.model))
         if compression_manager is not None:
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
                 compression_manager)

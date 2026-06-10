@@ -652,6 +652,55 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             })
 
 
+class TriAttentionConfig(BaseSparseAttentionConfig):
+    """Configuration for TriAttention sparse attention.
+
+    TriAttention periodically evicts cached tokens during generation, guided by
+    an offline-calibrated trigonometric importance score
+    (github.com/WeianMao/triattention). It runs on the KV-cache compression
+    framework with the standard ``KVCacheManagerV2``. Calibration statistics
+    are computed on the first request and cached to a config-keyed file, or
+    loaded from ``calibration_path`` if one is given.
+    """
+    algorithm: Literal["triattention"] = "triattention"
+    top_B: int = Field(
+        default=1024,
+        description="Tokens kept at each periodic eviction (upstream `budget`; "
+        "prompt tokens are always preserved on top).")
+    beta: int = Field(
+        default=128,
+        description="Eviction period in generation steps (upstream "
+        "`divide_length`): the eviction hook fires once every `beta` steps.")
+    calibration_path: Optional[str] = Field(
+        default=None,
+        description="Explicit precomputed calibration `.pt` to load. If unset, "
+        "calibration is computed on the first request and cached under "
+        "`calibration_cache_dir`, keyed by model and calib settings.")
+    calibration_cache_dir: Optional[str] = Field(
+        default=None,
+        description="Directory for the auto-computed calibration cache "
+        "(defaults to `$HF_HOME/triattn_calib`). Ignored if calibration_path "
+        "is set.")
+    calib_dataset: str = Field(
+        default="cnn_dailymail",
+        description="Calibration corpus used when computing stats on a miss.")
+    calib_batches: int = Field(
+        default=64,
+        description="Number of calibration samples to forward when computing "
+        "stats on a miss.")
+    calib_max_seq_length: int = Field(
+        default=2048, description="Max sequence length per calibration sample.")
+    window_size: int = Field(
+        default=128,
+        description="Most-recent tokens always preserved from eviction "
+        "(upstream TRIATTN_RUNTIME_WINDOW_SIZE). Prevents the scorer from "
+        "evicting freshly-generated tokens, which corrupts multi-round "
+        "eviction.")
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+
 class MoeLoadBalancerConfig(StrictBaseModel):
     """Pydantic configuration model for the Mixture of Experts (MoE) load balancer.
 
@@ -2653,6 +2702,7 @@ SparseAttentionConfig: TypeAlias = Annotated[
         RocketSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
+        TriAttentionConfig,
     ],
     Field(discriminator="algorithm"),
 ]

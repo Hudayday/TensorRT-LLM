@@ -2988,14 +2988,22 @@ class PyTorchModelEngine(ModelEngine):
                                     (start_idx, end_idx, slot_idx))
                             else:
                                 input_ids.append(request.get_last_tokens(beam))
-                    past_seen_token_num = request.max_beam_num_tokens - 1
+                    # A compression manager that physically evicts KV sets
+                    # request.py_tri_evicted. num_cached (past_seen_token_num) then
+                    # uses the compacted length while the query keeps its true
+                    # decode position. py_tri_evicted is 0 without eviction, so
+                    # this is a no-op on every other path.
+                    evicted = int(getattr(request, 'py_tri_evicted', 0) or 0)
+                    past_seen_token_num = request.max_beam_num_tokens - 1 - evicted
+                    query_position = request.max_beam_num_tokens - 1
                 else:
                     # the request has previous tensor
                     # previous_batch_indices is per-request, not per-beam
                     previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
+                    query_position = past_seen_token_num
 
-                position_id = past_seen_token_num
+                position_id = query_position
                 if _has_cp_helix:
                     # We compute a global position_id because each helix rank has only a subset of
                     # tokens for a sequence.
