@@ -12,11 +12,15 @@ Behavior-layer integration (kv-cache-compression framework):
     ``KV_CACHE_COMPRESSION_MANAGER`` resource manager; PyExecutor's main loop
     drives its ``on_generation_step_end`` each iteration. Eviction sets
     ``request.py_tri_evicted``.
-  - Pattern 3: ``kv_cache_manager_class = TriAttentionKVCacheManagerV2`` — a
-    resize-only V2 subclass that shrinks each evicted request's history_length
-    to the compacted length. KV_CACHE_MANAGER is ordered LAST among resource
-    managers (see ``_util.py``), so this subclass's resize runs AFTER
-    TriAttention's eviction and reads a fresh ``py_tri_evicted``.
+  - Pattern 1 (no V2 subclass): uses the plain ``KVCacheManagerV2``. The
+    compacted-history reconcile lives in ``on_generation_step_end`` itself --
+    every step, for any request with cumulative evictions, it shrinks
+    history_length to ``max_beam - py_tri_evicted`` directly on the plain
+    manager's ``kv_cache_map`` entry. KV_CACHE_MANAGER is ordered BEFORE this
+    compression manager (framework default), so the plain manager's per-step
+    reset of history to max_beam-1 happens first and our reconcile is the last
+    word. (``kv_cache_manager_class = KVCacheManagerV2`` is only an isinstance
+    sanity check.)
   - ``TriAttentionTrtllmAttention`` (custom backend, kept because physical
     eviction needs ``num_cached`` reconciliation) carries
     ``TriAttentionTrtllmAttentionMetadata``, which clamps
@@ -184,58 +188,85 @@ class TriAttention(SparseAttentionManager):
             rid = request.py_request_id
             step = self._gen_steps.get(rid, 0) + 1
             self._gen_steps[rid] = step
-            if step % self.beta != 0:
+            if step % self.beta == 0:
+                self._maybe_evict(request, rid, num_layers)
+            # Pattern 1 (no V2 subclass): the plain KVCacheManagerV2's
+            # update_resources already reset this request's history_length to
+            # max_beam-1 THIS iteration (it doesn't know about eviction). We own
+            # the compacted history, so reconcile it here -- EVERY step for any
+            # request with cumulative evictions, not only on the eviction step:
+            # the in-between steps would otherwise leave history at the full
+            # length while the cache content is compacted -> kernel reads a stale
+            # tail. The compression manager is ordered AFTER KV_CACHE_MANAGER
+            # (framework default), so this reconcile is the last word.
+            ev = self._evicted.get(rid, 0)
+            if ev > 0:
+                request.py_tri_evicted = ev
+                kv_cache_map = getattr(mgr, "kv_cache_map", None)
+                kv_cache = (kv_cache_map.get(rid)
+                            if kv_cache_map is not None else None)
+                if kv_cache is not None and getattr(kv_cache, "is_active", False):
+                    # history = max_beam - cum_evicted = num_cached + 1. Bypass the
+                    # monotonic-decrease guard (kept tokens already gather-compacted
+                    # to the front); capacity kept (block-free is a follow-up).
+                    target_hist = request.max_beam_num_tokens - ev
+                    if target_hist < kv_cache.history_length:
+                        kv_cache._history_length = target_hist
+                    kv_cache.resize(None, target_hist)
+
+    def _maybe_evict(self, request: "LlmRequest", rid: int,
+                     num_layers: int) -> None:
+        """Score + physically evict this request down to top-B (per-layer,
+        layer-uniform); update the cumulative ``self._evicted[rid]`` and
+        ``request.py_tri_evicted``. Called every ``beta`` steps."""
+        # round_start = current query absolute position. max_beam_num_tokens
+        # counts the just-generated (uncommitted) token; the cache holds
+        # max_beam-1 committed tokens, so the latest committed position is
+        # max_beam-1 (matches num_cached / position_ids derivation).
+        round_start = request.max_beam_num_tokens - 1
+        # FULL committed count (includes the just-generated token at slot
+        # round_start). Using round_start (=count-1) stranded+lost that token.
+        seq_len = request.max_beam_num_tokens - self._evicted.get(rid, 0)
+        if seq_len <= self.top_B:
+            return
+        # Clamp to the COMMITTED extent: a just-written token's K may not be
+        # flushed to the paged pool yet (reads all-zeros). Trim trailing
+        # all-zero (uncommitted) slots so attention never sees a zero-K row.
+        _k0 = self._read_request_k(request, 0, seq_len)
+        if _k0 is not None:
+            _nz = (_k0.abs().sum(dim=(0, 2)) > 0)
+            if bool(_nz.any()):
+                _committed = int(_nz.nonzero().max()) + 1
+                if _committed < seq_len:
+                    seq_len = _committed
+        if seq_len <= self.top_B:
+            return
+        # PER-LAYER eviction: each layer scores its OWN cached K_rot, aggregates
+        # heads by mean, keeps its own budget + recency window, compacted
+        # INDEPENDENTLY. Every layer keeps the SAME COUNT (top_B), so the
+        # per-request num_cached is consistent across layers; only the kept SET
+        # differs. Kept K retains its original RoPE rotation.
+        keep_count = None
+        for layer_idx in range(num_layers):
+            k_rot = self._read_request_k(request, layer_idx, seq_len)
+            if k_rot is None:
                 continue
-            # round_start = current query absolute position. max_beam_num_tokens
-            # counts the just-generated (uncommitted) token; the cache holds
-            # max_beam-1 committed tokens, so the latest committed position is
-            # max_beam-1 (matches num_cached / position_ids derivation).
-            round_start = request.max_beam_num_tokens - 1
-            # FULL committed count (includes the just-generated token at slot
-            # round_start). Using round_start (=count-1) stranded+lost that token
-            # each round.
-            seq_len = request.max_beam_num_tokens - self._evicted.get(rid, 0)
-            if seq_len <= self.top_B:
+            head_scores = self._score_layer(k_rot, None, layer_idx, round_start)
+            if head_scores is None:
                 continue
-            # Clamp to the COMMITTED extent: a just-written token's K may not be
-            # flushed to the paged pool yet (reads all-zeros). Trim trailing
-            # all-zero (uncommitted) slots so attention never sees a zero-K row.
-            _k0 = self._read_request_k(request, 0, seq_len)
-            if _k0 is not None:
-                _nz = (_k0.abs().sum(dim=(0, 2)) > 0)
-                if bool(_nz.any()):
-                    _committed = int(_nz.nonzero().max()) + 1
-                    if _committed < seq_len:
-                        seq_len = _committed
-            if seq_len <= self.top_B:
-                continue
-            # PER-LAYER eviction: each layer scores its OWN cached K_rot,
-            # aggregates heads by mean, keeps its own budget + recency window,
-            # compacted INDEPENDENTLY. Every layer keeps the SAME COUNT (top_B),
-            # so the per-request num_cached is consistent across layers; only
-            # the kept SET differs. Kept K retains its original RoPE rotation.
-            keep_count = None
-            for layer_idx in range(num_layers):
-                k_rot = self._read_request_k(request, layer_idx, seq_len)
-                if k_rot is None:
-                    continue
-                head_scores = self._score_layer(k_rot, None, layer_idx, round_start)
-                if head_scores is None:
-                    continue
-                layer_score = head_scores.mean(dim=0)  # [seq] mean over heads
-                keep = self._select_with_recency(layer_score, seq_len)
-                self._evict_layer(request, layer_idx, keep, seq_len)
-                keep_count = int(keep.numel())
-            if keep_count is None:
-                continue
-            evicted = seq_len - keep_count
-            if evicted > 0:
-                self._evicted[rid] = self._evicted.get(rid, 0) + evicted
-                # Hand the cumulative physical-eviction count to the V2 manager
-                # subclass (resize) + the metadata shim (num_cached clamp).
-                # seq_len counts the full committed length, so evicted_cum is
-                # exact; history = max_beam - evicted_cum = num_cached + 1.
-                request.py_tri_evicted = self._evicted[rid]
+            layer_score = head_scores.mean(dim=0)  # [seq] mean over heads
+            keep = self._select_with_recency(layer_score, seq_len)
+            self._evict_layer(request, layer_idx, keep, seq_len)
+            keep_count = int(keep.numel())
+        if keep_count is None:
+            return
+        evicted = seq_len - keep_count
+        if evicted > 0:
+            # cumulative count consumed by the every-step reconcile (history
+            # shrink) above + the metadata shim (num_cached clamp). seq_len is
+            # the full committed length, so evicted_cum is exact.
+            self._evicted[rid] = self._evicted.get(rid, 0) + evicted
+            request.py_tri_evicted = self._evicted[rid]
 
     # ------------------------------------------------------------------ #
     # Selection + scoring                                                #
@@ -566,80 +597,18 @@ TriAttentionTrtllmAttention.Metadata = TriAttentionTrtllmAttentionMetadata
 
 
 # ====================================================================== #
-# Pattern-3 V2 cache-manager subclass: resize-ONLY.                       #
+# Pattern 1: TriAttention uses the plain KVCacheManagerV2 (NO subclass).   #
 #                                                                        #
-# The TriAttention behavior-layer compression manager runs its eviction   #
-# (on_generation_step_end) FIRST each iteration (the framework drives it;  #
-# KV_CACHE_MANAGER is ordered LAST -- see _util.py), setting               #
-# request.py_tri_evicted. This subclass then shrinks each evicted gen      #
-# request's history to the compacted length so the V2 slot mapping matches #
-# the front-compacted data. Positions stay correct because K is stored     #
-# post-RoPE (rope_fusion=False) and the gather only relocates already-     #
-# rotated bytes.                                                           #
+# The compacted-history reconcile lives in on_generation_step_end (above): #
+# the plain V2 manager's update_resources resets each request's history to #
+# max_beam-1 every step (it is unaware of eviction); the compression       #
+# manager is ordered AFTER KV_CACHE_MANAGER (framework default) and        #
+# shrinks history back to the compacted length there. kv_cache_manager_class#
+# is the BASE V2 type purely as an isinstance sanity check that the         #
+# injected manager is a V2 manager (the base __init__ asserts it).          #
 # ====================================================================== #
 from tensorrt_llm._torch.pyexecutor.resource_manager import (  # noqa: E402
     KVCacheManagerV2 as _KVCacheManagerV2,
 )
 
-
-class TriAttentionKVCacheManagerV2(_KVCacheManagerV2):
-    """Resize-only V2 subclass for TriAttention (Pattern 3). Holds no algorithm
-    state -- the TriAttention compression manager owns that and runs first."""
-
-    def update_resources(self, scheduled_batch, attn_metadata=None,
-                         kv_cache_dtype_byte_size=None):
-        from tensorrt_llm._torch.pyexecutor.resource_manager import (
-            _update_kv_cache_draft_token_location, DEFAULT_BEAM_INDEX)
-        from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-        # base resize for context + COMPACTED resize for evicted gen reqs.
-        if not self.is_draft:
-            _update_kv_cache_draft_token_location(
-                self, scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
-        for req in scheduled_batch.context_requests:
-            if req.py_request_id not in self.kv_cache_map:
-                continue
-            kv_cache = self.kv_cache_map[req.py_request_id]
-            if not kv_cache.is_active:
-                continue
-            if (self.enable_block_reuse and not self.is_draft
-                    and not req.is_dummy_request):
-                if req.context_current_position > kv_cache.num_committed_tokens:
-                    tokens = self._augment_tokens_for_block_reuse(
-                        req.get_tokens(DEFAULT_BEAM_INDEX), req,
-                        start=kv_cache.num_committed_tokens,
-                        end=req.context_current_position)
-                    kv_cache.commit(tokens)
-                if req.context_remaining_length == 0:
-                    kv_cache.stop_committing()
-            elif not kv_cache.resize(None, req.context_current_position):
-                raise ValueError(
-                    f"TriAttn ctx resize failed req {req.py_request_id}")
-        for req in scheduled_batch.generation_requests:
-            if req.py_request_id not in self.kv_cache_map:
-                continue
-            kv_cache = self.kv_cache_map[req.py_request_id]
-            if not kv_cache.is_active:
-                continue
-            ev = int(getattr(req, "py_tri_evicted", 0) or 0)
-            terminal = req.state in (LlmRequestState.GENERATION_COMPLETE,
-                                     LlmRequestState.CONTEXT_INIT)
-            if ev > 0 and not terminal:
-                # Compacted: shrink history to the kept length. Bypass the
-                # monotonic-decrease guard (kept tokens already gather-compacted
-                # to the front). Keep capacity for now (coherence first; the
-                # block-free / capacity shrink is a verified follow-up).
-                # history = max_beam - py_tri_evicted == num_cached + 1.
-                target_hist = req.max_beam_num_tokens - ev
-                if target_hist < kv_cache.history_length:
-                    kv_cache._history_length = target_hist
-                ok = kv_cache.resize(None, target_hist)
-            else:
-                new_capacity = (None if terminal
-                                else kv_cache.capacity - req.py_rewind_len)
-                ok = kv_cache.resize(new_capacity, req.max_beam_num_tokens - 1)
-            if not ok:
-                raise ValueError(
-                    f"TriAttn gen resize failed req {req.py_request_id}")
-
-
-TriAttention.kv_cache_manager_class = TriAttentionKVCacheManagerV2
+TriAttention.kv_cache_manager_class = _KVCacheManagerV2

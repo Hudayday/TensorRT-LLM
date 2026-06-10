@@ -71,19 +71,6 @@ def create_sparse_attention_manager(
     return None
 
 
-def get_compression_manager_kv_cache_manager_cls(
-        sparse_attn_config: "SparseAttentionConfig"):
-    """Pattern 3: behavior-layer methods may declare a custom ``KVCacheManagerV2``
-    subclass (the framework factory consults this to instantiate the right V2
-    type). Returns the subclass *class* for such methods, else ``None`` (use
-    the standard V2 manager, Patterns 1/2). Maps from the algorithm so the V2
-    type is known before the compression manager instance is built."""
-    if sparse_attn_config.algorithm == "triattention":
-        from .triattention import TriAttentionKVCacheManagerV2
-        return TriAttentionKVCacheManagerV2
-    return None
-
-
 def create_compression_manager(
     sparse_attn_config: "Optional[SparseAttentionConfig]",
     kv_cache_manager: "KVCacheManagerV2",

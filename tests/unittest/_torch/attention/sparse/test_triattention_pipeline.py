@@ -189,12 +189,14 @@ class TestTriAttentionClass:
         cfg = TriAttentionConfig(calibration_path="x")
         assert cfg.ships_attention_backend is True
 
-    def test_pattern3_declares_v2_subclass(self):
-        # Pattern 3: TriAttention escape-hatches a custom resize-only V2 subclass.
-        from tensorrt_llm._torch.attention_backend.sparse.triattention import (
-            TriAttentionKVCacheManagerV2,
+    def test_pattern1_uses_base_v2(self):
+        # Pattern 1: no V2 subclass; kv_cache_manager_class is the BASE V2 type
+        # (isinstance sanity check only). The compacted-history reconcile lives
+        # in on_generation_step_end.
+        from tensorrt_llm._torch.pyexecutor.resource_manager import (
+            KVCacheManagerV2,
         )
-        assert TriAttention.kv_cache_manager_class is TriAttentionKVCacheManagerV2
+        assert TriAttention.kv_cache_manager_class is KVCacheManagerV2
 
     def test_supports_kv_cache_reuse_false(self):
         # Per-request periodic eviction is not safe to reuse across requests.
@@ -254,23 +256,23 @@ class TestFactory:
 
     def test_raises_for_wrong_cache_mgr_type(self, dummy_calibration_pt):
         cfg = TriAttentionConfig(top_B=32, beta=16, calibration_path=dummy_calibration_pt)
-        # Pattern 3: BaseKVCacheCompressionManager.__init__ asserts the injected
+        # Pattern 1: BaseKVCacheCompressionManager.__init__ asserts the injected
         # manager isinstance of the declared kv_cache_manager_class
-        # (TriAttentionKVCacheManagerV2). A non-matching object -> AssertionError.
+        # (KVCacheManagerV2, the base type). A non-matching object -> AssertionError.
         with pytest.raises(AssertionError, match="kv_cache_manager_class"):
             create_sparse_attention_manager(cfg, kv_cache_manager="not_a_v2")
 
     @CUDA_REQUIRED
     def test_returns_triattention_instance_with_v2(self, dummy_calibration_pt):
-        # Pattern 3: TriAttention declares kv_cache_manager_class =
-        # TriAttentionKVCacheManagerV2 (a resize-only V2 subclass), so the
-        # injected manager must be an instance of that subclass (the base
-        # __init__ asserts it). Stub one via __new__ to avoid real allocation.
-        from tensorrt_llm._torch.attention_backend.sparse.triattention import (
-            TriAttentionKVCacheManagerV2,
+        # Pattern 1: TriAttention uses the plain KVCacheManagerV2 (no subclass);
+        # kv_cache_manager_class = KVCacheManagerV2 (base) is only an isinstance
+        # check, so a plain V2 instance satisfies the factory. Stub one via
+        # __new__ to avoid real allocation.
+        from tensorrt_llm._torch.pyexecutor.resource_manager import (
+            KVCacheManagerV2,
         )
 
-        fake_v2 = TriAttentionKVCacheManagerV2.__new__(TriAttentionKVCacheManagerV2)
+        fake_v2 = KVCacheManagerV2.__new__(KVCacheManagerV2)
         cfg = TriAttentionConfig(top_B=32, beta=16, calibration_path=dummy_calibration_pt)
         mgr = create_sparse_attention_manager(cfg, kv_cache_manager=fake_v2)
         assert isinstance(mgr, TriAttention)
