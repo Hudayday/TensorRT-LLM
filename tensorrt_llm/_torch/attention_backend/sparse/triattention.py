@@ -47,6 +47,17 @@ from tensorrt_llm._torch.attention_backend.sparse.kv_cache_compression_manager i
 )
 from tensorrt_llm.logger import logger
 
+try:
+    from .triattention_kernels import (
+        triton_tri_score,
+        triton_tri_reduce_heads,
+        triton_tri_select,
+        triton_tri_compact,
+    )
+    _TRI_TRITON_AVAILABLE = True
+except Exception:  # triton not importable in some envs (CPU-only / mocked tests)
+    _TRI_TRITON_AVAILABLE = False
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -95,6 +106,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         offset_max_length: int = 65536,
         score_aggregation: str = "mean",
         window_size: int = 128,
+        use_triton: bool = False,
     ):
         super().__init__(kv_cache_manager)
         self.top_B = top_B
@@ -106,6 +118,13 @@ class TriAttention(BaseKVCacheCompressionManager):
         # correctness knob for multi-round eviction.
         self.window_size = int(os.environ.get("TRTLLM_TRI_WINDOW", str(window_size)))
         self.score_aggregation = score_aggregation
+        # A/B flag for the vendored Triton eviction kernels. Default OFF; the
+        # PyTorch path stays the reference. A config arg drives it (reaches the
+        # executor worker via the serialized config); the env var is a fallback.
+        _env = os.environ.get("TRTLLM_TRI_TRITON")
+        if _env is not None:
+            use_triton = _env not in ("0", "", "false", "False")
+        self.use_triton = bool(use_triton) and _TRI_TRITON_AVAILABLE
 
         # Calibration is resolved on the first request (on_request_init), not
         # here: it is model-intrinsic, so it is computed once and cached to a
@@ -153,6 +172,14 @@ class TriAttention(BaseKVCacheCompressionManager):
         # Squared per-frequency RoPE scaling factor (required calibration key).
         self._freq_scale_sq = self.calibration["freq_scale_sq"].to(dtype=torch.float32)
         self._attention_scale = float(self.calibration.get("attention_scale", 1.0))
+        # Pre-split query stats + MLR coefficient for the Triton score kernel so
+        # it doesn't recompute (E_q_norm - |E_q|) per call. Shapes [L, H, F].
+        _Eq = self.calibration["E_q"]
+        self._tri_q_real = _Eq.real.to(torch.float32).contiguous()
+        self._tri_q_imag = _Eq.imag.to(torch.float32).contiguous()
+        self._tri_mlr_coef = (
+            self.calibration["E_q_norm"].to(torch.float32) - _Eq.abs().to(torch.float32)
+        ).contiguous()
         self._calibrated = True
 
     # The framework drives all 8 lifecycle hooks; TriAttention overrides only
@@ -261,6 +288,14 @@ class TriAttention(BaseKVCacheCompressionManager):
         # differs. Kept K retains its original RoPE rotation.
         keep_count = None
         for layer_idx in range(num_layers):
+            if self.use_triton:
+                keep = self._maybe_evict_layer_triton(
+                    request, layer_idx, seq_len, round_start
+                )
+                if keep is None:
+                    continue
+                keep_count = int(keep.numel())
+                continue
             k_rot = self._read_request_k(request, layer_idx, seq_len)
             if k_rot is None:
                 continue
@@ -280,6 +315,47 @@ class TriAttention(BaseKVCacheCompressionManager):
             # the full committed length, so evicted_cum is exact.
             self._evicted[rid] = self._evicted.get(rid, 0) + evicted
             request.py_tri_evicted = self._evicted[rid]
+
+    def _maybe_evict_layer_triton(self, request, layer_idx, seq_len, round_start):
+        """Triton A/B path for one layer of _maybe_evict: fused paged-read+score,
+        head-mean, recency+topk select, in-place compaction. Returns the kept
+        slot indices (sorted ascending), or None if the pool is unreadable.
+
+        Mirrors the PyTorch branch exactly; the per-block kernels are verified
+        allclose / bit-exact against _score_layer / _select_with_recency /
+        _evict_layer by the standalone GPU equivalence test.
+        """
+        mgr = self.kv_cache_manager
+        get_buffers = getattr(mgr, "get_buffers", None)
+        if get_buffers is None:
+            return None
+        pool = get_buffers(layer_idx, kv_layout="HND")
+        if pool is None:
+            return None
+        page_ids = self._resolve_page_ids(request, layer_idx)
+        if not page_ids:
+            return None
+        device = pool.device
+        page_ids_t = torch.as_tensor(page_ids, device=device, dtype=torch.int64)
+        # Build the geometric offsets once, on the pool's device (mirrors the
+        # set-before-use ordering in _score_layer).
+        if self._offsets is None:
+            self._offsets = _build_geometric_offsets(self._offset_max_length, device)
+        # (1)+(2): fused paged-K read + score, then mean over heads -> [seq].
+        head_scores = triton_tri_score(
+            pool, page_ids_t,
+            self._tri_q_real[layer_idx], self._tri_q_imag[layer_idx],
+            self._tri_mlr_coef[layer_idx],
+            self._freq_scale_sq, self.calibration["omega"],
+            self._offsets,
+            float(round_start), seq_len, self._H,
+            score_aggregation=self.score_aggregation,
+        )
+        layer_score = triton_tri_reduce_heads(head_scores)
+        # (3): recency window + top-k select. (4): physical compaction in place.
+        keep = triton_tri_select(layer_score, seq_len, self.top_B, self.window_size)
+        triton_tri_compact(pool, page_ids_t, keep, seq_len)
+        return keep
 
     # ------------------------------------------------------------------ #
     # Selection + scoring                                                #

@@ -68,6 +68,7 @@ def create_kv_cache_compression_manager(
             calib_batches=sparse_attn_config.calib_batches,
             calib_max_seq_length=sparse_attn_config.calib_max_seq_length,
             window_size=sparse_attn_config.window_size,
+            use_triton=sparse_attn_config.use_triton,
         )
     _warn_if_unregistered(sparse_attn_config,
                           "running without a compression manager")

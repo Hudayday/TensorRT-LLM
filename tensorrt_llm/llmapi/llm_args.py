@@ -696,6 +696,11 @@ class TriAttentionConfig(BaseSparseAttentionConfig):
         "(upstream TRIATTN_RUNTIME_WINDOW_SIZE). Prevents the scorer from "
         "evicting freshly-generated tokens, which corrupts multi-round "
         "eviction.")
+    use_triton: bool = Field(
+        default=False,
+        description="Use the vendored Triton eviction kernels (score / reduce "
+        "/ select / compact) instead of the PyTorch reference. The PyTorch path "
+        "stays the default and is the A/B correctness reference.")
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
