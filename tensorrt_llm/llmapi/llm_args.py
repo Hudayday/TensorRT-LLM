@@ -652,6 +652,23 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             })
 
 
+class TriAttentionSparseAttentionConfig(BaseSparseAttentionConfig):
+    """Attention-backend selector for TriAttention.
+
+    TriAttention's eviction algorithm and all of its tuning knobs live in
+    :class:`TriAttentionKvCacheCompressionConfig` (the compression manager); this
+    sparse-attention config only routes the attention backend
+    (``TriAttentionTrtllmAttention``) and the optional block-free KV-cache
+    manager subclass (``TriAttentionKVCacheManagerV2``). Set both
+    ``sparse_attention_config`` and ``kv_cache_compression_config`` with
+    ``algorithm="triattention"`` to enable TriAttention end-to-end.
+    """
+    algorithm: Literal["triattention"] = "triattention"
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+
 class MoeLoadBalancerConfig(StrictBaseModel):
     """Pydantic configuration model for the Mixture of Experts (MoE) load balancer.
 
@@ -2653,6 +2670,7 @@ SparseAttentionConfig: TypeAlias = Annotated[
         RocketSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
+        TriAttentionSparseAttentionConfig,
     ],
     Field(discriminator="algorithm"),
 ]
@@ -2672,6 +2690,94 @@ class KvCacheCompressionConfig(StrictBaseModel):
         "Name of the KV-cache compression algorithm to run; selects which "
         "compression manager is built. Concrete algorithm configs subclass this "
         "and set the value.")
+
+
+class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
+    """KV-cache compression config for TriAttention.
+
+    TriAttention periodically evicts cached tokens during generation, guided by
+    an offline-calibrated trigonometric importance score
+    (github.com/WeianMao/triattention). It runs on the KV-cache compression
+    framework with the standard ``KVCacheManagerV2`` (or the optional block-free
+    ``TriAttentionKVCacheManagerV2`` subclass). Calibration statistics are
+    computed on the first request and cached to a config-keyed file, or loaded
+    from ``calibration_path`` if one is given.
+
+    Pair this with a ``TriAttentionSparseAttentionConfig`` (same
+    ``algorithm="triattention"``) so the attention backend + KV-cache manager
+    class are routed too.
+    """
+    algorithm: Literal["triattention"] = "triattention"
+    eviction_mode: Literal["per_layer", "union", "per_head",
+                           "per_layer_perhead"] = Field(
+        default="per_layer",
+        description="Which token set each eviction keeps. `per_layer` (default) "
+        "scores a layer, averages heads, and keeps one set per layer (the "
+        "simplest variant). `per_head`/`per_layer_perhead`/`union` reproduce the "
+        "upstream algorithm: each KV head keeps its own set (per_head shares it "
+        "across layers via mean-of-per-layer-max; per_layer_perhead is fully "
+        "independent per layer; union takes the union of per-head top-k then "
+        "re-ranks). The upstream AIME default is `per_head`.")
+    normalize_scores: bool = Field(
+        default=True,
+        description="Z-normalize each head's scores over the decode region "
+        "before selection (upstream default). Only used by the per_head / "
+        "per_layer_perhead / union modes; ignored by `per_layer`.")
+    pin_prefill: bool = Field(
+        default=True,
+        description="Always preserve the prompt (prefill) tokens; only decode "
+        "tokens compete for the budget (upstream behaviour). Only used by the "
+        "per_head / per_layer_perhead / union modes; ignored by `per_layer`, "
+        "which uses the recency window instead.")
+    top_B: int = Field(
+        default=1024,
+        description="Tokens kept at each periodic eviction (upstream `budget`; "
+        "prompt tokens are always preserved on top).")
+    beta: int = Field(
+        default=128,
+        description="Eviction period in generation steps (upstream "
+        "`divide_length`): the eviction hook fires once every `beta` steps.")
+    model_path: Optional[str] = Field(
+        default=None,
+        description="Checkpoint path used to compute calibration on the first "
+        "request when `calibration_path` is not given. Optional if "
+        "`calibration_path` is set.")
+    calibration_path: Optional[str] = Field(
+        default=None,
+        description="Explicit precomputed calibration `.pt` to load. If unset, "
+        "calibration is computed on the first request and cached under "
+        "`calibration_cache_dir`, keyed by model and calib settings.")
+    calibration_cache_dir: Optional[str] = Field(
+        default=None,
+        description="Directory for the auto-computed calibration cache "
+        "(defaults to `$HF_HOME/triattn_calib`). Ignored if calibration_path "
+        "is set.")
+    calib_dataset: str = Field(
+        default="cnn_dailymail",
+        description="Calibration corpus used when computing stats on a miss.")
+    calib_batches: int = Field(
+        default=64,
+        description="Number of calibration samples to forward when computing "
+        "stats on a miss.")
+    calib_max_seq_length: int = Field(
+        default=2048, description="Max sequence length per calibration sample.")
+    window_size: int = Field(
+        default=128,
+        description="Most-recent tokens always preserved from eviction "
+        "(upstream TRIATTN_RUNTIME_WINDOW_SIZE). Prevents the scorer from "
+        "evicting freshly-generated tokens, which corrupts multi-round "
+        "eviction.")
+    use_triton: bool = Field(
+        default=False,
+        description="Use the vendored Triton eviction kernels (score / reduce "
+        "/ select / compact) instead of the PyTorch reference. The PyTorch path "
+        "stays the default and is the A/B correctness reference.")
+    use_batched: bool = Field(
+        default=False,
+        description="Process ALL requests evicting on the same step in ONE pass "
+        "of batched kernels (score x request x layer, select, per-layer compact), "
+        "decoupling launch count from request count for large-batch serving. "
+        "Requires use_triton. Default off; the per-request path is the reference.")
 
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
