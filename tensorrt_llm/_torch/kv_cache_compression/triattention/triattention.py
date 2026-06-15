@@ -105,6 +105,9 @@ _TRI_KEEPPROBE_FILE = f"/scratch/triattn_e2e/keepprobe/kp_{os.getpid()}.jsonl"
 # iteration later (event.query()-guarded), so the page-reuse-gating finish_event
 # transitively orders behind the compaction kernel (fixes the read-after-free).
 _TRI_FREE_BLOCKS = os.path.exists("/scratch/triattn_e2e/.tri_free_blocks")
+# correctness probe (remove before PR): logs the num_cached the attention kernel
+# actually reads per evicted request -> assert it == kept/budget (not full length).
+_TRI_CORRECTNESS = os.path.exists("/scratch/triattn_e2e/.tri_correctness")
 
 
 def _build_geometric_offsets(max_length: int, device: torch.device) -> torch.Tensor:
@@ -298,20 +301,20 @@ class TriAttention(BaseKVCacheCompressionManager):
     # whole eviction runs once per period in on_generation_step_end, which loops
     # the layers and reads each layer's keys straight from the KV pool.
 
-    def prepare_resources(self, scheduled_batch: "ScheduledRequests") -> None:
-        """Run the periodic eviction at the START of the iteration -- BEFORE this
-        iteration's forward -- so the forward (and the attention metadata) read
-        the post-eviction, post-reconcile cache.
+    def on_generation_step_begin(self, scheduled_batch: "ScheduledRequests",
+                                 attn_metadata=None, **kwargs) -> None:
+        """Periodic physical eviction, PRE-forward (framework hook, fired from the
+        base prepare_resources before _forward_step). Every beta steps over budget:
+        score the full cache, select top-B, physically compact, and record
+        per-request ``py_tri_evicted`` -- which the forward's attention metadata and
+        the V2 block-free both read.
 
-        Doing the eviction in on_generation_step_end (AFTER the forward, via
-        update_resources) races the overlap scheduler: the next iteration's
-        forward is launched before the eviction mutates the KV, so it reads a
-        racy / stale-length cache (det bs=32 overlap-ON: 32/32 divergent; a GPU
-        sync around the eviction did NOT fix it because the forward's metadata
-        was already computed). Mirrors RocketKV, which evicts before the forward
-        (at the prefill->generation boundary).
+        Uses the pre-forward hook (NOT post-forward on_generation_step_end) because
+        the latter races the overlap scheduler: the next iteration's forward is
+        enqueued before the post-forward hook mutates the KV, so it reads a racy /
+        stale-length cache (det bs=32 overlap-ON: 32/32 divergent; a GPU sync did
+        NOT fix it -- the forward metadata was already computed). Mirrors RocketKV.
         """
-        super().prepare_resources(scheduled_batch)
         self._periodic_evict(scheduled_batch)
 
     def _periodic_evict(
@@ -1655,6 +1658,23 @@ class TriAttentionTrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     # history. (ev==0 path is untouched, so dense/no-evict steps
                     # keep the stock max_beam-1 -> byte-identical.)
                     kvp.num_cached_tokens_per_seq[i] = int(kvp.num_cached_tokens_per_seq[i]) + 1 - ev
+            if _TRI_CORRECTNESS:
+                # confirm the attention kernel is fed exactly the kept/budget KV
+                # (num_cached after reconcile) for every evicted request.
+                try:
+                    import json as _ccj
+                    _bud = int(getattr(e, "top_B", 0))
+                    with open("/scratch/triattn_e2e/correctness_numcached.jsonl", "a") as _ccf:
+                        for _i in range(num_contexts, num_requests):
+                            _ev = e.evicted_count(req_ids[_i])
+                            if _ev:
+                                _ccf.write(_ccj.dumps({"rid": int(req_ids[_i]),
+                                    "step": int(e._gen_steps.get(req_ids[_i], -1)),
+                                    "num_cached_fed_to_attn": int(kvp.num_cached_tokens_per_seq[_i]),
+                                    "budget": _bud, "evicted": int(_ev),
+                                    "le_budget_plus_window": bool(int(kvp.num_cached_tokens_per_seq[_i]) <= _bud + 256)}) + "\n")
+                except Exception:
+                    pass
             if _TRI_FWDPROBE:
                 # forward-side probe (remove before PR): log the num_cached the
                 # attention kernel actually uses, per (gen step, request), in the

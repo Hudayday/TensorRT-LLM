@@ -35,6 +35,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.logger import logger
 
 _TRI_FREE_BLOCKS = os.path.exists("/scratch/triattn_e2e/.tri_free_blocks")
+# correctness probe (remove before PR): logs per-eviction freed-block count so we can
+# assert evicted blocks are physically returned to the pool (freed > 0 on shrink).
+_TRI_CORRECTNESS = os.path.exists("/scratch/triattn_e2e/.tri_correctness")
 
 
 def _div_up(a: int, b: int) -> int:
@@ -109,6 +112,7 @@ class TriAttentionKVCacheManagerV2(KVCacheManagerV2):
         # never shrink below the committed prefix (block_reuse OFF -> committed=0)
         target_cap = max(target_cap, committed * tpb)
         new_num_blocks = _div_up(target_cap, tpb)
+        _old_nb = int(kv_cache.num_blocks)   # correctness probe: blocks before resize
         try:
             # 3) only when SHRINKING blocks: release the trailing dense locks so
             #    resize()'s shrink precondition holds (V2 then deletes + recycles).
@@ -116,6 +120,18 @@ class TriAttentionKVCacheManagerV2(KVCacheManagerV2):
                 self._tri_unlock_trailing_dense_blocks(kv_cache, new_num_blocks)
             # one resize handles grow (alloc next-token block) and shrink (free).
             kv_cache.resize(target_cap, target_hist)
+            if _TRI_CORRECTNESS:
+                try:
+                    import json as _cj
+                    with open("/scratch/triattn_e2e/correctness_blockfree.jsonl", "a") as _cf:
+                        _cf.write(_cj.dumps({"rid": int(req.py_request_id),
+                            "blocks_before": _old_nb, "blocks_after": int(kv_cache.num_blocks),
+                            "freed": _old_nb - int(kv_cache.num_blocks),
+                            "target_cap_tokens": int(target_cap), "tpb": int(tpb),
+                            "kept_kv_tokens": int(kv_cache.num_blocks) * int(tpb),
+                            "history_len": int(kv_cache.history_length)}) + "\n")
+                except Exception:
+                    pass
         except Exception as e:  # defensive: degrade to safe no-free history set
             logger.warning(f"TriAttention reclaim fell back to no-free for "
                            f"{req.py_request_id}: {e}")

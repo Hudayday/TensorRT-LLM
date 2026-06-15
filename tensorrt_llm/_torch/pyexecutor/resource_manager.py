@@ -2185,6 +2185,19 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         chunk). Override for a one-shot prefill-end eviction.
         """
 
+    def on_generation_step_begin(
+        self,
+        scheduled_batch: "ScheduledRequests",
+        attn_metadata: Optional["AttentionMetadata"] = None,
+        **kwargs,
+    ) -> None:
+        """Fired once per generation step, BEFORE this step's forward (from
+        ``prepare_resources``). Override for eviction that must mutate the KV
+        *before* the forward + attention metadata read it -- a post-forward hook
+        (``on_generation_step_end``) races the overlap scheduler, which enqueues
+        the next forward before the hook runs.
+        """
+
     def on_generation_step_end(
         self,
         scheduled_batch: "ScheduledRequests",
@@ -2221,13 +2234,16 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         return 0
 
     def prepare_resources(self, scheduled_batch: "ScheduledRequests") -> None:
-        """Fire :meth:`on_request_init` once per request, on its first prefill
-        chunk -- the same ``is_first_context_chunk`` gate ``KVCacheManager``
-        uses, so no manager-side dedup bookkeeping is needed.
+        """Fire :meth:`on_request_init` once per request (on its first prefill
+        chunk -- same ``is_first_context_chunk`` gate ``KVCacheManager`` uses),
+        then :meth:`on_generation_step_begin` (pre-forward) every iteration.
+        PyExecutor calls this BEFORE ``_forward_step``, so the step-begin hook is
+        the sanctioned place for eviction that must mutate the KV pre-forward.
         """
         for req in scheduled_batch.context_requests:
             if req.is_first_context_chunk:
                 self.on_request_init(req)
+        self.on_generation_step_begin(scheduled_batch)
 
     def update_resources(
         self,
