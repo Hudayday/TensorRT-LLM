@@ -2216,6 +2216,16 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         ``KVCacheManagerV2``; subclasses must not free them here.
         """
 
+    def adjust_attention_metadata(self,
+                                  attn_metadata: "AttentionMetadata") -> None:
+        """Reconcile the attention metadata to the compressed cache, just BEFORE
+        ``attn_metadata.prepare()`` (the model engine calls this for the active
+        compression manager). A method that physically evicts / compacts the KV
+        cache must override this to correct the per-request cached-token count
+        (and anything derived from it) so ``prepare()`` builds the kernel lengths
+        from the compacted cache, not the logical length. Default: no-op.
+        """
+
     # ================================================================== #
     # BaseResourceManager interface — PyExecutor auto-invokes these each  #
     # iteration; they translate into the semantic lifecycle hooks above.  #
@@ -2284,8 +2294,9 @@ def create_kv_cache_compression_manager(
     a dispatch branch here; the framework ships none.
     """
     if config.algorithm == "triattention":
-        from tensorrt_llm._torch.kv_cache_compression.triattention import (
-            TriAttention)
+        from tensorrt_llm._torch.kv_cache_compression.triattention import \
+            TriAttention
+
         # Read tuning knobs off the config defensively (getattr defaults) so a
         # base KvCacheCompressionConfig coerced down from the TriAttention
         # subclass still builds with the documented defaults. Mirrors the
@@ -2296,16 +2307,12 @@ def create_kv_cache_compression_manager(
             beta=getattr(config, "beta", 128),
             model_path=getattr(config, "model_path", None),
             calibration_path=getattr(config, "calibration_path", None),
-            calibration_cache_dir=getattr(config, "calibration_cache_dir", None),
-            calib_dataset=getattr(config, "calib_dataset", "cnn_dailymail"),
-            calib_batches=getattr(config, "calib_batches", 64),
-            calib_max_seq_length=getattr(config, "calib_max_seq_length", 2048),
             window_size=getattr(config, "window_size", 128),
-            use_triton=getattr(config, "use_triton", False),
-            use_batched=getattr(config, "use_batched", False),
             eviction_mode=getattr(config, "eviction_mode", "per_layer"),
             normalize_scores=getattr(config, "normalize_scores", True),
             pin_prefill=getattr(config, "pin_prefill", True),
+            reclaim_evicted_blocks=getattr(config, "reclaim_evicted_blocks",
+                                           False),
         )
     logger.warning(
         "KV-cache compression algorithm '%s' is not registered; running without "

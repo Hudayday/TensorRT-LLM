@@ -2237,6 +2237,11 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
             num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
         attn_metadata.kv_cache_manager = kv_cache_manager
+        # Overlap fast path: reconcile the compacted cache before prepare() (same
+        # hook as the full path; manager resolved at the _prepare_tp_inputs entry).
+        _kvc = getattr(self, "_step_kv_compression_manager", None)
+        if _kvc is not None:
+            _kvc.adjust_attention_metadata(attn_metadata)
         attn_metadata.prepare()
 
         # Get LoRA parameters
@@ -2644,6 +2649,16 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests,
                 new_tokens=new_tokens_device,
                 runtime_draft_len=self.runtime_draft_len)
+
+        # Resolve the active KV-cache compression manager once for this step. Both
+        # the incremental (overlap) path delegated just below and the full path
+        # further down reconcile the attention metadata through it before
+        # attn_metadata.prepare(). No-op for the draft engine / when none runs.
+        self._step_kv_compression_manager = (
+            resource_manager.get_resource_manager(
+                ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER) if
+            (resource_manager is not None
+             and not self.is_draft_model) else None)
 
         if self._can_use_incremental_update(scheduled_requests,
                                             new_tokens_device,
@@ -3427,6 +3442,12 @@ class PyTorchModelEngine(ModelEngine):
 
         if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
             attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
+        # Full path: reconcile the compacted cache before prepare() so it builds
+        # the kernel KV lengths from the compacted cache (manager resolved at the
+        # _prepare_tp_inputs entry; no-op when no compression manager runs).
+        if self._step_kv_compression_manager is not None:
+            self._step_kv_compression_manager.adjust_attention_metadata(
+                attn_metadata)
         attn_metadata.prepare()
 
         peft_cache_manager = resource_manager and resource_manager.get_resource_manager(
