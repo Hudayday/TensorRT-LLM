@@ -1272,6 +1272,74 @@ class _KVCache:
             user = lock._user
             self._block(user.ordinal, user.beam_index)[user.life_cycle] = lock
 
+    def _unlock_trailing_dense_blocks(self, new_num_blocks: BlockOrdinal) -> None:
+        """For dense (full-attention, ``window_size is None``) layers, unlock the
+        trailing blocks at ordinal >= ``new_num_blocks`` so ``resize()`` can free
+        them.
+
+        These layers are deliberately skipped by ``_unlock_stale_blocks`` (their
+        stale range is always empty), so a shrink below them would otherwise fail
+        the trailing ``BAD_PAGE_INDEX`` assert. KV-cache compression (e.g.
+        TriAttention) physically compacts the kept tokens to the front and then
+        calls ``fork()`` to shrink, which releases the now-unused dense trailing
+        pages. Locks are dropped inside ``_record_event`` so the page-reuse
+        finish_event is armed (mirrors ``_unlock_stale_blocks``). The caller must
+        already have ordered this after any kernel still reading the freed pages
+        (e.g. waited the compaction event)."""
+        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        num_blocks = typed_len(self._blocks)
+        with self._record_event():
+            for lc_idx, lc in self.manager._life_cycles.items():
+                if lc_idx == ssm_lc_id:
+                    continue  # SSM pages live in _ssm_blocks, not in _blocks
+                if not (isinstance(lc, AttnLifeCycle) and lc.window_size is None):
+                    continue  # SWA layers are handled by _unlock_stale_blocks
+                for ordinal in typed_range(new_num_blocks, num_blocks):
+                    block = self._blocks[ordinal]
+                    for beam_block in block.pages:
+                        if beam_block[lc_idx] is not None:
+                            # drop with no lingering ref -> finish_event armed,
+                            # page returns to the pool, _base_page_indices -> BAD.
+                            beam_block[lc_idx] = None
+
+    def fork(self, num_tokens: int | None = None) -> "_KVCache":
+        """Compact this cache to the first ``num_tokens`` and free the trailing
+        blocks -- the KV-cache-compression capacity gain.
+
+        Stopgap, in-place implementation: shrinks ``history_length`` and capacity
+        to ``num_tokens`` (rounded up to a block, plus one slot for the next decode
+        token) and releases the freed trailing pages, including dense
+        (full-attention) layers that the normal shrink path skips. Returns
+        ``self``.
+
+        This matches the contract of the planned page-sharing ``fork(num_tokens)``
+        (all-full-attention always succeeds); the eventual version will return a
+        *new* instance, so callers should use the return value rather than assume
+        in-place.
+
+        The fine-grained per-(layer, head) gather of the kept tokens is the
+        caller's responsibility (done before ``fork``), and the caller must order
+        ``fork`` after any kernel still reading the soon-to-be-freed pages (e.g.
+        wait the compaction CUDA event). ``num_tokens`` defaults to the current
+        history length."""
+        if num_tokens is None:
+            num_tokens = self._history_length
+        tpb = self.tokens_per_block
+        # +1 slot so the next decode token has room without an immediate regrow.
+        target_cap = div_up(num_tokens + 1, tpb) * tpb
+        # Never shrink below the committed prefix (committed == 0 when block reuse
+        # is off, which is the case for compression).
+        target_cap = max(target_cap, self._num_committed_blocks * tpb)
+        new_num_blocks = div_up(target_cap, tpb)
+        # History is monotonic through resize(); set it directly first (the kept
+        # tokens were already gather-compacted to the front by the caller).
+        if num_tokens < self._history_length:
+            self._history_length = num_tokens
+        if new_num_blocks < typed_len(self._blocks):
+            self._unlock_trailing_dense_blocks(BlockOrdinal(new_num_blocks))
+        self.resize(target_cap, num_tokens)
+        return self
+
     class DeltaScratchSlots(NamedTuple):
         excess: TypedIndexList[LifeCycleId, list[ScratchSlotLock]]
         delta_cnt: TypedIndexList[LifeCycleId, int]

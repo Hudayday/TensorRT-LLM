@@ -332,17 +332,10 @@ class KvCacheCreator:
                     "Block reuse does not work with MTP for hybrid linear models "
                     "when using the legacy MambaCacheManager (TRTLLM_USE_CPP_MAMBA=1)"
                 )
-        # TriAttention (a KV-cache compression method, not sparse attention)
-        # reclaims eviction-freed blocks via a KVCacheManagerV2 subclass -- pure
-        # pass-through unless its block-free reclaim is enabled. Select it off the
-        # compression config (only when V2 is already the chosen manager).
-        compression_config = getattr(self._llm_args,
-                                     "kv_cache_compression_config", None)
-        if cls is KVCacheManagerV2 and compression_config is not None and getattr(
-                compression_config, "algorithm", None) == "triattention":
-            from ..kv_cache_compression.triattention import \
-                TriAttentionKVCacheManagerV2
-            cls = TriAttentionKVCacheManagerV2
+        # TriAttention (and other KV-cache compression methods) run on the plain
+        # KVCacheManagerV2: the eviction-freed block reclaim now goes through
+        # _KVCache.fork(), driven from update_resources for compressed requests, so
+        # no manager subclass is needed.
         return cls
 
     def _per_manager_cache_cost(self,

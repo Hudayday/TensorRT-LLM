@@ -8,15 +8,13 @@ framework's ``adjust_attention_metadata`` hook.
 
 Public surface:
   - ``TriAttention`` -- the ``BaseKVCacheCompressionManager`` (the eviction
-    manager; runs in the pre-forward ``on_generation_step_begin`` hook).
-  - ``TriAttentionKVCacheManagerV2`` -- the optional block-free ``KVCacheManagerV2``
-    subclass (reclaims eviction-freed blocks; pure pass-through when disabled).
+    manager; runs in the pre-forward ``on_generation_step_begin`` hook). Block
+    reclaim goes through ``_KVCache.fork()`` from the V2 adapter's
+    ``update_resources``, so there is no KV-cache-manager subclass.
 """
 
 from .triattention import TriAttention
-from .triattention_kv_manager import TriAttentionKVCacheManagerV2
 
 __all__ = [
     "TriAttention",
-    "TriAttentionKVCacheManagerV2",
 ]

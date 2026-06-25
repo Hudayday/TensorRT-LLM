@@ -23,10 +23,10 @@ import torch
 from pydantic import TypeAdapter, ValidationError
 
 # TriAttention lives in the kv_cache_compression package. It exposes only the
-# manager + the optional block-free KV-manager subclass -- no attention classes.
+# compression manager -- no attention classes, no KV-cache-manager subclass
+# (block reclaim now goes through _KVCache.fork()).
 from tensorrt_llm._torch.kv_cache_compression.triattention import (
     TriAttention,
-    TriAttentionKVCacheManagerV2,
 )
 
 # The framework base class + factory live in pyexecutor.resource_manager.
@@ -81,7 +81,7 @@ class TestPackageSurface:
     def test_public_symbols_importable_from_package(self):
         import tensorrt_llm._torch.kv_cache_compression.triattention as pkg
 
-        expected = {"TriAttention", "TriAttentionKVCacheManagerV2"}
+        expected = {"TriAttention"}
         assert expected.issubset(set(pkg.__all__))
         for name in expected:
             assert isinstance(getattr(pkg, name), type), name
@@ -320,37 +320,32 @@ class TestStepBeginHookRefactor:
 
 
 # ---------------------------------------------------------------------------
-# Block-free KV-manager subclass: subclasses V2; block-free reclaim is gated OFF
-# by default (pure pass-through, byte-identical).
+# Block reclaim: the KV-manager subclass was removed. Reclaim now runs through
+# _KVCache.fork() (V2 core), driven from the V2 adapter's update_resources for
+# compressed requests (guarded by py_triattn_evicted > 0).
 # ---------------------------------------------------------------------------
 
 
-class TestBlockFreeManager:
-    def test_is_v2_subclass(self):
-        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+class TestNoBlockFreeSubclass:
+    def test_subclass_module_removed(self):
+        import importlib
 
-        assert issubclass(TriAttentionKVCacheManagerV2, KVCacheManagerV2)
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(
+                "tensorrt_llm._torch.kv_cache_compression.triattention."
+                "triattention_kv_manager")
 
-    def test_block_free_defaults_off(self):
-        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kv_manager as km
+    def test_subclass_not_exported(self):
+        import tensorrt_llm._torch.kv_cache_compression.triattention as pkg
 
-        assert km._RECLAIM_BLOCKS is False
+        assert "TriAttentionKVCacheManagerV2" not in pkg.__all__
+        assert not hasattr(pkg, "TriAttentionKVCacheManagerV2")
 
-    def test_passthrough_delegates_to_super_when_off(self, monkeypatch):
-        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kv_manager as km
-        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+    def test_v2_core_exposes_fork(self):
+        from tensorrt_llm.runtime.kv_cache_manager_v2._core._kv_cache import \
+            _KVCache
 
-        monkeypatch.setattr(km, "_RECLAIM_BLOCKS", False)
-        called = {}
-
-        def fake_super(self, scheduled_batch, attn_metadata=None, kv_cache_dtype_byte_size=None):
-            called["args"] = (scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
-
-        monkeypatch.setattr(KVCacheManagerV2, "update_resources", fake_super)
-        mgr = TriAttentionKVCacheManagerV2.__new__(TriAttentionKVCacheManagerV2)
-        sentinel = object()
-        mgr.update_resources(sentinel, None, None)
-        assert called["args"][0] is sentinel
+        assert callable(getattr(_KVCache, "fork", None))
 
 
 # ---------------------------------------------------------------------------

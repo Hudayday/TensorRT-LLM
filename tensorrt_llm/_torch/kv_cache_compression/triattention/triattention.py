@@ -12,8 +12,9 @@ kernel over the compacted cache. The model engine derives each request's cached
 length from its logical length (``max_beam - 1``), unaware of the eviction, so
 the compacted-length reconcile runs in ``adjust_attention_metadata`` -- the
 compression-framework hook the executor calls just before
-``attn_metadata.prepare()``. It uses the standard ``KVCacheManagerV2``, or the
-optional block-free ``TriAttentionKVCacheManagerV2`` subclass, which returns
+``attn_metadata.prepare()``. It uses the standard ``KVCacheManagerV2``: each
+eviction sets a generic per-request marker (``py_kv_evicted_tokens``) that the
+manager's ``update_resources`` reads to shrink history and return the
 eviction-freed blocks to the pool for the capacity gain.
 
 KV layout: the decode kernel stores keys in HND layout
@@ -193,8 +194,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         """Periodic physical eviction, PRE-forward (framework hook, fired from the
         base prepare_resources before _forward_step). Every beta steps over budget:
         score the full cache, select top-B, physically compact, and record
-        per-request ``py_triattn_evicted`` -- which the forward's attention metadata and
-        the V2 block-free both read.
+        per-request ``py_kv_evicted_tokens`` -- which the forward's attention
+        metadata and the V2 manager's block reclaim both read.
 
         Uses the pre-forward hook (NOT post-forward on_generation_step_end) because
         the latter races the overlap scheduler: the next iteration's forward is
@@ -235,23 +236,23 @@ class TriAttention(BaseKVCacheCompressionManager):
         if evict_now:
             self._evict_requests(evict_now, num_layers)
         # Block-reclaim ordering: record a CUDA event AFTER the compaction kernels
-        # (same stream they ran on). TriAttentionKVCacheManagerV2.update_resources
-        # waits this on the manager stream before the capacity-shrink, so the
-        # page-reuse-gating finish_event recorded inside resize() dominates the
-        # compaction -> no read-after-free when a freed page is reallocated.
+        # (same stream they ran on). KVCacheManagerV2.update_resources waits this
+        # on the manager stream before the capacity-shrink, so the page-reuse-gating
+        # finish_event recorded inside resize() dominates the compaction -> no
+        # read-after-free when a freed page is reallocated.
         if evict_now:
             _cev = torch.cuda.Event()
             _cev.record()
             for request, rid in evict_now:
-                request.py_triattn_compaction_event = _cev
+                request.py_kv_compaction_event = _cev
 
-        # History + capacity reconcile for evicting requests is owned solely by the
-        # V2 manager (TriAttentionKVCacheManagerV2.update_resources): every step it
-        # sets each evicting request's history to the compacted length (max_beam -
-        # evicted) and frees the trailing blocks. It reads ``py_triattn_evicted``,
-        # which _evict_requests sets and which persists on the request between
-        # eviction steps. The kernel's view is reconciled separately in
-        # adjust_attention_metadata.
+        # History + capacity reconcile for evicting requests is owned by the generic
+        # KVCacheManagerV2.update_resources reclaim path: every step it sets each
+        # evicting request's history to the compacted length (max_beam - evicted)
+        # and frees the trailing blocks via _KVCache.fork(). It reads the generic
+        # ``py_kv_evicted_tokens`` marker, which _evict_requests sets and which
+        # persists on the request between eviction steps. The kernel's view is
+        # reconciled separately in adjust_attention_metadata.
 
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
         """Drop this request's per-request step + evicted counters."""
@@ -610,7 +611,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         per_layer_perhead / union): ONE per-head score launch over
         (request x layer) via ``triton_tri_score_perhead``, then
         then selects + compacts each request via ``_evict_modes(precomputed=)``.
-        Updates ``self._evicted`` / ``request.py_triattn_evicted``."""
+        Updates ``self._evicted`` / ``request.py_kv_evicted_tokens``."""
         from .triattention_kernels import flat_perhead_to_list, triton_tri_score_perhead
 
         mgr = self.kv_cache_manager
@@ -711,7 +712,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             evicted = seq_len - keep_count
             if evicted > 0:
                 self._evicted[rid] = self._evicted.get(rid, 0) + evicted
-                request.py_triattn_evicted = self._evicted[rid]
+                request.py_kv_evicted_tokens = self._evicted[rid]
         if union_by_layer:
             from .triattention_kernels import triton_tri_compact
 

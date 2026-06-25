@@ -2936,9 +2936,9 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
     TriAttention periodically evicts cached tokens during generation, guided by
     an offline-calibrated trigonometric importance score
     (github.com/WeianMao/triattention). It runs on the KV-cache compression
-    framework with the standard ``KVCacheManagerV2`` (or the optional block-free
-    ``TriAttentionKVCacheManagerV2`` subclass). TRT-LLM does not compute
-    calibration: supply the official tool's ``.pt`` via ``calibration_path`` and
+    framework with the standard ``KVCacheManagerV2``, whose ``update_resources``
+    returns eviction-freed blocks to the pool for the capacity gain. TRT-LLM does
+    not compute calibration: supply the official tool's ``.pt`` via ``calibration_path`` and
     it is converted to the runtime schema at load. TriAttention is a pure
     compression method: it has no sparse-attention config and no attention
     backend of its own -- decode runs the model's standard attention over the

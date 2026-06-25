@@ -1904,11 +1904,41 @@ class KVCacheManagerV2(BaseResourceManager):
             # will be resumed by the scheduler on the next iteration.
             if not kv_cache.is_active:
                 continue
-            new_capacity = (
-                None
-                if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
-                else kv_cache.capacity - req.py_rewind_len
+            completing = req.state in (
+                LlmRequestState.GENERATION_COMPLETE,
+                LlmRequestState.CONTEXT_INIT,
             )
+            # Generic KV-cache-compression reclaim path (model-agnostic): any
+            # compression manager that physically compacts a request's kept tokens to
+            # the front sets py_kv_evicted_tokens (cumulative evicted count) and,
+            # optionally, py_kv_compaction_event (CUDA event to order the free after
+            # the compaction kernel). fork() then shrinks history to the compacted
+            # length and frees the evicted trailing blocks (incl. dense layers the
+            # normal shrink skips). Guarded by evicted > 0, so every other request /
+            # model is byte-identical to before. (Yao Yao OK'd doing this in
+            # update_resources; this path is decoupled from any specific algorithm.)
+            evicted = int(getattr(req, "py_kv_evicted_tokens", 0) or 0)
+            if evicted > 0 and not completing:
+                ev_obj = getattr(req, "py_kv_compaction_event", None)
+                if ev_obj is not None:
+                    try:
+                        self._stream.cuda_stream.wait_event(ev_obj)
+                    except Exception:
+                        pass
+                try:
+                    kv_cache.fork(req.max_beam_num_tokens - evicted)
+                except Exception as e:
+                    # Defensive: never crash the whole batch if one request's block
+                    # reclaim fails. Fall back to keeping (not freeing) its blocks.
+                    # fork() lowers history before any step that can raise, so this
+                    # resize sets the same history and cannot trip the monotonic guard.
+                    logger.warning(
+                        "KV-cache compression block reclaim fell back to no-free for "
+                        f"request {req.py_request_id}: {e}"
+                    )
+                    kv_cache.resize(None, req.max_beam_num_tokens - evicted)
+                continue
+            new_capacity = None if completing else kv_cache.capacity - req.py_rewind_len
             success = kv_cache.resize(new_capacity, req.max_beam_num_tokens - 1)
             if not success:
                 raise ValueError(
