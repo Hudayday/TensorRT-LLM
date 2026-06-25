@@ -94,33 +94,30 @@ class TriAttention(BaseKVCacheCompressionManager):
         offset_max_length: int = 65536,
         score_aggregation: str = "mean",
         window_size: int = 128,
-        eviction_mode: str = "per_layer",
+        eviction_mode: str = "union",
         normalize_scores: bool = True,
         pin_prefill: bool = True,
     ):
         super().__init__(kv_cache_manager)
         self.top_B = top_B
         self.beta = beta
-        # Which token set each eviction keeps:
-        #   per_layer          -- average heads, one set per layer (the simple
-        #                         variant; uses the recency window below).
+        # Which token set each eviction round keeps (all reproduce the upstream
+        # selection: z-normalize scores, pin the prompt tokens, no recency window):
+        #   union              -- union of every KV head's top-B, re-ranked by the
+        #                         per-token max score. Default; matches the official
+        #                         base setting (per-head and per-layer-per-head
+        #                         pruning both off).
         #   per_head           -- each KV head keeps its own set, shared across
-        #                         layers (mean of per-layer max). Upstream AIME
-        #                         default.
-        #   per_layer_perhead  -- each (layer, KV head) keeps its own set,
-        #                         fully independent per layer.
-        #   union              -- union of every head's top-k, re-ranked by the
-        #                         per-token max score.
-        # The non-per_layer modes reproduce the upstream selection: z-normalize
-        # the scores, pin the prompt (prefill) tokens, and use NO recency window.
+        #                         layers (mean of per-layer max).
+        #   per_layer_perhead  -- each (layer, KV head) keeps its own set, fully
+        #                         independent per layer.
         self.eviction_mode = eviction_mode
         self.normalize_scores = bool(normalize_scores)
         self.pin_prefill = bool(pin_prefill)
-        # Recency window: the most recent ``window_size`` tokens are ALWAYS kept
-        # (upstream TRIATTN_RUNTIME_WINDOW_SIZE). Without it the trig scorer
-        # evicts the model's freshly-generated tokens (they score low) and the
-        # model degenerates on repeated eviction -- the single most important
-        # correctness knob for multi-round eviction.
+        # Recency-window knob, kept for API compatibility. The upstream
+        # calibration-based selection does not apply a recency window on the AIME
+        # protocol and none of the implemented modes read this value, so it is
+        # currently inert; the prompt is preserved via pin_prefill instead.
         self.window_size = int(window_size)
         self.score_aggregation = score_aggregation
         # Production runs the fused-Triton eviction path unconditionally:
@@ -312,11 +309,11 @@ class TriAttention(BaseKVCacheCompressionManager):
 
     # --- Upstream-faithful eviction modes (per_head / per_layer_perhead / union) ---
     #
-    # These reproduce github.com/WeianMao/triattention's selection. The key
-    # differences from the per_layer path: scores are NOT averaged over heads
-    # (each KV head keeps its own token set), they are z-normalized per head over
-    # the decode region, the prompt (prefill) tokens are pinned, and there is no
-    # recency window. The kept COUNT stays uniform (= top_B) so paged attention
+    # These reproduce github.com/WeianMao/triattention's selection: scores are NOT
+    # averaged over heads (each KV head keeps its own token set), they are
+    # z-normalized per head over the decode region, the prompt (prefill) tokens are
+    # pinned, and there is no recency window. The kept COUNT stays uniform (= top_B)
+    # so paged attention
     # and the num_cached bookkeeping are unchanged; only the kept SET differs per
     # head. Kept K keeps its original RoPE rotation (scored post-RoPE), so a head
     # holding a different token set still scores the correct relative distance
@@ -436,7 +433,10 @@ class TriAttention(BaseKVCacheCompressionManager):
             return self._evict_per_layer_perhead(
                 request, seq_len, decode_start, decode_budget, per_layer_kv_scores
             )
-        return None  # defensive; the config Literal should prevent this
+        raise ValueError(
+            f"Unknown eviction_mode {self.eviction_mode!r}; expected one of "
+            "'union', 'per_head', 'per_layer_perhead'"
+        )
 
     def _evict_per_head(
         self,

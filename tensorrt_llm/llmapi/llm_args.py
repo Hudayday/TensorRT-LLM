@@ -2946,30 +2946,25 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
     framework's ``adjust_attention_metadata`` hook.
     """
     algorithm: Literal["triattention"] = "triattention"
-    eviction_mode: Literal[
-        "per_layer", "union", "per_head", "per_layer_perhead"] = Field(
-            default="per_layer",
-            description=
-            "Which token set each eviction keeps. `per_layer` (default) "
-            "scores a layer, averages heads, and keeps one set per layer (the "
-            "simplest variant). `per_head`/`per_layer_perhead`/`union` reproduce the "
-            "upstream algorithm: each KV head keeps its own set (per_head shares it "
-            "across layers via mean-of-per-layer-max; per_layer_perhead is fully "
-            "independent per layer; union takes the union of per-head top-k then "
-            "re-ranks). The upstream AIME default is `per_head`.")
+    eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
+        default="union",
+        description=
+        "Which token set each eviction round keeps. `union` (default) takes "
+        "the union of each KV head's top-B and re-ranks it by the per-token max "
+        "score; it matches the official base setting (per-head and "
+        "per-layer-per-head pruning both off). `per_head` keeps a per-KV-head "
+        "set shared across layers (mean of per-layer max); `per_layer_perhead` "
+        "keeps a fully independent set per (layer, KV head).")
     normalize_scores: bool = Field(
         default=True,
         description="Z-normalize each head's scores over the decode region "
-        "before selection (upstream default). Only used by the per_head / "
-        "per_layer_perhead / union modes; ignored by `per_layer`.")
+        "before selection (upstream default).")
     pin_prefill: bool = Field(
         default=True,
         description="Always preserve the prompt (prefill) tokens; only decode "
-        "tokens compete for the budget (upstream behaviour). Only used by the "
-        "per_head / per_layer_perhead / union modes; ignored by `per_layer`, "
-        "which uses the recency window instead.")
+        "tokens compete for the budget (upstream behaviour).")
     top_B: int = Field(
-        default=1024,
+        default=2048,
         description="Tokens kept at each periodic eviction (upstream `budget`; "
         "prompt tokens are always preserved on top).")
     beta: int = Field(

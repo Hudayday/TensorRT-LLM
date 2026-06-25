@@ -12,7 +12,7 @@ cover the config + construction + reconcile layer:
   - ``TriAttention`` construction, calibration loading, and the
     ``adjust_attention_metadata`` reconcile.
   - ``create_kv_cache_compression_manager`` factory dispatch.
-  - The block-free ``TriAttentionKVCacheManagerV2`` subclass (defaults OFF).
+  - That block reclaim goes through ``_KVCache.fork()`` (no manager subclass).
 
 These tests do not run real eviction or attention; that needs model weights and
 is covered by the NIAH end-to-end run.
@@ -25,9 +25,7 @@ from pydantic import TypeAdapter, ValidationError
 # TriAttention lives in the kv_cache_compression package. It exposes only the
 # compression manager -- no attention classes, no KV-cache-manager subclass
 # (block reclaim now goes through _KVCache.fork()).
-from tensorrt_llm._torch.kv_cache_compression.triattention import (
-    TriAttention,
-)
+from tensorrt_llm._torch.kv_cache_compression.triattention import TriAttention
 
 # The framework base class + factory live in pyexecutor.resource_manager.
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -120,10 +118,10 @@ class TestKvCacheCompressionConfig:
 
     def test_field_defaults(self):
         cfg = TriAttentionKvCacheCompressionConfig()
-        assert cfg.top_B == 1024
+        assert cfg.top_B == 2048
         assert cfg.beta == 128
         assert cfg.window_size == 128
-        assert cfg.eviction_mode == "per_layer"
+        assert cfg.eviction_mode == "union"
         assert cfg.normalize_scores is True
         assert cfg.pin_prefill is True
 
@@ -322,7 +320,7 @@ class TestStepBeginHookRefactor:
 # ---------------------------------------------------------------------------
 # Block reclaim: the KV-manager subclass was removed. Reclaim now runs through
 # _KVCache.fork() (V2 core), driven from the V2 adapter's update_resources for
-# compressed requests (guarded by py_triattn_evicted > 0).
+# compressed requests (guarded by py_kv_evicted_tokens > 0).
 # ---------------------------------------------------------------------------
 
 
@@ -332,8 +330,8 @@ class TestNoBlockFreeSubclass:
 
         with pytest.raises(ModuleNotFoundError):
             importlib.import_module(
-                "tensorrt_llm._torch.kv_cache_compression.triattention."
-                "triattention_kv_manager")
+                "tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kv_manager"
+            )
 
     def test_subclass_not_exported(self):
         import tensorrt_llm._torch.kv_cache_compression.triattention as pkg
@@ -342,8 +340,7 @@ class TestNoBlockFreeSubclass:
         assert not hasattr(pkg, "TriAttentionKVCacheManagerV2")
 
     def test_v2_core_exposes_fork(self):
-        from tensorrt_llm.runtime.kv_cache_manager_v2._core._kv_cache import \
-            _KVCache
+        from tensorrt_llm.runtime.kv_cache_manager_v2._core._kv_cache import _KVCache
 
         assert callable(getattr(_KVCache, "fork", None))
 

@@ -2419,12 +2419,12 @@ def create_kv_cache_compression_manager(
         # TriAttention.__init__ signature.
         return TriAttention(
             kv_cache_manager,
-            top_B=getattr(config, "top_B", 1024),
+            top_B=getattr(config, "top_B", 2048),
             beta=getattr(config, "beta", 128),
             model_path=getattr(config, "model_path", None),
             calibration_path=getattr(config, "calibration_path", None),
             window_size=getattr(config, "window_size", 128),
-            eviction_mode=getattr(config, "eviction_mode", "per_layer"),
+            eviction_mode=getattr(config, "eviction_mode", "union"),
             normalize_scores=getattr(config, "normalize_scores", True),
             pin_prefill=getattr(config, "pin_prefill", True),
         )
