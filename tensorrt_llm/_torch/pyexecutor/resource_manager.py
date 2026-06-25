@@ -2427,8 +2427,6 @@ def create_kv_cache_compression_manager(
             eviction_mode=getattr(config, "eviction_mode", "per_layer"),
             normalize_scores=getattr(config, "normalize_scores", True),
             pin_prefill=getattr(config, "pin_prefill", True),
-            reclaim_evicted_blocks=getattr(config, "reclaim_evicted_blocks",
-                                           False),
         )
     logger.warning(
         "KV-cache compression algorithm '%s' is not registered; running without "

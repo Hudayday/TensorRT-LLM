@@ -20,9 +20,8 @@ Three things keep the shrink safe (see the block-reclaim investigation):
   * History is monotonic through resize(), so set ``_history_length`` directly
     first, exactly like the existing num_cached reconcile.
 
-Gated by the ``reclaim_evicted_blocks`` config field (carried as the per-instance
-``_reclaim_blocks`` flag, set in ``TriAttention.__init__``); when off this is a
-pure pass-through to KVCacheManagerV2 (byte-identical).
+Reclaim is always on: this manager exists specifically to return eviction-freed
+blocks to the pool, so there is no on/off gate.
 """
 
 from __future__ import annotations
@@ -37,15 +36,13 @@ def _div_up(a: int, b: int) -> int:
 
 class TriAttentionKVCacheManagerV2(KVCacheManagerV2):
     """V2 manager that returns eviction-freed blocks to the pool (stream-ordered,
-    dense-layer-safe). Pure pass-through when block reclaim is off."""
+    dense-layer-safe)."""
 
     def update_resources(
         self, scheduled_batch, attn_metadata=None, kv_cache_dtype_byte_size=None
     ) -> None:
-        if not getattr(self, "_reclaim_blocks", False):
-            return super().update_resources(
-                scheduled_batch, attn_metadata, kv_cache_dtype_byte_size
-            )
+        # Reclaim is mandatory: this manager always returns eviction-freed blocks
+        # to the pool (the capacity gain is the whole point of this manager).
         # Context requests: identical to the base manager (eviction is decode-only).
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 

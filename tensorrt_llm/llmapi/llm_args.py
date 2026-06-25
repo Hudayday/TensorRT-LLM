@@ -2968,13 +2968,6 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "tokens compete for the budget (upstream behaviour). Only used by the "
         "per_head / per_layer_perhead / union modes; ignored by `per_layer`, "
         "which uses the recency window instead.")
-    reclaim_evicted_blocks: bool = Field(
-        default=False,
-        description="Return physically-evicted KV blocks to the shared pool (the "
-        "paper's capacity gain): more sequences fit, so larger batches run before "
-        "the pool is exhausted. Off by default, where eviction compacts in place "
-        "and the KV-cache manager is a pure pass-through to KVCacheManagerV2 "
-        "(byte-identical).")
     top_B: int = Field(
         default=1024,
         description="Tokens kept at each periodic eviction (upstream `budget`; "

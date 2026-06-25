@@ -96,15 +96,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         eviction_mode: str = "per_layer",
         normalize_scores: bool = True,
         pin_prefill: bool = True,
-        reclaim_evicted_blocks: bool = False,
     ):
         super().__init__(kv_cache_manager)
-        # Block-free capacity gain: return evicted physical blocks to the pool.
-        # Carried on the KV-cache-manager instance (the V2 subclass reads it in
-        # update_resources) so it reaches the IPC worker via the config -- no env
-        # / shared-file races. Off => the subclass is a pure pass-through.
-        self.reclaim_evicted_blocks = bool(reclaim_evicted_blocks)
-        setattr(kv_cache_manager, "_reclaim_blocks", self.reclaim_evicted_blocks)
         self.top_B = top_B
         self.beta = beta
         # Which token set each eviction keeps:
@@ -246,36 +239,19 @@ class TriAttention(BaseKVCacheCompressionManager):
         # waits this on the manager stream before the capacity-shrink, so the
         # page-reuse-gating finish_event recorded inside resize() dominates the
         # compaction -> no read-after-free when a freed page is reallocated.
-        if self.reclaim_evicted_blocks and evict_now:
+        if evict_now:
             _cev = torch.cuda.Event()
             _cev.record()
             for request, rid in evict_now:
                 request.py_triattn_compaction_event = _cev
 
-        # (3) reconcile history_length for EVERY request with cumulative evictions.
-        for request in gen_requests:
-            rid = request.py_request_id
-            # The cache manager's update_resources already reset this request's
-            # history_length to max_beam-1 this iteration (it does not know about
-            # eviction). Reconcile to the compacted length here -- every step for
-            # any request with cumulative evictions, not only on the eviction
-            # step, or the in-between steps leave history at the full length
-            # while the cache content is compacted and the kernel reads a stale
-            # tail. The compression manager runs after the cache manager, so this
-            # reconcile is the last word.
-            ev = self._evicted.get(rid, 0)
-            if ev > 0:
-                request.py_triattn_evicted = ev
-                kv_cache_map = getattr(mgr, "kv_cache_map", None)
-                kv_cache = kv_cache_map.get(rid) if kv_cache_map is not None else None
-                if kv_cache is not None and getattr(kv_cache, "is_active", False):
-                    # history = max_beam - cum_evicted = num_cached + 1. Bypass the
-                    # monotonic-decrease guard (kept tokens already gather-compacted
-                    # to the front).
-                    target_hist = request.max_beam_num_tokens - ev
-                    if target_hist < kv_cache.history_length:
-                        kv_cache._history_length = target_hist
-                    kv_cache.resize(None, target_hist)
+        # History + capacity reconcile for evicting requests is owned solely by the
+        # V2 manager (TriAttentionKVCacheManagerV2.update_resources): every step it
+        # sets each evicting request's history to the compacted length (max_beam -
+        # evicted) and frees the trailing blocks. It reads ``py_triattn_evicted``,
+        # which _evict_requests sets and which persists on the request between
+        # eviction steps. The kernel's view is reconciled separately in
+        # adjust_attention_metadata.
 
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
         """Drop this request's per-request step + evicted counters."""
