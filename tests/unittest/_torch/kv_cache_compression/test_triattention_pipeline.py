@@ -27,11 +27,10 @@ from pydantic import TypeAdapter, ValidationError
 # (block reclaim now goes through _KVCache.fork()).
 from tensorrt_llm._torch.kv_cache_compression.triattention import TriAttention
 
-# The framework base class + factory live in pyexecutor.resource_manager.
-from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseKVCacheCompressionManager,
-    create_kv_cache_compression_manager,
-)
+# Framework base class lives in pyexecutor.resource_manager; the factory lives
+# in pyexecutor._util (next to _create_kv_cache_manager), matching #15106.
+from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
+from tensorrt_llm._torch.pyexecutor.resource_manager import BaseKVCacheCompressionManager
 from tensorrt_llm.llmapi.llm_args import (
     DeepSeekSparseAttentionConfig,
     KvCacheCompressionConfig,
@@ -93,10 +92,11 @@ class TestPackageSurface:
             assert gone not in pkg.__all__
             assert not hasattr(pkg, gone)
 
-    def test_factory_and_base_live_in_resource_manager(self):
+    def test_factory_in_util_base_in_resource_manager(self):
+        from tensorrt_llm._torch.pyexecutor import _util
         from tensorrt_llm._torch.pyexecutor import resource_manager as rm
 
-        assert rm.create_kv_cache_compression_manager is (create_kv_cache_compression_manager)
+        assert _util.create_kv_cache_compression_manager is create_kv_cache_compression_manager
         assert rm.BaseKVCacheCompressionManager is BaseKVCacheCompressionManager
 
 

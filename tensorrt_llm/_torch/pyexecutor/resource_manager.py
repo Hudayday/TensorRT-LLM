@@ -1,6 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import copy
 import enum
 import math
@@ -26,6 +37,8 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
+from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
+                                                KV_CACHE_HASH_ALGO_V1)
 
 # isort: off
 # isort: on
@@ -53,8 +66,7 @@ WorldConfig = tensorrt_llm.bindings.WorldConfig
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
-    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
-                                              KvCacheCompressionConfig)
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
     from .kv_cache_manager_v2 import KVCacheManagerV2
 
@@ -91,6 +103,15 @@ class ResourceManagerType(enum.Enum):
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
     return (token_count + tokens_per_page) // tokens_per_page
+
+
+def _warn_if_unsupported_v1_kv_cache_event_hash_algo(hash_algo: str) -> None:
+    if hash_algo in (KV_CACHE_HASH_ALGO_AUTO, KV_CACHE_HASH_ALGO_V1):
+        return
+    logger.warning(
+        f"KVCacheManager only supports kv_cache_event_hash_algo={KV_CACHE_HASH_ALGO_V1}; "
+        f"requested {hash_algo}. The V1 event manager will emit {KV_CACHE_HASH_ALGO_V1} "
+        "event hashes.")
 
 
 class BaseResourceManager(ABC):
@@ -577,6 +598,8 @@ class KVCacheManager(BaseResourceManager):
         }
 
         if self.event_buffer_max_size > 0:
+            _warn_if_unsupported_v1_kv_cache_event_hash_algo(
+                kv_cache_config.kv_cache_event_hash_algo)
             if mapping.enable_attention_dp:
                 kwargs['event_manager'] = KVCacheEventManagerCpp(
                     max_kv_event_entries=self.event_buffer_max_size,
@@ -2396,44 +2419,6 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
     def free_resources(self, request: "LlmRequest") -> None:
         """Fire :meth:`on_request_finish`."""
         self.on_request_finish(request)
-
-
-def create_kv_cache_compression_manager(
-    config: "KvCacheCompressionConfig",
-    kv_cache_manager: "KVCacheManagerV2",
-) -> Optional[BaseKVCacheCompressionManager]:
-    """Build the KV-cache compression manager for ``config.algorithm``, or return
-    None if no algorithm matches.
-
-    Called from ``create_py_executor`` (``_util.py``) and registered as a
-    resource manager, like the KV cache manager itself. Concrete algorithms add
-    a dispatch branch here; the framework ships none.
-    """
-    if config.algorithm == "triattention":
-        from tensorrt_llm._torch.kv_cache_compression.triattention import \
-            TriAttention
-
-        # Read tuning knobs off the config defensively (getattr defaults) so a
-        # base KvCacheCompressionConfig coerced down from the TriAttention
-        # subclass still builds with the documented defaults. Mirrors the
-        # TriAttention.__init__ signature.
-        return TriAttention(
-            kv_cache_manager,
-            top_B=getattr(config, "top_B", 2048),
-            beta=getattr(config, "beta", 128),
-            model_path=getattr(config, "model_path", None),
-            calibration_path=getattr(config, "calibration_path", None),
-            window_size=getattr(config, "window_size", 128),
-            eviction_mode=getattr(config, "eviction_mode", "union"),
-            normalize_scores=getattr(config, "normalize_scores", True),
-            pin_prefill=getattr(config, "pin_prefill", True),
-        )
-    logger.warning(
-        "KV-cache compression algorithm '%s' is not registered; running without "
-        "a compression manager.",
-        config.algorithm,
-    )
-    return None
 
 
 class ResourceManager:

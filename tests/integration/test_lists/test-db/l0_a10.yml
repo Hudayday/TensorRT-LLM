@@ -15,7 +15,7 @@ l0_a10:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/sampler/test_torch_sampler.py
-  - unittest/_torch/sampler/test_torch_multi_arange.py
+  - unittest/_torch/test_torch_multi_arange.py
   - unittest/utils/test_util.py
   - unittest/utils/test_logger.py
   - unittest/_torch/test_model_config.py
@@ -118,6 +118,8 @@ l0_a10:
   - unittest/visual_gen/test_output.py
   - unittest/visual_gen/test_media_encoding.py
   - unittest/_torch/visual_gen/test_tensor_payload.py
+  - unittest/_torch/visual_gen/test_qwen_image_infer.py
+  - unittest/_torch/visual_gen/test_qwen_image_pipeline.py
   # llmapi
   - unittest/llmapi/test_llm_utils.py
   - unittest/llmapi/test_gc_utils.py
