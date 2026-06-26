@@ -77,12 +77,14 @@ class TriAttention(BaseKVCacheCompressionManager):
     consistent across layers.
     """
 
-    # The TRT-LLM IndexerTopK op sizes the single-block kernel's dynamic shared
-    # memory as k * 4 bytes with no opt-in past the 48 KB per-block cap, so its
-    # launch fails ("invalid argument") once k * 4 plus the kernel's static
-    # cub-sort shared memory exceeds 48 KB. k = 4096 (16 KB) is verified-safe;
-    # k = 8192 (32 KB) crashes. Above this the select falls back to torch.topk.
-    _INDEXER_TOPK_MAX_K = 4096
+    # The TRT-LLM IndexerTopK op's single-block kernel sizes dynamic shared memory
+    # as k * 4 bytes with no opt-in past the 48 KB per-block cap; its heuristic
+    # only supports k in {512, 1024, 2048}. At k = 4096 the op switches to a
+    # multi-block radix path that requires the caller to pre-allocate
+    # radix_aux_{indices,logits} (blocks_per_row > 1) -- which this caller does not,
+    # so it raises "radix_aux must be pre-allocated ... blocks_per_row=2". So any
+    # k above 2048 falls back to torch.topk (same kept set, correctness-equivalent).
+    _INDEXER_TOPK_MAX_K = 2048
 
     def __init__(
         self,
