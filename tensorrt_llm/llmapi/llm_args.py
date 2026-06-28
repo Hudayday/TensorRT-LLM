@@ -2712,6 +2712,12 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "tokens compete for the budget (upstream behaviour). Only used by the "
         "per_head / per_layer_perhead / union modes; ignored by `per_layer`, "
         "which uses the recency window instead.")
+    count_prompt_tokens: bool = Field(
+        default=True,
+        description="With pin_prefill, whether the pinned prompt counts toward "
+        "`top_B` (True: decode keeps top_B-prompt, total=top_B) or the budget is "
+        "decode-only (False: decode keeps top_B, total=prompt+top_B). Upstream "
+        "`count_prompt_tokens`; only meaningful with pin_prefill.")
     reclaim_evicted_blocks: bool = Field(
         default=False,
         description="Return physically-evicted KV blocks to the shared pool (the "
@@ -2744,6 +2750,13 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "(upstream TRIATTN_RUNTIME_WINDOW_SIZE). Prevents the scorer from "
         "evicting freshly-generated tokens, which corrupts multi-round "
         "eviction.")
+    skip_swa: bool = Field(
+        default=True,
+        description="On models with sliding-window (SWA/VSWA) layers (e.g. "
+        "GPT-OSS), evict/compact ONLY the full-attention layers and leave "
+        "sliding-window layers framework-windowed. Set False to compress every "
+        "layer like the official repo (no SWA awareness). No effect on "
+        "single-window models (e.g. Qwen3).")
 
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)

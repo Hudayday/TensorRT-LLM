@@ -2311,6 +2311,8 @@ def create_kv_cache_compression_manager(
             eviction_mode=getattr(config, "eviction_mode", "per_layer"),
             normalize_scores=getattr(config, "normalize_scores", True),
             pin_prefill=getattr(config, "pin_prefill", True),
+            count_prompt_tokens=getattr(config, "count_prompt_tokens", True),
+            skip_swa=getattr(config, "skip_swa", True),
             reclaim_evicted_blocks=getattr(config, "reclaim_evicted_blocks",
                                            False),
         )
