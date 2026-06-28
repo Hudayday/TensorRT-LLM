@@ -37,6 +37,7 @@ the manager converts it to our runtime schema at load (see _resolve_calibration)
 The scoring math follows the same upstream reference (``methods/pruning_utils.py``).
 """
 
+import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
@@ -99,6 +100,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         eviction_mode: str = "union",
         normalize_scores: bool = True,
         pin_prefill: bool = True,
+        count_prompt_tokens: bool = False,
+        skip_swa: bool = True,
     ):
         super().__init__(kv_cache_manager)
         self.top_B = top_B
@@ -116,6 +119,21 @@ class TriAttention(BaseKVCacheCompressionManager):
         self.eviction_mode = eviction_mode
         self.normalize_scores = bool(normalize_scores)
         self.pin_prefill = bool(pin_prefill)
+        # cpt=False (default): budget counts DECODE tokens only (pinned prompt is
+        # extra). cpt=True: budget INCLUDES the pinned prompt.
+        self.count_prompt_tokens = bool(count_prompt_tokens)
+        self.skip_swa = bool(skip_swa)
+        # per_head / per_layer_perhead compaction backend:
+        #   "torch" (default) -- the vectorized PyTorch reorder (_build_new_order +
+        #     _evict_layer_perhead). MEASURED FASTEST at BS=32 (per_head -13% vs
+        #     dense; per_layer -23%), beating both the old per-head loop (-35%) and
+        #     the fused Triton kernel below (-23%): once the per-head loop is
+        #     vectorized, the Triton per-layer scratch + 2-phase overhead dominates.
+        #   "triton"           -- one fused batched Triton launch per layer
+        #     (triton_tri_compact_perhead); may win at high-BS serving (the
+        #     launch-amortization regime) -- re-benchmark there. Both backends
+        #     produce a byte-identical compacted cache.
+        self._compact_backend = os.environ.get("TRIATTN_COMPACT_BACKEND", "torch")
         # Recency-window knob, kept for API compatibility. The upstream
         # calibration-based selection does not apply a recency window on the AIME
         # protocol and none of the implemented modes read this value, so it is
@@ -390,7 +408,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         if self.pin_prefill:
             decode_start = min(int(getattr(request, "py_prompt_len", 0) or 0), seq_len)
         decode_count = seq_len - decode_start
-        decode_budget = budget - decode_start
+        decode_budget = (budget - decode_start) if self.count_prompt_tokens else budget
         # Budget exhausted by the pinned prompt (or no decode tokens): keep the
         # first `budget` contiguous slots everywhere; nothing per-head to do.
         if decode_budget <= 0 or decode_count <= 0:
@@ -408,7 +426,10 @@ class TriAttention(BaseKVCacheCompressionManager):
         num_kv_heads = int(p0.shape[2])
         per_layer_kv_scores: List[torch.Tensor] = []
         union_rows: List[torch.Tensor] = []
+        dense_set = set(self._dense_layers(num_layers))
         for layer_idx in range(num_layers):
+            if layer_idx not in dense_set:
+                continue
             head_scores = precomputed[layer_idx]
             if head_scores is None:
                 return None
@@ -433,7 +454,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
         if self.eviction_mode == "per_layer_perhead":
             return self._evict_per_layer_perhead(
-                request, seq_len, decode_start, decode_budget, per_layer_kv_scores
+                request, num_layers, seq_len, decode_start, decode_budget, per_layer_kv_scores
             )
         raise ValueError(
             f"Unknown eviction_mode {self.eviction_mode!r}; expected one of "
@@ -454,13 +475,44 @@ class TriAttention(BaseKVCacheCompressionManager):
         applied to EVERY layer."""
         agg = torch.stack(per_layer_kv_scores, dim=0).mean(dim=0)  # [nkv, dc]
         keep_2d = self._decode_topk(agg, decode_start, decode_budget)  # [nkv, keep_count]
-        for layer_idx in range(num_layers):
-            self._evict_layer_perhead(request, layer_idx, keep_2d, seq_len)
+        # One keep set shared by every (dense) layer.
+        self._compact_perhead_layers(request, self._dense_layers(num_layers), keep_2d, seq_len)
         return int(keep_2d.shape[1])
+
+    def _compact_perhead_layers(
+        self, request: "LlmRequest", layer_indices: List[int], keep_2d: "torch.Tensor", seq_len: int
+    ) -> None:
+        """Physically compact ``layer_indices`` keeping a per-KV-head token set
+        (``keep_2d`` = ``[num_kv_heads, keep_count]``). Two interchangeable backends
+        (``self._compact_backend``) producing a byte-identical compacted cache:
+        ``triton`` runs one fused ``triton_tri_compact_perhead`` launch per layer;
+        ``torch`` runs the vectorized PyTorch reorder. SWA layers are excluded by
+        the caller (``layer_indices`` is already dense-only)."""
+        if int(keep_2d.shape[1]) >= seq_len:
+            return  # nothing to drop
+        if self._compact_backend == "torch":
+            new_order = self._build_new_order(keep_2d, seq_len)
+            for layer_idx in layer_indices:
+                self._evict_layer_perhead(request, layer_idx, new_order, seq_len)
+            return
+        from .triattention_kernels import triton_tri_compact_perhead
+
+        mgr = self.kv_cache_manager
+        get_buffers = getattr(mgr, "get_buffers", None)
+        if get_buffers is None:
+            return
+        for layer_idx in layer_indices:
+            pool = get_buffers(layer_idx, kv_layout="HND")
+            page_ids = self._resolve_page_ids(request, layer_idx)
+            if pool is None or not page_ids:
+                continue
+            page_ids_t = torch.as_tensor(page_ids, device=pool.device, dtype=torch.long)
+            triton_tri_compact_perhead(pool, [page_ids_t], [keep_2d.to(pool.device)], [seq_len])
 
     def _evict_per_layer_perhead(
         self,
         request: "LlmRequest",
+        num_layers: int,
         seq_len: int,
         decode_start: int,
         decode_budget: int,
@@ -468,11 +520,14 @@ class TriAttention(BaseKVCacheCompressionManager):
     ) -> Optional[int]:
         """per_layer_perhead: each (layer, KV head) selects independently from
         that layer's per-KV-head max (upstream
-        ``_select_per_layer_perhead_independent``)."""
+        ``_select_per_layer_perhead_independent``). ``per_layer_kv_scores`` is
+        DENSE-ONLY (sliding-window layers skipped in ``_evict_modes``), so pair it
+        with the real dense layer indices rather than ``enumerate`` (whose 0..N-1
+        running index would no longer match the physical layer)."""
         keep_count = None
-        for layer_idx, kv_scores in enumerate(per_layer_kv_scores):
+        for layer_idx, kv_scores in zip(self._dense_layers(num_layers), per_layer_kv_scores):
             keep_2d = self._decode_topk(kv_scores, decode_start, decode_budget)
-            self._evict_layer_perhead(request, layer_idx, keep_2d, seq_len)
+            self._compact_perhead_layers(request, [layer_idx], keep_2d, seq_len)
             keep_count = int(keep_2d.shape[1])
         return keep_count
 
@@ -548,23 +603,88 @@ class TriAttention(BaseKVCacheCompressionManager):
             union_idx = torch.cat([union_idx, extra])
         return torch.sort(union_idx).values
 
+    def _build_new_order(self, keep_2d: "torch.Tensor", seq_len: int) -> "torch.Tensor":
+        """Per-KV-head full token permutation ``[num_kv_heads, seq_len]``: each row =
+        kept slots (in their given order) then the dropped slots (ascending), so no
+        slot in ``[0, seq_len)`` is left holding stale data. Vectorized over heads
+        (one scatter + one nonzero + one cat) -- replaces the old per-head Python
+        loop, which issued ~num_kv_heads x more tiny ones/index_put/cat launches (the
+        dominant per_head eviction cost in the nsys kernel-launch profile). The
+        result is identical to the loop: kept-then-dropped, dropped ascending."""
+        keep_2d = keep_2d.to(dtype=torch.long)
+        nkv, keep_count = keep_2d.shape
+        if keep_count >= seq_len:
+            return keep_2d[:, :seq_len].contiguous()
+        kept_mask = torch.zeros(nkv, seq_len, device=keep_2d.device, dtype=torch.bool)
+        kept_mask.scatter_(1, keep_2d, True)
+        # nonzero is row-major sorted -> per-head dropped cols ascending; every row
+        # drops exactly seq_len-keep_count (keep_2d rows are unique), so reshape groups.
+        dropped = (~kept_mask).nonzero(as_tuple=True)[1].reshape(nkv, seq_len - keep_count)
+        return torch.cat([keep_2d, dropped], dim=1)
+
+    def _dense_layers(self, num_layers: int) -> List[int]:
+        """Layer indices that are FULL-attention (dense). Sliding-window (SWA/VSWA)
+        layers are framework-windowed and must NOT be evicted/compacted: their KV lives
+        in a small separate window pool, so applying the cross-layer union keep set
+        (full-sequence indices, layer-0 page ids) to them overwrites the wrong physical
+        slots and the SWA decode then attends to garbage (GPT-OSS-20B degeneration). The
+        SWA kernel already clamps reads to its window, so leaving those pools untouched
+        is correct even though num_cached is reconciled per-request. Single-window models
+        (e.g. Qwen3) -> all layers dense -> behavior byte-identical to before."""
+        if not self.skip_swa:  # official-style: compress EVERY layer (incl SWA)
+            return list(range(num_layers))
+        cached = getattr(self, "_dense_layers_cache", None)
+        if cached is not None:
+            return cached
+        dense = None
+        # AUTHORITATIVE: the model config's per-layer layer_types (GPT-OSS VSWA). The
+        # KV-manager's max_attention_window_vec is [None] for GPT-OSS (it stores full KV
+        # and the SWA mask is applied in the attention kernel), so it cannot reveal SWA
+        # layers -- must read layer_types, exactly like the official repo.
+        mp = getattr(self, "model_path", None)
+        if mp:
+            try:
+                from transformers import AutoConfig
+
+                cfg = AutoConfig.from_pretrained(mp, trust_remote_code=True)
+                lt = getattr(cfg, "layer_types", None)
+                if lt:
+                    dense = [
+                        li
+                        for li in range(num_layers)
+                        if li < len(lt) and "sliding" not in str(lt[li]).lower()
+                    ]
+            except Exception:
+                dense = None
+        if dense is None:  # fallback: KV-manager window vec (VSWA-aware managers)
+            mgr = self.kv_cache_manager
+            wv = getattr(mgr, "max_attention_window_vec", None)
+            ppl = getattr(mgr, "pp_layers", None)
+            if not wv or len(wv) <= 1:
+                dense = list(range(num_layers))
+            else:
+                dense = [
+                    li
+                    for li in range(num_layers)
+                    if wv[(ppl[li] if ppl is not None and li < len(ppl) else li) % len(wv)] is None
+                ]
+        self._dense_layers_cache = dense
+        return dense
+
     def _evict_layer_perhead(
-        self, request: "LlmRequest", layer_idx: int, keep_2d: "torch.Tensor", seq_len: int
+        self, request: "LlmRequest", layer_idx: int, new_order: "torch.Tensor", seq_len: int
     ) -> None:
         """Physically compact ONE layer's cache, keeping a DIFFERENT token set per
-        KV head. ``keep_2d`` is ``[num_kv_heads, keep_count]`` slot indices in
-        ``[0, seq_len)``; each KV head's token axis is reordered independently
-        (``[kept..., dropped...]``) so every slot in ``[0, seq_len)`` still holds
-        a real key/value. Same HND layout + no-re-RoPE reasoning as
-        the union compaction -- only the reorder is now per-head (a gather on the
-        ``num_kv_heads`` axis) rather than one shared permutation."""
+        KV head. ``new_order`` is the ``[num_kv_heads, seq_len]`` per-head token
+        permutation from ``_build_new_order`` (kept-then-dropped); each KV head's
+        token axis is reordered independently (a gather on the ``num_kv_heads`` axis)
+        so every slot in ``[0, seq_len)`` still holds a real key/value. Same HND
+        layout + no-re-RoPE reasoning as the union compaction. ``new_order`` is built
+        ONCE by the caller (it is identical across layers in per_head mode) rather
+        than rebuilt per layer."""
         mgr = self.kv_cache_manager
         get_buffers = getattr(mgr, "get_buffers", None)
         if get_buffers is None:
-            return
-        keep_2d = keep_2d.to(dtype=torch.long)
-        keep_count = int(keep_2d.shape[1])
-        if keep_count >= seq_len:
             return
         page_ids = self._resolve_page_ids(request, layer_idx)
         if not page_ids:
@@ -576,23 +696,13 @@ class TriAttention(BaseKVCacheCompressionManager):
         page_ids_t = torch.as_tensor(page_ids, device=pool.device, dtype=torch.long)
         request_pages = pool[page_ids_t]
         num_pages, kv_factor, num_kv_heads, _, head_dim = request_pages.shape
-        keep_2d = keep_2d.to(request_pages.device)
+        new_order = new_order.to(request_pages.device)
         # [kv_factor, num_kv_heads, num_pages * tokens_per_block, head_dim]
         kv_by_token = (
             request_pages.permute(1, 2, 0, 3, 4)
             .contiguous()
             .reshape(kv_factor, num_kv_heads, num_pages * tokens_per_block, head_dim)
         )
-        # Per-head full token permutation [num_kv_heads, seq_len]: kept slots
-        # first (in their given order), then the dropped slots -- so no slot in
-        # [0, seq_len) is left holding stale data.
-        all_token_ids = torch.arange(seq_len, device=kv_by_token.device, dtype=torch.long)
-        new_orders: List[torch.Tensor] = []
-        for h in range(num_kv_heads):
-            is_dropped = torch.ones(seq_len, device=kv_by_token.device, dtype=torch.bool)
-            is_dropped[keep_2d[h]] = False
-            new_orders.append(torch.cat([keep_2d[h], all_token_ids[is_dropped]]))
-        new_order = torch.stack(new_orders, dim=0)  # [num_kv_heads, seq_len]
         # Gather the token axis (dim 2) with a DIFFERENT order per KV head.
         region = kv_by_token[:, :, :seq_len]
         idx = new_order.view(1, num_kv_heads, seq_len, 1).expand(
@@ -705,7 +815,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 continue
             if is_union and isinstance(keep_count, torch.Tensor):
                 keep = keep_count
-                for lid in range(num_layers):
+                for lid in self._dense_layers(num_layers):  # skip sliding-window layers
                     grp = union_by_layer.setdefault(lid, ([], [], []))
                     grp[0].append(page_ids_list[r])
                     grp[1].append(keep)

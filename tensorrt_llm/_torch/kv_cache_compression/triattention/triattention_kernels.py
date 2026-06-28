@@ -72,6 +72,7 @@ def _tri_compact_kernel(
     PHASE: tl.constexpr,
     D_BLOCK: tl.constexpr,
     BLOCK_TOKENS: tl.constexpr,
+    PER_HEAD: tl.constexpr,
 ):
     # grid = (cdiv(total, BLOCK_TOKENS), kv_factor, num_kv_heads). Each program
     # moves BLOCK_TOKENS dest tokens' head_dim vectors for one (kv_factor half,
@@ -96,8 +97,14 @@ def _tri_compact_kernel(
             (kv_half.to(tl.int64) * num_kv_heads + kv_head.to(tl.int64)) * total + gs.to(tl.int64)
         ) * head_dim
         if PHASE == 0:
-            # gather: SOURCE local token (new_order[g]) of this token's request.
-            src = tl.load(new_order_ptr + gs)
+            # gather: SOURCE local token of this token's request. union (shared
+            # reorder) reads new_order[g]; per_head reads new_order[kv_head, g]
+            # (a different [kept...,dropped...] permutation per KV head), laid out
+            # row-major [num_kv_heads, total].
+            if PER_HEAD:
+                src = tl.load(new_order_ptr + kv_head.to(tl.int64) * total + gs)
+            else:
+                src = tl.load(new_order_ptr + gs)
             src_blk = src // tokens_per_block
             src_slot = (src % tokens_per_block).to(tl.int64)
             src_page = tl.load(page_ids_ptr + pbase + src_blk).to(tl.int64)
@@ -199,6 +206,91 @@ def triton_tri_compact(pool, page_ids_list, keep_list, seq_len_list):
             PHASE=phase,
             D_BLOCK=D_BLOCK,
             BLOCK_TOKENS=BLOCK_TOKENS,
+            PER_HEAD=False,
+        )
+
+
+def triton_tri_compact_perhead(pool, page_ids_list, keep_2d_list, seq_len_list):
+    """In-place PER-HEAD compaction over many requests sharing ONE layer ``pool``.
+
+    Same as ``triton_tri_compact`` but each KV head keeps a DIFFERENT token set:
+    ``keep_2d_list`` holds one ``[num_kv_heads, keep_count]`` tensor per request
+    (sorted-ascending kept local indices per head). For each request+head the
+    token axis is reordered ``[kept(head order)..., dropped(ascending)...]`` so
+    every slot in ``[0, seq_len)`` still holds a real key/value. This collapses
+    the old per-(layer,head) PyTorch gather/scatter loop into ONE batched launch
+    per layer (matching the union path's launch count). Byte-identical to the
+    PyTorch per-head reorder (validated by test_compact_perhead_equiv.py).
+    """
+    device = pool.device
+    _, kv_factor, num_kv_heads, tokens_per_block, head_dim = pool.shape
+
+    flat_new_order = []  # per request: [num_kv_heads, seq_len]
+    flat_dest_local = []  # per request: [seq_len]
+    flat_page_base = []
+    cat_page_ids = []
+    page_cursor = 0
+    for page_ids, keep_2d, seq_len in zip(page_ids_list, keep_2d_list, seq_len_list):
+        keep_2d = keep_2d.to(device=device, dtype=torch.long)  # [nkv, keep_count]
+        keep_count = int(keep_2d.shape[1])
+        if keep_count >= seq_len:
+            continue  # nothing to drop for this request
+        all_ids = torch.arange(seq_len, device=device, dtype=torch.long)
+        # dropped slots per head, ascending: mask out the kept slots, then gather
+        # the survivors. keep_count is uniform across heads, so the boolean mask
+        # selects exactly (seq_len - keep_count) per head -> reshape to [nkv, .].
+        is_dropped = torch.ones((num_kv_heads, seq_len), device=device, dtype=torch.bool)
+        is_dropped[torch.arange(num_kv_heads, device=device).unsqueeze(1), keep_2d] = False
+        dropped = (
+            all_ids.unsqueeze(0)
+            .expand(num_kv_heads, seq_len)[is_dropped]
+            .view(num_kv_heads, seq_len - keep_count)
+        )
+        new_order = torch.cat([keep_2d, dropped], dim=1).to(torch.int64)  # [nkv, seq_len]
+        flat_new_order.append(new_order)
+        flat_dest_local.append(all_ids.to(torch.int64))  # 0..seq_len-1 (shared by all heads)
+        pids = page_ids.to(device=device, dtype=torch.int64)
+        flat_page_base.append(torch.full((seq_len,), page_cursor, device=device, dtype=torch.int64))
+        cat_page_ids.append(pids)
+        page_cursor += int(pids.numel())
+
+    if not flat_new_order:
+        return
+    # [num_kv_heads, total] row-major -> kernel reads new_order[kv_head*total + g].
+    new_order_t = torch.cat(flat_new_order, dim=1).contiguous()
+    dest_local_t = torch.cat(flat_dest_local)
+    page_base_t = torch.cat(flat_page_base)
+    page_ids_t = torch.cat(cat_page_ids)
+    total = int(dest_local_t.numel())
+
+    _need = kv_factor * num_kv_heads * total * head_dim
+    scratch = _get_compact_scratch(_need, pool.dtype, device)[:_need].view(
+        kv_factor, num_kv_heads, total, head_dim
+    )
+    D_BLOCK = triton.next_power_of_2(head_dim)
+    BLOCK_TOKENS = 16  # same verified-best tile as the union path
+    grid = (triton.cdiv(total, BLOCK_TOKENS), kv_factor, num_kv_heads)
+    for phase in (0, 1):
+        _tri_compact_kernel[grid](
+            pool,
+            new_order_t.reshape(-1),
+            dest_local_t,
+            page_base_t,
+            page_ids_t,
+            scratch.reshape(-1),
+            total,
+            num_kv_heads,
+            tokens_per_block,
+            head_dim,
+            pool.stride(0),
+            pool.stride(1),
+            pool.stride(2),
+            pool.stride(3),
+            pool.stride(4),
+            PHASE=phase,
+            D_BLOCK=D_BLOCK,
+            BLOCK_TOKENS=BLOCK_TOKENS,
+            PER_HEAD=True,
         )
 
 

@@ -3108,6 +3108,17 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "(upstream TRIATTN_RUNTIME_WINDOW_SIZE). Prevents the scorer from "
         "evicting freshly-generated tokens, which corrupts multi-round "
         "eviction.")
+    skip_swa: bool = Field(
+        default=True,
+        description=
+        "GPT-OSS/VSWA: evict only full-attention (dense) layers, skip "
+        "sliding-window layers (their KV is window-pooled; compacting them corrupts "
+        "SWA decode). No-op on single-window models like Qwen3.")
+    count_prompt_tokens: bool = Field(
+        default=False,
+        description="If False (default), the KV budget counts only DECODE tokens "
+        "(the pinned prompt is kept on top); if True, the budget includes the "
+        "pinned prompt.")
 
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)

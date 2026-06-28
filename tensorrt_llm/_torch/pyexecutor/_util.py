@@ -1881,6 +1881,8 @@ def create_kv_cache_compression_manager(
             eviction_mode=getattr(config, "eviction_mode", "union"),
             normalize_scores=getattr(config, "normalize_scores", True),
             pin_prefill=getattr(config, "pin_prefill", True),
+            skip_swa=getattr(config, 'skip_swa', True),
+            count_prompt_tokens=getattr(config, 'count_prompt_tokens', False),
         )
     logger.warning(
         "KV-cache compression algorithm '%s' is not registered; running without "
