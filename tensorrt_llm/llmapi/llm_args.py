@@ -3093,9 +3093,9 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "`divide_length`): the eviction hook fires once every `beta` steps.")
     model_path: Optional[str] = Field(
         default=None,
-        description="Checkpoint path, used only to derive the model's RoPE "
-        "tables (omega / freq_scale_sq) when converting the official "
-        "calibration `.pt` to the runtime schema.")
+        description="Checkpoint path used to derive RoPE tables when converting "
+        "the official calibration and, when `skip_swa=True`, to classify "
+        "kernel-masked sliding-attention layers. Required when `skip_swa=True`.")
     calibration_path: Optional[str] = Field(
         default=None,
         description="Path to the official TriAttention calibration `.pt` "
@@ -3104,21 +3104,21 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "load.")
     window_size: int = Field(
         default=128,
-        description="Most-recent tokens always preserved from eviction "
-        "(upstream TRIATTN_RUNTIME_WINDOW_SIZE). Prevents the scorer from "
-        "evicting freshly-generated tokens, which corrupts multi-round "
-        "eviction.")
+        description="Compatibility field retained for existing configs. The "
+        "implemented calibration-based selection does not use a separate "
+        "recency window.")
     skip_swa: bool = Field(
         default=True,
         description=
-        "GPT-OSS/VSWA: evict only full-attention (dense) layers, skip "
-        "sliding-window layers (their KV is window-pooled; compacting them corrupts "
-        "SWA decode). No-op on single-window models like Qwen3.")
+        "For models such as GPT-OSS whose V2 cache is full-length for every "
+        "layer but whose attention kernel masks selected layers, exclude those "
+        "layers from TriAttention scoring and rebase their latest window before "
+        "capacity reclaim. True V2 SWA/VSWA lifecycles and SSM are rejected.")
     count_prompt_tokens: bool = Field(
         default=False,
         description="If False (default), the KV budget counts only DECODE tokens "
-        "(the pinned prompt is kept on top); if True, the budget includes the "
-        "pinned prompt.")
+        "(the pinned prompt is kept on top). Physical capacity reclaim currently "
+        "requires False.")
 
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)

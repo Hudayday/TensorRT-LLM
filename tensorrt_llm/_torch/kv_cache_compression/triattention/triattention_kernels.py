@@ -24,15 +24,21 @@ House rules honored throughout:
 
 from __future__ import annotations
 
+import os
 from typing import List, NamedTuple, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
+# Move only retained tokens to the compacted prefix. Once the compacted length is
+# published, the tail is unreachable, so reordering dropped tokens only adds traffic.
+# The opt-out exists for controlled in-process A/B comparisons.
+_COMPACT_KEPT_ONLY = os.environ.get("TRIATTN_COMPACT_KEPT_ONLY", "1") == "1"
+
 # --------------------------------------------------------------------------- #
 # Block (4): gather / compact kept tokens                                     #
-#   apply the full permutation [kept..., dropped...] to the (page, slot) token #
+#   gather retained tokens into the compacted (page, slot) prefix             #
 #   axis, for BOTH K and V, writing back the touched pages.  Two-pass          #
 #   (gather -> scratch -> scatter) to match the reference .clone() semantics   #
 #   and avoid the in-place read/write aliasing hazard.                         #
@@ -50,6 +56,21 @@ def _get_compact_scratch(need: int, dtype, device) -> torch.Tensor:
         buf = torch.empty(need, dtype=dtype, device=device)
         _COMPACT_SCRATCH[key] = buf
     return buf
+
+
+def _build_compaction_indices(
+    keep: torch.Tensor, seq_len: int, *, kept_only: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build source and destination token indices for one compaction segment."""
+    keep = keep.to(dtype=torch.int64)
+    if kept_only:
+        dest = torch.arange(keep.numel(), device=keep.device, dtype=torch.int64)
+        return keep, dest
+
+    all_ids = torch.arange(seq_len, device=keep.device, dtype=torch.int64)
+    is_dropped = torch.ones(seq_len, device=keep.device, dtype=torch.bool)
+    is_dropped[keep] = False
+    return torch.cat([keep, all_ids[is_dropped]]), all_ids
 
 
 @triton.jit
@@ -132,37 +153,52 @@ def _tri_compact_kernel(
             tl.store(pool_ptr + dst_base + d64 * s_dim, val, mask=m)
 
 
-def triton_tri_compact(pool, page_ids_list, keep_list, seq_len_list):
+def triton_tri_compact(pool, page_ids_list, keep_list, seq_len_list, *, dest_list=None):
     """In-place compaction over many requests sharing ONE layer ``pool``.
-    For each request, kept tokens are gathered to the front (slots
-    [0, keep_count_r)), exactly as if each request were compacted alone.
+    By default each request's kept tokens are gathered to the front. An explicit
+    ``dest_list`` copies only the supplied source/destination ranges.
 
     pool:          one layer's HND view [num_pages, kv_factor, nkv, tpb, hd].
     page_ids_list: list of 1-D int page-id tensors, one per request.
-    keep_list:     list of SORTED-ascending kept local-index tensors, one per request.
+    keep_list:     source local-index tensors, one per request.
     seq_len_list:  list of committed token counts, one per request.
-    Requests with keep_count >= seq_len are skipped (nothing to drop).
+    dest_list:     optional explicit destination tensors. When omitted, each
+                   source is a complete keep set compacted to [0, keep_count).
     """
     device = pool.device
     _, kv_factor, num_kv_heads, tokens_per_block, head_dim = pool.shape
+    if not (len(page_ids_list) == len(keep_list) == len(seq_len_list)):
+        raise ValueError("page_ids_list, keep_list, and seq_len_list must have equal lengths")
+    if dest_list is not None and len(dest_list) != len(keep_list):
+        raise ValueError("dest_list and keep_list must have equal lengths")
 
     flat_new_order = []
     flat_dest_local = []
     flat_page_base = []
     cat_page_ids = []
     page_cursor = 0
-    for page_ids, keep, seq_len in zip(page_ids_list, keep_list, seq_len_list):
+    for request_index, (page_ids, keep, seq_len) in enumerate(
+        zip(page_ids_list, keep_list, seq_len_list)
+    ):
         keep = keep.to(device=device, dtype=torch.long)
-        if int(keep.numel()) >= seq_len:
-            continue  # nothing to drop for this request
-        all_ids = torch.arange(seq_len, device=device, dtype=torch.long)
-        is_dropped = torch.ones(seq_len, device=device, dtype=torch.bool)
-        is_dropped[keep] = False
-        new_order = torch.cat([keep, all_ids[is_dropped]]).to(torch.int64)  # [seq_len]
+        keep_count = int(keep.numel())
+        if dest_list is None:
+            if keep_count >= seq_len:
+                continue  # nothing to drop for this request
+            new_order, dest = _build_compaction_indices(keep, seq_len, kept_only=_COMPACT_KEPT_ONLY)
+        else:
+            new_order = keep.to(torch.int64)
+            dest = dest_list[request_index].to(device=device, dtype=torch.int64)
+            if new_order.numel() != dest.numel():
+                raise ValueError("Each explicit source and destination must have equal lengths")
+            if new_order.numel() == 0:
+                continue
         flat_new_order.append(new_order)
-        flat_dest_local.append(all_ids.to(torch.int64))  # 0..seq_len-1
+        flat_dest_local.append(dest)
         pids = page_ids.to(device=device, dtype=torch.int64)
-        flat_page_base.append(torch.full((seq_len,), page_cursor, device=device, dtype=torch.int64))
+        flat_page_base.append(
+            torch.full((new_order.numel(),), page_cursor, device=device, dtype=torch.int64)
+        )
         cat_page_ids.append(pids)
         page_cursor += int(pids.numel())
 
@@ -301,8 +337,8 @@ def _flat_from_true_storage_base(anchor: torch.Tensor) -> Tuple[torch.Tensor, in
     per-layer element offsets index into it.
 
     Anchors on the TRUE storage base (NOT on the min layer data_ptr), so it is
-    correct even when the scored layers are a SUBSET of a larger allocation whose
-    lowest scored layer has storage_offset > 0 (VSWA grouping). Built via
+    correct even when the scored layers are a subset of a larger allocation whose
+    lowest scored layer has storage_offset > 0. Built via
     ``set_(storage, storage_offset=0, ...)`` so ``flat.data_ptr()`` IS the true
     base regardless of which layer we anchored on.
     """
@@ -513,9 +549,9 @@ def triton_tri_score_perhead(
     ``flat_perhead_to_list(perhead_scores, seg_offsets)``.
     """
     assert score_aggregation in ("mean", "max")
-    device = layer_pools[0].device
     L_all = len(layer_pools)
     layer_ids = list(range(L_all)) if layer_indices is None else list(layer_indices)
+    device = layer_pools[layer_ids[0]].device
     K = len(page_ids_list)
     assert len(seq_lens) == K and len(round_starts) == K
 
@@ -555,8 +591,8 @@ def triton_tri_score_perhead(
         pl = layer_pools[lid]
         # All scored layers must alias the SAME underlying storage.
         assert pl.untyped_storage().data_ptr() == anchor.untyped_storage().data_ptr(), (
-            "scored layer views do not share one storage (VSWA multi-pool); group "
-            "segments by pool group and call triton_tri_score_perhead per group."
+            "scored layer views do not share one storage; group segments by pool "
+            "and call triton_tri_score_perhead per group."
         )
         off_bytes = int(pl.data_ptr()) - storage_base
         assert off_bytes >= 0 and off_bytes % elt_size == 0, (

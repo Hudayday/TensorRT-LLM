@@ -12,7 +12,7 @@ cover the config + construction + reconcile layer:
   - ``TriAttention`` construction, calibration loading, and the
     ``adjust_attention_metadata`` reconcile.
   - ``create_kv_cache_compression_manager`` factory dispatch.
-  - That block reclaim goes through ``_KVCache.fork()`` (no manager subclass).
+  - Capacity-only V2 registration and compacted-capacity publication.
 
 These tests do not run real eviction or attention; that needs model weights and
 is covered by the NIAH end-to-end run.
@@ -23,9 +23,12 @@ import torch
 from pydantic import TypeAdapter, ValidationError
 
 # TriAttention lives in the kv_cache_compression package. It exposes only the
-# compression manager -- no attention classes, no KV-cache-manager subclass
-# (block reclaim now goes through _KVCache.fork()).
+# compression manager -- no attention classes or KV-cache-manager subclass.
 from tensorrt_llm._torch.kv_cache_compression.triattention import TriAttention
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+    _build_swa_rebase_copy,
+    _build_swa_rebase_keep,
+)
 
 # Framework base class lives in pyexecutor.resource_manager; the factory lives
 # in pyexecutor._util (next to _create_kv_cache_manager), matching #15106.
@@ -190,6 +193,52 @@ class TestTriAttentionClass:
         with pytest.raises(ValueError, match="calibration_path"):
             mgr._resolve_calibration()
 
+    @pytest.mark.parametrize(
+        ("pin_prefill", "count_prompt_tokens"),
+        [(False, False), (True, True)],
+    )
+    def test_physical_reclaim_requires_pinned_decode_only_budget(
+        self, pin_prefill, count_prompt_tokens
+    ):
+        with pytest.raises(ValueError, match="pin_prefill=True"):
+            TriAttention(
+                _make_fake_v2(),
+                top_B=8,
+                pin_prefill=pin_prefill,
+                count_prompt_tokens=count_prompt_tokens,
+            )
+
+    def test_request_init_registers_capacity_only_for_every_request(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        manager = _make_fake_v2()
+        manager.enable_decode_capacity_only = mock.Mock()
+        manager.set_compacted_capacity = mock.Mock()
+        manager.get_pre_forward_kv_length = mock.Mock()
+        manager.has_pending_compacted_capacity = mock.Mock()
+        triattention = TriAttention(manager, top_B=8, skip_swa=False)
+        triattention._calibrated = True
+
+        triattention.on_request_init(SimpleNamespace(py_request_id=11))
+        triattention.on_request_init(SimpleNamespace(py_request_id=12))
+
+        assert manager.enable_decode_capacity_only.call_args_list == [mock.call(11), mock.call(12)]
+
+    def test_request_init_fails_when_capacity_only_api_is_missing(self):
+        from types import SimpleNamespace
+
+        manager = SimpleNamespace(enable_block_reuse=False)
+        triattention = TriAttention(manager, top_B=8, skip_swa=False)
+        triattention._calibrated = True
+
+        with pytest.raises(RuntimeError, match="enable_decode_capacity_only"):
+            triattention.on_request_init(SimpleNamespace(py_request_id=11))
+
+    def test_skip_swa_requires_model_path(self):
+        with pytest.raises(ValueError, match="skip_swa=True requires model_path"):
+            TriAttention(_make_fake_v2(), top_B=8)
+
     def test_validate_rejects_missing_keys(self):
         mgr = TriAttention.__new__(TriAttention)
         with pytest.raises(ValueError, match="missing keys"):
@@ -214,9 +263,8 @@ class TestTriAttentionClass:
 
 
 # ---------------------------------------------------------------------------
-# adjust_attention_metadata: the cached-token reconcile (replaces the old
-# attention-metadata shim). The model engine derives num_cached from the logical
-# length; this hook subtracts the evicted count and clamps prompt_lens.
+# adjust_attention_metadata: use V2's authoritative pre-forward physical length
+# and clamp prompt_lens to that compacted prefix.
 # ---------------------------------------------------------------------------
 
 
@@ -244,10 +292,9 @@ class TestAttentionMetadataReconcile:
         mgr.adjust_attention_metadata(meta)  # must not raise / mutate
         assert meta.kv_cache_params.num_cached_tokens_per_seq == [100]
 
-    def test_evicted_request_num_cached_reconciled(self):
-        # num_cached -> (max_beam-1) + 1 - evicted. logical=100, evicted=10 -> 91.
+    def test_authoritative_pre_forward_length_replaces_logical_length(self):
         mgr = TriAttention.__new__(TriAttention)
-        mgr._evicted = {7: 10}
+        mgr._pre_forward_kv_lengths = {7: 91}
         meta = _FakeMetadata([100], [50], [7])
         mgr.adjust_attention_metadata(meta)
         assert meta.kv_cache_params.num_cached_tokens_per_seq[0] == 91
@@ -256,16 +303,15 @@ class TestAttentionMetadataReconcile:
     def test_prompt_len_clamped_to_compacted_cache(self):
         # A prompt longer than the whole compacted cache is clamped to num_cached.
         mgr = TriAttention.__new__(TriAttention)
-        mgr._evicted = {7: 10}
+        mgr._pre_forward_kv_lengths = {7: 91}
         meta = _FakeMetadata([100], [200], [7])
         mgr.adjust_attention_metadata(meta)
         assert meta.kv_cache_params.num_cached_tokens_per_seq[0] == 91
         assert meta.prompt_lens == [91]
 
-    def test_unevicted_request_untouched(self):
-        # ev==0 -> byte-identical (dense / no-evict steps and other models).
+    def test_request_without_authoritative_length_is_untouched(self):
         mgr = TriAttention.__new__(TriAttention)
-        mgr._evicted = {}
+        mgr._pre_forward_kv_lengths = {}
         meta = _FakeMetadata([100], [50], [7])
         mgr.adjust_attention_metadata(meta)
         assert meta.kv_cache_params.num_cached_tokens_per_seq == [100]
@@ -274,7 +320,7 @@ class TestAttentionMetadataReconcile:
     def test_context_requests_skipped(self):
         # Only generation requests (index >= num_contexts) are reconciled.
         mgr = TriAttention.__new__(TriAttention)
-        mgr._evicted = {1: 10, 2: 10}
+        mgr._pre_forward_kv_lengths = {1: 80, 2: 91}
         meta = _FakeMetadata([100, 100], [50, 50], [1, 2], num_contexts=1)
         mgr.adjust_attention_metadata(meta)
         # request 1 is a context request -> untouched; request 2 is generation.
@@ -313,14 +359,502 @@ class TestStepBeginHookRefactor:
             sb.assert_called_once_with(batch)
 
     def test_evicted_count_default_zero(self):
-        mgr = TriAttention(_make_fake_v2(), top_B=8, beta=4)
+        mgr = TriAttention(_make_fake_v2(), top_B=8, beta=4, skip_swa=False)
         assert mgr.evicted_count(12345) == 0
+
+    @staticmethod
+    def _make_due_decode_request(seq_len):
+        from types import SimpleNamespace
+
+        request = SimpleNamespace(
+            py_request_id=7,
+            py_prompt_len=1024,
+            max_beam_num_tokens=seq_len + 1,
+        )
+        batch = SimpleNamespace(generation_requests=[request])
+        mgr = TriAttention.__new__(TriAttention)
+        mgr._calibrated = True
+        mgr.kv_cache_manager = SimpleNamespace(
+            get_buffers=lambda *args, **kwargs: None,
+            get_pre_forward_kv_length=lambda _rid: seq_len,
+            has_pending_compacted_capacity=lambda _rid: False,
+        )
+        mgr._L = 2
+        mgr._gen_steps = {7: 127}
+        mgr._evicted = {}
+        mgr._pre_forward_kv_lengths = {}
+        mgr._capacity_only_request_ids = {7}
+        mgr.beta = 128
+        mgr.top_B = 4096
+        mgr.pin_prefill = True
+        mgr.count_prompt_tokens = False
+        return mgr, request, batch
+
+    def test_identity_gate_skips_exact_decode_only_budget(self):
+        from unittest import mock
+
+        mgr, _, batch = self._make_due_decode_request(seq_len=1024 + 4096)
+
+        with mock.patch.object(mgr, "_evict_requests") as evict:
+            mgr._periodic_evict(batch)
+
+        evict.assert_not_called()
+        assert mgr._gen_steps[7] == 128
+
+    def test_identity_gate_preserves_real_eviction_round(self):
+        from unittest import mock
+
+        mgr, request, batch = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
+        timeline = []
+        event = mock.Mock()
+        event.record.side_effect = lambda: timeline.append("event")
+        publish = mock.Mock(side_effect=lambda *args: timeline.append("publish"))
+        mgr.kv_cache_manager.set_compacted_capacity = publish
+
+        def compact(*args):
+            timeline.append("compact")
+            return [(7, 1024 + 4096 + 1)]
+
+        with (
+            mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict,
+            mock.patch.object(torch.cuda, "Event", return_value=event),
+        ):
+            mgr._periodic_evict(batch)
+
+        evict.assert_called_once_with([(request, 7)], 2)
+        event.record.assert_called_once_with()
+        publish.assert_called_once_with(7, 1024 + 4096 + 1, event)
+        assert timeline == ["compact", "event", "publish"]
+
+    def test_pending_target_retries_due_eviction_next_step(self):
+        from unittest import mock
+
+        mgr, _, batch = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
+        mgr.kv_cache_manager.has_pending_compacted_capacity = mock.Mock(return_value=True)
+
+        with mock.patch.object(mgr, "_evict_requests") as evict:
+            mgr._periodic_evict(batch)
+
+        evict.assert_not_called()
+        assert mgr._gen_steps[7] == 127
+        assert mgr._pre_forward_kv_lengths[7] == 1024 + 4096 + 1
+
+    def test_generation_only_request_is_initialized_once(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        manager = SimpleNamespace(
+            enable_block_reuse=False,
+            enable_decode_capacity_only=mock.Mock(),
+            set_compacted_capacity=mock.Mock(),
+            get_pre_forward_kv_length=mock.Mock(return_value=10),
+            has_pending_compacted_capacity=mock.Mock(return_value=False),
+            get_buffers=lambda *args, **kwargs: None,
+        )
+        request = SimpleNamespace(
+            py_request_id=7,
+            py_prompt_len=2,
+            max_beam_num_tokens=999,
+            is_dummy=False,
+        )
+        mgr = TriAttention(manager, top_B=8, beta=4, skip_swa=False)
+        mgr._calibrated = True
+        mgr._L = 2
+
+        mgr._periodic_evict(SimpleNamespace(generation_requests=[request]))
+        mgr._periodic_evict(SimpleNamespace(generation_requests=[request]))
+
+        manager.enable_decode_capacity_only.assert_called_once_with(7)
+        assert manager.get_pre_forward_kv_length.call_args_list == [mock.call(7), mock.call(7)]
+        assert mgr._capacity_only_request_ids == {7}
+
+    def test_generation_dummy_is_skipped(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        manager = SimpleNamespace(
+            enable_block_reuse=False,
+            enable_decode_capacity_only=mock.Mock(),
+            get_pre_forward_kv_length=mock.Mock(),
+        )
+        request = SimpleNamespace(py_request_id=7, is_dummy=True)
+        mgr = TriAttention(manager, top_B=8, beta=4, skip_swa=False)
+        mgr._calibrated = True
+
+        mgr._periodic_evict(SimpleNamespace(generation_requests=[request]))
+
+        manager.enable_decode_capacity_only.assert_not_called()
+        manager.get_pre_forward_kv_length.assert_not_called()
+        assert mgr._capacity_only_request_ids == set()
+
+    def test_evict_requests_returns_exact_post_forward_capacity(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels as kernels
+
+        # The reserved-but-unwritten slot may contain nonzero data from a reused
+        # page. Length accounting must use request metadata, not pool contents.
+        pools = [torch.ones(2, 2, 1, 8, 2), torch.ones(2, 2, 1, 8, 2)]
+        manager = SimpleNamespace(get_buffers=lambda layer, **kwargs: pools[layer])
+        request = SimpleNamespace(py_request_id=7, py_prompt_len=2, max_beam_num_tokens=999)
+        mgr = TriAttention.__new__(TriAttention)
+        mgr.kv_cache_manager = manager
+        mgr._evicted = {7: 5}
+        mgr._pre_forward_kv_lengths = {7: 8}
+        mgr.top_B = 4
+        mgr.pin_prefill = True
+        mgr.count_prompt_tokens = False
+        mgr.eviction_mode = "union"
+        mgr._offsets = torch.ones(1)
+        mgr._H = 1
+        mgr._triattn_q_real = torch.ones(2, 1, 1)
+        mgr._triattn_q_imag = torch.ones(2, 1, 1)
+        mgr._triattn_mlr_coef = torch.ones(2, 1, 1)
+        mgr._freq_scale_sq = torch.ones(1)
+        mgr.calibration = {"omega": torch.ones(1)}
+        mgr.score_aggregation = "mean"
+        mgr._attention_layer_partition = mock.Mock(return_value=([1], [0], 2))
+        mgr._resolve_page_ids = mock.Mock(
+            side_effect=lambda request, layer: [10, 11] if layer == 1 else [20, 21]
+        )
+        mgr._evict_modes = mock.Mock(return_value=torch.arange(6))
+        segment = SimpleNamespace(request_index=0, layer_index=1)
+
+        with (
+            mock.patch.object(
+                kernels,
+                "triton_tri_score_perhead",
+                return_value=(torch.empty(0), torch.empty(0), [segment]),
+            ) as score,
+            mock.patch.object(kernels, "flat_perhead_to_list", return_value=[torch.zeros(1, 8)]),
+            mock.patch.object(kernels, "triton_tri_compact") as compact,
+        ):
+            targets = mgr._evict_requests([(request, 7)], num_layers=2)
+
+        assert targets == [(7, 7)]
+        assert mgr._evicted == {7: 7}
+        assert mgr._pre_forward_kv_lengths == {7: 6}
+        assert score.call_args.kwargs["layer_indices"] == [1]
+        assert score.call_args.args[1][0].tolist() == [10, 11]
+        assert score.call_args.args[2] == [8]
+        assert score.call_args.args[3] == [13.0]
+        assert mgr._resolve_page_ids.call_args_list == [
+            mock.call(request, 1),
+            mock.call(request, 0),
+        ]
+        assert compact.call_count == 2
+        dense_call, swa_call = compact.call_args_list
+        assert dense_call.args[0] is pools[1]
+        assert dense_call.args[1][0].tolist() == [10, 11]
+        assert swa_call.args[0] is pools[0]
+        assert swa_call.args[1][0].tolist() == [20, 21]
+        assert swa_call.args[2][0].tolist() == [6, 7]
+        assert swa_call.kwargs["dest_list"][0].tolist() == [4, 5]
+        assert swa_call.args[2][0].numel() == 2
+
+    @pytest.mark.parametrize(
+        "draft_fields",
+        [
+            {"py_draft_tokens": [101, 102]},
+            {"py_draft_tokens": [], "num_draft_tokens": 2},
+        ],
+    )
+    def test_evict_requests_rejects_speculative_decode(self, draft_fields):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        pool = torch.zeros(2, 2, 1, 8, 2)
+        request = SimpleNamespace(
+            py_request_id=7,
+            py_prompt_len=2,
+            max_beam_num_tokens=9,
+            **draft_fields,
+        )
+        mgr = TriAttention.__new__(TriAttention)
+        mgr.kv_cache_manager = SimpleNamespace(get_buffers=lambda *args, **kwargs: pool)
+        mgr._evicted = {}
+        mgr._attention_layer_partition = mock.Mock(return_value=([0], [], None))
+
+        with pytest.raises(ValueError, match="does not support speculative decoding"):
+            mgr._evict_requests([(request, 7)], num_layers=1)
+
+    def test_dense_storage_groups_use_their_own_page_ids(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels as kernels
+
+        pools = [torch.zeros(2, 2, 1, 8, 2), torch.zeros(2, 2, 1, 8, 2)]
+        request = SimpleNamespace(py_request_id=7, py_prompt_len=2, max_beam_num_tokens=9)
+        mgr = TriAttention.__new__(TriAttention)
+        mgr.kv_cache_manager = SimpleNamespace(get_buffers=lambda layer, **kwargs: pools[layer])
+        mgr._evicted = {}
+        mgr._pre_forward_kv_lengths = {7: 8}
+        mgr.top_B = 4
+        mgr.pin_prefill = True
+        mgr.count_prompt_tokens = False
+        mgr.eviction_mode = "union"
+        mgr._offsets = torch.ones(1)
+        mgr._H = 1
+        mgr._triattn_q_real = torch.ones(2, 1, 1)
+        mgr._triattn_q_imag = torch.ones(2, 1, 1)
+        mgr._triattn_mlr_coef = torch.ones(2, 1, 1)
+        mgr._freq_scale_sq = torch.ones(1)
+        mgr.calibration = {"omega": torch.ones(1)}
+        mgr.score_aggregation = "mean"
+        mgr._attention_layer_partition = mock.Mock(return_value=([0, 1], [], None))
+        mgr._resolve_page_ids = mock.Mock(
+            side_effect=lambda request, layer: [10, 11] if layer == 0 else [20, 21]
+        )
+        mgr._evict_modes = mock.Mock(return_value=torch.arange(6))
+
+        def score_group(*args, **kwargs):
+            layer = kwargs["layer_indices"][0]
+            segment = SimpleNamespace(request_index=0, layer_index=layer)
+            return torch.empty(0), torch.empty(0), [segment]
+
+        with (
+            mock.patch.object(
+                kernels, "triton_tri_score_perhead", side_effect=score_group
+            ) as score,
+            mock.patch.object(kernels, "flat_perhead_to_list", return_value=[torch.zeros(1, 8)]),
+            mock.patch.object(kernels, "triton_tri_compact") as compact,
+        ):
+            targets = mgr._evict_requests([(request, 7)], num_layers=2)
+
+        assert targets == [(7, 7)]
+        assert score.call_count == 2
+        first_score, second_score = score.call_args_list
+        assert first_score.kwargs["layer_indices"] == [0]
+        assert first_score.args[1][0].tolist() == [10, 11]
+        assert second_score.kwargs["layer_indices"] == [1]
+        assert second_score.args[1][0].tolist() == [20, 21]
+        assert compact.call_count == 2
+        first_compact, second_compact = compact.call_args_list
+        assert first_compact.args[0] is pools[0]
+        assert first_compact.args[1][0].tolist() == [10, 11]
+        assert second_compact.args[0] is pools[1]
+        assert second_compact.args[1][0].tolist() == [20, 21]
+
+
+class TestTopKRouting:
+    def test_score_width_4096_routes_to_torch_topk(self):
+        from unittest import mock
+
+        mgr = TriAttention.__new__(TriAttention)
+        scores = torch.arange(2 * 4096, dtype=torch.float32).reshape(2, 4096)
+        real_topk = torch.topk
+
+        with mock.patch.object(torch, "topk", wraps=real_topk) as topk:
+            result = mgr._indexer_topk_idx(scores, 8)
+
+        topk.assert_called_once()
+        args, kwargs = topk.call_args
+        assert args[0] is scores
+        assert args[1:] == (8,)
+        assert kwargs == {"dim": 1, "sorted": False}
+        assert result.shape == (2, 8)
+        assert result.dtype == torch.long
+
+
+class TestKeptOnlyCompaction:
+    def test_retained_prefix_matches_legacy_full_reorder(self):
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+            _build_compaction_indices,
+        )
+
+        seq_len = 17
+        keep = torch.tensor([0, 2, 5, 9, 16], dtype=torch.long)
+        source = torch.arange(2 * 3 * seq_len * 4).reshape(2, 3, seq_len, 4)
+
+        kept_src, kept_dst = _build_compaction_indices(keep, seq_len, kept_only=True)
+        legacy_src, legacy_dst = _build_compaction_indices(keep, seq_len, kept_only=False)
+        kept_result = torch.full_like(source, -1)
+        legacy_result = torch.full_like(source, -1)
+        kept_result[:, :, kept_dst] = source[:, :, kept_src]
+        legacy_result[:, :, legacy_dst] = source[:, :, legacy_src]
+
+        assert torch.equal(kept_result[:, :, : keep.numel()], legacy_result[:, :, : keep.numel()])
+        assert kept_src.numel() == keep.numel()
+        assert legacy_src.numel() == seq_len
+
+
+class TestKernelMaskedSwa:
+    def test_rebase_boundary_keeps_exact_latest_window(self):
+        keep = _build_swa_rebase_keep(seq_len=10, keep_count=4, window_size=4)
+
+        assert keep.tolist() == [6, 7, 8, 9]
+        assert keep.numel() == 4
+
+    def test_rebase_preserves_prefix_and_places_latest_window_at_tail(self):
+        keep = _build_swa_rebase_keep(seq_len=12, keep_count=7, window_size=3)
+
+        assert keep.tolist() == [0, 1, 2, 3, 9, 10, 11]
+        assert keep[-3:].tolist() == [9, 10, 11]
+
+    def test_rebase_copy_moves_only_window_to_compacted_tail(self):
+        source, destination = _build_swa_rebase_copy(seq_len=12, keep_count=7, window_size=3)
+
+        assert source.tolist() == [9, 10, 11]
+        assert destination.tolist() == [4, 5, 6]
+        assert source.numel() == destination.numel() == 3
+
+    def test_rebase_rejects_budget_smaller_than_window(self):
+        with pytest.raises(ValueError, match="at least the SWA window size"):
+            _build_swa_rebase_keep(seq_len=10, keep_count=3, window_size=4)
+
+    def test_layer_partition_uses_local_model_config(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        mgr = TriAttention.__new__(TriAttention)
+        mgr.skip_swa = True
+        mgr.model_path = "/models/gpt-oss"
+        mgr.top_B = 128
+        mgr.kv_cache_manager = SimpleNamespace(num_layers=4)
+        config = SimpleNamespace(
+            layer_types=[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            sliding_window=128,
+        )
+
+        with mock.patch("transformers.AutoConfig.from_pretrained", return_value=config) as load:
+            dense, sliding, window = mgr._attention_layer_partition(4)
+
+        load.assert_called_once_with(
+            "/models/gpt-oss", trust_remote_code=True, local_files_only=True
+        )
+        assert dense == [1, 3]
+        assert sliding == [0, 2]
+        assert window == 128
+
+    def test_layer_partition_rejects_decode_budget_smaller_than_window(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        mgr = TriAttention.__new__(TriAttention)
+        mgr.skip_swa = True
+        mgr.model_path = "/models/gpt-oss"
+        mgr.top_B = 127
+        mgr.kv_cache_manager = SimpleNamespace(num_layers=2)
+        config = SimpleNamespace(
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=128,
+        )
+
+        with (
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=config),
+            pytest.raises(ValueError, match="decode budget top_B=127"),
+        ):
+            mgr._attention_layer_partition(2)
+
+    def test_layer_partition_uses_pp_local_to_global_mapping(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        mgr = TriAttention.__new__(TriAttention)
+        mgr.skip_swa = True
+        mgr.model_path = "/models/gpt-oss"
+        mgr.top_B = 128
+        mgr.kv_cache_manager = SimpleNamespace(pp_layers=[1, 2], num_layers=4)
+        config = SimpleNamespace(
+            layer_types=[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            sliding_window=128,
+        )
+
+        with mock.patch("transformers.AutoConfig.from_pretrained", return_value=config):
+            dense, sliding, window = mgr._attention_layer_partition(2)
+
+        assert dense == [0]
+        assert sliding == [1]
+        assert window == 128
+
+    def test_layer_partition_rejects_ambiguous_window_metadata(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        mgr = TriAttention.__new__(TriAttention)
+        mgr.skip_swa = True
+        mgr.model_path = "/models/ambiguous"
+        mgr.top_B = 128
+        mgr.kv_cache_manager = SimpleNamespace(num_layers=2)
+        config = SimpleNamespace(layer_types=None, sliding_window=128)
+
+        with (
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=config),
+            pytest.raises(ValueError, match="cannot classify"),
+        ):
+            mgr._attention_layer_partition(2)
+
+    def test_layer_partition_honors_explicit_disabled_sliding_window(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        mgr = TriAttention.__new__(TriAttention)
+        mgr.skip_swa = True
+        mgr.model_path = "/models/qwen3"
+        mgr.top_B = 128
+        mgr.kv_cache_manager = SimpleNamespace(num_layers=2)
+        config = SimpleNamespace(
+            layer_types=None,
+            sliding_window=None,
+            max_window_layers=36,
+            use_sliding_window=False,
+        )
+
+        with mock.patch("transformers.AutoConfig.from_pretrained", return_value=config):
+            dense, sliding, window = mgr._attention_layer_partition(2)
+
+        assert dense == [0, 1]
+        assert sliding == []
+        assert window is None
+
+    def test_pp_page_lookup_uses_global_layer_id(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        get_batch = mock.Mock(return_value=[[10, 11]])
+        mgr = TriAttention.__new__(TriAttention)
+        mgr.kv_cache_manager = SimpleNamespace(
+            pp_layers=[9, 10],
+            num_layers=36,
+            get_batch_cache_indices=get_batch,
+        )
+        request = SimpleNamespace(py_request_id=7)
+
+        assert mgr._resolve_page_ids(request, 0) == [10, 11]
+        get_batch.assert_called_once_with([7], 9)
+
+    def test_page_lookup_failure_is_not_hidden(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        get_batch = mock.Mock(side_effect=KeyError("missing pool"))
+        mgr = TriAttention.__new__(TriAttention)
+        mgr.kv_cache_manager = SimpleNamespace(
+            pp_layers=[9],
+            num_layers=36,
+            get_batch_cache_indices=get_batch,
+        )
+        request = SimpleNamespace(py_request_id=7)
+
+        with pytest.raises(RuntimeError, match="Failed to resolve KV pages"):
+            mgr._resolve_page_ids(request, 0)
 
 
 # ---------------------------------------------------------------------------
-# Block reclaim: the KV-manager subclass was removed. Reclaim now runs through
-# _KVCache.fork() (V2 core), driven from the V2 adapter's update_resources for
-# compressed requests (guarded by py_kv_evicted_tokens > 0).
+# Block reclaim uses the explicit V2 capacity-only API; no manager subclass is
+# needed.
 # ---------------------------------------------------------------------------
 
 
@@ -339,10 +873,13 @@ class TestNoBlockFreeSubclass:
         assert "TriAttentionKVCacheManagerV2" not in pkg.__all__
         assert not hasattr(pkg, "TriAttentionKVCacheManagerV2")
 
-    def test_v2_core_exposes_fork(self):
-        from tensorrt_llm.runtime.kv_cache_manager_v2._core._kv_cache import _KVCache
+    def test_v2_exposes_capacity_only_api(self):
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 
-        assert callable(getattr(_KVCache, "fork", None))
+        assert callable(getattr(KVCacheManagerV2, "enable_decode_capacity_only", None))
+        assert callable(getattr(KVCacheManagerV2, "set_compacted_capacity", None))
+        assert callable(getattr(KVCacheManagerV2, "get_pre_forward_kv_length", None))
+        assert callable(getattr(KVCacheManagerV2, "has_pending_compacted_capacity", None))
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +896,10 @@ class TestFactory:
         # TriAttention rewrites stored keys; the base guard rejects a cache
         # manager that has block reuse enabled (the guard fires in __init__).
         cfg = TriAttentionKvCacheCompressionConfig(
-            top_B=32, beta=16, calibration_path=flat_calibration_pt
+            top_B=32,
+            beta=16,
+            calibration_path=flat_calibration_pt,
+            skip_swa=False,
         )
         with pytest.raises(ValueError, match="block reuse"):
             create_kv_cache_compression_manager(
@@ -371,7 +911,7 @@ class TestFactory:
         # Calibration is deferred to the first request, so construction needs
         # no calibration file or CUDA.
         fake_v2 = _make_fake_v2(enable_block_reuse=False)
-        cfg = TriAttentionKvCacheCompressionConfig(top_B=32, beta=16)
+        cfg = TriAttentionKvCacheCompressionConfig(top_B=32, beta=16, skip_swa=False)
         mgr = create_kv_cache_compression_manager(cfg, kv_cache_manager=fake_v2)
         assert isinstance(mgr, TriAttention)
         assert mgr.top_B == 32
@@ -379,7 +919,12 @@ class TestFactory:
         assert mgr.kv_cache_manager is fake_v2
 
     def test_factory_propagates_eviction_mode(self):
-        cfg = TriAttentionKvCacheCompressionConfig(top_B=64, beta=8, eviction_mode="per_head")
+        cfg = TriAttentionKvCacheCompressionConfig(
+            top_B=64,
+            beta=8,
+            eviction_mode="per_head",
+            skip_swa=False,
+        )
         mgr = create_kv_cache_compression_manager(
             cfg, kv_cache_manager=_make_fake_v2(enable_block_reuse=False)
         )

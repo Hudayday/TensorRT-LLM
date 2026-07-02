@@ -8,28 +8,24 @@ the eviction runs in one pre-forward ``on_generation_step_begin`` hook.
 
 TriAttention is a :class:`BaseKVCacheCompressionManager` and nothing more -- it
 has no attention backend of its own; decode runs the model's standard dense
-kernel over the compacted cache. The model engine derives each request's cached
-length from its logical length (``max_beam - 1``), unaware of the eviction, so
-the compacted-length reconcile runs in ``adjust_attention_metadata`` -- the
-compression-framework hook the executor calls just before
-``attn_metadata.prepare()``. It uses the standard ``KVCacheManagerV2``: each
-eviction sets a generic per-request marker (``py_kv_evicted_tokens``) that the
-manager's ``update_resources`` reads to shrink history and return the
-eviction-freed blocks to the pool for the capacity gain.
+kernel over the compacted cache. The V2 manager reports each request's
+authoritative pre-forward physical length after scheduling; TriAttention writes
+that value through ``adjust_attention_metadata`` just before
+``attn_metadata.prepare()``. Physical reclaim uses the standard capacity-only
+API, which preserves finalized history while returning trailing pages after
+compaction finishes.
 
 KV layout: the decode kernel stores keys in HND layout
 ``[num_pages, kv_factor, num_kv_heads, tokens_per_block, head_dim]``. The Python
 gather / score / compact code MUST read ``get_buffers`` with ``kv_layout="HND"``;
 reading the default NHD silently swaps the token and head axes and scrambles the
-cache (a self-consistent NHD round-trip passes an integrity probe, but the
-kernel reads garbage). See ``_read_request_k`` / ``_evict_layer_perhead``.
+cache. See ``_evict_layer_perhead``.
 
 Position handling: kept keys retain their original RoPE rotation (no re-RoPE on
-compaction). The decode query rotates at its true absolute position
-(``model_engine`` keeps the query position at ``max_beam - 1`` while decoupling
-``num_cached = max_beam - 1 - evicted``), so a query at its true position
-against a kept key at its original rotation still yields the correct relative
-distance.
+compaction). The model engine keeps the decode query at its true absolute
+position while the attention metadata uses the compacted physical length, so a
+query against a kept key at its original rotation still yields the correct
+relative distance.
 
 Calibration is NOT computed here: the user calibrates with the official tool
 (github.com/WeianMao/triattention) and passes that .pt via ``calibration_path``;
@@ -38,7 +34,7 @@ The scoring math follows the same upstream reference (``methods/pruning_utils.py
 """
 
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -67,25 +63,88 @@ def _build_geometric_offsets(max_length: int, device: torch.device) -> torch.Ten
     return torch.tensor(offsets, device=device, dtype=torch.float32)
 
 
+def _validate_swa_rebase(seq_len: int, keep_count: int, window_size: int) -> None:
+    if window_size <= 0:
+        raise ValueError(f"SWA window size must be positive, got {window_size}")
+    if keep_count < window_size:
+        raise ValueError(
+            f"TriAttention compacted length {keep_count} must be at least the "
+            f"SWA window size {window_size}"
+        )
+    if keep_count > seq_len:
+        raise ValueError(
+            f"TriAttention compacted length {keep_count} exceeds cache length {seq_len}"
+        )
+
+
+def _build_swa_rebase_keep(
+    seq_len: int,
+    keep_count: int,
+    window_size: int,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """Return source slots that place the latest SWA window at the new tail."""
+    _validate_swa_rebase(seq_len, keep_count, window_size)
+    prefix = torch.arange(keep_count - window_size, device=device, dtype=torch.long)
+    recent = torch.arange(seq_len - window_size, seq_len, device=device, dtype=torch.long)
+    return torch.cat([prefix, recent])
+
+
+def _build_swa_rebase_copy(
+    seq_len: int,
+    keep_count: int,
+    window_size: int,
+    device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return the source and destination ranges needed for an SWA rebase."""
+    _validate_swa_rebase(seq_len, keep_count, window_size)
+    source = torch.arange(seq_len - window_size, seq_len, device=device, dtype=torch.long)
+    destination = torch.arange(
+        keep_count - window_size, keep_count, device=device, dtype=torch.long
+    )
+    return source, destination
+
+
+def _request_draft_length(request: "LlmRequest") -> int:
+    """Return the active speculative-draft length exposed by a request."""
+    draft_tokens = getattr(request, "py_draft_tokens", None)
+    if draft_tokens is not None and len(draft_tokens) > 0:
+        return len(draft_tokens)
+    for field in ("num_draft_tokens", "py_num_draft_tokens"):
+        value = getattr(request, field, 0)
+        if isinstance(value, int) and value > 0:
+            return value
+    if (
+        getattr(request, "is_disagg_generation_transmission_complete", False)
+        and (context_params := getattr(request, "context_phase_params", None)) is not None
+        and (context_drafts := getattr(context_params, "draft_tokens", None)) is not None
+        and len(context_drafts) > 0
+    ):
+        return len(context_drafts)
+    return 0
+
+
 class TriAttention(BaseKVCacheCompressionManager):
     """Periodic physical KV eviction driven by trigonometric importance scoring.
 
-    Overrides ``on_generation_step_end``: every ``beta`` generation steps it
+    Overrides ``on_generation_step_begin``: every ``beta`` generation steps it
     reads the cached keys through the ``KVCacheManagerV2``, scores each token
     with offline-calibrated stats, and physically evicts the tokens below the
-    top-B keep set. Each layer scores its own keys and keeps the same count
-    (top-B) with its own kept set, so the per-request num_cached stays
-    consistent across layers.
+    keep set. Full-attention layers are scored; kernel-masked SWA layers preserve
+    their latest window in the same compacted prefix. Every layer ends with the
+    same request-wide cached length.
     """
 
     # The TRT-LLM IndexerTopK op's single-block kernel sizes dynamic shared memory
     # as k * 4 bytes with no opt-in past the 48 KB per-block cap; its heuristic
-    # only supports k in {512, 1024, 2048}. At k = 4096 the op switches to a
-    # multi-block radix path that requires the caller to pre-allocate
-    # radix_aux_{indices,logits} (blocks_per_row > 1) -- which this caller does not,
-    # so it raises "radix_aux must be pre-allocated ... blocks_per_row=2". So any
-    # k above 2048 falls back to torch.topk (same kept set, correctness-equivalent).
+    # only supports k in {512, 1024, 2048}, so k above 2048 must fall back.
+    # Independently of k, the op splits a row into multiple 2048-column sub-blocks
+    # once the score width reaches 4096. That path requires caller-owned radix
+    # scratch, which this caller does not provide. torch.topk is exact for both
+    # unsupported cases, so either boundary can fall back without changing the
+    # retained set.
     _INDEXER_TOPK_MAX_K = 2048
+    _INDEXER_TOPK_SUBBLOCK = 2048
 
     def __init__(
         self,
@@ -122,6 +181,11 @@ class TriAttention(BaseKVCacheCompressionManager):
         # cpt=False (default): budget counts DECODE tokens only (pinned prompt is
         # extra). cpt=True: budget INCLUDES the pinned prompt.
         self.count_prompt_tokens = bool(count_prompt_tokens)
+        if not self.pin_prefill or self.count_prompt_tokens:
+            raise ValueError(
+                "TriAttention physical KV reclaim requires pin_prefill=True and "
+                "count_prompt_tokens=False so finalized prompt KV is preserved"
+            )
         self.skip_swa = bool(skip_swa)
         # per_head / per_layer_perhead compaction backend:
         #   "torch" (default) -- the vectorized PyTorch reorder (_build_new_order +
@@ -148,8 +212,13 @@ class TriAttention(BaseKVCacheCompressionManager):
         # Calibration is the OFFICIAL TriAttention .pt (passed via
         # calibration_path), resolved + converted on the first request
         # (on_request_init). TRT-LLM does NOT compute calibration; model_path is
-        # used only to derive the model's RoPE tables (omega / freq_scale_sq).
+        # used for RoPE tables and local layer_types/sliding_window metadata.
         self.model_path = model_path
+        if self.skip_swa and self.model_path is None:
+            raise ValueError(
+                "TriAttention skip_swa=True requires model_path so kernel-masked "
+                "sliding-attention layers can be classified safely"
+            )
         self.calibration_path = calibration_path
         self.calibration: Optional[Dict[str, torch.Tensor]] = None
         self._calibrated = False
@@ -168,16 +237,44 @@ class TriAttention(BaseKVCacheCompressionManager):
         # Per-request generation-step counter; eviction fires when it hits
         # ``beta``. Cleared on request finish.
         self._gen_steps: Dict[int, int] = {}
-        # Cumulative physically-evicted token count per request, consumed by
-        # the per-step history reconcile and the metadata shim.
+        # Cumulative physically-evicted token count per request, consumed by the
+        # public introspection API.
         self._evicted: Dict[int, int] = {}
+        # Authoritative written-KV length for the forward being prepared. V2
+        # computes this from physical capacity and any pending overlap target.
+        self._pre_forward_kv_lengths: Dict[int, int] = {}
+        # Context requests initialize through the framework hook; generation-only
+        # disaggregated requests initialize lazily in the pre-forward hook.
+        self._capacity_only_request_ids: set[int] = set()
 
     def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
-        """Resolve calibration on the first request, then no-op.
+        """Register capacity-only decode and resolve calibration once.
 
         Loads the user-supplied OFFICIAL calibration .pt and converts it to our
         runtime schema (see _resolve_calibration). TRT-LLM does not calibrate.
         """
+        required_apis = {
+            name: getattr(self.kv_cache_manager, name, None)
+            for name in (
+                "enable_decode_capacity_only",
+                "set_compacted_capacity",
+                "get_pre_forward_kv_length",
+                "has_pending_compacted_capacity",
+            )
+        }
+        missing = [name for name, method in required_apis.items() if not callable(method)]
+        if missing:
+            raise RuntimeError(
+                "TriAttention requires KVCacheManagerV2 capacity-only APIs; "
+                f"missing: {', '.join(missing)}"
+            )
+        request_id = request.py_request_id
+        if request_id not in self._capacity_only_request_ids:
+            num_layers = self._num_layers_from_manager()
+            if num_layers is not None:
+                self._attention_layer_partition(num_layers)
+            required_apis["enable_decode_capacity_only"](request_id)
+            self._capacity_only_request_ids.add(request_id)
         if self._calibrated:
             return
         self.calibration = self._resolve_calibration()
@@ -210,9 +307,8 @@ class TriAttention(BaseKVCacheCompressionManager):
     ) -> None:
         """Periodic physical eviction, PRE-forward (framework hook, fired from the
         base prepare_resources before _forward_step). Every beta steps over budget:
-        score the full cache, select top-B, physically compact, and record
-        per-request ``py_kv_evicted_tokens`` -- which the forward's attention
-        metadata and the V2 manager's block reclaim both read.
+        score the full cache, select top-B, physically compact, reconcile the
+        forward's attention metadata, and publish the post-forward capacity to V2.
 
         Uses the pre-forward hook (NOT post-forward on_generation_step_end) because
         the latter races the overlap scheduler: the next iteration's forward is
@@ -227,11 +323,18 @@ class TriAttention(BaseKVCacheCompressionManager):
         scheduled_batch: "ScheduledRequests",
     ) -> None:
         """Bump a per-request step counter; every ``beta`` steps score the cache
-        and physically evict down to top-B (per-layer, layer-uniform count)."""
-        if not self._calibrated:
-            return
+        and physically evict to the pinned prompt plus top-B decode tokens."""
         gen_requests = getattr(scheduled_batch, "generation_requests", None)
         if not gen_requests:
+            return
+        active_requests = []
+        for request in gen_requests:
+            if bool(getattr(request, "is_dummy", False)):
+                continue
+            if request.py_request_id not in self._capacity_only_request_ids:
+                self.on_request_init(request)
+            active_requests.append(request)
+        if not active_requests or not self._calibrated:
             return
         mgr = self.kv_cache_manager
         get_buffers = getattr(mgr, "get_buffers", None)
@@ -241,40 +344,55 @@ class TriAttention(BaseKVCacheCompressionManager):
 
         # (1) bump per-request step counters; collect who evicts THIS step.
         evict_now = []
-        for request in gen_requests:
+        for request in active_requests:
             rid = request.py_request_id
+            draft_len = _request_draft_length(request)
+            if draft_len:
+                raise ValueError(
+                    "TriAttention physical eviction does not support speculative "
+                    f"decoding; request {rid} has {draft_len} draft tokens"
+                )
+            seq_len = int(mgr.get_pre_forward_kv_length(rid))
+            self._pre_forward_kv_lengths[rid] = seq_len
             step = self._gen_steps.get(rid, 0) + 1
             self._gen_steps[rid] = step
             if step % self.beta == 0:
-                evict_now.append((request, rid))
+                if mgr.has_pending_compacted_capacity(rid):
+                    # The overlap loop has not consumed the previous target yet.
+                    # Retry this eviction period on the next prepared forward.
+                    self._gen_steps[rid] = step - 1
+                    continue
+                if seq_len > self._minimum_evictable_length(request, seq_len):
+                    evict_now.append((request, rid))
 
-        # (2) evict. The path processes all evicting requests in ONE pass
-        # of eviction kernels (score x req x layer, select, per-layer compact).
-        if evict_now:
-            self._evict_requests(evict_now, num_layers)
-        # Block-reclaim ordering: record a CUDA event AFTER the compaction kernels
-        # (same stream they ran on). KVCacheManagerV2.update_resources waits this
-        # on the manager stream before the capacity-shrink, so the page-reuse-gating
-        # finish_event recorded inside resize() dominates the compaction -> no
-        # read-after-free when a freed page is reallocated.
-        if evict_now:
-            _cev = torch.cuda.Event()
-            _cev.record()
-            for request, rid in evict_now:
-                request.py_kv_compaction_event = _cev
+        # (2) Compact all affected dense and kernel-masked SWA layers before
+        # publishing any capacity target. One event orders every request in this
+        # eviction round after those kernels.
+        capacity_targets = self._evict_requests(evict_now, num_layers) if evict_now else []
+        if capacity_targets:
+            compaction_event = torch.cuda.Event()
+            compaction_event.record()
+            for rid, target_capacity in capacity_targets:
+                mgr.set_compacted_capacity(rid, target_capacity, compaction_event)
 
-        # History + capacity reconcile for evicting requests is owned by the generic
-        # KVCacheManagerV2.update_resources reclaim path: every step it sets each
-        # evicting request's history to the compacted length (max_beam - evicted)
-        # and frees the trailing blocks via _KVCache.fork(). It reads the generic
-        # ``py_kv_evicted_tokens`` marker, which _evict_requests sets and which
-        # persists on the request between eviction steps. The kernel's view is
-        # reconciled separately in adjust_attention_metadata.
+    def _minimum_evictable_length(self, request: "LlmRequest", seq_len: int) -> int:
+        """Return the largest cache length for which selection is an identity.
+
+        With a decode-only budget, pinned prompt tokens do not consume ``top_B``.
+        Selection therefore keeps every token until the cache exceeds
+        ``prompt_len + top_B``.
+        """
+        if self.pin_prefill and not self.count_prompt_tokens:
+            prompt_len = min(int(getattr(request, "py_prompt_len", 0) or 0), seq_len)
+            return prompt_len + self.top_B
+        return self.top_B
 
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
-        """Drop this request's per-request step + evicted counters."""
+        """Drop this request's per-request length and eviction state."""
         self._gen_steps.pop(request.py_request_id, None)
         self._evicted.pop(request.py_request_id, None)
+        self._pre_forward_kv_lengths.pop(request.py_request_id, None)
+        self._capacity_only_request_ids.discard(request.py_request_id)
 
     # ------------------------------------------------------------------ #
     # Attention-metadata reconcile (compression-framework hook)          #
@@ -287,20 +405,12 @@ class TriAttention(BaseKVCacheCompressionManager):
     def adjust_attention_metadata(self, attn_metadata) -> None:
         """Reconcile the attention metadata for this iteration's eviction.
 
-        The framework calls this (BaseKVCacheCompressionManager hook) right before
-        ``attn_metadata.prepare()``. The model engine derives
-        ``num_cached_tokens_per_seq`` from each request's logical length
-        (``max_beam_num_tokens - 1``), unaware of eviction; once TriAttention has
-        physically compacted the cache, the attention kernel must instead read the
-        compacted length. Both fixes run BEFORE prepare(), so prepare() builds
-        ``kv_lens`` and ``prompt_lens_cpu`` from the corrected values:
-          1. num_cached -> (max_beam-1) + 1 - evicted = max_beam - evicted, matching
-             the cache manager's compacted history.
-          2. clamp each evicted request's prompt_len down to num_cached -- a
-             prompt_len longer than the whole compacted cache desyncs the
-             prompt/gen split and garbles the output.
-        Requests with 0 evicted are untouched, so dense / no-evict steps stay
-        byte-identical (and this is a no-op for any model that never evicts).
+        The framework calls this immediately before ``attn_metadata.prepare()``.
+        V2 has already reported the written KV length after scheduling and after
+        accounting for any unconsumed overlap compaction target. Use that physical
+        value directly instead of reconstructing it from logical request length.
+        Prompt length is clamped when necessary so the prompt/generation split
+        cannot extend beyond the compacted prefix.
         """
         kvp = getattr(attn_metadata, "kv_cache_params", None)
         if kvp is None or getattr(kvp, "num_cached_tokens_per_seq", None) is None:
@@ -312,10 +422,9 @@ class TriAttention(BaseKVCacheCompressionManager):
         pl = list(prompt_lens) if prompt_lens is not None else None
         pl_changed = False
         for i in range(num_contexts, num_requests):
-            ev = self.evicted_count(req_ids[i])
-            if not ev:
+            nc = self._pre_forward_kv_lengths.get(req_ids[i])
+            if nc is None:
                 continue
-            nc = int(kvp.num_cached_tokens_per_seq[i]) + 1 - ev
             kvp.num_cached_tokens_per_seq[i] = nc
             if pl is not None and int(pl[i]) > nc:
                 pl[i] = nc
@@ -385,22 +494,17 @@ class TriAttention(BaseKVCacheCompressionManager):
         seq_len: int,
         precomputed: List["torch.Tensor"],
     ) -> Optional[Union[int, "torch.Tensor"]]:
-        """Select + physically compact per ``self.eviction_mode`` from the
-        precomputed per-layer scores. Returns the uniform kept count (= ``top_B``,
-        or ``seq_len`` if smaller), or None if nothing could be scored.
+        """Select and compact from precomputed dense-layer scores.
+
+        Returns either the uniform kept count or, for union mode, the sorted
+        shared keep tensor whose compaction is batched by the caller. Returns
+        ``None`` if no dense layer could be scored.
 
         ``precomputed``: per-layer ``[H, seq_len]`` scores (from the fused
         score kernel ``triton_tri_score_perhead``); used verbatim for the
-        selection + compaction.
-
-        ``compact``: when False AND ``self.eviction_mode == "union"``, the union
-        keep set is computed but NOT physically compacted -- the 1-D sorted keep
-        tensor (slot indices in ``[0, seq_len)``) is returned instead of the kept
-        count, so a caller can batch the per-layer compaction itself. For
-        per_head / per_layer_perhead this flag is ignored (they still compact and
-        return the kept count); only the layer-uniform union keep can be hoisted
-        out this way. The selection math is identical to the compacting path, so
-        the kept-slot set is byte-identical regardless of ``compact``."""
+        selection and compaction. Kernel-masked SWA entries are ``None`` and are
+        excluded by the dense-layer partition.
+        """
         budget = min(self.top_B, seq_len)
         # Prompt pin: only decode tokens [decode_start, seq_len) compete; the
         # first decode_start (prompt) tokens are always kept.
@@ -418,15 +522,19 @@ class TriAttention(BaseKVCacheCompressionManager):
         # per_layer_perhead reduce to per-KV-head [nkv, decode_count] (group-max),
         # z-normalized over the decode region. For union keep the raw per-head
         # rows to stack.
-        # num KV heads from the pool (HND dim 2); needed to group query-head scores.
+        dense_layers = self._dense_layers(num_layers)
+        if not dense_layers:
+            raise ValueError("TriAttention requires at least one full-attention layer")
+        # Number of KV heads from the first scored layer (HND dim 2).
         get_buffers = getattr(self.kv_cache_manager, "get_buffers", None)
-        p0 = get_buffers(0, kv_layout="HND") if get_buffers is not None else None
+        first_global_layer = self._global_layer_id(dense_layers[0], num_layers)
+        p0 = get_buffers(first_global_layer, kv_layout="HND") if get_buffers is not None else None
         if p0 is None:
             return None
         num_kv_heads = int(p0.shape[2])
         per_layer_kv_scores: List[torch.Tensor] = []
         union_rows: List[torch.Tensor] = []
-        dense_set = set(self._dense_layers(num_layers))
+        dense_set = set(dense_layers)
         for layer_idx in range(num_layers):
             if layer_idx not in dense_set:
                 continue
@@ -490,22 +598,34 @@ class TriAttention(BaseKVCacheCompressionManager):
         the caller (``layer_indices`` is already dense-only)."""
         if int(keep_2d.shape[1]) >= seq_len:
             return  # nothing to drop
+        mgr = self.kv_cache_manager
+        get_buffers = getattr(mgr, "get_buffers", None)
+        if get_buffers is None:
+            raise RuntimeError("TriAttention requires KVCacheManagerV2.get_buffers()")
+        num_layers = self._num_layers_from_manager()
+        if num_layers is None:
+            raise RuntimeError("TriAttention could not resolve the local attention layer count")
+        prepared_layers = []
+        for layer_idx in layer_indices:
+            global_layer = self._global_layer_id(layer_idx, num_layers)
+            pool = get_buffers(global_layer, kv_layout="HND")
+            page_ids = self._resolve_page_ids(request, layer_idx)
+            if pool is None:
+                raise RuntimeError(f"Missing KV pool for attention layer {global_layer}")
+            if not page_ids:
+                raise RuntimeError(
+                    f"Missing KV page ids for attention layer {global_layer} "
+                    f"of request {request.py_request_id}"
+                )
+            prepared_layers.append((layer_idx, pool, page_ids))
         if self._compact_backend == "torch":
             new_order = self._build_new_order(keep_2d, seq_len)
-            for layer_idx in layer_indices:
+            for layer_idx, _, _ in prepared_layers:
                 self._evict_layer_perhead(request, layer_idx, new_order, seq_len)
             return
         from .triattention_kernels import triton_tri_compact_perhead
 
-        mgr = self.kv_cache_manager
-        get_buffers = getattr(mgr, "get_buffers", None)
-        if get_buffers is None:
-            return
-        for layer_idx in layer_indices:
-            pool = get_buffers(layer_idx, kv_layout="HND")
-            page_ids = self._resolve_page_ids(request, layer_idx)
-            if pool is None or not page_ids:
-                continue
+        for _, pool, page_ids in prepared_layers:
             page_ids_t = torch.as_tensor(page_ids, device=pool.device, dtype=torch.long)
             triton_tri_compact_perhead(pool, [page_ids_t], [keep_2d.to(pool.device)], [seq_len])
 
@@ -555,12 +675,12 @@ class TriAttention(BaseKVCacheCompressionManager):
         fastest available top-k for the dense ``[rows, seq]`` eviction select
         (~4-6x faster than torch.topk at scale, same kept SET for distinct
         scores). Returns ``[rows, k]`` int64 slot indices in ``[0, seq)``,
-        unsorted (the caller scatters into a mask / re-sorts by slot). For ``k``
-        beyond what the op can launch (``_INDEXER_TOPK_MAX_K``) it falls back to
-        ``torch.topk``, which is correct for any ``k``."""
+        unsorted (the caller scatters into a mask / re-sorts by slot). Falls back
+        to ``torch.topk`` when either ``k`` exceeds the launch cap or the score
+        width requires the unsupported multi-block radix path."""
         rows, seq = scores.shape
         k = int(k)
-        if k > self._INDEXER_TOPK_MAX_K:
+        if k > self._INDEXER_TOPK_MAX_K or seq >= 2 * self._INDEXER_TOPK_SUBBLOCK:
             return torch.topk(scores, k, dim=1, sorted=False).indices.to(torch.long)
         out = torch.empty((rows, k), dtype=torch.int32, device=scores.device)
         seq_lens = torch.full((rows,), seq, dtype=torch.int32, device=scores.device)
@@ -622,54 +742,137 @@ class TriAttention(BaseKVCacheCompressionManager):
         dropped = (~kept_mask).nonzero(as_tuple=True)[1].reshape(nkv, seq_len - keep_count)
         return torch.cat([keep_2d, dropped], dim=1)
 
-    def _dense_layers(self, num_layers: int) -> List[int]:
-        """Layer indices that are FULL-attention (dense). Sliding-window (SWA/VSWA)
-        layers are framework-windowed and must NOT be evicted/compacted: their KV lives
-        in a small separate window pool, so applying the cross-layer union keep set
-        (full-sequence indices, layer-0 page ids) to them overwrites the wrong physical
-        slots and the SWA decode then attends to garbage (GPT-OSS-20B degeneration). The
-        SWA kernel already clamps reads to its window, so leaving those pools untouched
-        is correct even though num_cached is reconciled per-request. Single-window models
-        (e.g. Qwen3) -> all layers dense -> behavior byte-identical to before."""
-        if not self.skip_swa:  # official-style: compress EVERY layer (incl SWA)
-            return list(range(num_layers))
-        cached = getattr(self, "_dense_layers_cache", None)
+    def _local_to_global_layers(self, num_layers: int) -> List[int]:
+        """Return V2's global layer id for every local TriAttention layer slot."""
+        cached = getattr(self, "_local_to_global_layers_cache", None)
+        if cached is not None:
+            if len(cached) != num_layers:
+                raise ValueError(
+                    f"TriAttention layer count changed from {len(cached)} to {num_layers}"
+                )
+            return cached
+
+        mgr = self.kv_cache_manager
+        pp_layers = getattr(mgr, "pp_layers", None)
+        if pp_layers is not None:
+            global_layers = [int(layer) for layer in pp_layers]
+            if len(global_layers) != num_layers:
+                raise ValueError(
+                    f"KVCacheManagerV2 exposes {len(global_layers)} PP layers, "
+                    f"but TriAttention received {num_layers} local layers"
+                )
+        else:
+            total_layers = int(getattr(mgr, "num_layers", num_layers))
+            if total_layers != num_layers:
+                raise ValueError(
+                    "TriAttention requires KVCacheManagerV2.pp_layers for pipeline-parallel "
+                    "local-to-global layer mapping"
+                )
+            global_layers = list(range(num_layers))
+        self._local_to_global_layers_cache = global_layers
+        return global_layers
+
+    def _global_layer_id(self, local_layer: int, num_layers: int) -> int:
+        return self._local_to_global_layers(num_layers)[local_layer]
+
+    @staticmethod
+    def _has_sliding_window_signal(config) -> bool:
+        """Return whether config metadata hints at sliding attention."""
+        use_sliding_window = getattr(config, "use_sliding_window", None)
+        if isinstance(use_sliding_window, bool):
+            return use_sliding_window
+        for field in (
+            "sliding_window",
+            "sliding_window_size",
+            "sliding_window_pattern",
+            "max_window_layers",
+        ):
+            value = getattr(config, field, None)
+            if isinstance(value, bool):
+                if value:
+                    return True
+            elif isinstance(value, (int, float)):
+                if value > 0:
+                    return True
+            elif value:
+                return True
+        return False
+
+    def _attention_layer_partition(
+        self, num_layers: int
+    ) -> Tuple[List[int], List[int], Optional[int]]:
+        """Return dense layers, kernel-masked SWA layers, and the SWA window.
+
+        The V2 registration guard has already rejected real windowed lifecycles.
+        A sliding layer found here is therefore stored at full length and applies
+        its window only in the attention kernel.
+        """
+        if not self.skip_swa:
+            return list(range(num_layers)), [], None
+        cached = getattr(self, "_attention_layer_partition_cache", None)
         if cached is not None:
             return cached
-        dense = None
-        # AUTHORITATIVE: the model config's per-layer layer_types (GPT-OSS VSWA). The
-        # KV-manager's max_attention_window_vec is [None] for GPT-OSS (it stores full KV
-        # and the SWA mask is applied in the attention kernel), so it cannot reveal SWA
-        # layers -- must read layer_types, exactly like the official repo.
-        mp = getattr(self, "model_path", None)
-        if mp:
-            try:
-                from transformers import AutoConfig
 
-                cfg = AutoConfig.from_pretrained(mp, trust_remote_code=True)
-                lt = getattr(cfg, "layer_types", None)
-                if lt:
-                    dense = [
-                        li
-                        for li in range(num_layers)
-                        if li < len(lt) and "sliding" not in str(lt[li]).lower()
-                    ]
-            except Exception:
-                dense = None
-        if dense is None:  # fallback: KV-manager window vec (VSWA-aware managers)
-            mgr = self.kv_cache_manager
-            wv = getattr(mgr, "max_attention_window_vec", None)
-            ppl = getattr(mgr, "pp_layers", None)
-            if not wv or len(wv) <= 1:
-                dense = list(range(num_layers))
-            else:
-                dense = [
-                    li
-                    for li in range(num_layers)
-                    if wv[(ppl[li] if ppl is not None and li < len(ppl) else li) % len(wv)] is None
-                ]
-        self._dense_layers_cache = dense
-        return dense
+        model_path = getattr(self, "model_path", None)
+        if model_path is None:
+            raise ValueError("TriAttention skip_swa=True requires model_path")
+
+        try:
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(
+                model_path, trust_remote_code=True, local_files_only=True
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"TriAttention could not load the local model config from {model_path!r}"
+            ) from exc
+        config = getattr(config, "text_config", config)
+        layer_types = getattr(config, "layer_types", None)
+        if not layer_types:
+            if self._has_sliding_window_signal(config):
+                raise ValueError(
+                    "Model config exposes sliding-window metadata but no layer_types; "
+                    "TriAttention cannot classify kernel-masked SWA layers safely"
+                )
+            result = (list(range(num_layers)), [], None)
+            self._attention_layer_partition_cache = result
+            return result
+        global_layers = self._local_to_global_layers(num_layers)
+        if global_layers and max(global_layers) >= len(layer_types):
+            raise ValueError(
+                f"Model config has {len(layer_types)} layer_types entries, "
+                f"but this PP rank references global layer {max(global_layers)}"
+            )
+
+        swa_layers = [
+            local_layer
+            for local_layer, global_layer in enumerate(global_layers)
+            if "sliding" in str(layer_types[global_layer]).lower()
+        ]
+        swa_set = set(swa_layers)
+        dense_layers = [layer for layer in range(num_layers) if layer not in swa_set]
+        window_size = None
+        if swa_layers:
+            raw_window = getattr(config, "sliding_window", None)
+            if not isinstance(raw_window, int) or raw_window <= 0:
+                raise ValueError(
+                    "TriAttention requires a positive integer model sliding_window "
+                    "when layer_types contains sliding attention"
+                )
+            if self.top_B < raw_window:
+                raise ValueError(
+                    f"TriAttention decode budget top_B={self.top_B} must be at least "
+                    f"the kernel-masked SWA window size {raw_window}"
+                )
+            window_size = raw_window
+        result = (dense_layers, swa_layers, window_size)
+        self._attention_layer_partition_cache = result
+        return result
+
+    def _dense_layers(self, num_layers: int) -> List[int]:
+        """Return full-attention layers used for TriAttention scoring."""
+        return self._attention_layer_partition(num_layers)[0]
 
     def _evict_layer_perhead(
         self, request: "LlmRequest", layer_idx: int, new_order: "torch.Tensor", seq_len: int
@@ -685,13 +888,20 @@ class TriAttention(BaseKVCacheCompressionManager):
         mgr = self.kv_cache_manager
         get_buffers = getattr(mgr, "get_buffers", None)
         if get_buffers is None:
-            return
+            raise RuntimeError("TriAttention requires KVCacheManagerV2.get_buffers()")
         page_ids = self._resolve_page_ids(request, layer_idx)
         if not page_ids:
-            return
-        pool = get_buffers(layer_idx, kv_layout="HND")
+            raise RuntimeError(
+                f"Missing KV page ids for local attention layer {layer_idx} "
+                f"of request {request.py_request_id}"
+            )
+        num_layers = self._num_layers_from_manager()
+        if num_layers is None:
+            raise RuntimeError("TriAttention could not resolve the local attention layer count")
+        global_layer = self._global_layer_id(layer_idx, num_layers)
+        pool = get_buffers(global_layer, kv_layout="HND")
         if pool is None:
-            return
+            raise RuntimeError(f"Missing KV pool for attention layer {global_layer}")
         tokens_per_block = pool.shape[3]
         page_ids_t = torch.as_tensor(page_ids, device=pool.device, dtype=torch.long)
         request_pages = pool[page_ids_t]
@@ -718,74 +928,143 @@ class TriAttention(BaseKVCacheCompressionManager):
         )
         pool[page_ids_t[:num_touched_pages]] = repaged[:num_touched_pages]
 
-    def _evict_requests(self, evict_reqs, num_layers: int) -> None:
-        """Batched eviction over ALL requests evicting this step (per_head /
-        per_layer_perhead / union): ONE per-head score launch over
-        (request x layer) via ``triton_tri_score_perhead``, then
-        then selects + compacts each request via ``_evict_modes(precomputed=)``.
-        Updates ``self._evicted`` / ``request.py_kv_evicted_tokens``."""
+    def _evict_requests(self, evict_reqs, num_layers: int) -> List[Tuple[int, int]]:
+        """Score and compact requests, returning ``(request_id, capacity)`` targets.
+
+        Only full-attention layers participate in scoring. For kernel-masked SWA
+        layers, the latest model window is rebased to the tail of the common
+        compacted prefix before the request-wide capacity is reduced.
+        """
         from .triattention_kernels import flat_perhead_to_list, triton_tri_score_perhead
 
         mgr = self.kv_cache_manager
         get_buffers = getattr(mgr, "get_buffers", None)
         if get_buffers is None:
-            return
-        layer_pools = [get_buffers(layer, kv_layout="HND") for layer in range(num_layers)]
+            raise RuntimeError("TriAttention requires KVCacheManagerV2.get_buffers()")
+        global_layers = self._local_to_global_layers(num_layers)
+        layer_pools = [get_buffers(layer, kv_layout="HND") for layer in global_layers]
         if any(p is None for p in layer_pools):
-            return
-        device = layer_pools[0].device
-        # Per-request committed-trim + page ids.
-        kept = []  # (request, rid, page_ids_t, seq_len, round_start)
-        for request, rid in evict_reqs:
-            round_start = request.max_beam_num_tokens - 1
-            seq_len = request.max_beam_num_tokens - self._evicted.get(rid, 0)
-            if seq_len <= self.top_B:
-                continue
-            _k0 = self._read_request_k(request, 0, seq_len)
-            if _k0 is not None:
-                _nz = _k0.abs().sum(dim=(0, 2)) > 0
-                if bool(_nz.any()):
-                    _committed = int(_nz.nonzero().max()) + 1
-                    if _committed < seq_len:
-                        seq_len = _committed
-            if seq_len <= self.top_B:
-                continue
-            page_ids = self._resolve_page_ids(request, 0)
-            if not page_ids:
-                continue
-            kept.append(
-                (
-                    request,
-                    rid,
-                    torch.as_tensor(page_ids, device=device, dtype=torch.int64),
-                    int(seq_len),
-                    float(round_start),
-                )
-            )
-        if not kept:
-            return
-        page_ids_list = [k[2] for k in kept]
-        seq_lens = [k[3] for k in kept]
-        round_starts = [k[4] for k in kept]
-        if self._offsets is None:
-            self._offsets = _build_geometric_offsets(self._offset_max_length, device)
-        # Batched per-head score, grouped by storage (VSWA multi-pool safe),
-        # emitting [H, seq] per (layer, request).
+            missing = [layer for layer, pool in zip(global_layers, layer_pools) if pool is None]
+            raise RuntimeError(f"Missing KV pools for attention layers {missing}")
+        dense_layers, swa_layers, swa_window = self._attention_layer_partition(num_layers)
+        if not dense_layers:
+            raise ValueError("TriAttention requires at least one full-attention layer")
+        first_dense_layer = dense_layers[0]
+        device = layer_pools[first_dense_layer].device
+
+        # Dense pools may have distinct block tables. Resolve one representative
+        # layer per storage group and reuse its page ids only within that group.
         from collections import defaultdict as _defaultdict
 
         storage_groups = _defaultdict(list)
-        for layer in range(num_layers):
+        for layer in dense_layers:
             storage_groups[layer_pools[layer].untyped_storage().data_ptr()].append(layer)
-        req_layer_scores = [dict() for _ in kept]  # [req] -> {layer_idx: [H,seq]}
+        dense_group_representatives = [layers[0] for layers in storage_groups.values()]
+        layer_group_representative = {
+            layer: layers[0] for layers in storage_groups.values() for layer in layers
+        }
+
+        # Resolve request length and page metadata before mutating any layer.
+        prepared = []
+        for request, rid in evict_reqs:
+            draft_len = _request_draft_length(request)
+            if draft_len:
+                raise ValueError(
+                    "TriAttention physical eviction does not support speculative "
+                    f"decoding; request {rid} has {draft_len} draft tokens"
+                )
+            seq_len = self._pre_forward_kv_lengths.get(rid)
+            if seq_len is None:
+                raise RuntimeError(f"Missing authoritative pre-forward KV length for request {rid}")
+            # Restore the uncompressed logical position from the authoritative
+            # physical prefix. This is max_beam-1 without overlap and max_beam
+            # for the previous-tensor overlap path, without branching on executor mode.
+            round_start = seq_len + self._evicted.get(rid, 0)
+            if seq_len <= self._minimum_evictable_length(request, seq_len):
+                continue
+            dense_page_ids_by_group = {}
+            for representative in dense_group_representatives:
+                group_page_ids = self._resolve_page_ids(request, representative)
+                if not group_page_ids:
+                    global_layer = global_layers[representative]
+                    raise RuntimeError(
+                        f"Missing KV page ids for attention layer {global_layer} of request {rid}"
+                    )
+                dense_page_ids_by_group[representative] = torch.as_tensor(
+                    group_page_ids,
+                    device=layer_pools[representative].device,
+                    dtype=torch.int64,
+                )
+            expected_keep_count = self._minimum_evictable_length(request, seq_len)
+            swa_source = None
+            swa_destination = None
+            swa_page_ids = {}
+            if swa_layers:
+                assert swa_window is not None
+                swa_source, swa_destination = _build_swa_rebase_copy(
+                    seq_len, expected_keep_count, swa_window, device=device
+                )
+                for layer in swa_layers:
+                    layer_page_ids = self._resolve_page_ids(request, layer)
+                    if not layer_page_ids:
+                        raise RuntimeError(
+                            f"Missing KV page ids for kernel-masked SWA layer {layer} "
+                            f"of request {rid}"
+                        )
+                    swa_page_ids[layer] = torch.as_tensor(
+                        layer_page_ids,
+                        device=layer_pools[layer].device,
+                        dtype=torch.int64,
+                    )
+            prepared.append(
+                {
+                    "request": request,
+                    "request_id": rid,
+                    "dense_page_ids_by_group": dense_page_ids_by_group,
+                    "seq_len": int(seq_len),
+                    "round_start": float(round_start),
+                    "expected_keep_count": expected_keep_count,
+                    "swa_source": swa_source,
+                    "swa_destination": swa_destination,
+                    "swa_page_ids": swa_page_ids,
+                }
+            )
+        if not prepared:
+            return []
+        seq_lens = [item["seq_len"] for item in prepared]
+        round_starts = [item["round_start"] for item in prepared]
+        if self._offsets is None:
+            self._offsets = _build_geometric_offsets(self._offset_max_length, device)
+        if global_layers and max(global_layers) >= self._triattn_q_real.shape[0]:
+            raise ValueError(
+                f"TriAttention calibration has {self._triattn_q_real.shape[0]} layers, "
+                f"but this PP rank references global layer {max(global_layers)}"
+            )
+        if global_layers == list(range(global_layers[0], global_layers[0] + num_layers)):
+            layer_slice = slice(global_layers[0], global_layers[0] + num_layers)
+            q_real = self._triattn_q_real[layer_slice]
+            q_imag = self._triattn_q_imag[layer_slice]
+            mlr_coef = self._triattn_mlr_coef[layer_slice]
+        else:
+            layer_ids = torch.as_tensor(
+                global_layers, device=self._triattn_q_real.device, dtype=torch.long
+            )
+            q_real = self._triattn_q_real.index_select(0, layer_ids)
+            q_imag = self._triattn_q_imag.index_select(0, layer_ids)
+            mlr_coef = self._triattn_mlr_coef.index_select(0, layer_ids)
+        # Score only dense layers, grouped by their backing storage.
+        req_layer_scores = [dict() for _ in prepared]  # [req] -> {layer_idx: [H,seq]}
         for lids in storage_groups.values():
+            representative = lids[0]
+            group_page_ids = [item["dense_page_ids_by_group"][representative] for item in prepared]
             ph, so, sm = triton_tri_score_perhead(
                 layer_pools,
-                page_ids_list,
+                group_page_ids,
                 seq_lens,
                 round_starts,
-                self._triattn_q_real,
-                self._triattn_q_imag,
-                self._triattn_mlr_coef,
+                q_real,
+                q_imag,
+                mlr_coef,
                 self._freq_scale_sq,
                 self.calibration["omega"],
                 self._offsets,
@@ -797,7 +1076,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             for s, meta in enumerate(sm):
                 req_layer_scores[meta.request_index][meta.layer_index] = seg_list[s]
         # Per request: select from the precomputed scores. All scores were taken
-        # BEFORE any compaction; requests touch disjoint pages, so compacting one
+        # before any compaction; requests touch disjoint pages, so compacting one
         # does not disturb another's (already-read) scores.
         #
         # For union (1-D layer-uniform keep) we compute keep WITHOUT compacting,
@@ -806,30 +1085,64 @@ class TriAttention(BaseKVCacheCompressionManager):
         # kernel-equivalence validated by test_compact_equiv.py).
         is_union = self.eviction_mode == "union"
         union_by_layer = {} if is_union else None
-        for r, (request, rid, _pi, seq_len, round_start) in enumerate(kept):
+        swa_by_layer = {}
+        pending_updates = []
+        for r, item in enumerate(prepared):
+            request = item["request"]
+            rid = item["request_id"]
+            seq_len = item["seq_len"]
             precomputed = [req_layer_scores[r].get(layer) for layer in range(num_layers)]
-            if any(p is None for p in precomputed):
+            if any(precomputed[layer] is None for layer in dense_layers):
                 continue
             keep_count = self._evict_modes(request, num_layers, seq_len, precomputed=precomputed)
             if keep_count is None:
                 continue
             if is_union and isinstance(keep_count, torch.Tensor):
                 keep = keep_count
-                for lid in self._dense_layers(num_layers):  # skip sliding-window layers
+                keep_count = int(keep.numel())
+                for lid in dense_layers:
                     grp = union_by_layer.setdefault(lid, ([], [], []))
-                    grp[0].append(page_ids_list[r])
+                    representative = layer_group_representative[lid]
+                    grp[0].append(item["dense_page_ids_by_group"][representative])
                     grp[1].append(keep)
                     grp[2].append(seq_len)
-                keep_count = int(keep.numel())
+            if keep_count != item["expected_keep_count"]:
+                raise RuntimeError(
+                    f"TriAttention selected {keep_count} tokens for request {rid}, "
+                    f"expected {item['expected_keep_count']}"
+                )
             evicted = seq_len - keep_count
             if evicted > 0:
-                self._evicted[rid] = self._evicted.get(rid, 0) + evicted
-                request.py_kv_evicted_tokens = self._evicted[rid]
-        if union_by_layer:
+                for lid in swa_layers:
+                    grp = swa_by_layer.setdefault(lid, ([], [], [], []))
+                    grp[0].append(item["swa_page_ids"][lid])
+                    grp[1].append(item["swa_source"])
+                    grp[2].append(seq_len)
+                    grp[3].append(item["swa_destination"])
+                pending_updates.append((rid, evicted, keep_count))
+
+        if union_by_layer or swa_by_layer:
             from .triattention_kernels import triton_tri_compact
 
+        if union_by_layer:
             for lid, (pl, kl, sl) in union_by_layer.items():
                 triton_tri_compact(layer_pools[lid], pl, kl, sl)
+        for lid, (pl, sources, seq_lens, destinations) in swa_by_layer.items():
+            triton_tri_compact(
+                layer_pools[lid],
+                pl,
+                sources,
+                seq_lens,
+                dest_list=destinations,
+            )
+
+        capacity_targets = []
+        for rid, evicted, keep_count in pending_updates:
+            self._evicted[rid] = self._evicted.get(rid, 0) + evicted
+            self._pre_forward_kv_lengths[rid] = keep_count
+            # The current forward appends one token immediately after the kept prefix.
+            capacity_targets.append((rid, keep_count + 1))
+        return capacity_targets
 
     # ------------------------------------------------------------------ #
     # V2-manager cache access + physical eviction (HND physical layout)  #
@@ -848,82 +1161,37 @@ class TriAttention(BaseKVCacheCompressionManager):
         returns; the key/value split is a SEPARATE axis (kv_factor, dim 1) that
         callers index on their own. We do NOT divide or rescale the ids here.
 
-        Falls back to the V1 ``get_cache_indices(request)`` signature, and returns
-        ``None`` when neither API exists (e.g. mocked unit tests). Negative ids
-        (unallocated slots) are filtered out.
+        Returns ``None`` when V2 has no page metadata for the request. Negative
+        ids (unallocated slots) are filtered out.
         """
         mgr = self.kv_cache_manager
-        get_batch = getattr(mgr, "get_batch_cache_indices", None)  # V2 API
+        get_batch = getattr(mgr, "get_batch_cache_indices", None)
         if get_batch is not None:
             try:
-                batch = get_batch([request.py_request_id], layer_idx)
-            except Exception:
-                batch = None
+                num_layers = self._num_layers_from_manager()
+                if num_layers is None:
+                    return None
+                global_layer = self._global_layer_id(layer_idx, num_layers)
+                batch = get_batch([request.py_request_id], global_layer)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to resolve KV pages for local layer {layer_idx} "
+                    f"of request {request.py_request_id}"
+                ) from exc
             if batch:
                 page_ids = [int(p) for p in batch[0] if int(p) >= 0]
                 return page_ids or None
-        get_single = getattr(mgr, "get_cache_indices", None)  # V1 fallback
-        if get_single is not None:
-            try:
-                page_ids = get_single(request)
-            except Exception:
-                page_ids = None
-            if page_ids:
-                return [int(p) for p in page_ids if int(p) >= 0]
         return None
 
-    def _read_request_k(
-        self, request: "LlmRequest", layer_idx: int, seq_len: int
-    ) -> Optional[torch.Tensor]:
-        """Read this request's KEY tensor for one layer out of the paged pool.
-
-        Steps: (1) get a VIEW of the layer's pool in HND layout, (2) slice out
-        this request's pages, (3) take the KEY half, (4) merge the (page, slot)
-        axes into one token axis and trim padding past ``seq_len``.
-
-        Returns ``[num_kv_heads, seq_len, head_dim]`` (keys only), or ``None``
-        when the manager exposes no readable pool (mocked tests).
-
-        WHY HND: ``get_buffers`` reinterprets the SAME raw bytes under a chosen
-        layout. The trtllm-gen / XQA attention kernel stores keys in HND
-        ``[num_pages, kv_factor, num_kv_heads, tokens_per_block, head_dim]``; we
-        MUST read with that same layout. ``get_buffers`` defaults to NHD (head
-        and token axes swapped) -- reading NHD here would silently transpose
-        heads and tokens and return scrambled keys.
-        """
+    def _num_layers_from_manager(self) -> Optional[int]:
         mgr = self.kv_cache_manager
-        get_buffers = getattr(mgr, "get_buffers", None)
-        if get_buffers is None:
-            return None
-        # HND view: [num_pages, kv_factor, num_kv_heads, tokens_per_block, head_dim]
-        pool = get_buffers(layer_idx, kv_layout="HND")
-        if pool is None:
-            return None
-        page_ids = self._resolve_page_ids(request, layer_idx)
-        if not page_ids:
-            return None
-        tokens_per_block = pool.shape[3]  # HND: dim 3 = slots per page
-        KEY = 0  # kv_factor index: 0 = key, 1 = value
-        # this request's pages, keys only:
-        #   [num_pages, num_kv_heads, tokens_per_block, head_dim]
-        pages = pool[page_ids][:, KEY]
-        num_pages, num_kv_heads = pages.shape[0], pages.shape[1]
-        # The logical token axis is (page, slot). Move num_kv_heads to the front,
-        # then merge (page, slot) into one contiguous token axis:
-        #   [num_kv_heads, num_pages, tokens_per_block, head_dim]
-        #     -> [num_kv_heads, num_pages * tokens_per_block, head_dim]
-        keys = pages.permute(1, 0, 2, 3).reshape(
-            num_kv_heads, num_pages * tokens_per_block, pages.shape[3]
-        )
-        keys = keys[:, :seq_len, :]  # drop padding slots beyond seq_len
-        return keys.contiguous()  # [num_kv_heads, seq_len, head_dim]
-
-    def _num_layers_from_manager(self) -> int:
-        mgr = self.kv_cache_manager
+        pp_layers = getattr(mgr, "pp_layers", None)
+        if pp_layers is not None:
+            return len(pp_layers)
         layer_offsets = getattr(mgr, "layer_offsets", None)
         if layer_offsets:
             return len(layer_offsets)
-        return self._L  # fall back to the calibrated layer count
+        return getattr(self, "_L", None)  # fall back to the calibrated layer count
 
     # ------------------------------------------------------------------ #
     # Helpers: calibration loading                                       #
