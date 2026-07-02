@@ -220,8 +220,8 @@ class TestTriAttentionClass:
         triattention.on_request_init(first)
         triattention.on_request_init(second)
 
-        assert first.py_kv_cache_decode_capacity_only
-        assert second.py_kv_cache_decode_capacity_only
+        assert first.py_kv_cache_generation_capacity_only
+        assert second.py_kv_cache_generation_capacity_only
 
     def test_request_init_rejects_native_v2_swa(self):
         from types import SimpleNamespace
@@ -234,7 +234,7 @@ class TestTriAttentionClass:
 
         with pytest.raises(ValueError, match="full-attention V2 lifecycles"):
             triattention.on_request_init(request)
-        assert not hasattr(request, "py_kv_cache_decode_capacity_only")
+        assert not hasattr(request, "py_kv_cache_generation_capacity_only")
 
     def test_request_init_rejects_attention_dp(self):
         from types import SimpleNamespace
@@ -501,7 +501,7 @@ class TestStepBeginHookRefactor:
         mgr._periodic_evict(SimpleNamespace(generation_requests=[request]))
         mgr._periodic_evict(SimpleNamespace(generation_requests=[request]))
 
-        assert request.py_kv_cache_decode_capacity_only
+        assert request.py_kv_cache_generation_capacity_only
         assert mgr._pre_forward_kv_lengths == {7: 10}
         assert mgr._capacity_only_request_ids == {7}
 
@@ -515,7 +515,7 @@ class TestStepBeginHookRefactor:
 
         mgr._periodic_evict(SimpleNamespace(generation_requests=[request]))
 
-        assert not hasattr(request, "py_kv_cache_decode_capacity_only")
+        assert not hasattr(request, "py_kv_cache_generation_capacity_only")
         assert mgr._capacity_only_request_ids == set()
 
     def test_request_finish_orders_unconsumed_compaction_before_free(self):
@@ -526,7 +526,7 @@ class TestStepBeginHookRefactor:
         manager = SimpleNamespace(_stream=mock.Mock())
         request = SimpleNamespace(
             py_request_id=7,
-            py_kv_cache_decode_capacity_only=True,
+            py_kv_cache_generation_capacity_only=True,
             py_kv_cache_compaction=(129, 256, event),
         )
         mgr = TriAttention.__new__(TriAttention)
@@ -539,7 +539,7 @@ class TestStepBeginHookRefactor:
         mgr.on_request_finish(request)
 
         manager._stream.wait_event.assert_called_once_with(event)
-        assert not request.py_kv_cache_decode_capacity_only
+        assert not request.py_kv_cache_generation_capacity_only
         assert request.py_kv_cache_compaction is None
         assert mgr._capacity_only_request_ids == set()
 

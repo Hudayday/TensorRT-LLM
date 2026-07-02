@@ -36,7 +36,7 @@ def _request(request_id: int, *, rewind: int = 0, complete: bool = False) -> Mag
     request.py_request_id = request_id
     request.py_rewind_len = rewind
     request.max_beam_num_tokens = 201
-    request.py_kv_cache_decode_capacity_only = False
+    request.py_kv_cache_generation_capacity_only = False
     request.py_kv_cache_compaction = None
     request.state = (
         LlmRequestState.GENERATION_COMPLETE if complete else LlmRequestState.GENERATION_IN_PROGRESS
@@ -59,7 +59,7 @@ def test_capacity_only_is_request_scoped() -> None:
     regular_cache = _cache()
     compacted_cache = _cache()
     manager.kv_cache_map = {1: regular_cache, 2: compacted_cache}
-    compacted.py_kv_cache_decode_capacity_only = True
+    compacted.py_kv_cache_generation_capacity_only = True
 
     manager.update_resources(SimpleNamespace(generation_requests=[regular, compacted]))
 
@@ -88,7 +88,7 @@ def test_capacity_only_completion_preserves_history() -> None:
     request = _request(1, complete=True)
     cache = _cache()
     manager.kv_cache_map[1] = cache
-    request.py_kv_cache_decode_capacity_only = True
+    request.py_kv_cache_generation_capacity_only = True
 
     manager.update_resources(SimpleNamespace(generation_requests=[request]))
 
@@ -102,7 +102,7 @@ def test_compaction_target_preserves_overlap_growth() -> None:
     request.py_kv_cache_compaction = (129, 256, event)
     cache = _cache(capacity=257)
     manager.kv_cache_map[1] = cache
-    request.py_kv_cache_decode_capacity_only = True
+    request.py_kv_cache_generation_capacity_only = True
 
     manager.update_resources(SimpleNamespace(generation_requests=[request]))
 
@@ -119,7 +119,7 @@ def test_failed_compaction_resize_keeps_target() -> None:
     cache = _cache(capacity=256)
     cache.resize.return_value = False
     manager.kv_cache_map[1] = cache
-    request.py_kv_cache_decode_capacity_only = True
+    request.py_kv_cache_generation_capacity_only = True
 
     with pytest.raises(ValueError, match="Failed to resize KV cache"):
         manager.update_resources(SimpleNamespace(generation_requests=[request]))

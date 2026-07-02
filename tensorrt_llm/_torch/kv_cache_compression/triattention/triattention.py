@@ -259,7 +259,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             num_layers = self._num_layers_from_manager()
             if num_layers is not None:
                 self._attention_layer_partition(num_layers)
-            request.py_kv_cache_decode_capacity_only = True
+            request.py_kv_cache_generation_capacity_only = True
             self._capacity_only_request_ids.add(request_id)
         if self._calibrated:
             return
@@ -441,7 +441,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         compaction = getattr(request, "py_kv_cache_compaction", None)
         if compaction is not None and compaction[2] is not None:
             self.kv_cache_manager._stream.wait_event(compaction[2])
-        request.py_kv_cache_decode_capacity_only = False
+        request.py_kv_cache_generation_capacity_only = False
         request.py_kv_cache_compaction = None
         self._gen_steps.pop(request.py_request_id, None)
         self._evicted.pop(request.py_request_id, None)
