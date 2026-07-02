@@ -802,7 +802,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
         self._decode_capacity_only_requests: set[int] = set()
-        self._pending_compacted_capacities: dict[int, tuple[int, Optional[torch.cuda.Event]]] = {}
+        self._pending_compacted_capacities: dict[
+            int, tuple[int, int, Optional[torch.cuda.Event]]
+        ] = {}
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -1302,6 +1304,16 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if self.enable_block_reuse:
             raise ValueError("Decode capacity-only mode requires block reuse to be disabled")
+        if (
+            self.max_beam_width != 1
+            or self.num_extra_kv_tokens
+            or self.max_total_draft_tokens
+            or self._kv_reserve_draft_tokens
+        ):
+            raise ValueError(
+                "Decode capacity-only mode currently supports single-token, beam-width-one "
+                "decoding only"
+            )
         if any(window is not None for window in self.max_attention_window_vec) or any(
             not isinstance(layer, AttentionLayerConfig) or layer.sliding_window_size is not None
             for layer in self.kv_cache_manager_py_config.layers
@@ -1312,6 +1324,56 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         self._decode_capacity_only_requests.add(request_id)
 
+    def has_pending_compacted_capacity(self, request_id: int) -> bool:
+        """Return whether a compacted capacity target is waiting to be consumed."""
+        return request_id in self._pending_compacted_capacities
+
+    def get_pre_forward_kv_length(self, request_id: int) -> int:
+        """Return written KV tokens after scheduling and before the next forward.
+
+        The generation scheduler has reserved one unwritten slot at this point.
+        A pending compaction target can coexist with a later overlap reservation,
+        so derive the effective capacity from both instead of from request logical
+        length.
+        """
+        if request_id not in self._decode_capacity_only_requests:
+            raise ValueError(f"Request {request_id} is not enabled for decode capacity-only mode")
+        kv_cache = self.kv_cache_map.get(request_id)
+        if kv_cache is None or not kv_cache.is_active:
+            raise ValueError(f"Request {request_id} has no active KV cache")
+        allocated_draft_len = self._allocated_draft_lens.get(request_id)
+        if allocated_draft_len is None:
+            raise ValueError(
+                f"Request {request_id} has no generation capacity reserved for this forward"
+            )
+        if allocated_draft_len:
+            raise ValueError(
+                "Decode capacity-only mode currently supports single-token, beam-width-one "
+                "decoding only"
+            )
+        effective_capacity = kv_cache.capacity
+        pending_target = self._pending_compacted_capacities.get(request_id)
+        if pending_target is not None:
+            target_capacity, published_capacity, _ = pending_target
+            capacity_growth = kv_cache.capacity - published_capacity
+            if capacity_growth < 0:
+                raise ValueError(
+                    f"Request {request_id} capacity {kv_cache.capacity} fell below "
+                    f"published capacity {published_capacity}"
+                )
+            effective_capacity = target_capacity + capacity_growth
+        if effective_capacity < 1:
+            raise ValueError(
+                f"Request {request_id} has invalid pre-forward capacity {effective_capacity}"
+            )
+        written_length = effective_capacity - 1
+        if written_length < kv_cache.history_length:
+            raise ValueError(
+                f"Request {request_id} pre-forward KV length {written_length} is below "
+                f"finalized history {kv_cache.history_length}"
+            )
+        return written_length
+
     def set_compacted_capacity(
         self,
         request_id: int,
@@ -1320,9 +1382,10 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> None:
         """Queue a one-shot physical capacity target for a compacted request.
 
-        The target is consumed by the next active generation update. If an event
-        is supplied, the manager's execution stream waits for it before releasing
-        trailing KV pages.
+        The target is consumed by the next active generation update. Capacity
+        reserved after this call is added to the target, so an overlapped next
+        forward cannot lose its slot. If an event is supplied, the manager's
+        execution stream waits for it before releasing trailing KV pages.
 
         Args:
             request_id: Request previously enabled for capacity-only decode.
@@ -1332,7 +1395,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         Raises:
             ValueError: If the request is not enabled, has no KV cache, the target
-                is below finalized history, or another target is still pending.
+                does not leave a forward slot above finalized history, exceeds
+                current capacity, or another target is still pending.
         """
         if request_id not in self._decode_capacity_only_requests:
             raise ValueError(f"Request {request_id} is not enabled for decode capacity-only mode")
@@ -1341,14 +1405,23 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(request_id)
         if kv_cache is None:
             raise ValueError(f"Request {request_id} has no KV cache to compact")
-        if target_capacity < kv_cache.history_length:
+        if target_capacity > kv_cache.capacity:
             raise ValueError(
                 f"Compacted capacity {target_capacity} for request {request_id} "
-                f"cannot be below finalized history {kv_cache.history_length}"
+                f"cannot exceed current capacity {kv_cache.capacity}"
+            )
+        if target_capacity <= kv_cache.history_length:
+            raise ValueError(
+                f"Compacted capacity {target_capacity} for request {request_id} "
+                f"must leave a forward slot above finalized history {kv_cache.history_length}"
             )
         if request_id in self._pending_compacted_capacities:
             raise ValueError(f"Request {request_id} already has a pending compacted capacity")
-        self._pending_compacted_capacities[request_id] = (target_capacity, event)
+        self._pending_compacted_capacities[request_id] = (
+            target_capacity,
+            kv_cache.capacity,
+            event,
+        )
 
     def _effective_draft_len(self, req: LlmRequest) -> int:
         """Draft token length to use for next-step KV capacity calculation.
@@ -1451,23 +1524,53 @@ class KVCacheManagerV2(BaseResourceManager):
         host page-index buffer.
 
         Mirror the effective draft length used in _required_gen_capacity
-        so disagg-gen-trans-complete revert stays symmetric.
+        so disagg-gen-trans-complete revert stays symmetric. The scheduler
+        overwrites ``_allocated_draft_lens`` for every revert-eligible
+        allocation; a successful revert consumes that marker.
         """
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None or not kv_cache.is_active:
             return
-        draft_len = self._allocated_draft_lens.pop(
+        has_allocation_marker = req.py_request_id in self._allocated_draft_lens
+        draft_len = self._allocated_draft_lens.get(
             req.py_request_id, self._effective_draft_len(req)
+        )
+        pending_target = self._pending_compacted_capacities.get(req.py_request_id)
+        published_this_allocation = (
+            has_allocation_marker
+            and pending_target is not None
+            and pending_target[1] == kv_cache.capacity
         )
         reverted_cap = kv_cache.capacity - 1 - draft_len
         if reverted_cap < 0:
+            self._allocated_draft_lens.pop(req.py_request_id, None)
             return
+        reverted_pending_target = None
+        if published_this_allocation:
+            target_capacity, published_capacity, event = pending_target
+            reverted_target = target_capacity - 1 - draft_len
+            if reverted_target < kv_cache.history_length:
+                raise RuntimeError(
+                    f"Reverting request {req.py_request_id} would move compacted "
+                    f"capacity {reverted_target} below finalized history "
+                    f"{kv_cache.history_length}"
+                )
+            reverted_pending_target = (
+                reverted_target,
+                published_capacity - 1 - draft_len,
+                event,
+            )
+        if pending_target is not None and pending_target[2] is not None:
+            self._stream.wait_event(pending_target[2])
         if not kv_cache.resize(reverted_cap):
             raise RuntimeError(
                 f"Failed to revert KV cache capacity for request "
                 f"{req.py_request_id} from {kv_cache.capacity} to "
                 f"{reverted_cap}"
             )
+        self._allocated_draft_lens.pop(req.py_request_id, None)
+        if reverted_pending_target is not None:
+            self._pending_compacted_capacities[req.py_request_id] = reverted_pending_target
 
     def revert_allocate_context(self, req: LlmRequest) -> None:
         """Undo the capacity growth from this iter's ``resize_context``.
@@ -2265,8 +2368,8 @@ class KVCacheManagerV2(BaseResourceManager):
         request_id = request.py_request_id
         self._allocated_draft_lens.pop(request_id, None)
         pending_target = self._pending_compacted_capacities.get(request_id)
-        if pending_target is not None and pending_target[1] is not None:
-            self._stream.wait_event(pending_target[1])
+        if pending_target is not None and pending_target[2] is not None:
+            self._stream.wait_event(pending_target[2])
         self._decode_capacity_only_requests.discard(request_id)
         self._pending_compacted_capacities.pop(request_id, None)
         kv_cache = self.kv_cache_map.pop(request_id, None)
@@ -2561,7 +2664,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if request_id in self._decode_capacity_only_requests:
                 pending_target = self._pending_compacted_capacities.get(request_id)
                 if pending_target is not None:
-                    target_capacity, event = pending_target
+                    target_capacity, published_capacity, event = pending_target
                     if event is not None:
                         self._stream.wait_event(event)
                 if completing:
@@ -2569,7 +2672,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 elif pending_target is None:
                     new_capacity = kv_cache.capacity - req.py_rewind_len
                 else:
-                    new_capacity = target_capacity - req.py_rewind_len
+                    capacity_growth = kv_cache.capacity - published_capacity
+                    if capacity_growth < 0:
+                        raise ValueError(
+                            f"Request {request_id} capacity {kv_cache.capacity} fell below "
+                            f"published capacity {published_capacity}"
+                        )
+                    new_capacity = target_capacity + capacity_growth - req.py_rewind_len
                 success = kv_cache.resize(new_capacity, None)
                 if not success:
                     raise ValueError(
