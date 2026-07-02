@@ -8,12 +8,12 @@ the eviction runs in one pre-forward ``on_generation_step_begin`` hook.
 
 TriAttention is a :class:`BaseKVCacheCompressionManager` and nothing more -- it
 has no attention backend of its own; decode runs the model's standard dense
-kernel over the compacted cache. The V2 manager reports each request's
-authoritative pre-forward physical length after scheduling; TriAttention writes
-that value through ``adjust_attention_metadata`` just before
-``attn_metadata.prepare()``. Physical reclaim uses the standard capacity-only
-API, which preserves finalized history while returning trailing pages after
-compaction finishes.
+kernel over the compacted cache. TriAttention derives each request's effective
+pre-forward physical length from V2 capacity and any unconsumed compaction;
+it writes that value through ``adjust_attention_metadata`` just before
+``attn_metadata.prepare()``. Physical reclaim uses V2's existing resize path:
+TriAttention publishes a request-scoped capacity-only target and trailing pages
+return to the pool after compaction finishes.
 
 KV layout: the decode kernel stores keys in HND layout
 ``[num_pages, kv_factor, num_kv_heads, tokens_per_block, head_dim]``. The Python
@@ -40,6 +40,7 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import BaseKVCacheCompressionManager
 from tensorrt_llm.logger import logger
+from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
@@ -240,40 +241,25 @@ class TriAttention(BaseKVCacheCompressionManager):
         # Cumulative physically-evicted token count per request, consumed by the
         # public introspection API.
         self._evicted: Dict[int, int] = {}
-        # Authoritative written-KV length for the forward being prepared. V2
-        # computes this from physical capacity and any pending overlap target.
+        # Authoritative written-KV length for the forward being prepared.
         self._pre_forward_kv_lengths: Dict[int, int] = {}
         # Context requests initialize through the framework hook; generation-only
         # disaggregated requests initialize lazily in the pre-forward hook.
         self._capacity_only_request_ids: set[int] = set()
 
     def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
-        """Register capacity-only decode and resolve calibration once.
+        """Mark capacity-only decode and resolve calibration once.
 
         Loads the user-supplied OFFICIAL calibration .pt and converts it to our
         runtime schema (see _resolve_calibration). TRT-LLM does not calibrate.
         """
-        required_apis = {
-            name: getattr(self.kv_cache_manager, name, None)
-            for name in (
-                "enable_decode_capacity_only",
-                "set_compacted_capacity",
-                "get_pre_forward_kv_length",
-                "has_pending_compacted_capacity",
-            )
-        }
-        missing = [name for name, method in required_apis.items() if not callable(method)]
-        if missing:
-            raise RuntimeError(
-                "TriAttention requires KVCacheManagerV2 capacity-only APIs; "
-                f"missing: {', '.join(missing)}"
-            )
         request_id = request.py_request_id
         if request_id not in self._capacity_only_request_ids:
+            self._validate_v2_compatibility()
             num_layers = self._num_layers_from_manager()
             if num_layers is not None:
                 self._attention_layer_partition(num_layers)
-            required_apis["enable_decode_capacity_only"](request_id)
+            request.py_kv_cache_decode_capacity_only = True
             self._capacity_only_request_ids.add(request_id)
         if self._calibrated:
             return
@@ -294,6 +280,33 @@ class TriAttention(BaseKVCacheCompressionManager):
         ).contiguous()
         self._calibrated = True
 
+    def _validate_v2_compatibility(self) -> None:
+        """Reject runtime modes that do not follow single-token full-attention V2."""
+        manager = self.kv_cache_manager
+        mapping = getattr(manager, "mapping", None)
+        if getattr(mapping, "enable_attention_dp", False):
+            raise ValueError("TriAttention does not support attention DP")
+        if getattr(manager, "is_disagg", False):
+            raise ValueError("TriAttention does not support disaggregated serving")
+        if (
+            getattr(manager, "max_beam_width", 1) != 1
+            or getattr(manager, "num_extra_kv_tokens", 0)
+            or getattr(manager, "max_total_draft_tokens", 0)
+            or getattr(manager, "_kv_reserve_draft_tokens", 0)
+        ):
+            raise ValueError("TriAttention requires single-token, beam-width-one decoding")
+        windows = getattr(manager, "max_attention_window_vec", ())
+        config = getattr(manager, "kv_cache_manager_py_config", None)
+        layers = getattr(config, "layers", ())
+        if any(window is not None for window in windows) or any(
+            not isinstance(layer, AttentionLayerConfig) or layer.sliding_window_size is not None
+            for layer in layers
+        ):
+            raise ValueError(
+                "TriAttention requires full-attention V2 lifecycles; native SWA, "
+                "VSWA, and SSM pools are not supported"
+            )
+
     # The framework drives all lifecycle hooks; TriAttention overrides three:
     # on_request_init (resolve calibration once), on_generation_step_begin
     # (periodic eviction), and on_request_finish (per-request cleanup). It scores
@@ -308,7 +321,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         """Periodic physical eviction, PRE-forward (framework hook, fired from the
         base prepare_resources before _forward_step). Every beta steps over budget:
         score the full cache, select top-B, physically compact, reconcile the
-        forward's attention metadata, and publish the post-forward capacity to V2.
+        forward's attention metadata, and resize V2 to the compacted capacity.
 
         Uses the pre-forward hook (NOT post-forward on_generation_step_end) because
         the latter races the overlap scheduler: the next iteration's forward is
@@ -352,28 +365,64 @@ class TriAttention(BaseKVCacheCompressionManager):
                     "TriAttention physical eviction does not support speculative "
                     f"decoding; request {rid} has {draft_len} draft tokens"
                 )
-            seq_len = int(mgr.get_pre_forward_kv_length(rid))
+            kv_cache = mgr.kv_cache_map.get(rid)
+            if kv_cache is None or not kv_cache.is_active:
+                raise RuntimeError(f"Request {rid} has no active V2 KV cache")
+            raw_capacity = int(kv_cache.capacity)
+            compaction = getattr(request, "py_kv_cache_compaction", None)
+            if compaction is not None:
+                target_capacity, published_capacity, _ = compaction
+                capacity_growth = raw_capacity - published_capacity
+                if capacity_growth < 0:
+                    raise RuntimeError(
+                        f"Request {rid} capacity {raw_capacity} fell below "
+                        f"published capacity {published_capacity}"
+                    )
+                effective_capacity = target_capacity + capacity_growth
+            else:
+                effective_capacity = raw_capacity
+            # The scheduler has reserved one unwritten slot for this forward.
+            seq_len = effective_capacity - 1
+            if seq_len < kv_cache.history_length:
+                raise RuntimeError(
+                    f"Request {rid} KV length {seq_len} is below finalized "
+                    f"history {kv_cache.history_length}"
+                )
             self._pre_forward_kv_lengths[rid] = seq_len
             step = self._gen_steps.get(rid, 0) + 1
             self._gen_steps[rid] = step
             if step % self.beta == 0:
-                if mgr.has_pending_compacted_capacity(rid):
-                    # The overlap loop has not consumed the previous target yet.
-                    # Retry this eviction period on the next prepared forward.
+                if compaction is not None:
                     self._gen_steps[rid] = step - 1
                     continue
                 if seq_len > self._minimum_evictable_length(request, seq_len):
                     evict_now.append((request, rid))
 
-        # (2) Compact all affected dense and kernel-masked SWA layers before
-        # publishing any capacity target. One event orders every request in this
-        # eviction round after those kernels.
+        # (2) Compact all affected dense and kernel-masked SWA layers, then publish
+        # one target per request. V2 consumes it at its existing post-enqueue
+        # update boundary, where host block-table mutation is overlap-safe.
         capacity_targets = self._evict_requests(evict_now, num_layers) if evict_now else []
         if capacity_targets:
             compaction_event = torch.cuda.Event()
             compaction_event.record()
+            requests_by_id = {request.py_request_id: request for request in active_requests}
             for rid, target_capacity in capacity_targets:
-                mgr.set_compacted_capacity(rid, target_capacity, compaction_event)
+                kv_cache = mgr.kv_cache_map.get(rid)
+                if kv_cache is None or not kv_cache.is_active:
+                    raise RuntimeError(f"Request {rid} has no active V2 KV cache")
+                if target_capacity > kv_cache.capacity:
+                    raise RuntimeError(
+                        f"Request {rid} compacted capacity {target_capacity} exceeds "
+                        f"current capacity {kv_cache.capacity}"
+                    )
+                request = requests_by_id[rid]
+                if getattr(request, "py_kv_cache_compaction", None) is not None:
+                    raise RuntimeError(f"Request {rid} already has an unconsumed KV compaction")
+                request.py_kv_cache_compaction = (
+                    target_capacity,
+                    int(kv_cache.capacity),
+                    compaction_event,
+                )
 
     def _minimum_evictable_length(self, request: "LlmRequest", seq_len: int) -> int:
         """Return the largest cache length for which selection is an identity.
@@ -389,6 +438,11 @@ class TriAttention(BaseKVCacheCompressionManager):
 
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
         """Drop this request's per-request length and eviction state."""
+        compaction = getattr(request, "py_kv_cache_compaction", None)
+        if compaction is not None and compaction[2] is not None:
+            self.kv_cache_manager._stream.wait_event(compaction[2])
+        request.py_kv_cache_decode_capacity_only = False
+        request.py_kv_cache_compaction = None
         self._gen_steps.pop(request.py_request_id, None)
         self._evicted.pop(request.py_request_id, None)
         self._pre_forward_kv_lengths.pop(request.py_request_id, None)
@@ -406,9 +460,9 @@ class TriAttention(BaseKVCacheCompressionManager):
         """Reconcile the attention metadata for this iteration's eviction.
 
         The framework calls this immediately before ``attn_metadata.prepare()``.
-        V2 has already reported the written KV length after scheduling and after
-        accounting for any unconsumed overlap compaction target. Use that physical
-        value directly instead of reconstructing it from logical request length.
+        V2 capacity after scheduling gives the written KV length for this
+        forward. Use that physical value instead of reconstructing it from
+        logical request length.
         Prompt length is clamped when necessary so the prompt/generation split
         cannot extend beyond the compacted prefix.
         """
@@ -803,9 +857,9 @@ class TriAttention(BaseKVCacheCompressionManager):
     ) -> Tuple[List[int], List[int], Optional[int]]:
         """Return dense layers, kernel-masked SWA layers, and the SWA window.
 
-        The V2 registration guard has already rejected real windowed lifecycles.
-        A sliding layer found here is therefore stored at full length and applies
-        its window only in the attention kernel.
+        TriAttention initialization has already rejected real V2 windowed
+        lifecycles. A sliding layer found here is therefore stored at full length
+        and applies its window only in the attention kernel.
         """
         if not self.skip_swa:
             return list(range(num_layers)), [], None

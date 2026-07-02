@@ -12,7 +12,7 @@ cover the config + construction + reconcile layer:
   - ``TriAttention`` construction, calibration loading, and the
     ``adjust_attention_metadata`` reconcile.
   - ``create_kv_cache_compression_manager`` factory dispatch.
-  - Capacity-only V2 registration and compacted-capacity publication.
+  - Capacity-only V2 registration and immediate compacted-capacity resize.
 
 These tests do not run real eviction or attention; that needs model weights and
 is covered by the NIAH end-to-end run.
@@ -210,29 +210,52 @@ class TestTriAttentionClass:
 
     def test_request_init_registers_capacity_only_for_every_request(self):
         from types import SimpleNamespace
-        from unittest import mock
 
         manager = _make_fake_v2()
-        manager.enable_decode_capacity_only = mock.Mock()
-        manager.set_compacted_capacity = mock.Mock()
-        manager.get_pre_forward_kv_length = mock.Mock()
-        manager.has_pending_compacted_capacity = mock.Mock()
         triattention = TriAttention(manager, top_B=8, skip_swa=False)
         triattention._calibrated = True
+        first = SimpleNamespace(py_request_id=11)
+        second = SimpleNamespace(py_request_id=12)
 
-        triattention.on_request_init(SimpleNamespace(py_request_id=11))
-        triattention.on_request_init(SimpleNamespace(py_request_id=12))
+        triattention.on_request_init(first)
+        triattention.on_request_init(second)
 
-        assert manager.enable_decode_capacity_only.call_args_list == [mock.call(11), mock.call(12)]
+        assert first.py_kv_cache_decode_capacity_only
+        assert second.py_kv_cache_decode_capacity_only
 
-    def test_request_init_fails_when_capacity_only_api_is_missing(self):
+    def test_request_init_rejects_native_v2_swa(self):
         from types import SimpleNamespace
 
-        manager = SimpleNamespace(enable_block_reuse=False)
+        manager = _make_fake_v2()
+        manager.max_attention_window_vec = [128]
+        triattention = TriAttention(manager, top_B=128, skip_swa=False)
+        triattention._calibrated = True
+        request = SimpleNamespace(py_request_id=11)
+
+        with pytest.raises(ValueError, match="full-attention V2 lifecycles"):
+            triattention.on_request_init(request)
+        assert not hasattr(request, "py_kv_cache_decode_capacity_only")
+
+    def test_request_init_rejects_attention_dp(self):
+        from types import SimpleNamespace
+
+        manager = _make_fake_v2()
+        manager.mapping = SimpleNamespace(enable_attention_dp=True)
         triattention = TriAttention(manager, top_B=8, skip_swa=False)
         triattention._calibrated = True
 
-        with pytest.raises(RuntimeError, match="enable_decode_capacity_only"):
+        with pytest.raises(ValueError, match="attention DP"):
+            triattention.on_request_init(SimpleNamespace(py_request_id=11))
+
+    def test_request_init_rejects_speculative_capacity(self):
+        from types import SimpleNamespace
+
+        manager = _make_fake_v2()
+        manager.num_extra_kv_tokens = 4
+        triattention = TriAttention(manager, top_B=8, skip_swa=False)
+        triattention._calibrated = True
+
+        with pytest.raises(ValueError, match="single-token"):
             triattention.on_request_init(SimpleNamespace(py_request_id=11))
 
     def test_skip_swa_requires_model_path(self):
@@ -365,6 +388,7 @@ class TestStepBeginHookRefactor:
     @staticmethod
     def _make_due_decode_request(seq_len):
         from types import SimpleNamespace
+        from unittest import mock
 
         request = SimpleNamespace(
             py_request_id=7,
@@ -374,10 +398,16 @@ class TestStepBeginHookRefactor:
         batch = SimpleNamespace(generation_requests=[request])
         mgr = TriAttention.__new__(TriAttention)
         mgr._calibrated = True
+        cache = SimpleNamespace(
+            capacity=seq_len + 1,
+            history_length=1024,
+            is_active=True,
+            resize=mock.Mock(return_value=True),
+        )
         mgr.kv_cache_manager = SimpleNamespace(
             get_buffers=lambda *args, **kwargs: None,
-            get_pre_forward_kv_length=lambda _rid: seq_len,
-            has_pending_compacted_capacity=lambda _rid: False,
+            kv_cache_map={7: cache},
+            _stream=mock.Mock(),
         )
         mgr._L = 2
         mgr._gen_steps = {7: 127}
@@ -408,8 +438,7 @@ class TestStepBeginHookRefactor:
         timeline = []
         event = mock.Mock()
         event.record.side_effect = lambda: timeline.append("event")
-        publish = mock.Mock(side_effect=lambda *args: timeline.append("publish"))
-        mgr.kv_cache_manager.set_compacted_capacity = publish
+        cache = mgr.kv_cache_manager.kv_cache_map[7]
 
         def compact(*args):
             timeline.append("compact")
@@ -423,33 +452,41 @@ class TestStepBeginHookRefactor:
 
         evict.assert_called_once_with([(request, 7)], 2)
         event.record.assert_called_once_with()
-        publish.assert_called_once_with(7, 1024 + 4096 + 1, event)
-        assert timeline == ["compact", "event", "publish"]
+        cache.resize.assert_not_called()
+        assert request.py_kv_cache_compaction == (
+            1024 + 4096 + 1,
+            1024 + 4096 + 2,
+            event,
+        )
+        assert timeline == ["compact", "event"]
 
-    def test_pending_target_retries_due_eviction_next_step(self):
+    def test_pending_compaction_uses_effective_length_and_defers_eviction(self):
         from unittest import mock
 
-        mgr, _, batch = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
-        mgr.kv_cache_manager.has_pending_compacted_capacity = mock.Mock(return_value=True)
+        mgr, request, batch = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
+        cache = mgr.kv_cache_manager.kv_cache_map[7]
+        published_capacity = cache.capacity
+        request.py_kv_cache_compaction = (
+            published_capacity,
+            published_capacity,
+            mock.Mock(),
+        )
+        cache.capacity += 1
 
         with mock.patch.object(mgr, "_evict_requests") as evict:
             mgr._periodic_evict(batch)
 
         evict.assert_not_called()
         assert mgr._gen_steps[7] == 127
-        assert mgr._pre_forward_kv_lengths[7] == 1024 + 4096 + 1
+        assert mgr._pre_forward_kv_lengths[7] == 1024 + 4096 + 2
 
     def test_generation_only_request_is_initialized_once(self):
         from types import SimpleNamespace
-        from unittest import mock
 
         manager = SimpleNamespace(
             enable_block_reuse=False,
-            enable_decode_capacity_only=mock.Mock(),
-            set_compacted_capacity=mock.Mock(),
-            get_pre_forward_kv_length=mock.Mock(return_value=10),
-            has_pending_compacted_capacity=mock.Mock(return_value=False),
             get_buffers=lambda *args, **kwargs: None,
+            kv_cache_map={7: SimpleNamespace(capacity=11, history_length=2, is_active=True)},
         )
         request = SimpleNamespace(
             py_request_id=7,
@@ -464,27 +501,46 @@ class TestStepBeginHookRefactor:
         mgr._periodic_evict(SimpleNamespace(generation_requests=[request]))
         mgr._periodic_evict(SimpleNamespace(generation_requests=[request]))
 
-        manager.enable_decode_capacity_only.assert_called_once_with(7)
-        assert manager.get_pre_forward_kv_length.call_args_list == [mock.call(7), mock.call(7)]
+        assert request.py_kv_cache_decode_capacity_only
+        assert mgr._pre_forward_kv_lengths == {7: 10}
         assert mgr._capacity_only_request_ids == {7}
 
     def test_generation_dummy_is_skipped(self):
         from types import SimpleNamespace
-        from unittest import mock
 
-        manager = SimpleNamespace(
-            enable_block_reuse=False,
-            enable_decode_capacity_only=mock.Mock(),
-            get_pre_forward_kv_length=mock.Mock(),
-        )
+        manager = SimpleNamespace(enable_block_reuse=False)
         request = SimpleNamespace(py_request_id=7, is_dummy=True)
         mgr = TriAttention(manager, top_B=8, beta=4, skip_swa=False)
         mgr._calibrated = True
 
         mgr._periodic_evict(SimpleNamespace(generation_requests=[request]))
 
-        manager.enable_decode_capacity_only.assert_not_called()
-        manager.get_pre_forward_kv_length.assert_not_called()
+        assert not hasattr(request, "py_kv_cache_decode_capacity_only")
+        assert mgr._capacity_only_request_ids == set()
+
+    def test_request_finish_orders_unconsumed_compaction_before_free(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        event = mock.Mock()
+        manager = SimpleNamespace(_stream=mock.Mock())
+        request = SimpleNamespace(
+            py_request_id=7,
+            py_kv_cache_decode_capacity_only=True,
+            py_kv_cache_compaction=(129, 256, event),
+        )
+        mgr = TriAttention.__new__(TriAttention)
+        mgr.kv_cache_manager = manager
+        mgr._gen_steps = {7: 1}
+        mgr._evicted = {7: 127}
+        mgr._pre_forward_kv_lengths = {7: 128}
+        mgr._capacity_only_request_ids = {7}
+
+        mgr.on_request_finish(request)
+
+        manager._stream.wait_event.assert_called_once_with(event)
+        assert not request.py_kv_cache_decode_capacity_only
+        assert request.py_kv_cache_compaction is None
         assert mgr._capacity_only_request_ids == set()
 
     def test_evict_requests_returns_exact_post_forward_capacity(self):
@@ -853,8 +909,7 @@ class TestKernelMaskedSwa:
 
 
 # ---------------------------------------------------------------------------
-# Block reclaim uses the explicit V2 capacity-only API; no manager subclass is
-# needed.
+# Block reclaim uses V2's existing resize operation; no manager subclass is needed.
 # ---------------------------------------------------------------------------
 
 
@@ -873,13 +928,10 @@ class TestNoBlockFreeSubclass:
         assert "TriAttentionKVCacheManagerV2" not in pkg.__all__
         assert not hasattr(pkg, "TriAttentionKVCacheManagerV2")
 
-    def test_v2_exposes_capacity_only_api(self):
+    def test_v2_has_no_triattention_specific_capacity_api(self):
         from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 
-        assert callable(getattr(KVCacheManagerV2, "enable_decode_capacity_only", None))
-        assert callable(getattr(KVCacheManagerV2, "set_compacted_capacity", None))
-        assert callable(getattr(KVCacheManagerV2, "get_pre_forward_kv_length", None))
-        assert callable(getattr(KVCacheManagerV2, "has_pending_compacted_capacity", None))
+        assert not hasattr(KVCacheManagerV2, "enable_decode_capacity_only")
 
 
 # ---------------------------------------------------------------------------
