@@ -801,6 +801,8 @@ class KVCacheManagerV2(BaseResourceManager):
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
+        self._decode_capacity_only_requests: set[int] = set()
+        self._pending_compacted_capacities: dict[int, tuple[int, Optional[torch.cuda.Event]]] = {}
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -1282,6 +1284,71 @@ class KVCacheManagerV2(BaseResourceManager):
         """Return True if *request_id* has a live, non-suspended KV cache."""
         kv_cache = self.kv_cache_map.get(request_id)
         return kv_cache is not None and kv_cache.is_active
+
+    def enable_decode_capacity_only(self, request_id: int) -> None:
+        """Preserve a request's finalized history while decoding.
+
+        Capacity-only decode is intended for KV compression methods that compact
+        uncommitted decode KV to the front of an all-full-attention cache. Context
+        updates still advance history to the finalized prompt prefix; decode
+        updates only resize capacity around that prefix.
+
+        Args:
+            request_id: Request whose decode capacity will be managed explicitly.
+
+        Raises:
+            ValueError: If block reuse is enabled or any local layer has an SWA or
+                SSM lifecycle.
+        """
+        if self.enable_block_reuse:
+            raise ValueError("Decode capacity-only mode requires block reuse to be disabled")
+        if any(window is not None for window in self.max_attention_window_vec) or any(
+            not isinstance(layer, AttentionLayerConfig) or layer.sliding_window_size is not None
+            for layer in self.kv_cache_manager_py_config.layers
+        ):
+            raise ValueError(
+                "Decode capacity-only mode supports full-attention layers only; "
+                "SWA, VSWA, and SSM layers are not supported"
+            )
+        self._decode_capacity_only_requests.add(request_id)
+
+    def set_compacted_capacity(
+        self,
+        request_id: int,
+        target_capacity: int,
+        event: Optional[torch.cuda.Event] = None,
+    ) -> None:
+        """Queue a one-shot physical capacity target for a compacted request.
+
+        The target is consumed by the next active generation update. If an event
+        is supplied, the manager's execution stream waits for it before releasing
+        trailing KV pages.
+
+        Args:
+            request_id: Request previously enabled for capacity-only decode.
+            target_capacity: Physical capacity before the generation rewind is
+                applied.
+            event: Optional CUDA event recorded after compaction.
+
+        Raises:
+            ValueError: If the request is not enabled, has no KV cache, the target
+                is below finalized history, or another target is still pending.
+        """
+        if request_id not in self._decode_capacity_only_requests:
+            raise ValueError(f"Request {request_id} is not enabled for decode capacity-only mode")
+        if target_capacity < 0:
+            raise ValueError(f"Compacted capacity must be non-negative, got {target_capacity}")
+        kv_cache = self.kv_cache_map.get(request_id)
+        if kv_cache is None:
+            raise ValueError(f"Request {request_id} has no KV cache to compact")
+        if target_capacity < kv_cache.history_length:
+            raise ValueError(
+                f"Compacted capacity {target_capacity} for request {request_id} "
+                f"cannot be below finalized history {kv_cache.history_length}"
+            )
+        if request_id in self._pending_compacted_capacities:
+            raise ValueError(f"Request {request_id} already has a pending compacted capacity")
+        self._pending_compacted_capacities[request_id] = (target_capacity, event)
 
     def _effective_draft_len(self, req: LlmRequest) -> int:
         """Draft token length to use for next-step KV capacity calculation.
@@ -2195,19 +2262,25 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests.add(request_id)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        self._allocated_draft_lens.pop(request.py_request_id, None)
-        kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
+        request_id = request.py_request_id
+        self._allocated_draft_lens.pop(request_id, None)
+        pending_target = self._pending_compacted_capacities.get(request_id)
+        if pending_target is not None and pending_target[1] is not None:
+            self._stream.wait_event(pending_target[1])
+        self._decode_capacity_only_requests.discard(request_id)
+        self._pending_compacted_capacities.pop(request_id, None)
+        kv_cache = self.kv_cache_map.pop(request_id, None)
         if kv_cache is None:
-            self.impl.clear_stats_excluded(request.py_request_id)
+            self.impl.clear_stats_excluded(request_id)
             return
         kv_cache.discard_pending_stats()
         self.try_commit_blocks_for_reuse(request, kv_cache)
         kv_cache.close()
-        self.impl.clear_stats_excluded(request.py_request_id)
-        if request.py_request_id in self._early_freed_index_requests:
-            self._early_freed_index_requests.discard(request.py_request_id)
+        self.impl.clear_stats_excluded(request_id)
+        if request_id in self._early_freed_index_requests:
+            self._early_freed_index_requests.discard(request_id)
         else:
-            self.index_mapper.remove_sequence(request.py_request_id)
+            self.index_mapper.remove_sequence(request_id)
 
     def get_batch_cache_indices(
         self, request_ids: List[int], layer_idx: Optional[int] = None
@@ -2484,35 +2557,27 @@ class KVCacheManagerV2(BaseResourceManager):
                 LlmRequestState.GENERATION_COMPLETE,
                 LlmRequestState.CONTEXT_INIT,
             )
-            # Generic KV-cache-compression reclaim path (model-agnostic): any
-            # compression manager that physically compacts a request's kept tokens to
-            # the front sets py_kv_evicted_tokens (cumulative evicted count) and,
-            # optionally, py_kv_compaction_event (CUDA event to order the free after
-            # the compaction kernel). fork() then shrinks history to the compacted
-            # length and frees the evicted trailing blocks (incl. dense layers the
-            # normal shrink skips). Guarded by evicted > 0, so every other request /
-            # model is byte-identical to before. (Yao Yao OK'd doing this in
-            # update_resources; this path is decoupled from any specific algorithm.)
-            evicted = int(getattr(req, "py_kv_evicted_tokens", 0) or 0)
-            if evicted > 0 and not completing:
-                ev_obj = getattr(req, "py_kv_compaction_event", None)
-                if ev_obj is not None:
-                    try:
-                        self._stream.cuda_stream.wait_event(ev_obj)
-                    except Exception:
-                        pass
-                try:
-                    kv_cache.fork(req.max_beam_num_tokens - evicted)
-                except Exception as e:
-                    # Defensive: never crash the whole batch if one request's block
-                    # reclaim fails. Fall back to keeping (not freeing) its blocks.
-                    # fork() lowers history before any step that can raise, so this
-                    # resize sets the same history and cannot trip the monotonic guard.
-                    logger.warning(
-                        "KV-cache compression block reclaim fell back to no-free for "
-                        f"request {req.py_request_id}: {e}"
+            request_id = req.py_request_id
+            if request_id in self._decode_capacity_only_requests:
+                pending_target = self._pending_compacted_capacities.get(request_id)
+                if pending_target is not None:
+                    target_capacity, event = pending_target
+                    if event is not None:
+                        self._stream.wait_event(event)
+                if completing:
+                    new_capacity = None
+                elif pending_target is None:
+                    new_capacity = kv_cache.capacity - req.py_rewind_len
+                else:
+                    new_capacity = target_capacity - req.py_rewind_len
+                success = kv_cache.resize(new_capacity, None)
+                if not success:
+                    raise ValueError(
+                        f"Failed to resize KV cache for request {request_id} "
+                        f"to capacity {new_capacity} while preserving its finalized history"
                     )
-                    kv_cache.resize(None, req.max_beam_num_tokens - evicted)
+                if completing or pending_target is not None:
+                    self._pending_compacted_capacities.pop(request_id, None)
                 continue
             new_capacity = None if completing else kv_cache.capacity - req.py_rewind_len
             success = kv_cache.resize(new_capacity, req.max_beam_num_tokens - 1)
