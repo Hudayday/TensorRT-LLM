@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """TriAttention KV-cache compression: periodic physical KV eviction.
 
 Every ``beta`` generation steps TriAttention scores each cached token with a
@@ -39,6 +54,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import BaseKVCacheCompressionManager
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
@@ -186,6 +202,9 @@ class _FixedUnionWorkspace:
         self.keep = torch.empty(self.total_keep, dtype=torch.long, device=device)
         self.keep[:prompt_len].copy_(torch.arange(prompt_len, dtype=torch.long, device=device))
         self._compaction_buffers = {}
+        self.prewarm_attempted = False
+        self.prewarmed = False
+        self.prewarm_failed = False
 
     def select(self, per_head_scores: torch.Tensor) -> torch.Tensor:
         """Return a persistent sorted keep tensor without dynamic output shapes."""
@@ -256,18 +275,16 @@ class _FixedUnionWorkspace:
             int(head_dim),
         )
 
-    def compact(
+    def prepare_compaction(
         self,
         pool: torch.Tensor,
         page_ids: torch.Tensor,
         seq_len: int,
-        *,
-        copy_page_ids: bool = True,
-    ) -> None:
-        """Compact one HND layer using persistent indices and scratch storage."""
+    ) -> tuple:
+        """Materialize fixed compaction buffers without launching a kernel."""
         if not self.can_compact(pool, page_ids, seq_len):
             raise ValueError("pool no longer matches the fixed union compaction bucket")
-        _, kv_factor, num_kv_heads, tokens_per_block, head_dim = pool.shape
+        _, kv_factor, num_kv_heads, _, head_dim = pool.shape
         key = self._compaction_key(pool, page_ids)
         buffers = self._compaction_buffers.get(key)
         if buffers is None:
@@ -281,6 +298,18 @@ class _FixedUnionWorkspace:
             )
             buffers = (fixed_page_ids, destination, page_base, scratch)
             self._compaction_buffers[key] = buffers
+        return buffers
+
+    def compact(
+        self,
+        pool: torch.Tensor,
+        page_ids: torch.Tensor,
+        seq_len: int,
+        *,
+        copy_page_ids: bool = True,
+    ) -> None:
+        """Compact one HND layer using persistent indices and scratch storage."""
+        buffers = self.prepare_compaction(pool, page_ids, seq_len)
         fixed_page_ids, destination, page_base, scratch = buffers
         if copy_page_ids:
             fixed_page_ids.copy_(page_ids)
@@ -424,8 +453,15 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._fixed_union_compaction_enabled = (
             self._fixed_union_enabled and os.environ.get("TRIATTN_COMPACT_KEPT_ONLY", "1") == "1"
         )
+        # Keep cold-path prewarm independently selectable so its correctness and
+        # performance evidence cannot be confused with the fixed-buffer change.
+        self._fixed_union_prewarm_enabled = (
+            self._fixed_union_enabled and os.environ.get("TRIATTN_FIXED_PREWARM", "0") == "1"
+        )
         self._fixed_union_workspaces = {}
         self._fixed_union_active = {}
+        self._fixed_union_prewarm_states = {}
+        self._fixed_union_prewarmed_workspaces = {}
 
     def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
         """Mark capacity-only decode and resolve calibration once.
@@ -441,6 +477,10 @@ class TriAttention(BaseKVCacheCompressionManager):
                 self._attention_layer_partition(num_layers)
             request.py_kv_cache_generation_capacity_only = True
             self._capacity_only_request_ids.add(request_id)
+        self._ensure_calibrated()
+
+    def _ensure_calibrated(self) -> None:
+        """Resolve calibration once for startup prewarm or the first request."""
         if self._calibrated:
             return
         self.calibration = self._resolve_calibration()
@@ -487,13 +527,14 @@ class TriAttention(BaseKVCacheCompressionManager):
                 "VSWA, and SSM pools are not supported"
             )
 
-    # The framework drives all lifecycle hooks; TriAttention overrides three:
-    # on_request_init (resolve calibration once), on_generation_step_begin
-    # (periodic eviction), and on_request_finish (per-request cleanup). It scores
-    # from offline calibration, not from live queries or attention scores, so it
-    # needs no per-layer attention hook: the whole eviction runs once per period
-    # in on_generation_step_begin, which loops the layers and reads each layer's
-    # keys straight from the KV pool.
+    # The framework drives startup prewarm and all request-lifecycle hooks.
+    # TriAttention overrides prewarm plus three lifecycle hooks: on_request_init
+    # (resolve calibration once), on_generation_step_begin (periodic eviction),
+    # and on_request_finish (per-request cleanup). It scores from offline
+    # calibration, not from live queries or attention scores, so it needs no
+    # per-layer attention hook: the whole eviction runs once per period in
+    # on_generation_step_begin, which loops the layers and reads each layer's keys
+    # straight from the KV pool.
 
     def on_generation_step_begin(
         self, scheduled_batch: "ScheduledRequests", attn_metadata=None, **kwargs
@@ -583,26 +624,27 @@ class TriAttention(BaseKVCacheCompressionManager):
         # update boundary, where host block-table mutation is overlap-safe.
         capacity_targets = self._evict_requests(evict_now, num_layers) if evict_now else []
         if capacity_targets:
-            compaction_event = torch.cuda.Event()
-            compaction_event.record()
-            requests_by_id = {request.py_request_id: request for request in active_requests}
-            for rid, target_capacity in capacity_targets:
-                kv_cache = mgr.kv_cache_map.get(rid)
-                if kv_cache is None or not kv_cache.is_active:
-                    raise RuntimeError(f"Request {rid} has no active V2 KV cache")
-                if target_capacity > kv_cache.capacity:
-                    raise RuntimeError(
-                        f"Request {rid} compacted capacity {target_capacity} exceeds "
-                        f"current capacity {kv_cache.capacity}"
+            with nvtx_range("triattention.publish", color="red"):
+                compaction_event = torch.cuda.Event()
+                compaction_event.record()
+                requests_by_id = {request.py_request_id: request for request in active_requests}
+                for rid, target_capacity in capacity_targets:
+                    kv_cache = mgr.kv_cache_map.get(rid)
+                    if kv_cache is None or not kv_cache.is_active:
+                        raise RuntimeError(f"Request {rid} has no active V2 KV cache")
+                    if target_capacity > kv_cache.capacity:
+                        raise RuntimeError(
+                            f"Request {rid} compacted capacity {target_capacity} exceeds "
+                            f"current capacity {kv_cache.capacity}"
+                        )
+                    request = requests_by_id[rid]
+                    if getattr(request, "py_kv_cache_compaction", None) is not None:
+                        raise RuntimeError(f"Request {rid} already has an unconsumed KV compaction")
+                    request.py_kv_cache_compaction = (
+                        target_capacity,
+                        int(kv_cache.capacity),
+                        compaction_event,
                     )
-                request = requests_by_id[rid]
-                if getattr(request, "py_kv_cache_compaction", None) is not None:
-                    raise RuntimeError(f"Request {rid} already has an unconsumed KV compaction")
-                request.py_kv_cache_compaction = (
-                    target_capacity,
-                    int(kv_cache.capacity),
-                    compaction_event,
-                )
 
     def _minimum_evictable_length(self, request: "LlmRequest", seq_len: int) -> int:
         """Return the largest cache length for which selection is an identity.
@@ -615,6 +657,385 @@ class TriAttention(BaseKVCacheCompressionManager):
             prompt_len = min(int(getattr(request, "py_prompt_len", 0) or 0), seq_len)
             return prompt_len + self.top_B
         return self.top_B
+
+    @staticmethod
+    def _dummy_pool_like(pool: torch.Tensor, num_pages: int, *, zero: bool) -> torch.Tensor:
+        """Create an independent HND view with the live pool's exact strides."""
+        if pool.ndim != 5 or num_pages <= 0:
+            raise ValueError("fixed prewarm requires a five-dimensional HND pool")
+        shape = (num_pages, *(int(value) for value in pool.shape[1:]))
+        strides = tuple(int(value) for value in pool.stride())
+        dummy = torch.empty_strided(
+            shape,
+            strides,
+            dtype=pool.dtype,
+            device=pool.device,
+        )
+        if dummy.untyped_storage().data_ptr() == pool.untyped_storage().data_ptr():
+            raise RuntimeError("fixed prewarm dummy unexpectedly aliases the live KV pool")
+        if zero:
+            dummy.zero_()
+        return dummy
+
+    def _fixed_union_prewarm_key(
+        self,
+        layer_pools: List[torch.Tensor],
+        dense_layers: List[int],
+        storage_groups: List[List[int]],
+        num_layers: int,
+        future_seq_len: int,
+        prompt_len: int,
+    ) -> tuple:
+        """Return a provenance key containing geometry but no request identity."""
+        decode_width = future_seq_len - prompt_len
+        use_fixed_workspace = self.top_B > self._INDEXER_TOPK_MAX_K
+        selection_backend = (
+            "fixed_union.torch_topk" if use_fixed_workspace else "eager_union.torch_topk"
+        )
+        if use_fixed_workspace:
+            compaction_backend = (
+                "triton_tri_compact_fixed"
+                if getattr(self, "_fixed_union_compaction_enabled", False)
+                else "disabled"
+            )
+        else:
+            compaction_backend = "triton_tri_compact"
+        pool_geometry = []
+        for lids in storage_groups:
+            pool = layer_pools[lids[0]]
+            tokens_per_block = int(pool.shape[3])
+            num_pages = (future_seq_len + 1 + tokens_per_block - 1) // tokens_per_block
+            device = _FixedUnionWorkspace._canonical_device(pool.device)
+            pool_geometry.append(
+                (
+                    len(lids),
+                    str(device),
+                    str(pool.dtype),
+                    tuple(int(value) for value in pool.shape[1:]),
+                    tuple(int(value) for value in pool.stride()),
+                    num_pages,
+                )
+            )
+        return (
+            "triattention.fixed-prewarm.v1",
+            num_layers,
+            tuple(dense_layers),
+            int(self._H),
+            int(self._F),
+            int(self._offset_max_length),
+            self.score_aggregation,
+            bool(self.normalize_scores),
+            "triton_tri_score_perhead",
+            selection_backend,
+            compaction_backend,
+            getattr(self, "_compact_backend", "torch"),
+            future_seq_len,
+            prompt_len,
+            self.top_B,
+            len(dense_layers) * int(self._H),
+            decode_width,
+            tuple(pool_geometry),
+        )
+
+    def _fixed_union_live_geometry(
+        self,
+        num_layers: int,
+    ) -> Tuple[List[torch.Tensor], List[int], List[List[int]]]:
+        """Read live pool metadata without exposing its storage to prewarm kernels."""
+        get_buffers = getattr(self.kv_cache_manager, "get_buffers", None)
+        if get_buffers is None:
+            raise RuntimeError("TriAttention requires KVCacheManagerV2.get_buffers()")
+        global_layers = self._local_to_global_layers(num_layers)
+        layer_pools = [get_buffers(layer, kv_layout="HND") for layer in global_layers]
+        if any(pool is None for pool in layer_pools):
+            raise RuntimeError("TriAttention fixed prewarm could not resolve every KV pool")
+        dense_layers = self._dense_layers(num_layers)
+        if not dense_layers:
+            raise ValueError("TriAttention requires at least one full-attention layer")
+        groups = {}
+        for layer in dense_layers:
+            pointer = layer_pools[layer].untyped_storage().data_ptr()
+            groups.setdefault(pointer, []).append(layer)
+        return layer_pools, dense_layers, list(groups.values())
+
+    def _local_score_calibration(
+        self,
+        num_layers: int,
+        global_layers: List[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return calibration tensors indexed in this PP rank's local layer order."""
+        if global_layers and max(global_layers) >= self._triattn_q_real.shape[0]:
+            raise ValueError(
+                f"TriAttention calibration has {self._triattn_q_real.shape[0]} layers, "
+                f"but this PP rank references global layer {max(global_layers)}"
+            )
+        if global_layers == list(range(global_layers[0], global_layers[0] + num_layers)):
+            layer_slice = slice(global_layers[0], global_layers[0] + num_layers)
+            return (
+                self._triattn_q_real[layer_slice],
+                self._triattn_q_imag[layer_slice],
+                self._triattn_mlr_coef[layer_slice],
+            )
+        layer_ids = torch.as_tensor(
+            global_layers,
+            device=self._triattn_q_real.device,
+            dtype=torch.long,
+        )
+        return (
+            self._triattn_q_real.index_select(0, layer_ids),
+            self._triattn_q_imag.index_select(0, layer_ids),
+            self._triattn_mlr_coef.index_select(0, layer_ids),
+        )
+
+    @staticmethod
+    def _parse_fixed_prewarm_shapes(raw_shapes: str) -> List[Tuple[int, int]]:
+        """Parse comma-separated ``prompt_len:decode_width`` exact buckets."""
+        shapes = []
+        for raw_shape in raw_shapes.split(","):
+            raw_shape = raw_shape.strip()
+            if not raw_shape:
+                continue
+            fields = raw_shape.split(":")
+            if len(fields) != 2:
+                raise ValueError(
+                    "TRIATTN_FIXED_PREWARM_SHAPES entries must use prompt_len:decode_width"
+                )
+            try:
+                prompt_len, decode_width = (int(field) for field in fields)
+            except ValueError as exc:
+                raise ValueError(
+                    "TRIATTN_FIXED_PREWARM_SHAPES entries must contain integers"
+                ) from exc
+            if prompt_len < 0 or decode_width <= 0:
+                raise ValueError(
+                    "TRIATTN_FIXED_PREWARM_SHAPES requires prompt_len >= 0 and decode_width > 0"
+                )
+            shapes.append((prompt_len, decode_width))
+        return list(dict.fromkeys(shapes))
+
+    def prewarm(self) -> None:
+        """Warm explicitly configured fixed-buffer buckets before graph capture.
+
+        Startup has no real request from which to infer prompt length or the
+        overlap-sensitive first eviction width. Exact buckets are therefore an
+        explicit provenance input. The primary B=beta=4096 benchmark uses the
+        measured ``1024:8192`` bucket; other workloads must supply their own
+        observed prompt length and decode width rather than infer one from beta.
+        """
+        if not getattr(self, "_fixed_union_prewarm_enabled", False):
+            return
+        raw_shapes = os.environ.get("TRIATTN_FIXED_PREWARM_SHAPES", "")
+        try:
+            shapes = self._parse_fixed_prewarm_shapes(raw_shapes)
+        except ValueError as exc:
+            logger.warning(f"TriAttention fixed-buffer prewarm is disabled: {exc}")
+            return
+        if not shapes:
+            logger.warning(
+                "TriAttention fixed-buffer prewarm is enabled but "
+                "TRIATTN_FIXED_PREWARM_SHAPES is empty; using the runtime path without prewarm"
+            )
+            return
+        if self.eviction_mode != "union":
+            return
+        try:
+            self._validate_v2_compatibility()
+            self._ensure_calibrated()
+            num_layers = self._num_layers_from_manager()
+            if num_layers is None:
+                raise RuntimeError("TriAttention could not resolve the local layer count")
+            layer_pools, dense_layers, storage_groups = self._fixed_union_live_geometry(num_layers)
+        except Exception as exc:
+            # This is an optional startup optimization. Backend/JIT exception
+            # classes vary across Torch and Triton versions, so fail closed at
+            # this boundary and leave runtime on the established fixed path.
+            logger.warning(
+                f"TriAttention prewarm failed; using the established runtime path: {exc}"
+            )
+            return
+        for prompt_len, decode_width in shapes:
+            try:
+                self._prewarm_fixed_union_bucket(
+                    layer_pools,
+                    dense_layers,
+                    storage_groups,
+                    num_layers,
+                    prompt_len,
+                    decode_width,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "TriAttention prewarm bucket "
+                    f"{prompt_len}:{decode_width} failed; using the established runtime path: {exc}"
+                )
+
+    def _prewarm_fixed_union_bucket(
+        self,
+        layer_pools: List[torch.Tensor],
+        dense_layers: List[int],
+        storage_groups: List[List[int]],
+        num_layers: int,
+        prompt_len: int,
+        decode_width: int,
+    ) -> None:
+        """Warm one exact score/select/compact bucket using private dummy KV."""
+        if decode_width <= self.top_B:
+            logger.warning(
+                "TriAttention prewarm bucket has no eviction work "
+                f"({prompt_len}:{decode_width}); skipping prewarm"
+            )
+            return
+        use_fixed_workspace = self.top_B > self._INDEXER_TOPK_MAX_K
+        use_eager_torch_topk = decode_width >= 2 * self._INDEXER_TOPK_SUBBLOCK
+        if not use_fixed_workspace and not use_eager_torch_topk:
+            logger.warning(
+                "TriAttention prewarm bucket does not use a torch-topk route "
+                f"({prompt_len}:{decode_width}); skipping prewarm"
+            )
+            return
+        seq_len = prompt_len + decode_width
+        first_pool = layer_pools[dense_layers[0]]
+        rows = len(dense_layers) * int(self._H)
+        key = self._fixed_union_prewarm_key(
+            layer_pools,
+            dense_layers,
+            storage_groups,
+            num_layers,
+            seq_len,
+            prompt_len,
+        )
+        states = self._fixed_union_prewarm_states
+        if states.get(key) in ("running", "ready", "failed"):
+            return
+        states[key] = "running"
+        workspace = None
+        try:
+            with nvtx_range("triattention.prewarm", color="green"):
+                if use_fixed_workspace:
+                    workspace = _FixedUnionWorkspace(
+                        rows,
+                        decode_width,
+                        self.top_B,
+                        prompt_len,
+                        dtype=torch.float32,
+                        device=first_pool.device,
+                    )
+                    workspace.prewarm_attempted = True
+                dummy_pools: List[Optional[torch.Tensor]] = [None] * num_layers
+                group_inputs = []
+                for lids in storage_groups:
+                    live_pool = layer_pools[lids[0]]
+                    tokens_per_block = int(live_pool.shape[3])
+                    num_pages = (seq_len + 1 + tokens_per_block - 1) // tokens_per_block
+                    dummy_pool = self._dummy_pool_like(live_pool, num_pages, zero=True)
+                    for layer in lids:
+                        # Aliasing only occurs among private dummy layer views.
+                        # The exact strides and launch geometry match production.
+                        dummy_pools[layer] = dummy_pool
+                    page_ids = torch.arange(
+                        num_pages,
+                        dtype=torch.int64,
+                        device=dummy_pool.device,
+                    )
+                    group_inputs.append((lids, dummy_pool, page_ids))
+
+                device = first_pool.device
+                if self._offsets is None:
+                    self._offsets = _build_geometric_offsets(self._offset_max_length, device)
+                global_layers = self._local_to_global_layers(num_layers)
+                q_real, q_imag, mlr_coef = self._local_score_calibration(
+                    num_layers,
+                    global_layers,
+                )
+                from .triattention_kernels import triton_tri_score_perhead
+
+                scores_by_layer = {}
+                with nvtx_range("triattention.prewarm.score", color="blue"):
+                    for lids, _, page_ids in group_inputs:
+                        per_head, _, _ = triton_tri_score_perhead(
+                            dummy_pools,
+                            [page_ids],
+                            [seq_len],
+                            [float(seq_len)],
+                            q_real,
+                            q_imag,
+                            mlr_coef,
+                            self._freq_scale_sq,
+                            self.calibration["omega"],
+                            self._offsets,
+                            self._H,
+                            score_aggregation=self.score_aggregation,
+                            layer_indices=lids,
+                        )
+                        for slot, layer in enumerate(lids):
+                            scores_by_layer[layer] = per_head.narrow(
+                                1,
+                                slot * seq_len,
+                                seq_len,
+                            )
+                with nvtx_range("triattention.prewarm.select", color="yellow"):
+                    head_matrix = torch.cat(
+                        [
+                            self._zscore_decode(scores_by_layer[layer][:, prompt_len:seq_len])
+                            for layer in dense_layers
+                        ],
+                        dim=0,
+                    )
+                    if workspace is not None:
+                        keep = workspace.select(head_matrix)
+                    else:
+                        # The width-based torch-topk fallback is an eager route.
+                        # Use alternating monotonic rows so the per-row union
+                        # covers the full decode domain and both top-k stages
+                        # compile for the real width instead of a tie-collapsed
+                        # dummy subset.
+                        token = torch.arange(
+                            decode_width,
+                            dtype=head_matrix.dtype,
+                            device=head_matrix.device,
+                        )
+                        direction = torch.where(
+                            torch.arange(rows, device=head_matrix.device) % 2 == 0,
+                            1.0,
+                            -1.0,
+                        ).to(head_matrix.dtype)
+                        head_matrix.copy_(direction[:, None] * token[None, :])
+                        combined = head_matrix.max(dim=0).values
+                        decode_keep = self._select_union(
+                            head_matrix,
+                            combined,
+                            self.top_B,
+                        )
+                        prompt = torch.arange(
+                            prompt_len,
+                            dtype=torch.long,
+                            device=head_matrix.device,
+                        )
+                        keep = torch.sort(torch.cat([prompt, decode_keep + prompt_len])).values
+                if workspace is None or getattr(self, "_fixed_union_compaction_enabled", False):
+                    with nvtx_range("triattention.prewarm.compact", color="purple"):
+                        if workspace is not None:
+                            for _, dummy_pool, page_ids in group_inputs:
+                                workspace.compact(dummy_pool, page_ids, seq_len)
+                        else:
+                            from .triattention_kernels import triton_tri_compact
+
+                            for _, dummy_pool, page_ids in group_inputs:
+                                triton_tri_compact(
+                                    dummy_pool,
+                                    [page_ids],
+                                    [keep],
+                                    [seq_len],
+                                )
+        except Exception:
+            states[key] = "failed"
+            if workspace is not None:
+                workspace.prewarm_failed = True
+            raise
+        states[key] = "ready"
+        if workspace is not None:
+            workspace.prewarmed = True
+            self._fixed_union_prewarmed_workspaces[key] = workspace
 
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
         """Drop this request's per-request length and eviction state."""
@@ -739,6 +1160,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         seq_len: int,
         precomputed: List["torch.Tensor"],
         use_fixed_union: bool = False,
+        fixed_union_prewarm_key: Optional[tuple] = None,
     ) -> Optional[Union[int, "torch.Tensor"]]:
         """Select and compact from precomputed dense-layer scores.
 
@@ -802,6 +1224,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 decode_budget,
                 torch.cat(union_rows, dim=0),
                 use_fixed_workspace=use_fixed_union,
+                prewarm_key=fixed_union_prewarm_key,
             )
         if self.eviction_mode == "per_head":
             return self._evict_per_head(
@@ -907,6 +1330,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         decode_budget: int,
         head_matrix: "torch.Tensor",
         use_fixed_workspace: bool = False,
+        prewarm_key: Optional[tuple] = None,
     ) -> "torch.Tensor":
         """union: union of every head's top-k, re-ranked by the per-token max
         (upstream ``_select_union_based``). One 1-D keep set shared by every
@@ -920,6 +1344,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 head_matrix,
                 decode_budget,
                 decode_start,
+                prewarm_key=prewarm_key,
             )
         if workspace is not None:
             active = getattr(self, "_fixed_union_active", None)
@@ -938,12 +1363,26 @@ class TriAttention(BaseKVCacheCompressionManager):
         keep = torch.sort(torch.cat([prefill_idx, keep_1d + decode_start])).values
         return keep
 
+    @staticmethod
+    def _fixed_union_workspace_shape_key(
+        rows: int,
+        width: int,
+        keep_count: int,
+        prompt_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple:
+        device = _FixedUnionWorkspace._canonical_device(device)
+        return (rows, width, keep_count, prompt_len, dtype, str(device))
+
     def _get_fixed_union_workspace(
         self,
         request_id: int,
         scores: torch.Tensor,
         keep_count: int,
         prompt_len: int,
+        *,
+        prewarm_key: Optional[tuple] = None,
     ) -> Optional[_FixedUnionWorkspace]:
         """Get a shape bucket when fixed selection preserves the eager contract."""
         if not getattr(self, "_fixed_union_enabled", False) or scores.ndim != 2:
@@ -954,15 +1393,28 @@ class TriAttention(BaseKVCacheCompressionManager):
         uses_torch_topk = keep_count > self._INDEXER_TOPK_MAX_K
         if rows <= 0 or keep_count <= 0 or width <= keep_count or not uses_torch_topk:
             return None
-        key = (
-            request_id,
+        shape_key = self._fixed_union_workspace_shape_key(
             rows,
             width,
             keep_count,
             prompt_len,
             scores.dtype,
-            str(scores.device),
+            scores.device,
         )
+        if getattr(self, "_fixed_union_prewarm_enabled", False) and prewarm_key is not None:
+            states = getattr(self, "_fixed_union_prewarm_states", {})
+            workspace = getattr(self, "_fixed_union_prewarmed_workspaces", {}).get(prewarm_key)
+            if (
+                states.get(prewarm_key) == "ready"
+                and workspace is not None
+                and workspace.prewarmed
+                and workspace._matches_input(scores)
+                and workspace.keep_count == keep_count
+                and workspace.prompt_len == prompt_len
+            ):
+                return workspace
+
+        key = (request_id, *shape_key)
         workspaces = getattr(self, "_fixed_union_workspaces", None)
         if workspaces is None:
             self._fixed_union_workspaces = {}
@@ -1276,112 +1728,104 @@ class TriAttention(BaseKVCacheCompressionManager):
 
         # Resolve request length and page metadata before mutating any layer.
         prepared = []
-        for request, rid in evict_reqs:
-            draft_len = _request_draft_length(request)
-            if draft_len:
-                raise ValueError(
-                    "TriAttention physical eviction does not support speculative "
-                    f"decoding; request {rid} has {draft_len} draft tokens"
-                )
-            seq_len = self._pre_forward_kv_lengths.get(rid)
-            if seq_len is None:
-                raise RuntimeError(f"Missing authoritative pre-forward KV length for request {rid}")
-            # Restore the uncompressed logical position from the authoritative
-            # physical prefix. This is max_beam-1 without overlap and max_beam
-            # for the previous-tensor overlap path, without branching on executor mode.
-            round_start = seq_len + self._evicted.get(rid, 0)
-            if seq_len <= self._minimum_evictable_length(request, seq_len):
-                continue
-            dense_page_ids_by_group = {}
-            for representative in dense_group_representatives:
-                group_page_ids = self._resolve_page_ids(request, representative)
-                if not group_page_ids:
-                    global_layer = global_layers[representative]
-                    raise RuntimeError(
-                        f"Missing KV page ids for attention layer {global_layer} of request {rid}"
+        with nvtx_range("triattention.metadata", color="cyan"):
+            for request, rid in evict_reqs:
+                draft_len = _request_draft_length(request)
+                if draft_len:
+                    raise ValueError(
+                        "TriAttention physical eviction does not support speculative "
+                        f"decoding; request {rid} has {draft_len} draft tokens"
                     )
-                dense_page_ids_by_group[representative] = torch.as_tensor(
-                    group_page_ids,
-                    device=layer_pools[representative].device,
-                    dtype=torch.int64,
-                )
-            expected_keep_count = self._minimum_evictable_length(request, seq_len)
-            swa_source = None
-            swa_destination = None
-            swa_page_ids = {}
-            if swa_layers:
-                assert swa_window is not None
-                swa_source, swa_destination = _build_swa_rebase_copy(
-                    seq_len, expected_keep_count, swa_window, device=device
-                )
-                for layer in swa_layers:
-                    layer_page_ids = self._resolve_page_ids(request, layer)
-                    if not layer_page_ids:
+                seq_len = self._pre_forward_kv_lengths.get(rid)
+                if seq_len is None:
+                    raise RuntimeError(
+                        f"Missing authoritative pre-forward KV length for request {rid}"
+                    )
+                # Restore the uncompressed logical position from the authoritative
+                # physical prefix. This is max_beam-1 without overlap and max_beam
+                # for the previous-tensor overlap path, without branching on executor mode.
+                round_start = seq_len + self._evicted.get(rid, 0)
+                if seq_len <= self._minimum_evictable_length(request, seq_len):
+                    continue
+                dense_page_ids_by_group = {}
+                for representative in dense_group_representatives:
+                    group_page_ids = self._resolve_page_ids(request, representative)
+                    if not group_page_ids:
+                        global_layer = global_layers[representative]
                         raise RuntimeError(
-                            f"Missing KV page ids for kernel-masked SWA layer {layer} "
+                            f"Missing KV page ids for attention layer {global_layer} "
                             f"of request {rid}"
                         )
-                    swa_page_ids[layer] = torch.as_tensor(
-                        layer_page_ids,
-                        device=layer_pools[layer].device,
+                    dense_page_ids_by_group[representative] = torch.as_tensor(
+                        group_page_ids,
+                        device=layer_pools[representative].device,
                         dtype=torch.int64,
                     )
-            prepared.append(
-                {
-                    "request": request,
-                    "request_id": rid,
-                    "dense_page_ids_by_group": dense_page_ids_by_group,
-                    "seq_len": int(seq_len),
-                    "round_start": float(round_start),
-                    "expected_keep_count": expected_keep_count,
-                    "swa_source": swa_source,
-                    "swa_destination": swa_destination,
-                    "swa_page_ids": swa_page_ids,
-                }
-            )
+                expected_keep_count = self._minimum_evictable_length(request, seq_len)
+                swa_source = None
+                swa_destination = None
+                swa_page_ids = {}
+                if swa_layers:
+                    assert swa_window is not None
+                    swa_source, swa_destination = _build_swa_rebase_copy(
+                        seq_len, expected_keep_count, swa_window, device=device
+                    )
+                    for layer in swa_layers:
+                        layer_page_ids = self._resolve_page_ids(request, layer)
+                        if not layer_page_ids:
+                            raise RuntimeError(
+                                f"Missing KV page ids for kernel-masked SWA layer {layer} "
+                                f"of request {rid}"
+                            )
+                        swa_page_ids[layer] = torch.as_tensor(
+                            layer_page_ids,
+                            device=layer_pools[layer].device,
+                            dtype=torch.int64,
+                        )
+                prepared.append(
+                    {
+                        "request": request,
+                        "request_id": rid,
+                        "dense_page_ids_by_group": dense_page_ids_by_group,
+                        "seq_len": int(seq_len),
+                        "round_start": float(round_start),
+                        "expected_keep_count": expected_keep_count,
+                        "swa_source": swa_source,
+                        "swa_destination": swa_destination,
+                        "swa_page_ids": swa_page_ids,
+                    }
+                )
         if not prepared:
             return []
         seq_lens = [item["seq_len"] for item in prepared]
         round_starts = [item["round_start"] for item in prepared]
         if self._offsets is None:
             self._offsets = _build_geometric_offsets(self._offset_max_length, device)
-        if global_layers and max(global_layers) >= self._triattn_q_real.shape[0]:
-            raise ValueError(
-                f"TriAttention calibration has {self._triattn_q_real.shape[0]} layers, "
-                f"but this PP rank references global layer {max(global_layers)}"
-            )
-        if global_layers == list(range(global_layers[0], global_layers[0] + num_layers)):
-            layer_slice = slice(global_layers[0], global_layers[0] + num_layers)
-            q_real = self._triattn_q_real[layer_slice]
-            q_imag = self._triattn_q_imag[layer_slice]
-            mlr_coef = self._triattn_mlr_coef[layer_slice]
-        else:
-            layer_ids = torch.as_tensor(
-                global_layers, device=self._triattn_q_real.device, dtype=torch.long
-            )
-            q_real = self._triattn_q_real.index_select(0, layer_ids)
-            q_imag = self._triattn_q_imag.index_select(0, layer_ids)
-            mlr_coef = self._triattn_mlr_coef.index_select(0, layer_ids)
+        q_real, q_imag, mlr_coef = self._local_score_calibration(
+            num_layers,
+            global_layers,
+        )
         # Score only dense layers, grouped by their backing storage.
         req_layer_scores = [dict() for _ in prepared]  # [req] -> {layer_idx: [H,seq]}
         for lids in storage_groups.values():
             representative = lids[0]
             group_page_ids = [item["dense_page_ids_by_group"][representative] for item in prepared]
-            ph, so, sm = triton_tri_score_perhead(
-                layer_pools,
-                group_page_ids,
-                seq_lens,
-                round_starts,
-                q_real,
-                q_imag,
-                mlr_coef,
-                self._freq_scale_sq,
-                self.calibration["omega"],
-                self._offsets,
-                self._H,
-                score_aggregation=self.score_aggregation,
-                layer_indices=lids,
-            )
+            with nvtx_range("triattention.score", color="blue"):
+                ph, so, sm = triton_tri_score_perhead(
+                    layer_pools,
+                    group_page_ids,
+                    seq_lens,
+                    round_starts,
+                    q_real,
+                    q_imag,
+                    mlr_coef,
+                    self._freq_scale_sq,
+                    self.calibration["omega"],
+                    self._offsets,
+                    self._H,
+                    score_aggregation=self.score_aggregation,
+                    layer_indices=lids,
+                )
             seg_list = flat_perhead_to_list(ph, so)
             for s, meta in enumerate(sm):
                 req_layer_scores[meta.request_index][meta.layer_index] = seg_list[s]
@@ -1405,13 +1849,30 @@ class TriAttention(BaseKVCacheCompressionManager):
             precomputed = [req_layer_scores[r].get(layer) for layer in range(num_layers)]
             if any(precomputed[layer] is None for layer in dense_layers):
                 continue
-            keep_count = self._evict_modes(
-                request,
-                num_layers,
-                seq_len,
-                precomputed=precomputed,
-                use_fixed_union=is_union and len(prepared) == 1,
-            )
+            fixed_union_prewarm_key = None
+            if (
+                is_union
+                and len(prepared) == 1
+                and getattr(self, "_fixed_union_prewarm_enabled", False)
+            ):
+                prompt_len = min(int(getattr(request, "py_prompt_len", 0) or 0), seq_len)
+                fixed_union_prewarm_key = self._fixed_union_prewarm_key(
+                    layer_pools,
+                    dense_layers,
+                    list(storage_groups.values()),
+                    num_layers,
+                    seq_len,
+                    prompt_len,
+                )
+            with nvtx_range("triattention.select", color="yellow"):
+                keep_count = self._evict_modes(
+                    request,
+                    num_layers,
+                    seq_len,
+                    precomputed=precomputed,
+                    use_fixed_union=is_union and len(prepared) == 1,
+                    fixed_union_prewarm_key=fixed_union_prewarm_key,
+                )
             if keep_count is None:
                 continue
             if is_union and isinstance(keep_count, torch.Tensor):
@@ -1461,7 +1922,8 @@ class TriAttention(BaseKVCacheCompressionManager):
 
         if union_by_layer:
             for lid, (pl, kl, sl) in union_by_layer.items():
-                triton_tri_compact(layer_pools[lid], pl, kl, sl)
+                with nvtx_range("triattention.compact", color="purple"):
+                    triton_tri_compact(layer_pools[lid], pl, kl, sl)
         if fixed_union_compaction is not None:
             workspace, item, seq_len = fixed_union_compaction
             for lids in storage_groups.values():
@@ -1470,21 +1932,23 @@ class TriAttention(BaseKVCacheCompressionManager):
                 copied_buffer_keys = set()
                 for lid in lids:
                     buffer_key = workspace._compaction_key(layer_pools[lid], page_ids)
-                    workspace.compact(
-                        layer_pools[lid],
-                        page_ids,
-                        seq_len,
-                        copy_page_ids=buffer_key not in copied_buffer_keys,
-                    )
+                    with nvtx_range("triattention.compact", color="purple"):
+                        workspace.compact(
+                            layer_pools[lid],
+                            page_ids,
+                            seq_len,
+                            copy_page_ids=buffer_key not in copied_buffer_keys,
+                        )
                     copied_buffer_keys.add(buffer_key)
         for lid, (pl, sources, seq_lens, destinations) in swa_by_layer.items():
-            triton_tri_compact(
-                layer_pools[lid],
-                pl,
-                sources,
-                seq_lens,
-                dest_list=destinations,
-            )
+            with nvtx_range("triattention.compact", color="purple"):
+                triton_tri_compact(
+                    layer_pools[lid],
+                    pl,
+                    sources,
+                    seq_lens,
+                    dest_list=destinations,
+                )
 
         capacity_targets = []
         for rid, evicted, keep_count in pending_updates:

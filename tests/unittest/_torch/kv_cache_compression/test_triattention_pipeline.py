@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Unit tests for the TriAttention compression-manager pipeline.
 
 TriAttention is a pure KV-cache compression method on the PR-15106 framework: it
@@ -433,7 +448,10 @@ class TestStepBeginHookRefactor:
         assert mgr._gen_steps[7] == 128
 
     def test_identity_gate_preserves_real_eviction_round(self):
+        import contextlib
         from unittest import mock
+
+        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention as tri_module
 
         mgr, request, batch = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
         timeline = []
@@ -445,9 +463,16 @@ class TestStepBeginHookRefactor:
             timeline.append("compact")
             return [(7, 1024 + 4096 + 1)]
 
+        @contextlib.contextmanager
+        def track_range(name, **kwargs):
+            timeline.append(f"enter:{name}")
+            yield
+            timeline.append(f"exit:{name}")
+
         with (
             mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict,
             mock.patch.object(torch.cuda, "Event", return_value=event),
+            mock.patch.object(tri_module, "nvtx_range", side_effect=track_range),
         ):
             mgr._periodic_evict(batch)
 
@@ -459,7 +484,12 @@ class TestStepBeginHookRefactor:
             1024 + 4096 + 2,
             event,
         )
-        assert timeline == ["compact", "event"]
+        assert timeline == [
+            "compact",
+            "enter:triattention.publish",
+            "event",
+            "exit:triattention.publish",
+        ]
 
     def test_pending_compaction_uses_effective_length_and_defers_eviction(self):
         from unittest import mock
@@ -637,9 +667,11 @@ class TestStepBeginHookRefactor:
             mgr._evict_requests([(request, 7)], num_layers=1)
 
     def test_dense_storage_groups_use_their_own_page_ids(self):
+        import contextlib
         from types import SimpleNamespace
         from unittest import mock
 
+        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention as tri_module
         import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels as kernels
 
         pools = [torch.zeros(2, 2, 1, 8, 2), torch.zeros(2, 2, 1, 8, 2)]
@@ -677,6 +709,11 @@ class TestStepBeginHookRefactor:
             ) as score,
             mock.patch.object(kernels, "flat_perhead_to_list", return_value=[torch.zeros(1, 8)]),
             mock.patch.object(kernels, "triton_tri_compact") as compact,
+            mock.patch.object(
+                tri_module,
+                "nvtx_range",
+                side_effect=lambda *args, **kwargs: contextlib.nullcontext(),
+            ) as nvtx,
         ):
             targets = mgr._evict_requests([(request, 7)], num_layers=2)
 
@@ -693,6 +730,14 @@ class TestStepBeginHookRefactor:
         assert first_compact.args[1][0].tolist() == [10, 11]
         assert second_compact.args[0] is pools[1]
         assert second_compact.args[1][0].tolist() == [20, 21]
+        assert [call.args[0] for call in nvtx.call_args_list] == [
+            "triattention.metadata",
+            "triattention.score",
+            "triattention.score",
+            "triattention.select",
+            "triattention.compact",
+            "triattention.compact",
+        ]
 
 
 class TestTopKRouting:
@@ -758,6 +803,422 @@ class TestFixedUnionWorkspace:
         )
 
         assert workspace._matches_input(scores)
+
+    def test_prewarm_has_distinct_nested_environment_gate(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TRIATTN_FIXED_BUFFER_UNION": "0",
+                "TRIATTN_FIXED_PREWARM": "1",
+            },
+        ):
+            manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
+            assert not manager._fixed_union_prewarm_enabled
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TRIATTN_FIXED_BUFFER_UNION": "1",
+                "TRIATTN_FIXED_PREWARM": "0",
+            },
+        ):
+            manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
+            assert manager._fixed_union_enabled
+            assert not manager._fixed_union_prewarm_enabled
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TRIATTN_FIXED_BUFFER_UNION": "1",
+                "TRIATTN_FIXED_PREWARM": "1",
+            },
+        ):
+            manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
+            assert manager._fixed_union_prewarm_enabled
+
+    def test_prewarm_shape_parser_is_exact_and_fail_closed(self):
+        assert TriAttention._parse_fixed_prewarm_shapes("1024:8192, 0:4097,1024:8192") == [
+            (1024, 8192),
+            (0, 4097),
+        ]
+        assert TriAttention._parse_fixed_prewarm_shapes("") == []
+        with pytest.raises(ValueError, match="prompt_len:decode_width"):
+            TriAttention._parse_fixed_prewarm_shapes("1024")
+        with pytest.raises(ValueError, match="contain integers"):
+            TriAttention._parse_fixed_prewarm_shapes("prompt:4225")
+        with pytest.raises(ValueError, match="prompt_len >= 0"):
+            TriAttention._parse_fixed_prewarm_shapes("-1:4225")
+
+    def test_dummy_pool_preserves_geometry_without_aliasing_live_storage(self):
+        live = torch.arange(3 * 2 * 2 * 4 * 3, dtype=torch.float32).reshape(3, 2, 2, 4, 3)
+        before = live.clone()
+
+        dummy = TriAttention._dummy_pool_like(live, num_pages=2, zero=True)
+
+        assert dummy.shape == (2, 2, 2, 4, 3)
+        assert dummy.stride() == live.stride()
+        assert dummy.dtype == live.dtype
+        assert dummy.device == live.device
+        assert dummy.untyped_storage().data_ptr() != live.untyped_storage().data_ptr()
+        assert torch.equal(live, before)
+        assert torch.count_nonzero(dummy) == 0
+
+    def test_prewarm_key_uses_geometry_not_storage_pointer(self):
+        manager, pools = self._make_mocked_prewarm_manager()
+        clone_storage = torch.empty(64, dtype=pools[0].dtype)
+        clone_pools = [
+            clone_storage.as_strided(pools[0].shape, pools[0].stride(), storage_offset=0),
+            clone_storage.as_strided(pools[1].shape, pools[1].stride(), storage_offset=32),
+        ]
+
+        first = manager._fixed_union_prewarm_key(
+            pools,
+            [0, 1],
+            [[0, 1]],
+            num_layers=2,
+            future_seq_len=7,
+            prompt_len=2,
+        )
+        second = manager._fixed_union_prewarm_key(
+            clone_pools,
+            [0, 1],
+            [[0, 1]],
+            num_layers=2,
+            future_seq_len=7,
+            prompt_len=2,
+        )
+
+        assert first == second
+
+    @staticmethod
+    def _make_mocked_prewarm_manager():
+        from types import SimpleNamespace
+
+        shape = (2, 2, 1, 4, 2)
+        stride = (16, 8, 8, 2, 1)
+        storage = torch.arange(64, dtype=torch.float32)
+        pools = [
+            storage.as_strided(shape, stride, storage_offset=0),
+            storage.as_strided(shape, stride, storage_offset=32),
+        ]
+        manager = TriAttention.__new__(TriAttention)
+        manager.kv_cache_manager = SimpleNamespace(get_buffers=lambda layer, **kwargs: pools[layer])
+        manager.top_B = 4
+        manager._INDEXER_TOPK_MAX_K = 2
+        manager._H = 2
+        manager._F = 1
+        manager._offset_max_length = 1
+        manager._offsets = torch.ones(1)
+        manager._triattn_q_real = torch.ones(2, 2, 1)
+        manager._triattn_q_imag = torch.ones(2, 2, 1)
+        manager._triattn_mlr_coef = torch.ones(2, 2, 1)
+        manager._freq_scale_sq = torch.ones(1)
+        manager.calibration = {"omega": torch.ones(1)}
+        manager.score_aggregation = "mean"
+        manager.normalize_scores = True
+        manager.eviction_mode = "union"
+        manager.skip_swa = False
+        manager._compact_backend = "torch"
+        manager._fixed_union_compaction_enabled = True
+        manager._fixed_union_prewarm_enabled = True
+        manager._fixed_union_prewarm_states = {}
+        manager._fixed_union_prewarmed_workspaces = {}
+        manager._fixed_union_enabled = True
+        manager._fixed_union_workspaces = {}
+        manager._fixed_union_active = {}
+        manager._gen_steps = {}
+        manager._evicted = {}
+        manager._pre_forward_kv_lengths = {}
+        manager._capacity_only_request_ids = set()
+        manager._local_to_global_layers_cache = [0, 1]
+        manager._attention_layer_partition_cache = ([0, 1], [], None)
+        return manager, pools
+
+    def test_startup_prewarm_uses_dummy_score_select_and_compact_once(self):
+        import contextlib
+        from unittest import mock
+
+        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention as tri_module
+        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels as kernels
+
+        manager, pools = self._make_mocked_prewarm_manager()
+        live_before = [pool.clone() for pool in pools]
+        layer_pools, dense_layers, storage_groups = manager._fixed_union_live_geometry(2)
+        seen_dummy_pools = []
+        seen_page_ids = []
+        request_state_before = (
+            manager._gen_steps.copy(),
+            manager._evicted.copy(),
+            manager._pre_forward_kv_lengths.copy(),
+            manager._capacity_only_request_ids.copy(),
+        )
+
+        def fake_score(dummy_pools, page_ids_list, seq_lens, *args, **kwargs):
+            assert seq_lens == [7]
+            assert kwargs["layer_indices"] == [0, 1]
+            dummy_pool = dummy_pools[0]
+            assert dummy_pools[1] is dummy_pool
+            assert dummy_pool.shape == (2, 2, 1, 4, 2)
+            assert dummy_pool.stride() == pools[0].stride()
+            assert dummy_pool.untyped_storage().data_ptr() != pools[0].untyped_storage().data_ptr()
+            seen_dummy_pools.append(dummy_pool)
+            seen_page_ids.append(page_ids_list[0].clone())
+            values = torch.arange(2 * 2 * 7, dtype=torch.float32).reshape(2, 2 * 7)
+            return values, torch.tensor([0, 7, 14], dtype=torch.int32), []
+
+        def fake_compact(workspace, dummy_pool, page_ids, seq_len, **kwargs):
+            assert seq_len == 7
+            assert dummy_pool is seen_dummy_pools[0]
+            assert dummy_pool.untyped_storage().data_ptr() != pools[0].untyped_storage().data_ptr()
+            assert page_ids.tolist() == [0, 1]
+
+        with (
+            mock.patch.object(kernels, "triton_tri_score_perhead", side_effect=fake_score) as score,
+            mock.patch.object(
+                _FixedUnionWorkspace, "compact", autospec=True, side_effect=fake_compact
+            ) as compact,
+            mock.patch.object(
+                tri_module,
+                "nvtx_range",
+                return_value=contextlib.nullcontext(),
+            ) as nvtx,
+            mock.patch.object(torch, "topk", wraps=torch.topk) as topk,
+            mock.patch.object(torch.cuda, "Event") as event,
+            mock.patch.object(torch.cuda, "synchronize") as synchronize,
+        ):
+            manager._prewarm_fixed_union_bucket(
+                layer_pools,
+                dense_layers,
+                storage_groups,
+                num_layers=2,
+                prompt_len=2,
+                decode_width=5,
+            )
+            manager._prewarm_fixed_union_bucket(
+                layer_pools,
+                dense_layers,
+                storage_groups,
+                num_layers=2,
+                prompt_len=2,
+                decode_width=5,
+            )
+
+        score.assert_called_once()
+        compact.assert_called_once()
+        assert [call.args[0] for call in nvtx.call_args_list] == [
+            "triattention.prewarm",
+            "triattention.prewarm.score",
+            "triattention.prewarm.select",
+            "triattention.prewarm.compact",
+        ]
+        assert topk.call_count == 2
+        event.assert_not_called()
+        synchronize.assert_not_called()
+        assert seen_page_ids[0].tolist() == [0, 1]
+        assert list(manager._fixed_union_prewarm_states.values()) == ["ready"]
+        assert len(manager._fixed_union_prewarmed_workspaces) == 1
+        prewarm_key = next(iter(manager._fixed_union_prewarm_states))
+        runtime_scores = torch.zeros((4, 5), dtype=torch.float32)
+        workspace = manager._get_fixed_union_workspace(
+            99,
+            runtime_scores,
+            4,
+            2,
+            prewarm_key=prewarm_key,
+        )
+        assert workspace is next(iter(manager._fixed_union_prewarmed_workspaces.values()))
+        assert workspace.prewarmed
+        mismatched_key = (*prewarm_key[:-1], ("different-pool-geometry",))
+        fallback = manager._get_fixed_union_workspace(
+            100,
+            runtime_scores,
+            4,
+            2,
+            prewarm_key=mismatched_key,
+        )
+        assert fallback is not workspace
+        assert not fallback.prewarmed
+        assert request_state_before == (
+            manager._gen_steps,
+            manager._evicted,
+            manager._pre_forward_kv_lengths,
+            manager._capacity_only_request_ids,
+        )
+        for pool, before in zip(pools, live_before):
+            assert torch.equal(pool, before)
+
+    def test_prewarm_failure_marks_bucket_and_runtime_falls_back(self):
+        from unittest import mock
+
+        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels as kernels
+
+        manager, pools = self._make_mocked_prewarm_manager()
+        live_before = [pool.clone() for pool in pools]
+        request_state_before = (
+            manager._gen_steps.copy(),
+            manager._evicted.copy(),
+            manager._pre_forward_kv_lengths.copy(),
+            manager._capacity_only_request_ids.copy(),
+        )
+        layer_pools, dense_layers, storage_groups = manager._fixed_union_live_geometry(2)
+        with mock.patch.object(
+            kernels,
+            "triton_tri_score_perhead",
+            side_effect=RuntimeError("compile failed"),
+        ):
+            with pytest.raises(RuntimeError, match="compile failed"):
+                manager._prewarm_fixed_union_bucket(
+                    layer_pools,
+                    dense_layers,
+                    storage_groups,
+                    num_layers=2,
+                    prompt_len=2,
+                    decode_width=5,
+                )
+
+        assert list(manager._fixed_union_prewarm_states.values()) == ["failed"]
+        assert not manager._fixed_union_prewarmed_workspaces
+        fallback = manager._get_fixed_union_workspace(
+            99,
+            torch.zeros((4, 5), dtype=torch.float32),
+            4,
+            2,
+        )
+        assert fallback is not None
+        assert not fallback.prewarmed
+        assert request_state_before == (
+            manager._gen_steps,
+            manager._evicted,
+            manager._pre_forward_kv_lengths,
+            manager._capacity_only_request_ids,
+        )
+        for pool, before in zip(pools, live_before):
+            assert torch.equal(pool, before)
+
+    def test_width_fallback_prewarm_keeps_runtime_on_eager_route(self):
+        import contextlib
+        from unittest import mock
+
+        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention as tri_module
+        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels as kernels
+
+        manager, pools = self._make_mocked_prewarm_manager()
+        manager.top_B = 2
+        manager._INDEXER_TOPK_MAX_K = 2
+        manager._INDEXER_TOPK_SUBBLOCK = 2
+        live_before = [pool.clone() for pool in pools]
+        layer_pools, dense_layers, storage_groups = manager._fixed_union_live_geometry(2)
+
+        def fake_score(*args, **kwargs):
+            values = torch.arange(2 * 2 * 6, dtype=torch.float32).reshape(2, 2 * 6)
+            return values, torch.tensor([0, 6, 12], dtype=torch.int32), []
+
+        with (
+            mock.patch.object(kernels, "triton_tri_score_perhead", side_effect=fake_score),
+            mock.patch.object(kernels, "triton_tri_compact") as compact,
+            mock.patch.object(
+                tri_module,
+                "nvtx_range",
+                side_effect=lambda *args, **kwargs: contextlib.nullcontext(),
+            ) as nvtx,
+            mock.patch.object(torch, "topk", wraps=torch.topk) as topk,
+        ):
+            manager._prewarm_fixed_union_bucket(
+                layer_pools,
+                dense_layers,
+                storage_groups,
+                num_layers=2,
+                prompt_len=2,
+                decode_width=4,
+            )
+
+        assert [call.args[0] for call in nvtx.call_args_list] == [
+            "triattention.prewarm",
+            "triattention.prewarm.score",
+            "triattention.prewarm.select",
+            "triattention.prewarm.compact",
+        ]
+        assert topk.call_count == 2
+        compact.assert_called_once()
+        assert compact.call_args.args[2][0].tolist() == [0, 1, 4, 5]
+        assert compact.call_args.args[3] == [6]
+        assert list(manager._fixed_union_prewarm_states.values()) == ["ready"]
+        assert not manager._fixed_union_prewarmed_workspaces
+        assert (
+            manager._get_fixed_union_workspace(
+                99,
+                torch.zeros((4, 4), dtype=torch.float32),
+                2,
+                2,
+            )
+            is None
+        )
+        for pool, before in zip(pools, live_before):
+            assert torch.equal(pool, before)
+
+    def test_workspace_allocation_failure_marks_bucket_failed(self):
+        from unittest import mock
+
+        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention as tri_module
+
+        manager, pools = self._make_mocked_prewarm_manager()
+        live_before = [pool.clone() for pool in pools]
+        request_state_before = (
+            manager._gen_steps.copy(),
+            manager._evicted.copy(),
+            manager._pre_forward_kv_lengths.copy(),
+            manager._capacity_only_request_ids.copy(),
+        )
+        layer_pools, dense_layers, storage_groups = manager._fixed_union_live_geometry(2)
+
+        with mock.patch.object(
+            tri_module,
+            "_FixedUnionWorkspace",
+            side_effect=MemoryError("workspace OOM"),
+        ):
+            with pytest.raises(MemoryError, match="workspace OOM"):
+                manager._prewarm_fixed_union_bucket(
+                    layer_pools,
+                    dense_layers,
+                    storage_groups,
+                    num_layers=2,
+                    prompt_len=2,
+                    decode_width=5,
+                )
+
+        assert list(manager._fixed_union_prewarm_states.values()) == ["failed"]
+        assert not manager._fixed_union_prewarmed_workspaces
+        assert request_state_before == (
+            manager._gen_steps,
+            manager._evicted,
+            manager._pre_forward_kv_lengths,
+            manager._capacity_only_request_ids,
+        )
+        for pool, before in zip(pools, live_before):
+            assert torch.equal(pool, before)
+
+    def test_missing_or_mismatched_prewarm_bucket_preserves_fixed_fallback(self):
+        manager, _ = self._make_mocked_prewarm_manager()
+
+        missing = manager._get_fixed_union_workspace(
+            11,
+            torch.zeros((4, 5), dtype=torch.float32),
+            4,
+            2,
+        )
+        mismatched = manager._get_fixed_union_workspace(
+            12,
+            torch.zeros((4, 6), dtype=torch.float32),
+            4,
+            2,
+        )
+
+        assert missing is not None and not missing.prewarmed
+        assert mismatched is not None and not mismatched.prewarmed
+        assert missing is not mismatched
 
     def test_finite_distinct_matches_eager_and_reuses_buffers(self):
         rows = 3

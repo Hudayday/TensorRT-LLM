@@ -2286,10 +2286,11 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
     base implementations below translate those callbacks into the lifecycle
     hooks.
 
-    Concrete compression methods subclass this directly. All 4 hooks default to
-    no-op; subclasses override what they need. The manager never inherits from
-    any cache manager because this layer decides *how* the physical KV is used,
-    not *what* physical KV exists. Subclasses hold ``KVCacheManagerV2`` as a tool.
+    Concrete compression methods subclass this directly. The startup callback,
+    request-lifecycle hooks, and metadata adjustment below all default to no-op;
+    subclasses override what they need. The manager never inherits from any
+    cache manager because this layer decides *how* the physical KV is used, not
+    *what* physical KV exists. Subclasses hold ``KVCacheManagerV2`` as a tool.
     """
 
     def __init__(self, kv_cache_manager: "KVCacheManagerV2"):
@@ -2303,7 +2304,19 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
                 f"KvCacheConfig.enable_block_reuse to False.")
 
     # ================================================================== #
-    # KV-cache lifecycle hooks (4, in temporal order).                   #
+    # Optional startup callback. This is not a request-lifecycle hook.    #
+    # ================================================================== #
+
+    def prewarm(self) -> None:
+        """Optional startup warmup after autotuning and before graph capture.
+
+        Compression methods may override this to compile or allocate private
+        fixed-shape workspaces. Implementations must not create requests or
+        mutate live KV-cache state.
+        """
+
+    # ================================================================== #
+    # KV-cache request-lifecycle hooks (5, in temporal order).           #
     # Subclasses override what they need; all default to no-op.          #
     # ================================================================== #
 
