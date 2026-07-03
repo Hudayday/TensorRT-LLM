@@ -727,6 +727,38 @@ class TestFixedUnionWorkspace:
         selected = torch.topk(subset, keep_count, sorted=False).indices
         return union_indices.index_select(0, torch.sort(selected).values)
 
+    def test_gptoss_bucket_canonicalizes_unindexed_cuda_device(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        meta_scores = torch.empty((12 * 64, 4225), dtype=torch.float32, device="meta")
+        meta_workspace = _FixedUnionWorkspace(
+            12 * 64,
+            4225,
+            4096,
+            1024,
+            dtype=meta_scores.dtype,
+            device=meta_scores.device,
+        )
+        assert meta_workspace.select(meta_scores).shape == (1024 + 4096,)
+
+        with mock.patch.object(torch.cuda, "current_device", return_value=0) as current_device:
+            device = _FixedUnionWorkspace._canonical_device(torch.device("cuda"))
+        current_device.assert_called_once_with()
+
+        workspace = _FixedUnionWorkspace.__new__(_FixedUnionWorkspace)
+        workspace.rows = 12 * 64
+        workspace.width = 4225
+        workspace.dtype = torch.float32
+        workspace.device = device
+        scores = SimpleNamespace(
+            shape=(12 * 64, 4225),
+            dtype=torch.float32,
+            device=torch.device("cuda:0"),
+        )
+
+        assert workspace._matches_input(scores)
+
     def test_finite_distinct_matches_eager_and_reuses_buffers(self):
         rows = 3
         width = 257

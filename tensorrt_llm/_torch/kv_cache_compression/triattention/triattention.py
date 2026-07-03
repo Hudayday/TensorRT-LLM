@@ -137,6 +137,20 @@ class _FixedUnionWorkspace:
     tie contract. Non-finite scores remain unsupported.
     """
 
+    @staticmethod
+    def _canonical_device(device: torch.device) -> torch.device:
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            return torch.device("cuda", torch.cuda.current_device())
+        return device
+
+    def _matches_input(self, per_head_scores: torch.Tensor) -> bool:
+        return (
+            tuple(per_head_scores.shape) == (self.rows, self.width)
+            and per_head_scores.dtype == self.dtype
+            and per_head_scores.device == self.device
+        )
+
     def __init__(
         self,
         rows: int,
@@ -155,6 +169,7 @@ class _FixedUnionWorkspace:
         self.prompt_len = prompt_len
         self.total_keep = prompt_len + keep_count
         self.dtype = dtype
+        device = self._canonical_device(device)
         self.device = device
 
         self.combined = torch.empty(width, dtype=dtype, device=device)
@@ -174,11 +189,7 @@ class _FixedUnionWorkspace:
 
     def select(self, per_head_scores: torch.Tensor) -> torch.Tensor:
         """Return a persistent sorted keep tensor without dynamic output shapes."""
-        if (
-            tuple(per_head_scores.shape) != (self.rows, self.width)
-            or per_head_scores.dtype != self.dtype
-            or per_head_scores.device != self.device
-        ):
+        if not self._matches_input(per_head_scores):
             raise ValueError("fixed union input no longer matches its workspace bucket")
 
         torch.max(
