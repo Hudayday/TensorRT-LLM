@@ -811,6 +811,702 @@ class TestTopKRouting:
         assert result.dtype == torch.long
 
 
+def _torch_tri_score_oracle(
+    layer_pools,
+    page_ids,
+    seq_lens,
+    round_starts,
+    q_real,
+    q_imag,
+    mlr_coef,
+    freq_scale_sq,
+    omega,
+    offsets,
+    layer_indices,
+    aggregation,
+):
+    """Independent Torch implementation of the paged TriAttention score."""
+    scores = []
+    num_q_heads = int(q_real.shape[1])
+    for request, seq_len in enumerate(seq_lens):
+        phase = (round_starts[request] + offsets[:, None]) * omega[None, :]
+        mean_cos = torch.cos(phase).mean(dim=0)
+        mean_sin = torch.sin(phase).mean(dim=0)
+        for layer in layer_indices:
+            pool = layer_pools[layer]
+            request_page_ids = (
+                page_ids[layer][request] if isinstance(page_ids, dict) else page_ids[request]
+            )
+            keys = (
+                pool.index_select(0, request_page_ids)[:, 0]
+                .permute(1, 0, 2, 3)
+                .reshape(pool.shape[2], -1, pool.shape[4])[:, :seq_len]
+                .float()
+            )
+            num_kv_heads = int(keys.shape[0])
+            group_size = num_q_heads // num_kv_heads
+            head_scores = []
+            for head in range(num_q_heads):
+                key = keys[head // group_size]
+                num_freqs = int(key.shape[-1]) // 2
+                key_real = key[:, :num_freqs]
+                key_imag = key[:, num_freqs:]
+                product_real = q_real[layer, head] * key_real + q_imag[layer, head] * key_imag
+                product_imag = q_imag[layer, head] * key_real - q_real[layer, head] * key_imag
+                if aggregation == "mean":
+                    position = (
+                        freq_scale_sq * (product_real * mean_cos - product_imag * mean_sin)
+                    ).sum(dim=-1)
+                else:
+                    position = (
+                        (
+                            freq_scale_sq[None, None, :]
+                            * (
+                                product_real[None] * torch.cos(phase)[:, None, :]
+                                - product_imag[None] * torch.sin(phase)[:, None, :]
+                            )
+                        )
+                        .sum(dim=-1)
+                        .max(dim=0)
+                        .values
+                    )
+                mlr = (
+                    torch.sqrt(key_real.square() + key_imag.square())
+                    * mlr_coef[layer, head]
+                    * freq_scale_sq
+                ).sum(dim=-1)
+                head_scores.append(position + mlr)
+            scores.append(torch.stack(head_scores))
+    return scores
+
+
+def _logical_kv(pool, page_ids, seq_len):
+    return (
+        pool.index_select(0, page_ids)
+        .permute(1, 2, 0, 3, 4)
+        .reshape(pool.shape[1], pool.shape[2], -1, pool.shape[4])[:, :, :seq_len]
+    )
+
+
+def _torch_union_keep(head_scores, prompt_len, budget):
+    decode = head_scores[:, prompt_len:]
+    decode = (decode - decode.mean(dim=1, keepdim=True)) / decode.std(
+        dim=1, unbiased=False, keepdim=True
+    ).clamp_min(1e-6)
+    combined = decode.max(dim=0).values
+    row_top = torch.topk(decode, budget, dim=1, sorted=False).indices
+    union = torch.unique(row_top, sorted=True)
+    assert union.numel() >= budget
+    selected = union.index_select(
+        0,
+        torch.topk(combined.index_select(0, union), budget, sorted=False).indices,
+    )
+    prompt = torch.arange(prompt_len, dtype=torch.long, device=head_scores.device)
+    return torch.sort(torch.cat([prompt, selected + prompt_len])).values
+
+
+class TestFixedScoreMetadata:
+    def test_stage2_gate_requires_stage1_prewarm(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TRIATTN_FIXED_BUFFER_UNION": "1",
+                "TRIATTN_FIXED_PREWARM": "0",
+                "TRIATTN_FIXED_SCORE_METADATA": "1",
+            },
+        ):
+            manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
+            assert not manager._fixed_score_metadata_enabled
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TRIATTN_FIXED_BUFFER_UNION": "1",
+                "TRIATTN_FIXED_PREWARM": "1",
+                "TRIATTN_FIXED_SCORE_METADATA": "1",
+            },
+        ):
+            manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
+            assert manager._fixed_score_metadata_enabled
+
+    @pytest.mark.parametrize("request_count", [1, 7, 8])
+    def test_ready_workspace_requires_uniform_exact_runtime_geometry(self, request_count):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        manager = TriAttention.__new__(TriAttention)
+        manager._fixed_score_metadata_enabled = True
+        manager._fixed_union_prewarm_key = mock.Mock(return_value=("bucket",))
+        workspace = SimpleNamespace(
+            max_requests=8,
+            matches=mock.Mock(return_value=True),
+            prewarm_key=("bucket",),
+        )
+        manager._fixed_score_workspaces = {("bucket",): workspace}
+        manager._fixed_score_prewarm_states = {("bucket",): "ready"}
+        manager._fixed_score_runtime_counts = {}
+        pools = [torch.empty(1), torch.empty(1)]
+        prepared = [
+            {"request": SimpleNamespace(py_prompt_len=2), "seq_len": 8}
+            for _ in range(request_count)
+        ]
+
+        result = manager._fixed_score_workspace_for(pools, [0, 1], [[0], [1]], [], 2, prepared)
+
+        assert result is workspace
+        workspace.matches.assert_called_once_with(pools, [[0], [1]], [0, 1])
+        workspace.matches.return_value = False
+        assert (
+            manager._fixed_score_workspace_for(pools, [0, 1], [[0], [1]], [], 2, prepared) is None
+        )
+        assert manager._fixed_score_runtime_counts[("bucket",)]["fallback"] == 1
+        workspace.matches.return_value = True
+        manager._fixed_score_prewarm_states[("bucket",)] = "failed"
+        assert (
+            manager._fixed_score_workspace_for(pools, [0, 1], [[0], [1]], [], 2, prepared) is None
+        )
+        assert manager._fixed_score_runtime_counts[("bucket",)]["fallback"] == 2
+
+    def test_busy_pinned_staging_falls_back_without_querying_page_tables(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            _FixedScoreMetadataWorkspace,
+        )
+
+        workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
+        workspace.device = torch.device("cuda")
+        workspace.max_requests = 8
+        stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=4)
+        workspace.stream = stream
+        workspace.copy_pending = True
+        workspace.copy_done = SimpleNamespace(query=mock.Mock(return_value=False))
+        get_batch = mock.Mock(side_effect=AssertionError("busy workspace queried V2"))
+
+        with mock.patch.object(torch.cuda, "current_stream", return_value=stream):
+            assert not workspace.stage(get_batch, [1], [8.0])
+        workspace.copy_done.query.assert_called_once_with()
+        get_batch.assert_not_called()
+
+    def test_cross_stream_staging_is_rejected_before_page_table_query(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            _FixedScoreMetadataWorkspace,
+            _FixedScoreStreamMismatch,
+        )
+
+        workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
+        workspace.device = torch.device("cuda")
+        workspace.max_requests = 8
+        workspace.stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=4)
+        workspace.copy_pending = False
+        workspace.copy_done = SimpleNamespace(query=mock.Mock())
+        get_batch = mock.Mock(side_effect=AssertionError("cross-stream workspace queried V2"))
+
+        other_stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=5)
+        with mock.patch.object(torch.cuda, "current_stream", return_value=other_stream):
+            with pytest.raises(_FixedScoreStreamMismatch, match="first CUDA stream"):
+                workspace.stage(get_batch, [1], [8.0])
+        workspace.copy_done.query.assert_not_called()
+        get_batch.assert_not_called()
+
+    def test_attach_page_ids_does_not_swallow_cross_stream_rejection(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            _FixedScoreStreamMismatch,
+        )
+
+        manager = TriAttention.__new__(TriAttention)
+        get_batch = mock.Mock()
+        manager.kv_cache_manager = SimpleNamespace(get_batch_cache_indices=get_batch)
+        manager._fixed_score_runtime_counts = {}
+        manager._resolve_page_ids = mock.Mock(side_effect=AssertionError("eager fallback used"))
+        workspace = SimpleNamespace(
+            prewarm_key=("bucket",),
+            stage=mock.Mock(
+                side_effect=_FixedScoreStreamMismatch(
+                    "TriAttention fixed score metadata is bound to its first CUDA stream"
+                )
+            ),
+        )
+        prepared = [
+            {
+                "request": SimpleNamespace(),
+                "request_id": 7,
+                "round_start": 8.0,
+            }
+        ]
+
+        with pytest.raises(_FixedScoreStreamMismatch, match="first CUDA stream"):
+            manager._attach_page_ids(
+                prepared,
+                dense_representatives=[0],
+                swa_layers=[],
+                layer_pools=[torch.empty(1)],
+                global_layers=[0],
+                workspace=workspace,
+            )
+        workspace.stage.assert_called_once_with(get_batch, [7], [8.0])
+        manager._resolve_page_ids.assert_not_called()
+        assert manager._fixed_score_runtime_counts[("bucket",)]["rejected"] == 1
+
+    def test_first_runtime_stream_is_retained_and_records_copy_event(self):
+        from unittest import mock
+
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            _FixedScoreMetadataWorkspace,
+        )
+
+        workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
+        workspace.device = torch.device("cuda")
+        workspace.max_requests = 1
+        workspace.stream = None
+        workspace.copy_pending = False
+        workspace.copy_done = mock.Mock()
+        workspace.global_representatives = (0,)
+        workspace.page_count = 1
+        buffer = mock.MagicMock()
+        buffer.__getitem__.return_value = buffer
+        buffer.copy_.return_value = buffer
+        buffer.view.return_value = buffer
+        workspace.page_ids_host = buffer
+        workspace.round_starts_host = buffer
+        workspace.page_ids_device = buffer
+        workspace.round_starts_device = buffer
+        workspace.offsets = buffer
+        workspace.omega = buffer
+        workspace.phase_base = buffer
+        workspace.phase = buffer
+        workspace.cos_phase = buffer
+        workspace.sin_phase = buffer
+        workspace.mean_cos = buffer
+        workspace.mean_sin = buffer
+        stream = object()
+
+        with (
+            mock.patch.object(torch.cuda, "current_stream", return_value=stream),
+            mock.patch.object(torch, "as_tensor", return_value=buffer),
+            mock.patch.object(torch, "add"),
+            mock.patch.object(torch, "mul"),
+            mock.patch.object(torch, "cos"),
+            mock.patch.object(torch, "sin"),
+            mock.patch.object(torch, "mean"),
+        ):
+            assert workspace.stage(lambda request_ids, layer: [[3]], [7], [8.0])
+        assert workspace.stream is stream
+        workspace.copy_done.record.assert_called_once_with(stream)
+
+    def test_staged_page_tables_bypass_per_request_cuda_materialization(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        manager = TriAttention.__new__(TriAttention)
+        get_batch = mock.Mock()
+        manager.kv_cache_manager = SimpleNamespace(get_batch_cache_indices=get_batch)
+        manager._fixed_score_runtime_counts = {}
+        manager._resolve_page_ids = mock.Mock(side_effect=AssertionError("eager fallback used"))
+        page_ids = torch.tensor([[[10, 11], [12, 13]], [[20, 21], [22, 23]]])
+        workspace = SimpleNamespace(
+            stage=mock.Mock(return_value=True),
+            page_ids_device=page_ids,
+            representative_slots={0: 0, 1: 1},
+            prewarm_key=("bucket",),
+        )
+        prepared = [
+            {"request": SimpleNamespace(), "request_id": 7, "round_start": 8.0},
+            {"request": SimpleNamespace(), "request_id": 8, "round_start": 9.0},
+        ]
+
+        result = manager._attach_page_ids(
+            prepared,
+            dense_representatives=[0],
+            swa_layers=[1],
+            layer_pools=[torch.empty(1), torch.empty(1)],
+            global_layers=[0, 1],
+            workspace=workspace,
+        )
+
+        assert result
+        workspace.stage.assert_called_once_with(get_batch, [7, 8], [8.0, 9.0])
+        manager._resolve_page_ids.assert_not_called()
+        assert manager._fixed_score_runtime_counts[("bucket",)]["hit"] == 1
+        assert prepared[1]["page_ids"][0].tolist() == [12, 13]
+        assert prepared[0]["page_ids"][1].tolist() == [20, 21]
+
+    @pytest.mark.parametrize("request_count", [1, 7, 8])
+    @CUDA_REQUIRED
+    def test_workspace_stages_dense_and_swa_tables_and_rejects_lifetime_changes(
+        self, request_count
+    ):
+        from unittest import mock
+
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            _FixedScoreMetadataWorkspace,
+            _FixedScoreStreamMismatch,
+        )
+
+        device = torch.device("cuda")
+        max_requests = 8
+        page_count = 2
+        seq_len = 7
+        layer_elements = max_requests * page_count * 2 * 1 * 4 * 4
+        shared = torch.randn(2 * layer_elements, device=device)
+        pools = [
+            shared[:layer_elements].view(max_requests * page_count, 2, 1, 4, 4),
+            shared[layer_elements:].view(max_requests * page_count, 2, 1, 4, 4),
+            torch.randn(max_requests * page_count, 2, 1, 4, 4, device=device),
+            torch.randn(max_requests * page_count, 2, 1, 4, 4, device=device),
+        ]
+        dense_groups = [[0, 1], [2]]
+        representatives = [0, 2, 3]
+        q_real = torch.randn(4, 2, 4, dtype=torch.float64, device=device)[..., ::2]
+        q_imag = torch.randn(4, 2, 4, dtype=torch.float64, device=device)[..., ::2]
+        mlr = torch.randn(4, 2, 4, dtype=torch.float64, device=device)[..., ::2]
+        freq = torch.tensor([1.0, 0.0, 1.0, 0.0], dtype=torch.float64, device=device)[::2]
+        omega = torch.tensor([0.01, 0.0, 0.03, 0.0], dtype=torch.float64, device=device)[::2]
+        offsets = torch.tensor([1.0, 0.0, 2.0, 0.0], dtype=torch.float64, device=device)[::2]
+        assert not q_real.is_contiguous()
+        assert not freq.is_contiguous()
+        assert not omega.is_contiguous()
+        assert not offsets.is_contiguous()
+        workspace = _FixedScoreMetadataWorkspace(
+            pools,
+            dense_groups,
+            representatives,
+            [10, 11, 12, 13],
+            max_requests,
+            seq_len,
+            2,
+            2,
+            q_real,
+            q_imag,
+            mlr,
+            freq,
+            offsets,
+            omega,
+        )
+        assert workspace.offsets.dtype == torch.float32
+        assert workspace.offsets.is_contiguous()
+        assert workspace.omega.dtype == torch.float32
+        assert workspace.omega.is_contiguous()
+        for group in workspace.groups.values():
+            for calibration in (*group.pointer_middle[2:], *group.pointer_tail):
+                assert calibration.dtype == torch.float32
+                assert calibration.is_contiguous()
+        tables = {
+            10: [[2 * request, 2 * request + 1] for request in range(request_count)],
+            12: [[2 * request + 1, 2 * request] for request in range(request_count)],
+            13: [[15 - 2 * request, 14 - 2 * request] for request in range(request_count)],
+        }
+        get_batch = mock.Mock(side_effect=lambda request_ids, layer: tables[layer])
+        request_ids = list(range(request_count))
+        round_starts = [float(9 + request) for request in request_ids]
+
+        assert workspace.stage(get_batch, request_ids, round_starts)
+        torch.cuda.current_stream(device).synchronize()
+        for slot, global_layer in enumerate((10, 12, 13)):
+            expected = torch.tensor(tables[global_layer], dtype=torch.int64, device=device)
+            assert torch.equal(workspace.page_ids_device[slot, :request_count], expected)
+        assert workspace.matches(pools, dense_groups, representatives)
+        changed_dense = list(pools)
+        changed_dense[1] = pools[1].clone()
+        assert not workspace.matches(changed_dense, dense_groups, representatives)
+        changed_shape = list(pools)
+        changed_shape[1] = pools[1].view(max_requests * page_count, 2, 1, 2, 8)
+        assert not workspace.matches(changed_shape, dense_groups, representatives)
+        changed_stride = list(pools)
+        changed_stride[1] = pools[1].as_strided(pools[1].shape, (32, 16, 16, 1, 4))
+        assert not workspace.matches(changed_stride, dense_groups, representatives)
+        changed_dtype = list(pools)
+        changed_dtype[1] = pools[1].view(torch.int32)
+        assert not workspace.matches(changed_dtype, dense_groups, representatives)
+        changed_swa = list(pools)
+        changed_swa[3] = pools[3].clone()
+        assert not workspace.matches(changed_swa, dense_groups, representatives)
+        assert not workspace.matches(pools, [[0], [1], [2]], [0, 1, 2, 3])
+
+        calls = get_batch.call_count
+        other_stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(other_stream):
+            with pytest.raises(_FixedScoreStreamMismatch, match="first CUDA stream"):
+                workspace.stage(get_batch, request_ids, round_starts)
+        assert get_batch.call_count == calls
+
+    @pytest.mark.parametrize("request_count", [1, 7, 8])
+    @pytest.mark.parametrize("aggregation", ["mean", "max"])
+    @CUDA_REQUIRED
+    def test_fixed_score_matches_eager_and_torch_oracle_across_two_groups(
+        self, request_count, aggregation
+    ):
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+            _FixedScoreGroup,
+            triton_tri_score_perhead,
+        )
+
+        device = torch.device("cuda")
+        torch.manual_seed(20260703 + request_count)
+        max_requests = 8
+        page_count = 2
+        seq_len = 7
+        page_ids = torch.arange(max_requests * page_count, dtype=torch.int64, device=device).view(
+            max_requests, page_count
+        )
+        layer_elements = max_requests * page_count * 2 * 1 * 4 * 4
+        shared = torch.randn(2 * layer_elements, device=device)
+        pools = [
+            shared[:layer_elements].view(max_requests * page_count, 2, 1, 4, 4),
+            shared[layer_elements:].view(max_requests * page_count, 2, 1, 4, 4),
+            torch.randn(max_requests * page_count, 2, 1, 4, 4, device=device),
+        ]
+        storage_groups = [[0, 1], [2]]
+        q_real = torch.randn(3, 2, 4, device=device)[..., ::2]
+        q_imag = torch.randn(3, 2, 4, device=device)[..., ::2]
+        mlr = torch.randn(3, 2, 4, device=device)[..., ::2]
+        freq = torch.tensor([0.7, 0.0, 1.3, 0.0], device=device)[::2]
+        omega = torch.tensor([0.013, 0.0, 0.071, 0.0], device=device)[::2]
+        offsets = torch.tensor([1.0, 0.0, 2.0, 0.0, 4.0, 0.0], device=device)[::2]
+        assert not q_real.is_contiguous()
+        assert not q_imag.is_contiguous()
+        assert not mlr.is_contiguous()
+        assert not freq.is_contiguous()
+        assert not omega.is_contiguous()
+        assert not offsets.is_contiguous()
+        round_device = torch.arange(max_requests, dtype=torch.float32, device=device) + 9.0
+        round_starts = round_device[:request_count].tolist()
+        seq_lens = [seq_len] * request_count
+        phase = (round_device[:, None, None] + offsets[None, :, None]) * omega[None, None]
+        oracle = _torch_tri_score_oracle(
+            pools,
+            page_ids[:request_count],
+            seq_lens,
+            round_starts,
+            q_real,
+            q_imag,
+            mlr,
+            freq,
+            omega,
+            offsets,
+            [0, 1, 2],
+            aggregation,
+        )
+        for layers in storage_groups:
+            group = _FixedScoreGroup(
+                pools,
+                layers,
+                max_requests,
+                page_count,
+                seq_len,
+                2,
+                page_ids,
+                q_real,
+                q_imag,
+                mlr,
+                freq,
+                omega,
+                offsets,
+            )
+            fixed, fixed_offsets = group.launch(
+                request_count,
+                round_device,
+                torch.cos(phase).mean(dim=1),
+                torch.sin(phase).mean(dim=1),
+                aggregation,
+            )
+            eager, eager_offsets, _ = triton_tri_score_perhead(
+                pools,
+                list(page_ids[:request_count]),
+                seq_lens,
+                round_starts,
+                q_real,
+                q_imag,
+                mlr,
+                freq,
+                omega,
+                offsets,
+                2,
+                score_aggregation=aggregation,
+                layer_indices=layers,
+            )
+            assert torch.equal(fixed, eager)
+            assert torch.equal(fixed_offsets, eager_offsets)
+            for request in range(request_count):
+                for layer_slot, layer in enumerate(layers):
+                    segment_index = request * len(layers) + layer_slot
+                    segment = fixed[:, segment_index * seq_len : (segment_index + 1) * seq_len]
+                    expected = oracle[request * len(pools) + layer]
+                    torch.testing.assert_close(segment, expected, rtol=5e-3, atol=5e-3)
+                    selected = torch.topk(segment.max(dim=0).values, 3).indices.sort().values
+                    expected_selected = (
+                        torch.topk(expected.max(dim=0).values, 3).indices.sort().values
+                    )
+                    assert torch.equal(selected, expected_selected)
+
+    @CUDA_REQUIRED
+    def test_gptoss_dense_swa_rebase_and_capacity_match_staging_fallback(self):
+        from types import SimpleNamespace
+
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            _FixedScoreMetadataWorkspace,
+        )
+
+        device = torch.device("cuda")
+        torch.manual_seed(731)
+        seq_len = 8
+        keep_count = 6
+        page_lists = {0: [1, 2, 0], 1: [0, 1, 2], 2: [2, 0, 1]}
+        page_ids = {
+            layer: torch.tensor(pages, dtype=torch.int64, device=device)
+            for layer, pages in page_lists.items()
+        }
+        base_pools = [
+            torch.arange(3 * 2 * 1 * 4 * 4, dtype=torch.float32, device=device).view(3, 2, 1, 4, 4),
+            torch.arange(3 * 2 * 1 * 4 * 4, dtype=torch.float32, device=device).view(3, 2, 1, 4, 4)
+            + 500.0,
+            torch.arange(3 * 2 * 1 * 4 * 4, dtype=torch.float32, device=device).view(3, 2, 1, 4, 4)
+            + 1000.0,
+        ]
+        q_real = torch.ones(3, 2, 2, device=device)
+        q_imag = torch.full_like(q_real, 0.25)
+        mlr = torch.full_like(q_real, 0.1)
+        freq = torch.tensor([0.8, 1.2], device=device)
+        omega = torch.tensor([0.017, 0.043], device=device)
+        offsets = torch.tensor([1.0, 2.0, 4.0], device=device)
+
+        def build(force_fallback):
+            pools = [pool.clone() for pool in base_pools]
+            cache = _make_fake_v2()
+            cache.max_batch_size = 8
+            cache.pp_layers = [0, 1, 2]
+            cache.num_layers = 3
+            cache.layer_offsets = {0: 0, 1: 1, 2: 2}
+            cache.batch_calls = []
+            cache.get_buffers = lambda layer, **kwargs: pools[layer]
+
+            def get_batch(request_ids, layer):
+                cache.batch_calls.append((tuple(request_ids), layer))
+                return [list(page_lists[layer]) for _ in request_ids]
+
+            cache.get_batch_cache_indices = get_batch
+            manager = TriAttention(
+                cache,
+                top_B=4,
+                beta=4,
+                score_aggregation="mean",
+                eviction_mode="union",
+                skip_swa=False,
+            )
+            manager._calibrated = True
+            manager._L = 3
+            manager._H = manager._F = 2
+            manager._triattn_q_real = q_real
+            manager._triattn_q_imag = q_imag
+            manager._triattn_mlr_coef = mlr
+            manager._freq_scale_sq = freq
+            manager.calibration = {"omega": omega}
+            manager._offsets = offsets
+            manager._attention_layer_partition = lambda num_layers: ([1, 2], [0], 2)
+            manager._local_to_global_layers_cache = [0, 1, 2]
+            manager._indexer_topk_supported = lambda width, k: False
+            manager._fixed_union_enabled = False
+            manager._fixed_union_prewarm_enabled = False
+            manager._fixed_union_compaction_enabled = False
+            manager._fixed_score_metadata_enabled = True
+            manager._fixed_union_prewarm_key = lambda *args: ("gptoss",)
+            workspace = _FixedScoreMetadataWorkspace(
+                pools,
+                [[1], [2]],
+                [1, 2, 0],
+                [0, 1, 2],
+                8,
+                seq_len,
+                2,
+                2,
+                q_real,
+                q_imag,
+                mlr,
+                freq,
+                offsets,
+                omega,
+            )
+            if force_fallback:
+                workspace.stage = lambda *args: False
+            workspace.prewarm_key = ("gptoss",)
+            manager._fixed_score_workspaces = {("gptoss",): workspace}
+            manager._fixed_score_prewarm_states = {("gptoss",): "ready"}
+            manager._fixed_score_runtime_counts = {}
+            manager._pre_forward_kv_lengths = {7: seq_len}
+            manager._evicted = {}
+            original_evict_modes = manager._evict_modes
+
+            def capture_keep(*args, **kwargs):
+                keep = original_evict_modes(*args, **kwargs)
+                manager.test_keep = keep.clone()
+                return keep
+
+            manager._evict_modes = capture_keep
+            request = SimpleNamespace(
+                py_request_id=7,
+                py_prompt_len=2,
+                py_draft_tokens=[],
+                max_beam_num_tokens=seq_len + 1,
+            )
+            return manager, request, pools, cache
+
+        fixed_manager, fixed_request, fixed_pools, fixed_cache = build(False)
+        eager_manager, eager_request, eager_pools, _ = build(True)
+        fixed_targets = fixed_manager._evict_requests([(fixed_request, 7)], num_layers=3)
+        eager_targets = eager_manager._evict_requests([(eager_request, 7)], num_layers=3)
+        torch.cuda.current_stream(device).synchronize()
+
+        assert fixed_targets == eager_targets == [(7, keep_count + 1)]
+        assert torch.equal(fixed_manager.test_keep, eager_manager.test_keep)
+        oracle_scores = _torch_tri_score_oracle(
+            base_pools,
+            {layer: ids.unsqueeze(0) for layer, ids in page_ids.items()},
+            [seq_len],
+            [float(seq_len)],
+            q_real,
+            q_imag,
+            mlr,
+            freq,
+            omega,
+            offsets,
+            [1, 2],
+            "mean",
+        )
+        assert torch.equal(
+            fixed_manager.test_keep,
+            _torch_union_keep(torch.cat(oracle_scores), prompt_len=2, budget=4),
+        )
+        assert fixed_manager._fixed_score_runtime_counts[("gptoss",)]["hit"] == 1
+        assert eager_manager._fixed_score_runtime_counts[("gptoss",)]["fallback"] == 1
+        assert fixed_manager._evicted == eager_manager._evicted == {7: 2}
+        assert fixed_manager._pre_forward_kv_lengths == {7: keep_count}
+        for layer in (1, 2):
+            original_dense = _logical_kv(base_pools[layer], page_ids[layer], seq_len)
+            expected_dense = original_dense.index_select(2, fixed_manager.test_keep)
+            fixed_dense = _logical_kv(fixed_pools[layer], page_ids[layer], keep_count)
+            eager_dense = _logical_kv(eager_pools[layer], page_ids[layer], keep_count)
+            assert torch.equal(fixed_dense, expected_dense)
+            assert torch.equal(fixed_dense, eager_dense)
+        original_swa = _logical_kv(base_pools[0], page_ids[0], seq_len)
+        swa_keep = _build_swa_rebase_keep(seq_len, keep_count, 2, device=device)
+        expected_swa = original_swa.index_select(2, swa_keep)
+        fixed_swa = _logical_kv(fixed_pools[0], page_ids[0], keep_count)
+        eager_swa = _logical_kv(eager_pools[0], page_ids[0], keep_count)
+        assert torch.equal(fixed_swa, expected_swa)
+        assert torch.equal(fixed_swa, eager_swa)
+        assert fixed_cache.batch_calls[:3] == [((7,), 1), ((7,), 2), ((7,), 0)]
+
+
 class TestFixedUnionWorkspace:
     @staticmethod
     def _reference(scores, keep_count):

@@ -326,6 +326,206 @@ class _FixedUnionWorkspace:
         )
 
 
+class _FixedScoreStreamMismatch(RuntimeError):
+    """Raised when a fixed score workspace is used from another CUDA stream."""
+
+
+class _FixedScoreMetadataWorkspace:
+    """Pool-bound fixed score metadata with one nonblocking page-table upload."""
+
+    def __init__(
+        self,
+        layer_pools: List[torch.Tensor],
+        dense_groups: List[List[int]],
+        page_representatives: List[int],
+        global_layers: List[int],
+        max_requests: int,
+        seq_len: int,
+        num_q_heads: int,
+        num_freqs: int,
+        q_real: torch.Tensor,
+        q_imag: torch.Tensor,
+        mlr_coef: torch.Tensor,
+        freq_scale_sq: torch.Tensor,
+        offsets: torch.Tensor,
+        omega: torch.Tensor,
+    ) -> None:
+        from .triattention_kernels import _FixedScoreGroup
+
+        if not dense_groups or not page_representatives or max_requests <= 0:
+            raise ValueError("fixed score metadata requires non-empty positive geometry")
+        self.device = _FixedUnionWorkspace._canonical_device(
+            layer_pools[page_representatives[0]].device
+        )
+        if self.device.type != "cuda":
+            raise ValueError("fixed score metadata is CUDA-only")
+        self.max_requests = max_requests
+        q_real = q_real.to(device=self.device, dtype=torch.float32).contiguous()
+        q_imag = q_imag.to(device=self.device, dtype=torch.float32).contiguous()
+        mlr_coef = mlr_coef.to(device=self.device, dtype=torch.float32).contiguous()
+        freq_scale_sq = freq_scale_sq.to(device=self.device, dtype=torch.float32).contiguous()
+        offsets = offsets.to(device=self.device, dtype=torch.float32).contiguous()
+        omega = omega.to(device=self.device, dtype=torch.float32).contiguous()
+        self.global_representatives = tuple(global_layers[layer] for layer in page_representatives)
+        self.representative_slots = {
+            representative: slot for slot, representative in enumerate(page_representatives)
+        }
+        self.signature = self._signature(layer_pools, dense_groups, page_representatives)
+        tokens_per_block = int(layer_pools[page_representatives[0]].shape[3])
+        self.page_count = (seq_len + tokens_per_block) // tokens_per_block
+        if any(
+            (seq_len + int(layer_pools[layer].shape[3])) // int(layer_pools[layer].shape[3])
+            != self.page_count
+            for layer in page_representatives
+        ):
+            raise ValueError("fixed score metadata requires a uniform page count")
+        page_shape = (len(page_representatives), max_requests, self.page_count)
+        self.page_ids_host = torch.empty(
+            page_shape, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        self.round_starts_host = torch.empty(
+            max_requests, dtype=torch.float32, device="cpu", pin_memory=True
+        )
+        self.page_ids_device = torch.empty(page_shape, dtype=torch.int64, device=self.device)
+        self.round_starts_device = torch.empty(
+            max_requests, dtype=torch.float32, device=self.device
+        )
+        num_offsets = int(offsets.numel())
+        self.phase_base = torch.empty(
+            (max_requests, num_offsets, 1), dtype=torch.float32, device=self.device
+        )
+        self.phase = torch.empty(
+            (max_requests, num_offsets, num_freqs), dtype=torch.float32, device=self.device
+        )
+        self.cos_phase = torch.empty_like(self.phase)
+        self.sin_phase = torch.empty_like(self.phase)
+        self.mean_cos = torch.empty(
+            (max_requests, num_freqs), dtype=torch.float32, device=self.device
+        )
+        self.mean_sin = torch.empty_like(self.mean_cos)
+        self.offsets = offsets
+        self.omega = omega
+        self.groups = {
+            layers[0]: _FixedScoreGroup(
+                layer_pools,
+                layers,
+                max_requests,
+                self.page_count,
+                seq_len,
+                num_q_heads,
+                self.page_ids_device[self.representative_slots[layers[0]]],
+                q_real,
+                q_imag,
+                mlr_coef,
+                freq_scale_sq,
+                omega,
+                offsets,
+            )
+            for layers in dense_groups
+        }
+        self.copy_done = torch.cuda.Event()
+        self.copy_pending = False
+        self.stream = None
+
+    def _signature(
+        self,
+        layer_pools: List[torch.Tensor],
+        dense_groups: List[List[int]],
+        representatives: List[int],
+    ) -> tuple:
+        layers = dict.fromkeys(
+            [layer for group in dense_groups for layer in group] + list(representatives)
+        )
+        tensors = tuple(
+            (
+                layer,
+                int(layer_pools[layer].untyped_storage().data_ptr()),
+                int(layer_pools[layer].data_ptr()),
+                tuple(layer_pools[layer].shape),
+                tuple(layer_pools[layer].stride()),
+                str(layer_pools[layer].device),
+                str(layer_pools[layer].dtype),
+            )
+            for layer in layers
+        )
+        return (
+            tuple(tuple(group) for group in dense_groups),
+            tuple(representatives),
+            tensors,
+        )
+
+    def matches(
+        self,
+        layer_pools: List[torch.Tensor],
+        dense_groups: List[List[int]],
+        representatives: List[int],
+    ) -> bool:
+        try:
+            return self.signature == self._signature(layer_pools, dense_groups, representatives)
+        except (AttributeError, IndexError, KeyError):
+            return False
+
+    def stage(
+        self,
+        get_batch_cache_indices,
+        request_ids: List[int],
+        round_starts: List[float],
+    ) -> bool:
+        """Stage one exact cohort without waiting, or reject it."""
+        request_count = len(request_ids)
+        if (
+            request_count == 0
+            or request_count > self.max_requests
+            or len(round_starts) != request_count
+        ):
+            return False
+        stream = torch.cuda.current_stream(self.device)
+        if self.stream is None:
+            self.stream = stream
+        elif (stream.device, stream.cuda_stream) != (
+            self.stream.device,
+            self.stream.cuda_stream,
+        ):
+            raise _FixedScoreStreamMismatch(
+                "TriAttention fixed score metadata is bound to its first CUDA stream"
+            )
+        if self.copy_pending and not self.copy_done.query():
+            return False
+        rows_by_group = []
+        for global_layer in self.global_representatives:
+            rows = get_batch_cache_indices(request_ids, global_layer)
+            rows = [[int(page) for page in row if int(page) >= 0] for row in rows]
+            if len(rows) != request_count or any(len(row) != self.page_count for row in rows):
+                return False
+            rows_by_group.append(rows)
+
+        self.page_ids_host[:, :request_count].copy_(
+            torch.as_tensor(rows_by_group, dtype=torch.int64)
+        )
+        self.round_starts_host[:request_count].copy_(
+            torch.as_tensor(round_starts, dtype=torch.float32)
+        )
+        try:
+            self.page_ids_device.copy_(self.page_ids_host, non_blocking=True)
+            self.round_starts_device.copy_(self.round_starts_host, non_blocking=True)
+        finally:
+            # The event guards pinned-source reuse. Requiring the same stream also
+            # orders the next device-buffer overwrite after every score consumer.
+            self.copy_done.record(stream)
+            self.copy_pending = True
+        torch.add(
+            self.round_starts_device.view(self.max_requests, 1, 1),
+            self.offsets.view(1, -1, 1),
+            out=self.phase_base,
+        )
+        torch.mul(self.phase_base, self.omega.view(1, 1, -1), out=self.phase)
+        torch.cos(self.phase, out=self.cos_phase)
+        torch.sin(self.phase, out=self.sin_phase)
+        torch.mean(self.cos_phase, dim=1, out=self.mean_cos)
+        torch.mean(self.sin_phase, dim=1, out=self.mean_sin)
+        return True
+
+
 class TriAttention(BaseKVCacheCompressionManager):
     """Periodic physical KV eviction driven by trigonometric importance scoring.
 
@@ -458,10 +658,17 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._fixed_union_prewarm_enabled = (
             self._fixed_union_enabled and os.environ.get("TRIATTN_FIXED_PREWARM", "0") == "1"
         )
+        self._fixed_score_metadata_enabled = (
+            self._fixed_union_prewarm_enabled
+            and os.environ.get("TRIATTN_FIXED_SCORE_METADATA", "0") == "1"
+        )
         self._fixed_union_workspaces = {}
         self._fixed_union_active = {}
         self._fixed_union_prewarm_states = {}
         self._fixed_union_prewarmed_workspaces = {}
+        self._fixed_score_workspaces = {}
+        self._fixed_score_prewarm_states = {}
+        self._fixed_score_runtime_counts = {}
 
     def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
         """Mark capacity-only decode and resolve calibration once.
@@ -1031,6 +1238,42 @@ class TriAttention(BaseKVCacheCompressionManager):
         if workspace is not None:
             workspace.prewarmed = True
             self._fixed_union_prewarmed_workspaces[key] = workspace
+        if getattr(self, "_fixed_score_metadata_enabled", False):
+            score_states = self._fixed_score_prewarm_states
+            score_states[key] = "running"
+            try:
+                _, swa_layers, _ = self._attention_layer_partition(num_layers)
+                representatives = [layers[0] for layers in storage_groups]
+                representatives.extend(
+                    layer for layer in swa_layers if layer not in representatives
+                )
+                score_workspace = _FixedScoreMetadataWorkspace(
+                    layer_pools,
+                    storage_groups,
+                    representatives,
+                    self._local_to_global_layers(num_layers),
+                    int(self.kv_cache_manager.max_batch_size),
+                    seq_len,
+                    int(self._H),
+                    int(self._F),
+                    q_real,
+                    q_imag,
+                    mlr_coef,
+                    self._freq_scale_sq,
+                    self._offsets,
+                    self.calibration["omega"],
+                )
+                score_workspace.prewarm_key = key
+                self._fixed_score_workspaces[key] = score_workspace
+            except Exception as exc:
+                score_states[key] = "failed"
+                self._fixed_score_workspaces.pop(key, None)
+                logger.warning(
+                    "TriAttention fixed score metadata prewarm failed; "
+                    f"using the Stage1 path: {exc}"
+                )
+            else:
+                score_states[key] = "ready"
 
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
         """Drop this request's per-request length and eviction state."""
@@ -1689,6 +1932,111 @@ class TriAttention(BaseKVCacheCompressionManager):
         )
         pool[page_ids_t[:num_touched_pages]] = repaged[:num_touched_pages]
 
+    def _record_fixed_score_runtime(self, key: Optional[tuple], outcome: str) -> None:
+        if key is None:
+            return
+        counts = getattr(self, "_fixed_score_runtime_counts", None)
+        if counts is None:
+            self._fixed_score_runtime_counts = {}
+            counts = self._fixed_score_runtime_counts
+        bucket = counts.setdefault(key, {"hit": 0, "fallback": 0, "rejected": 0})
+        bucket[outcome] += 1
+
+    def _fixed_score_workspace_for(
+        self,
+        layer_pools: List[torch.Tensor],
+        dense_layers: List[int],
+        dense_groups: List[List[int]],
+        swa_layers: List[int],
+        num_layers: int,
+        prepared: List[dict],
+    ) -> Optional[_FixedScoreMetadataWorkspace]:
+        if not getattr(self, "_fixed_score_metadata_enabled", False) or not prepared:
+            return None
+        seq_lens = {item["seq_len"] for item in prepared}
+        prompt_lens = {
+            min(int(getattr(item["request"], "py_prompt_len", 0) or 0), item["seq_len"])
+            for item in prepared
+        }
+        if len(seq_lens) != 1 or len(prompt_lens) != 1:
+            return None
+        seq_len = next(iter(seq_lens))
+        key = self._fixed_union_prewarm_key(
+            layer_pools,
+            dense_layers,
+            dense_groups,
+            num_layers,
+            seq_len,
+            next(iter(prompt_lens)),
+        )
+        workspace = self._fixed_score_workspaces.get(key)
+        representatives = [group[0] for group in dense_groups]
+        representatives.extend(layer for layer in swa_layers if layer not in representatives)
+        if (
+            getattr(self, "_fixed_score_prewarm_states", {}).get(key) != "ready"
+            or workspace is None
+            or len(prepared) > workspace.max_requests
+            or not workspace.matches(layer_pools, dense_groups, representatives)
+        ):
+            self._record_fixed_score_runtime(key, "fallback")
+            return None
+        return workspace
+
+    def _attach_page_ids(
+        self,
+        prepared: List[dict],
+        dense_representatives: List[int],
+        swa_layers: List[int],
+        layer_pools: List[torch.Tensor],
+        global_layers: List[int],
+        workspace: Optional[_FixedScoreMetadataWorkspace],
+    ) -> bool:
+        fixed = False
+        get_batch = getattr(self.kv_cache_manager, "get_batch_cache_indices", None)
+        if workspace is not None and get_batch is not None:
+            try:
+                fixed = workspace.stage(
+                    get_batch,
+                    [item["request_id"] for item in prepared],
+                    [item["round_start"] for item in prepared],
+                )
+            except _FixedScoreStreamMismatch:
+                self._record_fixed_score_runtime(
+                    getattr(workspace, "prewarm_key", None), "rejected"
+                )
+                raise
+            except Exception as exc:
+                logger.warning(f"TriAttention fixed score staging failed; using eager path: {exc}")
+        required_layers = [*dense_representatives, *swa_layers]
+        if fixed:
+            for request_index, item in enumerate(prepared):
+                item["page_ids"] = {
+                    layer: workspace.page_ids_device[
+                        workspace.representative_slots[layer], request_index
+                    ]
+                    for layer in required_layers
+                }
+            self._record_fixed_score_runtime(getattr(workspace, "prewarm_key", None), "hit")
+            return True
+
+        if workspace is not None:
+            self._record_fixed_score_runtime(getattr(workspace, "prewarm_key", None), "fallback")
+        for item in prepared:
+            request = item["request"]
+            request_id = item["request_id"]
+            item["page_ids"] = {}
+            for layer in required_layers:
+                page_ids = self._resolve_page_ids(request, layer)
+                if not page_ids:
+                    raise RuntimeError(
+                        f"Missing KV page ids for attention layer {global_layers[layer]} "
+                        f"of request {request_id}"
+                    )
+                item["page_ids"][layer] = torch.as_tensor(
+                    page_ids, device=layer_pools[layer].device, dtype=torch.int64
+                )
+        return False
+
     def _evict_requests(self, evict_reqs, num_layers: int) -> List[Tuple[int, int]]:
         """Score and compact requests, returning ``(request_id, capacity)`` targets.
 
@@ -1746,56 +2094,44 @@ class TriAttention(BaseKVCacheCompressionManager):
                 round_start = seq_len + self._evicted.get(rid, 0)
                 if seq_len <= self._minimum_evictable_length(request, seq_len):
                     continue
-                dense_page_ids_by_group = {}
-                for representative in dense_group_representatives:
-                    group_page_ids = self._resolve_page_ids(request, representative)
-                    if not group_page_ids:
-                        global_layer = global_layers[representative]
-                        raise RuntimeError(
-                            f"Missing KV page ids for attention layer {global_layer} "
-                            f"of request {rid}"
-                        )
-                    dense_page_ids_by_group[representative] = torch.as_tensor(
-                        group_page_ids,
-                        device=layer_pools[representative].device,
-                        dtype=torch.int64,
-                    )
                 expected_keep_count = self._minimum_evictable_length(request, seq_len)
                 swa_source = None
                 swa_destination = None
-                swa_page_ids = {}
                 if swa_layers:
                     assert swa_window is not None
                     swa_source, swa_destination = _build_swa_rebase_copy(
                         seq_len, expected_keep_count, swa_window, device=device
                     )
-                    for layer in swa_layers:
-                        layer_page_ids = self._resolve_page_ids(request, layer)
-                        if not layer_page_ids:
-                            raise RuntimeError(
-                                f"Missing KV page ids for kernel-masked SWA layer {layer} "
-                                f"of request {rid}"
-                            )
-                        swa_page_ids[layer] = torch.as_tensor(
-                            layer_page_ids,
-                            device=layer_pools[layer].device,
-                            dtype=torch.int64,
-                        )
                 prepared.append(
                     {
                         "request": request,
                         "request_id": rid,
-                        "dense_page_ids_by_group": dense_page_ids_by_group,
                         "seq_len": int(seq_len),
                         "round_start": float(round_start),
                         "expected_keep_count": expected_keep_count,
                         "swa_source": swa_source,
                         "swa_destination": swa_destination,
-                        "swa_page_ids": swa_page_ids,
                     }
                 )
         if not prepared:
             return []
+        dense_groups = list(storage_groups.values())
+        fixed_score_workspace = self._fixed_score_workspace_for(
+            layer_pools,
+            dense_layers,
+            dense_groups,
+            swa_layers,
+            num_layers,
+            prepared,
+        )
+        fixed_score_active = self._attach_page_ids(
+            prepared,
+            dense_group_representatives,
+            swa_layers,
+            layer_pools,
+            global_layers,
+            fixed_score_workspace,
+        )
         seq_lens = [item["seq_len"] for item in prepared]
         round_starts = [item["round_start"] for item in prepared]
         if self._offsets is None:
@@ -1808,26 +2144,39 @@ class TriAttention(BaseKVCacheCompressionManager):
         req_layer_scores = [dict() for _ in prepared]  # [req] -> {layer_idx: [H,seq]}
         for lids in storage_groups.values():
             representative = lids[0]
-            group_page_ids = [item["dense_page_ids_by_group"][representative] for item in prepared]
+            group_page_ids = [item["page_ids"][representative] for item in prepared]
             with nvtx_range("triattention.score", color="blue"):
-                ph, so, sm = triton_tri_score_perhead(
-                    layer_pools,
-                    group_page_ids,
-                    seq_lens,
-                    round_starts,
-                    q_real,
-                    q_imag,
-                    mlr_coef,
-                    self._freq_scale_sq,
-                    self.calibration["omega"],
-                    self._offsets,
-                    self._H,
-                    score_aggregation=self.score_aggregation,
-                    layer_indices=lids,
-                )
+                if fixed_score_active:
+                    ph, so = fixed_score_workspace.groups[representative].launch(
+                        len(prepared),
+                        fixed_score_workspace.round_starts_device,
+                        fixed_score_workspace.mean_cos,
+                        fixed_score_workspace.mean_sin,
+                        self.score_aggregation,
+                    )
+                    segments = (
+                        (request, layer) for request in range(len(prepared)) for layer in lids
+                    )
+                else:
+                    ph, so, sm = triton_tri_score_perhead(
+                        layer_pools,
+                        group_page_ids,
+                        seq_lens,
+                        round_starts,
+                        q_real,
+                        q_imag,
+                        mlr_coef,
+                        self._freq_scale_sq,
+                        self.calibration["omega"],
+                        self._offsets,
+                        self._H,
+                        score_aggregation=self.score_aggregation,
+                        layer_indices=lids,
+                    )
+                    segments = ((meta.request_index, meta.layer_index) for meta in sm)
             seg_list = flat_perhead_to_list(ph, so)
-            for s, meta in enumerate(sm):
-                req_layer_scores[meta.request_index][meta.layer_index] = seg_list[s]
+            for scores, (request, layer) in zip(seg_list, segments):
+                req_layer_scores[request][layer] = scores
         # Per request: select from the precomputed scores. All scores were taken
         # before any compaction; requests touch disjoint pages, so compacting one
         # does not disturb another's (already-read) scores.
@@ -1886,7 +2235,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                     and all(
                         workspace.can_compact(
                             layer_pools[lid],
-                            item["dense_page_ids_by_group"][layer_group_representative[lid]],
+                            item["page_ids"][layer_group_representative[lid]],
                             seq_len,
                         )
                         for lid in dense_layers
@@ -1898,7 +2247,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                     for lid in dense_layers:
                         grp = union_by_layer.setdefault(lid, ([], [], []))
                         representative = layer_group_representative[lid]
-                        grp[0].append(item["dense_page_ids_by_group"][representative])
+                        grp[0].append(item["page_ids"][representative])
                         grp[1].append(keep)
                         grp[2].append(seq_len)
             if keep_count != item["expected_keep_count"]:
@@ -1910,7 +2259,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             if evicted > 0:
                 for lid in swa_layers:
                     grp = swa_by_layer.setdefault(lid, ([], [], [], []))
-                    grp[0].append(item["swa_page_ids"][lid])
+                    grp[0].append(item["page_ids"][lid])
                     grp[1].append(item["swa_source"])
                     grp[2].append(seq_len)
                     grp[3].append(item["swa_destination"])
@@ -1927,7 +2276,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             workspace, item, seq_len = fixed_union_compaction
             for lids in storage_groups.values():
                 representative = lids[0]
-                page_ids = item["dense_page_ids_by_group"][representative]
+                page_ids = item["page_ids"][representative]
                 copied_buffer_keys = set()
                 for lid in lids:
                     buffer_key = workspace._compaction_key(layer_pools[lid], page_ids)

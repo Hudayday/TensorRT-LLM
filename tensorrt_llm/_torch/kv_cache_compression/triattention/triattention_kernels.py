@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Vendored Triton kernels for the TriAttention KV-eviction pipeline.
 
@@ -438,16 +439,16 @@ def _tri_score_perhead_kernel(
     seg_req_id,  # [nseg] int32: request slot (into page_ids_offsets etc.)
     seg_layer_id,  # [nseg] int32: ABSOLUTE layer id (indexes layer_base_ptrs + calib)
     seg_seq_len,  # [nseg] int32
-    seg_round_start,  # [nseg] fp32
+    req_round_start,  # [num_requests] fp32
     seg_out_offset,  # [nseg] int64: write base (column) into each [H, sum_seq] row
     seg_n_tblk,  # [nseg] int32: cdiv(seq_len, T_BLOCK)
     # per-LAYER calibration, [L,H,F] flattened layer-major:
     q_real_ptr,  # [L*H*F] fp32
     q_imag_ptr,  # [L*H*F] fp32
     mlr_coef_ptr,  # [L*H*F] fp32
-    # per-SEGMENT offset-collapsed phase ('mean' path), [nseg,F] flattened:
-    mean_cos_ptr,  # [nseg*F] fp32
-    mean_sin_ptr,  # [nseg*F] fp32
+    # per-REQUEST offset-collapsed phase ('mean' path), [num_requests,F] flattened:
+    mean_cos_ptr,  # [num_requests*F] fp32
+    mean_sin_ptr,  # [num_requests*F] fp32
     # shared freq vectors:
     freq_scale_sq_ptr,  # [F] fp32
     omega_ptr,  # [F] fp32 ('max' path only)
@@ -483,7 +484,7 @@ def _tri_score_perhead_kernel(
     seq_len = tl.load(seg_seq_len + seg)
     layer_id = tl.load(seg_layer_id + seg)
     req_id = tl.load(seg_req_id + seg)
-    rstart = tl.load(seg_round_start + seg)
+    rstart = tl.load(req_round_start + req_id)
     out_base = tl.load(seg_out_offset + seg)
     layer_elt = tl.load(layer_base_ptrs + layer_id).to(tl.int64)
     page_off = tl.load(page_ids_offsets + req_id)
@@ -506,9 +507,9 @@ def _tri_score_perhead_kernel(
     # KEY half is kv_factor index 0 -> its stride term is 0 (matches reference).
     tok_base = layer_elt + phys_page * s_page + slot * s_slot  # [T_BLOCK] int64
 
-    # per-segment 'mean'-path phase + shared freq scale.
-    mcos = tl.load(mean_cos_ptr + seg * num_freqs + f, mask=f_mask, other=0.0)
-    msin = tl.load(mean_sin_ptr + seg * num_freqs + f, mask=f_mask, other=0.0)
+    # per-request 'mean'-path phase + shared freq scale.
+    mcos = tl.load(mean_cos_ptr + req_id * num_freqs + f, mask=f_mask, other=0.0)
+    msin = tl.load(mean_sin_ptr + req_id * num_freqs + f, mask=f_mask, other=0.0)
     fss = tl.load(freq_scale_sq_ptr + f, mask=f_mask, other=0.0)
 
     # ---- PER-HEAD (position + mlr), GQA-deduped, NO head reduction ----
@@ -577,6 +578,170 @@ def _tri_score_perhead_kernel(
             tl.store(out_ptr + h.to(tl.int64) * sum_seq + out_base + t, score + mlr, mask=t_mask)
             qg += 1
         kv_head += 1
+
+
+def _launch_tri_score_perhead(
+    grid: tuple,
+    pointer_args: tuple,
+    geometry_args: tuple,
+    *,
+    score_aggregation: str,
+    token_block: int,
+    num_freqs: int,
+) -> None:
+    """Launch the shared score ABI for eager and fixed metadata owners."""
+    if score_aggregation not in ("mean", "max"):
+        raise ValueError(f"unsupported score aggregation: {score_aggregation}")
+    _tri_score_perhead_kernel[grid](
+        *pointer_args,
+        *geometry_args,
+        USE_MAX=(score_aggregation == "max"),
+        T_BLOCK=token_block,
+        F_BLOCK=triton.next_power_of_2(num_freqs),
+    )
+
+
+class _FixedScoreGroup:
+    """Persistent score metadata/output for one storage group and sequence bucket."""
+
+    def __init__(
+        self,
+        layer_pools: List[torch.Tensor],
+        layer_indices: List[int],
+        max_requests: int,
+        page_count: int,
+        seq_len: int,
+        num_q_heads: int,
+        page_ids: torch.Tensor,
+        q_real_LHF: torch.Tensor,
+        q_imag_LHF: torch.Tensor,
+        mlr_coef_LHF: torch.Tensor,
+        freq_scale_sq: torch.Tensor,
+        omega: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> None:
+        if not layer_indices or min(max_requests, page_count, seq_len) <= 0:
+            raise ValueError("fixed score group requires non-empty positive geometry")
+        self.max_requests = max_requests
+        self.seq_len = seq_len
+        self.num_q_heads = num_q_heads
+        self.num_layers = len(layer_indices)
+        p0 = layer_pools[layer_indices[0]]
+        if p0.ndim != 5:
+            raise ValueError("fixed score group requires HND pools")
+        device = p0.device
+        q_real_LHF = q_real_LHF.to(device=device, dtype=torch.float32).contiguous()
+        q_imag_LHF = q_imag_LHF.to(device=device, dtype=torch.float32).contiguous()
+        mlr_coef_LHF = mlr_coef_LHF.to(device=device, dtype=torch.float32).contiguous()
+        freq_scale_sq = freq_scale_sq.to(device=device, dtype=torch.float32).contiguous()
+        omega = omega.to(device=device, dtype=torch.float32).contiguous()
+        offsets = offsets.to(device=device, dtype=torch.float32).contiguous()
+        _, kv_factor, num_kv_heads, tokens_per_block, head_dim = p0.shape
+        if num_q_heads % num_kv_heads:
+            raise ValueError("query heads must be divisible by KV heads")
+        self.num_freqs = head_dim // 2
+        strides = tuple(int(value) for value in p0.stride())
+        self.geometry_args = (
+            num_q_heads,
+            num_kv_heads,
+            self.num_freqs,
+            head_dim,
+            tokens_per_block,
+            kv_factor,
+            int(offsets.numel()),
+            *strides,
+        )
+        anchor = layer_pools[layer_indices[0]]
+        pool_storage, storage_base = _flat_from_true_storage_base(anchor)
+        element_size = anchor.element_size()
+        layer_base_ptrs = torch.zeros(len(layer_pools), dtype=torch.int64, device=device)
+        for layer in layer_indices:
+            pool = layer_pools[layer]
+            if (
+                pool.untyped_storage().data_ptr() != anchor.untyped_storage().data_ptr()
+                or tuple(pool.shape[1:]) != tuple(p0.shape[1:])
+                or tuple(pool.stride()) != strides
+                or pool.dtype != p0.dtype
+            ):
+                raise ValueError("fixed score layers must share one uniform storage")
+            offset_bytes = int(pool.data_ptr()) - storage_base
+            if offset_bytes < 0 or offset_bytes % element_size:
+                raise ValueError("fixed score layer offset is invalid")
+            layer_base_ptrs[layer] = offset_bytes // element_size
+
+        num_segments = max_requests * self.num_layers
+        segment = torch.arange(num_segments, device=device)
+        page_ids_offsets = (
+            torch.arange(max_requests + 1, dtype=torch.int64, device=device) * page_count
+        )
+        seg_req = torch.arange(max_requests, dtype=torch.int32, device=device).repeat_interleave(
+            self.num_layers
+        )
+        seg_layer = torch.tensor(layer_indices, dtype=torch.int32, device=device).repeat(
+            max_requests
+        )
+        seg_seq = torch.full((num_segments,), seq_len, dtype=torch.int32, device=device)
+        seg_out_off = segment.to(torch.int64) * seq_len
+        self.token_block = 64
+        self.max_ntblk = (seq_len + self.token_block - 1) // self.token_block
+        seg_ntblk = torch.full((num_segments,), self.max_ntblk, dtype=torch.int32, device=device)
+        self.seg_offsets = (
+            torch.arange(num_segments + 1, dtype=torch.int32, device=device) * seq_len
+        )
+        self.output = torch.empty(
+            num_q_heads * num_segments * seq_len, dtype=torch.float32, device=device
+        )
+        if page_ids.shape != (max_requests, page_count) or not page_ids.is_contiguous():
+            raise ValueError("page ids do not match fixed score geometry")
+        self.pointer_prefix = (
+            pool_storage,
+            layer_base_ptrs,
+            page_ids.view(-1),
+            page_ids_offsets,
+            seg_req,
+            seg_layer,
+            seg_seq,
+        )
+        self.pointer_middle = (
+            seg_out_off,
+            seg_ntblk,
+            q_real_LHF.view(-1),
+            q_imag_LHF.view(-1),
+            mlr_coef_LHF.view(-1),
+        )
+        self.pointer_tail = (freq_scale_sq, omega, offsets)
+
+    def launch(
+        self,
+        request_count: int,
+        round_starts_device: torch.Tensor,
+        mean_cos: torch.Tensor,
+        mean_sin: torch.Tensor,
+        score_aggregation: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Launch the unchanged score kernel using the persistent metadata."""
+        if request_count <= 0 or request_count > self.max_requests:
+            raise ValueError("request count exceeds fixed score capacity")
+        num_segments = request_count * self.num_layers
+        sum_seq = num_segments * self.seq_len
+        output = self.output[: self.num_q_heads * sum_seq]
+        _launch_tri_score_perhead(
+            (num_segments, self.max_ntblk),
+            (
+                *self.pointer_prefix,
+                round_starts_device,
+                *self.pointer_middle,
+                mean_cos.view(-1),
+                mean_sin.view(-1),
+                *self.pointer_tail,
+                output,
+            ),
+            (sum_seq, *self.geometry_args),
+            score_aggregation=score_aggregation,
+            token_block=self.token_block,
+            num_freqs=self.num_freqs,
+        )
+        return output.view(self.num_q_heads, sum_seq), self.seg_offsets[: num_segments + 1]
 
 
 def triton_tri_score_perhead(
@@ -680,7 +845,6 @@ def triton_tri_score_perhead(
     seg_req = torch.empty(nseg, dtype=torch.int32, device=device)
     seg_layer = torch.empty(nseg, dtype=torch.int32, device=device)
     seg_seq = torch.empty(nseg, dtype=torch.int32, device=device)
-    seg_rstart = torch.empty(nseg, dtype=torch.float32, device=device)
     seg_out_off = torch.empty(nseg, dtype=torch.int64, device=device)
     seg_ntblk = torch.empty(nseg, dtype=torch.int32, device=device)
     seg_offsets = torch.zeros(nseg + 1, dtype=torch.int32, device=device)
@@ -693,12 +857,12 @@ def triton_tri_score_perhead(
     # (numerics-neutral). All three are env-tunable at call time for the bench/sweep;
     # the winning constants get baked in once validated byte-identical.
     T_BLOCK = 64  # verified token-tile width
-    F_BLOCK = triton.next_power_of_2(num_freqs)
 
-    mean_cos = torch.empty(nseg, num_freqs, dtype=torch.float32, device=device)
-    mean_sin = torch.empty(nseg, num_freqs, dtype=torch.float32, device=device)
-    omega_d = omega.to(device=device, dtype=torch.float32)
-    offsets_d = offsets.to(device=device, dtype=torch.float32)
+    request_round_starts = torch.as_tensor(round_starts, dtype=torch.float32, device=device)
+    mean_cos = torch.empty(K, num_freqs, dtype=torch.float32, device=device)
+    mean_sin = torch.empty(K, num_freqs, dtype=torch.float32, device=device)
+    omega_d = omega.to(device=device, dtype=torch.float32).contiguous()
+    offsets_d = offsets.to(device=device, dtype=torch.float32).contiguous()
 
     run = 0
     max_ntblk = 1
@@ -712,16 +876,15 @@ def triton_tri_score_perhead(
         phase = qp * omega_d.view(1, -1)  # [O,F]
         mc = torch.cos(phase).mean(dim=0)  # [F]
         ms = torch.sin(phase).mean(dim=0)  # [F]
+        mean_cos[r] = mc
+        mean_sin[r] = ms
         ntblk = (sl + T_BLOCK - 1) // T_BLOCK
         for layer_slot, lid in enumerate(layer_ids):
             seg_req[s] = r
             seg_layer[s] = lid
             seg_seq[s] = sl
-            seg_rstart[s] = rs
             seg_out_off[s] = run
             seg_ntblk[s] = ntblk
-            mean_cos[s] = mc
-            mean_sin[s] = ms
             seg_offsets[s + 1] = run + sl
             seg_meta.append(
                 SegMeta(seg_index=s, request_index=r, layer_index=lid, seq_len=sl, round_start=rs)
@@ -746,43 +909,47 @@ def triton_tri_score_perhead(
     #
     # Production launch: the kv_head-loop scoring kernel with Triton's autochosen
     # schedule.
-    grid = (nseg, max_ntblk)
-    _tri_score_perhead_kernel[grid](
-        pool_storage,
-        layer_base_ptrs,
-        page_ids_flat,
-        page_ids_offsets,
-        seg_req,
-        seg_layer,
-        seg_seq,
-        seg_rstart,
-        seg_out_off,
-        seg_ntblk,
-        q_real_f,
-        q_imag_f,
-        mlr_f,
-        mean_cos.view(-1).contiguous(),
-        mean_sin.view(-1).contiguous(),
-        fss_d,
-        omega_d,
-        offsets_d,
-        out,
-        sum_seq,
-        num_q_heads,
-        num_kv_heads,
-        num_freqs,
-        head_dim,
-        tokens_per_block,
-        kv_factor,
-        int(offsets_d.numel()),
-        s_page,
-        s_kv_factor,
-        s_kv_head,
-        s_slot,
-        s_dim,
-        USE_MAX=(score_aggregation == "max"),
-        T_BLOCK=T_BLOCK,
-        F_BLOCK=F_BLOCK,
+    _launch_tri_score_perhead(
+        (nseg, max_ntblk),
+        (
+            pool_storage,
+            layer_base_ptrs,
+            page_ids_flat,
+            page_ids_offsets,
+            seg_req,
+            seg_layer,
+            seg_seq,
+            request_round_starts,
+            seg_out_off,
+            seg_ntblk,
+            q_real_f,
+            q_imag_f,
+            mlr_f,
+            mean_cos.view(-1).contiguous(),
+            mean_sin.view(-1).contiguous(),
+            fss_d,
+            omega_d,
+            offsets_d,
+            out,
+        ),
+        (
+            sum_seq,
+            num_q_heads,
+            num_kv_heads,
+            num_freqs,
+            head_dim,
+            tokens_per_block,
+            kv_factor,
+            int(offsets_d.numel()),
+            s_page,
+            s_kv_factor,
+            s_kv_head,
+            s_slot,
+            s_dim,
+        ),
+        score_aggregation=score_aggregation,
+        token_block=T_BLOCK,
+        num_freqs=num_freqs,
     )
     return out.view(num_q_heads, sum_seq), seg_offsets, seg_meta
 
