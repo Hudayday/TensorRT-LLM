@@ -28,6 +28,7 @@ from tensorrt_llm._torch.kv_cache_compression.triattention import TriAttention
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
     _build_swa_rebase_copy,
     _build_swa_rebase_keep,
+    _FixedUnionWorkspace,
 )
 
 # Framework base class lives in pyexecutor.resource_manager; the factory lives
@@ -712,6 +713,124 @@ class TestTopKRouting:
         assert kwargs == {"dim": 1, "sorted": False}
         assert result.shape == (2, 8)
         assert result.dtype == torch.long
+
+
+class TestFixedUnionWorkspace:
+    @staticmethod
+    def _reference(scores, keep_count):
+        combined = scores.max(dim=0).values
+        row_top = torch.topk(scores, keep_count, dim=1, sorted=False).indices
+        union_mask = torch.zeros(combined.numel(), dtype=torch.bool, device=scores.device)
+        union_mask.scatter_(0, row_top.reshape(-1), True)
+        union_indices = torch.nonzero(union_mask, as_tuple=False).view(-1)
+        subset = combined.index_select(0, union_indices)
+        selected = torch.topk(subset, keep_count, sorted=False).indices
+        return union_indices.index_select(0, torch.sort(selected).values)
+
+    def test_finite_distinct_matches_eager_and_reuses_buffers(self):
+        rows = 3
+        width = 257
+        keep_count = 32
+        prompt_len = 11
+        token = torch.arange(width, dtype=torch.float32)
+        scores = torch.stack(
+            [torch.sin(token * scale) + token * 1e-4 for scale in (0.07, 0.11, 0.17)]
+        )
+        workspace = _FixedUnionWorkspace(
+            rows,
+            width,
+            keep_count,
+            prompt_len,
+            dtype=scores.dtype,
+            device=scores.device,
+        )
+        pointers = {
+            name: value.data_ptr()
+            for name, value in vars(workspace).items()
+            if isinstance(value, torch.Tensor)
+        }
+
+        first = workspace.select(scores).clone()
+        second = workspace.select(scores).clone()
+        reference = self._reference(scores, keep_count)
+
+        assert torch.equal(first, second)
+        assert torch.equal(first[:prompt_len], torch.arange(prompt_len))
+        assert torch.equal(first[prompt_len:] - prompt_len, reference)
+        assert pointers == {
+            name: value.data_ptr()
+            for name, value in vars(workspace).items()
+            if isinstance(value, torch.Tensor)
+        }
+
+    def test_finite_ties_are_repeatable_and_preserve_selected_values(self):
+        width = 257
+        keep_count = 32
+        token = torch.arange(width)
+        scores = torch.stack([(token % 11).float().roll(shift) for shift in (0, 3, 7)])
+        workspace = _FixedUnionWorkspace(
+            3,
+            width,
+            keep_count,
+            0,
+            dtype=scores.dtype,
+            device=scores.device,
+        )
+
+        first = workspace.select(scores).clone()
+        second = workspace.select(scores).clone()
+        reference = self._reference(scores, keep_count)
+        combined = scores.max(dim=0).values
+
+        assert torch.equal(first, second)
+        assert torch.equal(
+            combined.index_select(0, first).sort().values,
+            combined.index_select(0, reference).sort().values,
+        )
+
+    def test_manager_routes_only_large_torch_topk_bucket(self):
+        from types import SimpleNamespace
+
+        mgr = TriAttention.__new__(TriAttention)
+        mgr._fixed_union_enabled = True
+        mgr._fixed_union_workspaces = {}
+        mgr._fixed_union_active = {}
+        request = SimpleNamespace(py_request_id=7)
+        large = torch.arange(2 * 4096, dtype=torch.float32).reshape(2, 4096)
+        keep_count = 3072
+        fallback = mgr._evict_union(request, 1, 4100, 4, keep_count, large)
+
+        assert not mgr._fixed_union_workspaces
+        fixed = mgr._evict_union(
+            request,
+            1,
+            4100,
+            4,
+            keep_count,
+            large,
+            use_fixed_workspace=True,
+        )
+        workspace = mgr._get_fixed_union_workspace(7, large, keep_count, 4)
+
+        assert workspace is not None
+        assert torch.equal(fixed, fallback)
+        assert mgr._get_fixed_union_workspace(7, large, keep_count, 4) is workspace
+        assert mgr._get_fixed_union_workspace(7, large[:, :128], keep_count, 4) is None
+
+    def test_request_cleanup_does_not_drop_other_request_bucket(self):
+        mgr = TriAttention.__new__(TriAttention)
+        mgr._fixed_union_workspaces = {
+            (7, "shape-a"): object(),
+            (7, "shape-b"): object(),
+            (8, "shape-a"): object(),
+        }
+        mgr._fixed_union_active = {7: object(), 8: object()}
+
+        mgr._clear_fixed_union_workspaces(7)
+
+        assert set(mgr._fixed_union_workspaces) == {(8, "shape-a")}
+        assert 7 not in mgr._fixed_union_active
+        assert 8 in mgr._fixed_union_active
 
 
 class TestKeptOnlyCompaction:

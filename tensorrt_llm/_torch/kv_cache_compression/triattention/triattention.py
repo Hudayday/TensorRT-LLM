@@ -125,6 +125,167 @@ def _request_draft_length(request: "LlmRequest") -> int:
     return 0
 
 
+class _FixedUnionWorkspace:
+    """Persistent buffers for one request's fixed-shape union eviction.
+
+    This workspace is intentionally internal and shape-specific. It removes the
+    dynamic ``nonzero`` and temporary allocation chain only for the large-k
+    ``torch.topk`` route. The caller retains eager fallbacks for every other
+    shape and owns this object for the request lifetime. Finite ties are
+    repeatable for a fixed Torch runtime and preserve the selected-value
+    multiset; cross-backend token identity remains the existing unspecified
+    tie contract. Non-finite scores remain unsupported.
+    """
+
+    def __init__(
+        self,
+        rows: int,
+        width: int,
+        keep_count: int,
+        prompt_len: int,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        if rows <= 0 or width <= keep_count or keep_count <= 0:
+            raise ValueError("fixed union workspace requires rows > 0 and width > keep_count > 0")
+        self.rows = rows
+        self.width = width
+        self.keep_count = keep_count
+        self.prompt_len = prompt_len
+        self.total_keep = prompt_len + keep_count
+        self.dtype = dtype
+        self.device = device
+
+        self.combined = torch.empty(width, dtype=dtype, device=device)
+        self.combined_argmax = torch.empty(width, dtype=torch.long, device=device)
+        self.row_top_values = torch.empty((rows, keep_count), dtype=dtype, device=device)
+        self.row_top_indices = torch.empty((rows, keep_count), dtype=torch.long, device=device)
+        self.union_mask = torch.empty(width, dtype=torch.bool, device=device)
+        self.candidates = torch.empty(width, dtype=dtype, device=device)
+        self.negative_inf = torch.full((), float("-inf"), dtype=dtype, device=device)
+        self.final_values = torch.empty(keep_count, dtype=dtype, device=device)
+        self.final_indices = torch.empty(keep_count, dtype=torch.long, device=device)
+        self.sorted_indices = torch.empty_like(self.final_indices)
+        self.sort_order = torch.empty_like(self.final_indices)
+        self.keep = torch.empty(self.total_keep, dtype=torch.long, device=device)
+        self.keep[:prompt_len].copy_(torch.arange(prompt_len, dtype=torch.long, device=device))
+        self._compaction_buffers = {}
+
+    def select(self, per_head_scores: torch.Tensor) -> torch.Tensor:
+        """Return a persistent sorted keep tensor without dynamic output shapes."""
+        if (
+            tuple(per_head_scores.shape) != (self.rows, self.width)
+            or per_head_scores.dtype != self.dtype
+            or per_head_scores.device != self.device
+        ):
+            raise ValueError("fixed union input no longer matches its workspace bucket")
+
+        torch.max(
+            per_head_scores,
+            dim=0,
+            out=(self.combined, self.combined_argmax),
+        )
+        torch.topk(
+            per_head_scores,
+            self.keep_count,
+            dim=1,
+            largest=True,
+            sorted=False,
+            out=(self.row_top_values, self.row_top_indices),
+        )
+        self.union_mask.zero_()
+        self.union_mask.scatter_(0, self.row_top_indices.reshape(-1), True)
+        torch.where(
+            self.union_mask,
+            self.combined,
+            self.negative_inf,
+            out=self.candidates,
+        )
+        torch.topk(
+            self.candidates,
+            self.keep_count,
+            largest=True,
+            sorted=False,
+            out=(self.final_values, self.final_indices),
+        )
+        torch.sort(
+            self.final_indices,
+            out=(self.sorted_indices, self.sort_order),
+        )
+        torch.add(
+            self.sorted_indices,
+            self.prompt_len,
+            out=self.keep[self.prompt_len :],
+        )
+        return self.keep
+
+    def can_compact(self, pool: torch.Tensor, page_ids: torch.Tensor, seq_len: int) -> bool:
+        """Whether the fixed one-request compact launcher supports this pool."""
+        return (
+            pool.is_cuda
+            and pool.device == self.device
+            and pool.ndim == 5
+            and page_ids.ndim == 1
+            and page_ids.device == self.device
+            and page_ids.dtype == torch.int64
+            and self.total_keep < seq_len
+        )
+
+    @staticmethod
+    def _compaction_key(pool: torch.Tensor, page_ids: torch.Tensor) -> tuple:
+        _, kv_factor, num_kv_heads, tokens_per_block, head_dim = pool.shape
+        return (
+            str(pool.device),
+            pool.dtype,
+            int(page_ids.numel()),
+            int(kv_factor),
+            int(num_kv_heads),
+            int(tokens_per_block),
+            int(head_dim),
+        )
+
+    def compact(
+        self,
+        pool: torch.Tensor,
+        page_ids: torch.Tensor,
+        seq_len: int,
+        *,
+        copy_page_ids: bool = True,
+    ) -> None:
+        """Compact one HND layer using persistent indices and scratch storage."""
+        if not self.can_compact(pool, page_ids, seq_len):
+            raise ValueError("pool no longer matches the fixed union compaction bucket")
+        _, kv_factor, num_kv_heads, tokens_per_block, head_dim = pool.shape
+        key = self._compaction_key(pool, page_ids)
+        buffers = self._compaction_buffers.get(key)
+        if buffers is None:
+            fixed_page_ids = torch.empty_like(page_ids)
+            destination = torch.arange(self.total_keep, dtype=torch.int64, device=self.device)
+            page_base = torch.zeros(self.total_keep, dtype=torch.int64, device=self.device)
+            scratch = torch.empty(
+                kv_factor * num_kv_heads * self.total_keep * head_dim,
+                dtype=pool.dtype,
+                device=self.device,
+            )
+            buffers = (fixed_page_ids, destination, page_base, scratch)
+            self._compaction_buffers[key] = buffers
+        fixed_page_ids, destination, page_base, scratch = buffers
+        if copy_page_ids:
+            fixed_page_ids.copy_(page_ids)
+
+        from .triattention_kernels import triton_tri_compact_fixed
+
+        triton_tri_compact_fixed(
+            pool,
+            fixed_page_ids,
+            self.keep,
+            destination,
+            page_base,
+            scratch,
+        )
+
+
 class TriAttention(BaseKVCacheCompressionManager):
     """Periodic physical KV eviction driven by trigonometric importance scoring.
 
@@ -246,6 +407,14 @@ class TriAttention(BaseKVCacheCompressionManager):
         # Context requests initialize through the framework hook; generation-only
         # disaggregated requests initialize lazily in the pre-forward hook.
         self._capacity_only_request_ids: set[int] = set()
+        # Experimental production path promoted by the sealed real-shape P0.
+        # It remains opt-in until same-shape serving A/B closes the e2e gate.
+        self._fixed_union_enabled = os.environ.get("TRIATTN_FIXED_BUFFER_UNION", "0") == "1"
+        self._fixed_union_compaction_enabled = (
+            self._fixed_union_enabled and os.environ.get("TRIATTN_COMPACT_KEPT_ONLY", "1") == "1"
+        )
+        self._fixed_union_workspaces = {}
+        self._fixed_union_active = {}
 
     def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
         """Mark capacity-only decode and resolve calibration once.
@@ -447,6 +616,17 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._evicted.pop(request.py_request_id, None)
         self._pre_forward_kv_lengths.pop(request.py_request_id, None)
         self._capacity_only_request_ids.discard(request.py_request_id)
+        self._clear_fixed_union_workspaces(request.py_request_id)
+
+    def _clear_fixed_union_workspaces(self, request_id: int) -> None:
+        """Release fixed buffers only after this request's compaction is ordered."""
+        workspaces = getattr(self, "_fixed_union_workspaces", None)
+        if workspaces is not None:
+            for key in [key for key in workspaces if key[0] == request_id]:
+                del workspaces[key]
+        active = getattr(self, "_fixed_union_active", None)
+        if active is not None:
+            active.pop(request_id, None)
 
     # ------------------------------------------------------------------ #
     # Attention-metadata reconcile (compression-framework hook)          #
@@ -547,6 +727,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         num_layers: int,
         seq_len: int,
         precomputed: List["torch.Tensor"],
+        use_fixed_union: bool = False,
     ) -> Optional[Union[int, "torch.Tensor"]]:
         """Select and compact from precomputed dense-layer scores.
 
@@ -609,6 +790,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 decode_start,
                 decode_budget,
                 torch.cat(union_rows, dim=0),
+                use_fixed_workspace=use_fixed_union,
             )
         if self.eviction_mode == "per_head":
             return self._evict_per_head(
@@ -713,16 +895,79 @@ class TriAttention(BaseKVCacheCompressionManager):
         decode_start: int,
         decode_budget: int,
         head_matrix: "torch.Tensor",
+        use_fixed_workspace: bool = False,
     ) -> "torch.Tensor":
         """union: union of every head's top-k, re-ranked by the per-token max
         (upstream ``_select_union_based``). One 1-D keep set shared by every
         layer; returns the sorted kept slot indices in ``[0, seq_len)`` so the
         caller compacts all layers in one pass (``triton_tri_compact``)."""
+        request_id = request.py_request_id
+        workspace = None
+        if use_fixed_workspace:
+            workspace = self._get_fixed_union_workspace(
+                request_id,
+                head_matrix,
+                decode_budget,
+                decode_start,
+            )
+        if workspace is not None:
+            active = getattr(self, "_fixed_union_active", None)
+            if active is None:
+                self._fixed_union_active = {}
+                active = self._fixed_union_active
+            active[request_id] = workspace
+            return workspace.select(head_matrix)
+
+        active = getattr(self, "_fixed_union_active", None)
+        if active is not None:
+            active.pop(request_id, None)
         combined = head_matrix.max(dim=0).values  # [decode_count]
         keep_1d = self._select_union(head_matrix, combined, decode_budget)
         prefill_idx = torch.arange(decode_start, device=combined.device, dtype=torch.long)
         keep = torch.sort(torch.cat([prefill_idx, keep_1d + decode_start])).values
         return keep
+
+    def _get_fixed_union_workspace(
+        self,
+        request_id: int,
+        scores: torch.Tensor,
+        keep_count: int,
+        prompt_len: int,
+    ) -> Optional[_FixedUnionWorkspace]:
+        """Get a shape bucket when fixed selection preserves the eager contract."""
+        if not getattr(self, "_fixed_union_enabled", False) or scores.ndim != 2:
+            return None
+        rows, width = (int(value) for value in scores.shape)
+        # The fixed P0 uses torch.topk for both selection stages. Requiring a k
+        # above IndexerTopK's cap preserves that route even after union packing.
+        uses_torch_topk = keep_count > self._INDEXER_TOPK_MAX_K
+        if rows <= 0 or keep_count <= 0 or width <= keep_count or not uses_torch_topk:
+            return None
+        key = (
+            request_id,
+            rows,
+            width,
+            keep_count,
+            prompt_len,
+            scores.dtype,
+            str(scores.device),
+        )
+        workspaces = getattr(self, "_fixed_union_workspaces", None)
+        if workspaces is None:
+            self._fixed_union_workspaces = {}
+            workspaces = self._fixed_union_workspaces
+        workspace = workspaces.get(key)
+        if workspace is None:
+            workspace = _FixedUnionWorkspace(
+                rows,
+                width,
+                keep_count,
+                prompt_len,
+                dtype=scores.dtype,
+                device=scores.device,
+            )
+            workspaces[key] = workspace
+        return workspace
 
     def _indexer_topk_idx(self, scores: "torch.Tensor", k: int) -> "torch.Tensor":
         """Top-k indices per row via the TRT-LLM IndexerTopK op (AIR-TopK) — the
@@ -1141,6 +1386,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         union_by_layer = {} if is_union else None
         swa_by_layer = {}
         pending_updates = []
+        fixed_union_compaction = None
         for r, item in enumerate(prepared):
             request = item["request"]
             rid = item["request_id"]
@@ -1148,18 +1394,42 @@ class TriAttention(BaseKVCacheCompressionManager):
             precomputed = [req_layer_scores[r].get(layer) for layer in range(num_layers)]
             if any(precomputed[layer] is None for layer in dense_layers):
                 continue
-            keep_count = self._evict_modes(request, num_layers, seq_len, precomputed=precomputed)
+            keep_count = self._evict_modes(
+                request,
+                num_layers,
+                seq_len,
+                precomputed=precomputed,
+                use_fixed_union=is_union and len(prepared) == 1,
+            )
             if keep_count is None:
                 continue
             if is_union and isinstance(keep_count, torch.Tensor):
                 keep = keep_count
                 keep_count = int(keep.numel())
-                for lid in dense_layers:
-                    grp = union_by_layer.setdefault(lid, ([], [], []))
-                    representative = layer_group_representative[lid]
-                    grp[0].append(item["dense_page_ids_by_group"][representative])
-                    grp[1].append(keep)
-                    grp[2].append(seq_len)
+                workspace = getattr(self, "_fixed_union_active", {}).get(rid)
+                can_use_fixed_compaction = (
+                    len(prepared) == 1
+                    and getattr(self, "_fixed_union_compaction_enabled", False)
+                    and workspace is not None
+                    and workspace.keep is keep
+                    and all(
+                        workspace.can_compact(
+                            layer_pools[lid],
+                            item["dense_page_ids_by_group"][layer_group_representative[lid]],
+                            seq_len,
+                        )
+                        for lid in dense_layers
+                    )
+                )
+                if can_use_fixed_compaction:
+                    fixed_union_compaction = (workspace, item, seq_len)
+                else:
+                    for lid in dense_layers:
+                        grp = union_by_layer.setdefault(lid, ([], [], []))
+                        representative = layer_group_representative[lid]
+                        grp[0].append(item["dense_page_ids_by_group"][representative])
+                        grp[1].append(keep)
+                        grp[2].append(seq_len)
             if keep_count != item["expected_keep_count"]:
                 raise RuntimeError(
                     f"TriAttention selected {keep_count} tokens for request {rid}, "
@@ -1181,6 +1451,21 @@ class TriAttention(BaseKVCacheCompressionManager):
         if union_by_layer:
             for lid, (pl, kl, sl) in union_by_layer.items():
                 triton_tri_compact(layer_pools[lid], pl, kl, sl)
+        if fixed_union_compaction is not None:
+            workspace, item, seq_len = fixed_union_compaction
+            for lids in storage_groups.values():
+                representative = lids[0]
+                page_ids = item["dense_page_ids_by_group"][representative]
+                copied_buffer_keys = set()
+                for lid in lids:
+                    buffer_key = workspace._compaction_key(layer_pools[lid], page_ids)
+                    workspace.compact(
+                        layer_pools[lid],
+                        page_ids,
+                        seq_len,
+                        copy_page_ids=buffer_key not in copied_buffer_keys,
+                    )
+                    copied_buffer_keys.add(buffer_key)
         for lid, (pl, sources, seq_lens, destinations) in swa_by_layer.items():
             triton_tri_compact(
                 layer_pools[lid],

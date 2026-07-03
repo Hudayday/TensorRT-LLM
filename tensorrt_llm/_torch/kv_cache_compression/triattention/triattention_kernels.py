@@ -246,6 +246,67 @@ def triton_tri_compact(pool, page_ids_list, keep_list, seq_len_list, *, dest_lis
         )
 
 
+def triton_tri_compact_fixed(
+    pool: torch.Tensor,
+    page_ids: torch.Tensor,
+    keep: torch.Tensor,
+    destination: torch.Tensor,
+    page_base: torch.Tensor,
+    scratch: torch.Tensor,
+) -> None:
+    """Compact one request with caller-owned fixed-shape buffers.
+
+    The regular wrapper remains the general batched/ragged path. This entry
+    point only removes its per-call cat/arange/full allocation chain after the
+    manager has validated a stable one-request bucket.
+    """
+    if pool.ndim != 5:
+        raise ValueError("pool must use the five-dimensional HND layout")
+    _, kv_factor, num_kv_heads, tokens_per_block, head_dim = pool.shape
+    total = int(keep.numel())
+    tensors = (page_ids, keep, destination, page_base, scratch)
+    if any(tensor.device != pool.device for tensor in tensors):
+        raise ValueError("fixed compaction buffers must be on the pool device")
+    if (
+        page_ids.ndim != 1
+        or keep.ndim != 1
+        or destination.shape != keep.shape
+        or page_base.shape != keep.shape
+    ):
+        raise ValueError("fixed compaction index buffers have incompatible shapes")
+    if any(tensor.dtype != torch.int64 for tensor in tensors[:-1]):
+        raise ValueError("fixed compaction indices must use int64")
+    need = kv_factor * num_kv_heads * total * head_dim
+    if scratch.dtype != pool.dtype or scratch.numel() < need:
+        raise ValueError("fixed compaction scratch does not match the pool layout")
+
+    block_tokens = 16
+    dim_block = triton.next_power_of_2(head_dim)
+    grid = (triton.cdiv(total, block_tokens), kv_factor, num_kv_heads)
+    for phase in (0, 1):
+        _tri_compact_kernel[grid](
+            pool,
+            keep,
+            destination,
+            page_base,
+            page_ids,
+            scratch,
+            total,
+            num_kv_heads,
+            tokens_per_block,
+            head_dim,
+            pool.stride(0),
+            pool.stride(1),
+            pool.stride(2),
+            pool.stride(3),
+            pool.stride(4),
+            PHASE=phase,
+            D_BLOCK=dim_block,
+            BLOCK_TOKENS=block_tokens,
+            PER_HEAD=False,
+        )
+
+
 def triton_tri_compact_perhead(pool, page_ids_list, keep_2d_list, seq_len_list):
     """In-place PER-HEAD compaction over many requests sharing ONE layer ``pool``.
 
