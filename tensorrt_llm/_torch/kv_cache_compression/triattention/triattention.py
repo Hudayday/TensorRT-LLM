@@ -542,7 +542,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         """Periodic physical eviction, PRE-forward (framework hook, fired from the
         base prepare_resources before _forward_step). Every beta steps over budget:
         score the full cache, select top-B, physically compact, reconcile the
-        forward's attention metadata, and resize V2 to the compacted capacity.
+        forward's attention metadata, and publish a K+1 target that V2 consumes
+        at its post-forward update boundary.
 
         Uses the pre-forward hook (NOT post-forward on_generation_step_end) because
         the latter races the overlap scheduler: the next iteration's forward is
@@ -689,9 +690,12 @@ class TriAttention(BaseKVCacheCompressionManager):
         """Return a provenance key containing geometry but no request identity."""
         decode_width = future_seq_len - prompt_len
         use_fixed_workspace = self.top_B > self._INDEXER_TOPK_MAX_K
-        selection_backend = (
-            "fixed_union.torch_topk" if use_fixed_workspace else "eager_union.torch_topk"
-        )
+        if use_fixed_workspace:
+            selection_backend = "fixed_union.torch_topk"
+        elif self._indexer_topk_supported(decode_width, self.top_B):
+            selection_backend = "eager_union.indexer_topk"
+        else:
+            selection_backend = "eager_union.torch_topk"
         if use_fixed_workspace:
             compaction_backend = (
                 "triton_tri_compact_fixed"
@@ -717,7 +721,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 )
             )
         return (
-            "triattention.fixed-prewarm.v1",
+            "triattention.fixed-prewarm.v2",
             num_layers,
             tuple(dense_layers),
             int(self._H),
@@ -818,8 +822,7 @@ class TriAttention(BaseKVCacheCompressionManager):
 
         Startup has no real request from which to infer prompt length or the
         overlap-sensitive first eviction width. Exact buckets are therefore an
-        explicit provenance input. The primary B=beta=4096 benchmark uses the
-        measured ``1024:8192`` bucket; other workloads must supply their own
+        explicit provenance input. Workloads must supply their externally
         observed prompt length and decode width rather than infer one from beta.
         """
         if not getattr(self, "_fixed_union_prewarm_enabled", False):
@@ -886,13 +889,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
             return
         use_fixed_workspace = self.top_B > self._INDEXER_TOPK_MAX_K
-        use_eager_torch_topk = decode_width >= 2 * self._INDEXER_TOPK_SUBBLOCK
-        if not use_fixed_workspace and not use_eager_torch_topk:
-            logger.warning(
-                "TriAttention prewarm bucket does not use a torch-topk route "
-                f"({prompt_len}:{decode_width}); skipping prewarm"
-            )
-            return
         seq_len = prompt_len + decode_width
         first_pool = layer_pools[dense_layers[0]]
         rows = len(dense_layers) * int(self._H)
@@ -984,10 +980,9 @@ class TriAttention(BaseKVCacheCompressionManager):
                     if workspace is not None:
                         keep = workspace.select(head_matrix)
                     else:
-                        # The width-based torch-topk fallback is an eager route.
                         # Use alternating monotonic rows so the per-row union
-                        # covers the full decode domain and both top-k stages
-                        # compile for the real width instead of a tie-collapsed
+                        # covers the full decode domain and both eager top-k
+                        # stages warm the real width instead of a tie-collapsed
                         # dummy subset.
                         token = torch.arange(
                             decode_width,
@@ -1442,7 +1437,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         width requires the unsupported multi-block radix path."""
         rows, seq = scores.shape
         k = int(k)
-        if k > self._INDEXER_TOPK_MAX_K or seq >= 2 * self._INDEXER_TOPK_SUBBLOCK:
+        if not self._indexer_topk_supported(seq, k):
             return torch.topk(scores, k, dim=1, sorted=False).indices.to(torch.long)
         out = torch.empty((rows, k), dtype=torch.int32, device=scores.device)
         seq_lens = torch.full((rows,), seq, dtype=torch.int32, device=scores.device)
@@ -1450,6 +1445,10 @@ class TriAttention(BaseKVCacheCompressionManager):
             scores.contiguous().to(torch.float32), seq_lens, out, 1, k
         )
         return out.to(torch.long)
+
+    def _indexer_topk_supported(self, width: int, k: int) -> bool:
+        """Return whether the production selection route uses IndexerTopK."""
+        return int(k) <= self._INDEXER_TOPK_MAX_K and int(width) < 2 * self._INDEXER_TOPK_SUBBLOCK
 
     def _select_union(
         self, per_head_scores: "torch.Tensor", combined: "torch.Tensor", keep_count: int

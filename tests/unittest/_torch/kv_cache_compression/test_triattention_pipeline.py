@@ -397,6 +397,13 @@ class TestStepBeginHookRefactor:
             mgr.prepare_resources(batch)
             sb.assert_called_once_with(batch)
 
+    def test_step_begin_hook_documents_deferred_v2_resize_boundary(self):
+        doc = TriAttention.on_generation_step_begin.__doc__
+
+        assert "publish a K+1 target" in doc
+        assert "post-forward update boundary" in doc
+        assert "resize V2 to the compacted capacity" not in doc
+
     def test_evicted_count_default_zero(self):
         mgr = TriAttention(_make_fake_v2(), top_B=8, beta=4, skip_swa=False)
         assert mgr.evicted_count(12345) == 0
@@ -741,7 +748,51 @@ class TestStepBeginHookRefactor:
 
 
 class TestTopKRouting:
-    def test_score_width_4096_routes_to_torch_topk(self):
+    def test_indexer_route_predicate_preserves_prior_dispatch_domain(self):
+        mgr = TriAttention.__new__(TriAttention)
+
+        for width in (1, 4095, 4096, 8191):
+            for k in (1, 2048, 2049, 4096):
+                prior_route = not (
+                    k > mgr._INDEXER_TOPK_MAX_K or width >= 2 * mgr._INDEXER_TOPK_SUBBLOCK
+                )
+                assert mgr._indexer_topk_supported(width, k) is prior_route
+
+    def test_score_width_4095_k2048_routes_to_native_indexer_topk(self):
+        from unittest import mock
+
+        mgr = TriAttention.__new__(TriAttention)
+        scores = torch.arange(2 * 4095, dtype=torch.float32).reshape(2, 4095)
+
+        def fake_indexer(values, seq_lens, output, next_n, k):
+            assert values.shape == scores.shape
+            assert values.dtype == scores.dtype
+            assert values.device == scores.device
+            assert seq_lens.tolist() == [4095, 4095]
+            assert next_n == 1
+            assert k == 2048
+            output.copy_(torch.arange(k, dtype=torch.int32, device=output.device).expand(2, -1))
+
+        with (
+            mock.patch.object(
+                torch.ops.trtllm,
+                "indexer_topk_decode",
+                side_effect=fake_indexer,
+            ) as indexer,
+            mock.patch.object(
+                torch,
+                "topk",
+                side_effect=AssertionError("4095 must stay on native IndexerTopK"),
+            ),
+        ):
+            result = mgr._indexer_topk_idx(scores, 2048)
+
+        indexer.assert_called_once()
+        assert result.shape == (2, 2048)
+        assert result.dtype == torch.long
+        assert torch.equal(result[0], torch.arange(2048))
+
+    def test_score_width_4096_k2048_routes_to_torch_topk(self):
         from unittest import mock
 
         mgr = TriAttention.__new__(TriAttention)
@@ -749,14 +800,14 @@ class TestTopKRouting:
         real_topk = torch.topk
 
         with mock.patch.object(torch, "topk", wraps=real_topk) as topk:
-            result = mgr._indexer_topk_idx(scores, 8)
+            result = mgr._indexer_topk_idx(scores, 2048)
 
         topk.assert_called_once()
         args, kwargs = topk.call_args
         assert args[0] is scores
-        assert args[1:] == (8,)
+        assert args[1:] == (2048,)
         assert kwargs == {"dim": 1, "sorted": False}
-        assert result.shape == (2, 8)
+        assert result.shape == (2, 2048)
         assert result.dtype == torch.long
 
 
@@ -852,6 +903,38 @@ class TestFixedUnionWorkspace:
         with pytest.raises(ValueError, match="prompt_len >= 0"):
             TriAttention._parse_fixed_prewarm_shapes("-1:4225")
 
+    def test_startup_prewarm_dispatches_first_and_steady_buckets(self):
+        import os
+        from unittest import mock
+
+        manager, pools = self._make_mocked_prewarm_manager()
+        manager.top_B = 2048
+        manager._INDEXER_TOPK_MAX_K = 2048
+        manager._INDEXER_TOPK_SUBBLOCK = 2048
+        layer_pools, dense_layers, storage_groups = manager._fixed_union_live_geometry(2)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"TRIATTN_FIXED_PREWARM_SHAPES": "1024:4095,1024:4096"},
+            ),
+            mock.patch.object(manager, "_validate_v2_compatibility"),
+            mock.patch.object(manager, "_ensure_calibrated"),
+            mock.patch.object(manager, "_num_layers_from_manager", return_value=2),
+            mock.patch.object(
+                manager,
+                "_fixed_union_live_geometry",
+                return_value=(layer_pools, dense_layers, storage_groups),
+            ),
+            mock.patch.object(manager, "_prewarm_fixed_union_bucket") as prewarm_bucket,
+        ):
+            manager.prewarm()
+
+        assert [call.args[-2:] for call in prewarm_bucket.call_args_list] == [
+            (1024, 4095),
+            (1024, 4096),
+        ]
+
     def test_dummy_pool_preserves_geometry_without_aliasing_live_storage(self):
         live = torch.arange(3 * 2 * 2 * 4 * 3, dtype=torch.float32).reshape(3, 2, 2, 4, 3)
         before = live.clone()
@@ -892,6 +975,45 @@ class TestFixedUnionWorkspace:
         )
 
         assert first == second
+
+    def test_prewarm_key_records_exact_4095_indexer_boundary(self):
+        manager, pools = self._make_mocked_prewarm_manager()
+        manager.top_B = 2048
+        manager._INDEXER_TOPK_MAX_K = 2048
+        manager._INDEXER_TOPK_SUBBLOCK = 2048
+
+        native = manager._fixed_union_prewarm_key(
+            pools,
+            [0, 1],
+            [[0, 1]],
+            num_layers=2,
+            future_seq_len=1024 + 4095,
+            prompt_len=1024,
+        )
+        eager = manager._fixed_union_prewarm_key(
+            pools,
+            [0, 1],
+            [[0, 1]],
+            num_layers=2,
+            future_seq_len=1024 + 4096,
+            prompt_len=1024,
+        )
+        manager.top_B = 4096
+        fixed = manager._fixed_union_prewarm_key(
+            pools,
+            [0, 1],
+            [[0, 1]],
+            num_layers=2,
+            future_seq_len=1024 + 8191,
+            prompt_len=1024,
+        )
+
+        assert native[0] == "triattention.fixed-prewarm.v2"
+        assert native[9] == "eager_union.indexer_topk"
+        assert eager[9] == "eager_union.torch_topk"
+        assert fixed[9] == "fixed_union.torch_topk"
+        assert native[12:17] == (1024 + 4095, 1024, 2048, 4, 4095)
+        assert native != eager
 
     @staticmethod
     def _make_mocked_prewarm_manager():
@@ -1047,6 +1169,131 @@ class TestFixedUnionWorkspace:
             manager._pre_forward_kv_lengths,
             manager._capacity_only_request_ids,
         )
+        for pool, before in zip(pools, live_before):
+            assert torch.equal(pool, before)
+
+    def test_startup_prewarm_executes_exact_4095_native_indexer_bucket(self):
+        import contextlib
+        from unittest import mock
+
+        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention as tri_module
+        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels as kernels
+
+        manager, pools = self._make_mocked_prewarm_manager()
+        manager.top_B = 2048
+        manager._INDEXER_TOPK_MAX_K = 2048
+        manager._INDEXER_TOPK_SUBBLOCK = 2048
+        live_before = [pool.clone() for pool in pools]
+        live_ptrs = [pool.untyped_storage().data_ptr() for pool in pools]
+        layer_pools, dense_layers, storage_groups = manager._fixed_union_live_geometry(2)
+        seen_indexer_calls = []
+
+        def fake_score(*args, **kwargs):
+            seq_len = 1024 + 4095
+            values = torch.zeros((2, 2 * seq_len), dtype=torch.float32)
+            return values, torch.tensor([0, seq_len, 2 * seq_len], dtype=torch.int32), []
+
+        def fake_indexer(scores, k):
+            rows, width = scores.shape
+            seen_indexer_calls.append((rows, width, k))
+            assert width == 4095
+            assert k == 2048
+            if rows == 1:
+                return torch.arange(width - k, width, dtype=torch.long, device=scores.device)
+            low = torch.arange(k, dtype=torch.long, device=scores.device)
+            high = torch.arange(width - k, width, dtype=torch.long, device=scores.device)
+            return torch.stack([high if row % 2 == 0 else low for row in range(rows)])
+
+        with (
+            mock.patch.object(kernels, "triton_tri_score_perhead", side_effect=fake_score),
+            mock.patch.object(kernels, "triton_tri_compact") as compact,
+            mock.patch.object(manager, "_indexer_topk_idx", side_effect=fake_indexer),
+            mock.patch.object(
+                tri_module,
+                "nvtx_range",
+                side_effect=lambda *args, **kwargs: contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                torch,
+                "topk",
+                side_effect=AssertionError("native prewarm must not call torch.topk"),
+            ),
+        ):
+            manager._prewarm_fixed_union_bucket(
+                layer_pools,
+                dense_layers,
+                storage_groups,
+                num_layers=2,
+                prompt_len=1024,
+                decode_width=4095,
+            )
+
+        assert seen_indexer_calls == [(4, 4095, 2048), (1, 4095, 2048)]
+        compact.assert_called_once()
+        assert compact.call_args.args[3] == [1024 + 4095]
+        keep = compact.call_args.args[2][0]
+        assert keep.shape == (1024 + 2048,)
+        assert list(manager._fixed_union_prewarm_states.values()) == ["ready"]
+        assert not manager._fixed_union_prewarmed_workspaces
+        assert live_ptrs == [pool.untyped_storage().data_ptr() for pool in pools]
+        for pool, before in zip(pools, live_before):
+            assert torch.equal(pool, before)
+
+    def test_startup_prewarm_executes_exact_4096_torch_topk_bucket(self):
+        import contextlib
+        from unittest import mock
+
+        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention as tri_module
+        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels as kernels
+
+        manager, pools = self._make_mocked_prewarm_manager()
+        manager.top_B = 2048
+        manager._INDEXER_TOPK_MAX_K = 2048
+        manager._INDEXER_TOPK_SUBBLOCK = 2048
+        live_before = [pool.clone() for pool in pools]
+        live_ptrs = [pool.untyped_storage().data_ptr() for pool in pools]
+        layer_pools, dense_layers, storage_groups = manager._fixed_union_live_geometry(2)
+
+        def fake_score(*args, **kwargs):
+            seq_len = 1024 + 4096
+            values = torch.zeros((2, 2 * seq_len), dtype=torch.float32)
+            return values, torch.tensor([0, seq_len, 2 * seq_len], dtype=torch.int32), []
+
+        real_topk = torch.topk
+        with (
+            mock.patch.object(kernels, "triton_tri_score_perhead", side_effect=fake_score),
+            mock.patch.object(kernels, "triton_tri_compact") as compact,
+            mock.patch.object(
+                tri_module,
+                "nvtx_range",
+                side_effect=lambda *args, **kwargs: contextlib.nullcontext(),
+            ),
+            mock.patch.object(torch, "topk", wraps=real_topk) as topk,
+        ):
+            manager._prewarm_fixed_union_bucket(
+                layer_pools,
+                dense_layers,
+                storage_groups,
+                num_layers=2,
+                prompt_len=1024,
+                decode_width=4096,
+            )
+
+        assert [tuple(call.args[0].shape) for call in topk.call_args_list] == [
+            (4, 4096),
+            (1, 4096),
+        ]
+        assert all(call.args[1] == 2048 for call in topk.call_args_list)
+        assert all(call.kwargs == {"dim": 1, "sorted": False} for call in topk.call_args_list)
+        compact.assert_called_once()
+        assert compact.call_args.args[3] == [1024 + 4096]
+        keep = compact.call_args.args[2][0]
+        assert keep.shape == (1024 + 2048,)
+        assert list(manager._fixed_union_prewarm_states.values()) == ["ready"]
+        key = next(iter(manager._fixed_union_prewarm_states))
+        assert key[9] == "eager_union.torch_topk"
+        assert not manager._fixed_union_prewarmed_workspaces
+        assert live_ptrs == [pool.untyped_storage().data_ptr() for pool in pools]
         for pool, before in zip(pools, live_before):
             assert torch.equal(pool, before)
 
