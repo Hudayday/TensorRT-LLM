@@ -382,15 +382,64 @@ class StandaloneEvictionGraphCache:
         self.retired = []
         self.disabled = set()
         self.counts = {
+            "attempt": 0,
+            "attempted_requests": 0,
             "capture": 0,
+            "launch": 0,
+            "cache_hit": 0,
+            "covered_requests": 0,
+            # Historical observers treat replay as every successful
+            # CUDAGraph.replay(), including the first launch after capture.
             "replay": 0,
             "fallback": 0,
             "invalidated": 0,
+            "failure": 0,
             "capture_failure": 0,
             "replay_failure": 0,
             "retired": 0,
         }
+        self.bucket_counts = OrderedDict()
         self.last_error: Optional[dict[str, str]] = None
+
+    def _bucket_for(self, key: tuple, request_count: int) -> dict:
+        if request_count <= 0:
+            raise ValueError("standalone graph request count must be positive")
+        bucket = self.bucket_counts.get(key)
+        if bucket is None:
+            bucket = {
+                "request_count": int(request_count),
+                "attempt": 0,
+                "attempted_requests": 0,
+                "capture": 0,
+                "launch": 0,
+                "cache_hit": 0,
+                "covered_requests": 0,
+                "fallback": 0,
+                "invalidated": 0,
+                "failure": 0,
+                "capture_failure": 0,
+                "replay_failure": 0,
+            }
+            self.bucket_counts[key] = bucket
+        elif bucket["request_count"] != request_count:
+            raise ValueError("standalone graph key changed request-count semantics")
+        return bucket
+
+    def _record_attempt(self, key: tuple, request_count: int) -> dict:
+        bucket = self._bucket_for(key, request_count)
+        self.counts["attempt"] += 1
+        self.counts["attempted_requests"] += request_count
+        bucket["attempt"] += 1
+        bucket["attempted_requests"] += request_count
+        return bucket
+
+    def _record_fallback(self, bucket: dict) -> None:
+        self.counts["fallback"] += 1
+        bucket["fallback"] += 1
+
+    def record_fallback(self, *, key: tuple, request_count: int) -> None:
+        """Record a fail-safe fallback rejected before workspace mutation."""
+        self._record_fallback(self._record_attempt(key, request_count))
 
     @staticmethod
     def _event_complete(event: Optional[object]) -> bool:
@@ -439,10 +488,19 @@ class StandaloneEvictionGraphCache:
     def snapshot(self) -> dict:
         return {
             **self.counts,
+            "max_entries": self.max_entries,
+            "max_bytes": self.max_bytes,
             "active_entries": len(self.entries),
             "retired_entries": len(self.retired),
             "disabled_buckets": len(self.disabled),
             "owned_bytes": self._resident_bytes(),
+            "buckets": [
+                {
+                    "key": key,
+                    **counts,
+                }
+                for key, counts in self.bucket_counts.items()
+            ],
             "last_error": self.last_error,
         }
 
@@ -510,6 +568,7 @@ class StandaloneEvictionGraphCache:
         self,
         *,
         key: tuple,
+        request_count: int,
         fingerprint: tuple,
         workspace: FixedBatchedCompactionWorkspace,
         capture_body: Callable[[], None],
@@ -520,9 +579,10 @@ class StandaloneEvictionGraphCache:
         operations without executing them. Once replay is attempted, errors are
         propagated and the caller must not issue eager compaction for that step.
         """
+        bucket = self._record_attempt(key, request_count)
         self._collect_retired()
         if key in self.disabled:
-            self.counts["fallback"] += 1
+            self._record_fallback(bucket)
             return "fallback"
 
         entry = self.entries.get(key)
@@ -530,18 +590,22 @@ class StandaloneEvictionGraphCache:
             self.entries.pop(key)
             self._retire(entry)
             self.counts["invalidated"] += 1
+            bucket["invalidated"] += 1
             entry = None
 
         if entry is None:
             if not self._make_room(workspace.nbytes):
-                self.counts["fallback"] += 1
+                self._record_fallback(bucket)
                 return "fallback"
             try:
                 graph, capture_stream, graph_bytes = self._capture_graph(workspace, capture_body)
             except RuntimeError as exc:
                 self.disabled.add(key)
+                self.counts["failure"] += 1
                 self.counts["capture_failure"] += 1
-                self.counts["fallback"] += 1
+                bucket["failure"] += 1
+                bucket["capture_failure"] += 1
+                self._record_fallback(bucket)
                 self.last_error = {
                     "phase": "capture",
                     "type": type(exc).__name__,
@@ -553,7 +617,7 @@ class StandaloneEvictionGraphCache:
                 reset = getattr(graph, "reset", None)
                 if reset is not None:
                     reset()
-                self.counts["fallback"] += 1
+                self._record_fallback(bucket)
                 return "fallback"
             entry = _GraphEntry(
                 graph=graph,
@@ -564,6 +628,7 @@ class StandaloneEvictionGraphCache:
             )
             self.entries[key] = entry
             self.counts["capture"] += 1
+            bucket["capture"] += 1
             outcome = "capture"
         else:
             self.entries.move_to_end(key)
@@ -579,7 +644,10 @@ class StandaloneEvictionGraphCache:
             entry.last_use_event = _NeverCompleteEvent()
             self.retired.append(entry)
             self.counts["retired"] += 1
+            self.counts["failure"] += 1
             self.counts["replay_failure"] += 1
+            bucket["failure"] += 1
+            bucket["replay_failure"] += 1
             self.last_error = {
                 "phase": "replay",
                 "type": type(exc).__name__,
@@ -587,5 +655,12 @@ class StandaloneEvictionGraphCache:
             }
             raise
         entry.last_use_event = self._record_last_use(workspace)
+        self.counts["launch"] += 1
+        self.counts["covered_requests"] += request_count
         self.counts["replay"] += 1
+        bucket["launch"] += 1
+        bucket["covered_requests"] += request_count
+        if outcome == "replay":
+            self.counts["cache_hit"] += 1
+            bucket["cache_hit"] += 1
         return outcome

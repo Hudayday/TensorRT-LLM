@@ -189,6 +189,7 @@ class TestStandaloneEvictionGraphCache:
         assert (
             cache.execute(
                 key=("bucket",),
+                request_count=4,
                 fingerprint=("pointers",),
                 workspace=workspace,
                 capture_body=body,
@@ -198,6 +199,7 @@ class TestStandaloneEvictionGraphCache:
         assert (
             cache.execute(
                 key=("bucket",),
+                request_count=4,
                 fingerprint=("pointers",),
                 workspace=workspace,
                 capture_body=body,
@@ -209,6 +211,26 @@ class TestStandaloneEvictionGraphCache:
         assert graph.replays == 2
         assert cache.counts["capture"] == 1
         assert cache.counts["replay"] == 2
+        assert cache.counts["launch"] == 2
+        assert cache.counts["cache_hit"] == 1
+        assert cache.counts["covered_requests"] == 8
+        assert cache.snapshot()["buckets"] == [
+            {
+                "key": ("bucket",),
+                "request_count": 4,
+                "attempt": 2,
+                "attempted_requests": 8,
+                "capture": 1,
+                "launch": 2,
+                "cache_hit": 1,
+                "covered_requests": 8,
+                "fallback": 0,
+                "invalidated": 0,
+                "failure": 0,
+                "capture_failure": 0,
+                "replay_failure": 0,
+            }
+        ]
 
     def test_capture_failure_performs_one_caller_fallback(self):
         cache = StandaloneEvictionGraphCache(max_entries=1, max_bytes=1024)
@@ -216,6 +238,7 @@ class TestStandaloneEvictionGraphCache:
         eager = mock.Mock()
         outcome = cache.execute(
             key=("bucket",),
+            request_count=3,
             fingerprint=("pointers",),
             workspace=_cache_workspace(),
             capture_body=mock.Mock(),
@@ -235,6 +258,7 @@ class TestStandaloneEvictionGraphCache:
         assert (
             cache.execute(
                 key=("bucket",),
+                request_count=3,
                 fingerprint=("new-pointers",),
                 workspace=_cache_workspace(),
                 capture_body=mock.Mock(),
@@ -243,6 +267,9 @@ class TestStandaloneEvictionGraphCache:
         )
         cache._capture_graph.assert_called_once()
         assert cache.snapshot()["disabled_buckets"] == 1
+        assert cache.snapshot()["failure"] == 1
+        assert cache.snapshot()["buckets"][0]["fallback"] == 2
+        assert cache.snapshot()["buckets"][0]["covered_requests"] == 0
 
     def test_replay_failure_is_poisoned_without_eager_fallback(self):
         cache = StandaloneEvictionGraphCache(max_entries=1, max_bytes=1024)
@@ -254,6 +281,7 @@ class TestStandaloneEvictionGraphCache:
         with pytest.raises(RuntimeError, match="replay failed"):
             outcome = cache.execute(
                 key=("bucket",),
+                request_count=2,
                 fingerprint=("pointers",),
                 workspace=_cache_workspace(),
                 capture_body=mock.Mock(),
@@ -263,6 +291,8 @@ class TestStandaloneEvictionGraphCache:
 
         eager.assert_not_called()
         assert cache.counts["replay_failure"] == 1
+        assert cache.counts["failure"] == 1
+        assert cache.counts["covered_requests"] == 0
         assert cache.counts["fallback"] == 0
 
     def test_in_flight_entry_cannot_be_freed_to_make_room(self):
@@ -279,6 +309,7 @@ class TestStandaloneEvictionGraphCache:
         assert (
             cache.execute(
                 key=("first",),
+                request_count=1,
                 fingerprint=("one",),
                 workspace=workspace,
                 capture_body=mock.Mock(),
@@ -288,6 +319,7 @@ class TestStandaloneEvictionGraphCache:
         assert (
             cache.execute(
                 key=("second",),
+                request_count=1,
                 fingerprint=("two",),
                 workspace=workspace,
                 capture_body=mock.Mock(),
@@ -300,6 +332,7 @@ class TestStandaloneEvictionGraphCache:
         assert (
             cache.execute(
                 key=("second",),
+                request_count=1,
                 fingerprint=("two",),
                 workspace=workspace,
                 capture_body=mock.Mock(),
@@ -320,12 +353,14 @@ class TestStandaloneEvictionGraphCache:
 
         cache.execute(
             key=("bucket",),
+            request_count=7,
             fingerprint=("old",),
             workspace=workspace,
             capture_body=mock.Mock(),
         )
         cache.execute(
             key=("bucket",),
+            request_count=7,
             fingerprint=("new",),
             workspace=workspace,
             capture_body=mock.Mock(),
@@ -334,6 +369,65 @@ class TestStandaloneEvictionGraphCache:
         assert first_graph.resets == 1
         assert second_graph.replays == 1
         assert cache.counts["invalidated"] == 1
+        assert cache.counts["capture"] == 2
+        assert cache.counts["launch"] == 2
+        assert cache.counts["covered_requests"] == 14
+        assert cache.snapshot()["buckets"][0]["invalidated"] == 1
+
+    def test_two_exact_shapes_capture_once_then_reuse_first(self):
+        cache = StandaloneEvictionGraphCache(max_entries=2, max_bytes=1024)
+        first_graph = _FakeGraph()
+        second_graph = _FakeGraph()
+        cache._capture_graph = mock.Mock(
+            side_effect=[(first_graph, object(), 0), (second_graph, object(), 0)]
+        )
+        cache._record_last_use = mock.Mock(side_effect=[_FakeEvent(), _FakeEvent(), _FakeEvent()])
+        workspace = _cache_workspace()
+
+        assert (
+            cache.execute(
+                key=("shape-a", 4),
+                request_count=4,
+                fingerprint=("a",),
+                workspace=workspace,
+                capture_body=mock.Mock(),
+            )
+            == "capture"
+        )
+        assert (
+            cache.execute(
+                key=("shape-b", 2),
+                request_count=2,
+                fingerprint=("b",),
+                workspace=workspace,
+                capture_body=mock.Mock(),
+            )
+            == "capture"
+        )
+        assert (
+            cache.execute(
+                key=("shape-a", 4),
+                request_count=4,
+                fingerprint=("a",),
+                workspace=workspace,
+                capture_body=mock.Mock(),
+            )
+            == "replay"
+        )
+
+        assert cache.counts["capture"] == 2
+        assert cache.counts["launch"] == 3
+        assert cache.counts["cache_hit"] == 1
+        assert cache.counts["covered_requests"] == 10
+        assert [bucket["capture"] for bucket in cache.snapshot()["buckets"]] == [1, 1]
+        assert [bucket["cache_hit"] for bucket in cache.snapshot()["buckets"]] == [1, 0]
+
+    def test_key_cannot_change_request_count_semantics(self):
+        cache = StandaloneEvictionGraphCache(max_entries=1, max_bytes=1024)
+        cache.record_fallback(key=("bucket",), request_count=1)
+
+        with pytest.raises(ValueError, match="request-count semantics"):
+            cache.record_fallback(key=("bucket",), request_count=2)
 
     def test_capture_allocation_over_byte_cap_is_reset_before_replay(self):
         cache = StandaloneEvictionGraphCache(max_entries=1, max_bytes=128)
@@ -342,6 +436,7 @@ class TestStandaloneEvictionGraphCache:
 
         outcome = cache.execute(
             key=("bucket",),
+            request_count=1,
             fingerprint=("pointers",),
             workspace=_cache_workspace(nbytes=64),
             capture_body=mock.Mock(),
@@ -354,61 +449,31 @@ class TestStandaloneEvictionGraphCache:
 
 
 class TestStandaloneGraphBuckets:
-    @pytest.mark.parametrize(
-        "width,budget,backend",
-        [
-            (8191, 4096, "torch_topk"),
-            (8192, 4096, "torch_topk"),
-            (4095, 2048, "indexer_topk"),
-            (4096, 2048, "torch_topk"),
-            (4223, 4096, "torch_topk"),
-            (4224, 4096, "torch_topk"),
-        ],
-    )
-    @pytest.mark.parametrize("request_count", [1, 7, 8])
-    def test_exact_formal_matrix_is_accepted(self, width, budget, backend, request_count):
-        manager = TriAttention.__new__(TriAttention)
-        manager.top_B = budget
-        manager._standalone_cuda_graph_enabled = True
-        prepared = [
-            {
-                "seq_len": 1024 + width,
-                "request": SimpleNamespace(py_prompt_len=1024),
-                "expected_keep_count": 1024 + budget,
-            }
-            for _ in range(request_count)
-        ]
-        score = SimpleNamespace(prewarm_key=(width, budget))
-        selection = SimpleNamespace(
-            selection_backend=backend,
-            max_requests=8,
-            prompt_len=1024,
-            width=width,
-            keep_count=budget,
-        )
-
-        key = manager._standalone_graph_bucket_for(prepared, score, selection)
-
-        assert key is not None
-        assert key[2:7] == (
-            request_count,
-            1024 + width,
-            1024,
-            budget,
-            backend,
-        )
+    @staticmethod
+    def _mark_ready(manager, score, selection):
+        key = score.prewarm_key
+        manager._fixed_score_prewarm_states = {key: "ready"}
+        manager._fixed_score_workspaces = {key: score}
+        manager._cross_request_selection_prewarm_states = {key: "ready"}
+        manager._cross_request_selection_workspaces = {key: selection}
 
     @pytest.mark.parametrize(
-        "request_count,prompt_len,width,budget,backend",
+        "prompt_len,width,budget,backend,request_count",
         [
-            (2, 1024, 8192, 4096, "torch_topk"),
-            (1, 0, 8192, 4096, "torch_topk"),
-            (1, 1024, 8193, 4096, "torch_topk"),
-            (1, 1024, 4095, 2048, "torch_topk"),
+            (0, 2175, 2048, "indexer_topk", 1),
+            (256, 3072, 2048, "indexer_topk", 2),
+            (1024, 4095, 2048, "indexer_topk", 4),
+            (1024, 4096, 2048, "torch_topk", 7),
+            (1536, 4223, 4096, "torch_topk", 8),
+            (1024, 4224, 4096, "torch_topk", 8),
+            (1024, 5119, 4096, "torch_topk", 16),
+            (1024, 8191, 4096, "torch_topk", 1),
+            (2048, 8192, 4096, "torch_topk", 31),
+            (1024, 9216, 8192, "torch_topk", 32),
         ],
     )
-    def test_unsealed_shape_or_backend_falls_back(
-        self, request_count, prompt_len, width, budget, backend
+    def test_ready_dynamic_exact_bucket_is_accepted(
+        self, prompt_len, width, budget, backend, request_count
     ):
         manager = TriAttention.__new__(TriAttention)
         manager.top_B = budget
@@ -421,16 +486,152 @@ class TestStandaloneGraphBuckets:
             }
             for _ in range(request_count)
         ]
-        score = SimpleNamespace(prewarm_key=(width, budget))
+        score = SimpleNamespace(
+            prewarm_key=("exact", prompt_len, width, budget, backend),
+            max_requests=32,
+        )
         selection = SimpleNamespace(
             selection_backend=backend,
-            max_requests=8,
+            max_requests=32,
             prompt_len=prompt_len,
             width=width,
             keep_count=budget,
         )
+        self._mark_ready(manager, score, selection)
+
+        key = manager._standalone_graph_bucket_for(prepared, score, selection)
+
+        assert key is not None
+        assert key[1] == score.prewarm_key
+        assert key[2:7] == (
+            request_count,
+            prompt_len + width,
+            prompt_len,
+            budget,
+            backend,
+        )
+
+    @pytest.mark.parametrize(
+        "request_count,prompt_len,width,budget,backend,ready",
+        [
+            (0, 1024, 4095, 2048, "indexer_topk", True),
+            (33, 1024, 4095, 2048, "indexer_topk", True),
+            (1, 1024, 4095, 2048, "torch_topk", True),
+            (1, 1024, 4095, 2048, "indexer_topk", False),
+        ],
+    )
+    def test_unready_capacity_or_backend_mismatch_falls_back(
+        self, request_count, prompt_len, width, budget, backend, ready
+    ):
+        manager = TriAttention.__new__(TriAttention)
+        manager.top_B = budget
+        manager._standalone_cuda_graph_enabled = True
+        prepared = [
+            {
+                "seq_len": prompt_len + width,
+                "request": SimpleNamespace(py_prompt_len=prompt_len),
+                "expected_keep_count": prompt_len + budget,
+            }
+            for _ in range(request_count)
+        ]
+        score = SimpleNamespace(prewarm_key=(width, budget), max_requests=32)
+        selection = SimpleNamespace(
+            selection_backend=backend,
+            max_requests=32,
+            prompt_len=prompt_len,
+            width=width,
+            keep_count=budget,
+        )
+        if ready:
+            self._mark_ready(manager, score, selection)
 
         assert manager._standalone_graph_bucket_for(prepared, score, selection) is None
+
+    def test_mixed_geometry_or_stale_workspace_falls_back(self):
+        manager = TriAttention.__new__(TriAttention)
+        manager.top_B = 2048
+        manager._standalone_cuda_graph_enabled = True
+        prepared = [
+            {
+                "seq_len": 5119,
+                "request": SimpleNamespace(py_prompt_len=1024),
+                "expected_keep_count": 3072,
+            },
+            {
+                "seq_len": 5375,
+                "request": SimpleNamespace(py_prompt_len=1280),
+                "expected_keep_count": 3328,
+            },
+        ]
+        score = SimpleNamespace(prewarm_key=("mixed",), max_requests=32)
+        selection = SimpleNamespace(
+            selection_backend="indexer_topk",
+            max_requests=32,
+            prompt_len=1024,
+            width=4095,
+            keep_count=2048,
+        )
+        self._mark_ready(manager, score, selection)
+
+        assert manager._standalone_graph_bucket_for(prepared, score, selection) is None
+        manager._cross_request_selection_workspaces[score.prewarm_key] = SimpleNamespace()
+        prepared[1] = dict(prepared[0])
+        assert manager._standalone_graph_bucket_for(prepared, score, selection) is None
+
+    def test_stats_are_zero_filled_before_first_eviction(self, monkeypatch):
+        monkeypatch.setenv("TRIATTN_CUDA_GRAPH_MAX_ENTRIES", "2")
+        monkeypatch.setenv("TRIATTN_CUDA_GRAPH_MAX_BYTES", "1024")
+        manager = TriAttention.__new__(TriAttention)
+        manager._standalone_cuda_graph_enabled = True
+        manager._standalone_graph_cache = None
+        manager._standalone_graph_runtime_counts = {}
+
+        stats = manager._standalone_cuda_graph_stats()
+
+        assert stats["enabled"]
+        assert stats["attempt"] == 0
+        assert stats["capture"] == 0
+        assert stats["launch"] == 0
+        assert stats["cache_hit"] == 0
+        assert stats["covered_requests"] == 0
+        assert stats["buckets"] == []
+        assert stats["max_entries"] == 2
+        assert stats["max_bytes"] == 1024
+        assert stats["runtime"] == {}
+
+    def test_unready_eviction_records_admission_rejection_without_cache(self):
+        manager = TriAttention.__new__(TriAttention)
+        manager._standalone_cuda_graph_enabled = True
+        manager._standalone_graph_runtime_counts = {}
+        prepared = [
+            {
+                "seq_len": 5119,
+                "request": SimpleNamespace(py_prompt_len=1024),
+                "expected_keep_count": 3072,
+            }
+        ]
+
+        result = manager._try_standalone_cuda_graph(
+            prepared=prepared,
+            layer_pools=[torch.empty(1)],
+            dense_layers=[0],
+            dense_groups=[[0]],
+            swa_layers=[],
+            swa_window=None,
+            layer_group_representative={0: 0},
+            global_layers=[0],
+            score_workspace=None,
+            selection_workspace=None,
+            fixed_perhead_segment_views=mock.Mock(),
+        )
+
+        assert result is None
+        assert manager._standalone_graph_runtime_counts == {
+            "attempt": 1,
+            "attempt_requests": 1,
+            "admission_rejected": 1,
+            "admission_rejected_requests": 1,
+        }
 
     def test_capture_body_covers_phase_score_select_compact_then_publishes(self):
         import contextlib
@@ -438,24 +639,25 @@ class TestStandaloneGraphBuckets:
         import tensorrt_llm._torch.kv_cache_compression.triattention.triattention as tri_module
 
         manager = TriAttention.__new__(TriAttention)
-        manager.top_B = 4096
+        manager.top_B = 2048
         manager.normalize_scores = True
         manager.score_aggregation = "mean"
         manager._standalone_cuda_graph_enabled = True
         manager._evicted = {}
-        manager._pre_forward_kv_lengths = {7: 9215}
+        manager._pre_forward_kv_lengths = {7: 3328}
         prepared = [
             {
-                "request": SimpleNamespace(py_prompt_len=1024),
+                "request": SimpleNamespace(py_prompt_len=256),
                 "request_id": 7,
-                "seq_len": 9215,
-                "expected_keep_count": 5120,
+                "seq_len": 3328,
+                "expected_keep_count": 2304,
             }
         ]
-        score_output = torch.zeros(1, 9215)
+        score_output = torch.zeros(1, 3328)
         group = SimpleNamespace(launch=mock.Mock(return_value=(score_output, None)))
         score = SimpleNamespace(
-            prewarm_key=("formal-a-first",),
+            prewarm_key=("dynamic-indexer",),
+            max_requests=32,
             prepare_phase=mock.Mock(),
             groups={0: group},
             round_starts_device=torch.zeros(8),
@@ -463,13 +665,14 @@ class TestStandaloneGraphBuckets:
             mean_sin=torch.zeros(8, 1),
         )
         selection = SimpleNamespace(
-            selection_backend="torch_topk",
-            max_requests=8,
-            prompt_len=1024,
-            width=8191,
-            keep_count=4096,
+            selection_backend="indexer_topk",
+            max_requests=32,
+            prompt_len=256,
+            width=3072,
+            keep_count=2048,
             select_requests=mock.Mock(),
         )
+        self._mark_ready(manager, score, selection)
         workspace = SimpleNamespace(
             device=torch.device("cpu"),
             pointer_fingerprint=mock.Mock(return_value=("fingerprint",)),
@@ -495,7 +698,7 @@ class TestStandaloneGraphBuckets:
 
         manager._standalone_graph_workspace_for = mock.Mock(return_value=workspace)
         manager._standalone_graph_cache_for = mock.Mock(return_value=ExecutingCache())
-        views = torch.zeros(1, 1, 1, 9215)
+        views = torch.zeros(1, 1, 1, 3328)
         fixed_views = mock.Mock(return_value=views)
         stream = SimpleNamespace(device=torch.device("cpu"), cuda_stream=9)
         score.device = torch.device("cpu")
@@ -523,14 +726,20 @@ class TestStandaloneGraphBuckets:
                 fixed_perhead_segment_views=fixed_views,
             )
 
-        assert targets == [(7, 5121)]
+        assert targets == [(7, 2305)]
         score.prepare_phase.assert_called_once_with(1)
         group.launch.assert_called_once()
         selected_segments = selection.select_requests.call_args.args[0]
-        assert selected_segments[0][0].shape == (1, 8191)
+        assert selected_segments[0][0].shape == (1, 3072)
         workspace.launch.assert_called_once_with()
-        assert manager._evicted == {7: 4095}
-        assert manager._pre_forward_kv_lengths == {7: 5120}
+        assert manager._evicted == {7: 1024}
+        assert manager._pre_forward_kv_lengths == {7: 2304}
+        assert manager._standalone_graph_runtime_counts == {
+            "attempt": 1,
+            "attempt_requests": 1,
+            "success": 1,
+            "success_requests": 1,
+        }
 
     def test_graph_fallback_does_not_publish_or_execute_eager_inside_helper(self):
         manager = TriAttention.__new__(TriAttention)
@@ -546,7 +755,7 @@ class TestStandaloneGraphBuckets:
                 "expected_keep_count": 5120,
             }
         ]
-        score = SimpleNamespace(prewarm_key=("formal-a-first",))
+        score = SimpleNamespace(prewarm_key=("formal-a-first",), max_requests=8)
         selection = SimpleNamespace(
             selection_backend="torch_topk",
             max_requests=8,
@@ -554,6 +763,7 @@ class TestStandaloneGraphBuckets:
             width=8191,
             keep_count=4096,
         )
+        self._mark_ready(manager, score, selection)
         workspace = SimpleNamespace(
             device=torch.device("cpu"),
             pointer_fingerprint=mock.Mock(return_value=("fingerprint",)),
@@ -610,6 +820,7 @@ class TestStandaloneGraphBuckets:
         stream = SimpleNamespace(device=torch.device("cpu"), cuda_stream=9)
         score = SimpleNamespace(
             prewarm_key=("formal-a-first",),
+            max_requests=8,
             device=torch.device("cpu"),
             stream=stream,
         )
@@ -620,6 +831,7 @@ class TestStandaloneGraphBuckets:
             width=8191,
             keep_count=4096,
         )
+        self._mark_ready(manager, score, selection)
         workspace = SimpleNamespace(
             device=torch.device("cpu"),
             nbytes=64,
@@ -657,7 +869,16 @@ class TestStandaloneGraphBuckets:
         manager._standalone_graph_workspace_for.assert_called_once()
         cache._capture_graph.assert_called_once()
         assert cache.snapshot()["capture_failure"] == 1
+        assert cache.snapshot()["attempt"] == 2
+        assert cache.snapshot()["fallback"] == 2
+        assert cache.snapshot()["covered_requests"] == 0
         assert cache.snapshot()["disabled_buckets"] == 1
+        assert manager._standalone_graph_runtime_counts == {
+            "attempt": 2,
+            "attempt_requests": 2,
+            "fallback": 2,
+            "fallback_requests": 2,
+        }
 
 
 class TestFixedBatchedCompactionWorkspace:
@@ -770,9 +991,8 @@ class TestFixedBatchedCompactionWorkspace:
 
 class TestStandaloneGraphCuda:
     @staticmethod
-    def _build_formal_path(width, budget, backend, request_count, initial_pool):
+    def _build_formal_path(width, budget, backend, request_count, initial_pool, *, prompt_len):
         device = initial_pool.device
-        prompt_len = 1024
         seq_len = prompt_len + width
         tokens_per_block = int(initial_pool.shape[3])
         page_count = (seq_len + tokens_per_block) // tokens_per_block
@@ -788,7 +1008,7 @@ class TestStandaloneGraphCuda:
             [[0]],
             [0],
             [0],
-            8,
+            request_count,
             seq_len,
             1,
             1,
@@ -807,7 +1027,7 @@ class TestStandaloneGraphCuda:
             dtype=torch.float32,
             device=device,
             selection_backend=backend,
-            max_requests=8,
+            max_requests=request_count,
         )
         compaction = FixedBatchedCompactionWorkspace(
             layer_pools=[pool],
@@ -870,25 +1090,29 @@ class TestStandaloneGraphCuda:
         return pool, score, selection, compaction, stage, body, stage4_body
 
     @pytest.mark.parametrize(
-        "width,budget,backend",
+        "prompt_len,width,budget,backend,request_count",
         [
-            (8191, 4096, "torch_topk"),
-            (8192, 4096, "torch_topk"),
-            (4095, 2048, "indexer_topk"),
-            (4096, 2048, "torch_topk"),
-            (4223, 4096, "torch_topk"),
-            (4224, 4096, "torch_topk"),
+            (0, 2175, 2048, "indexer_topk", 1),
+            (256, 3072, 2048, "indexer_topk", 2),
+            (1024, 4095, 2048, "indexer_topk", 4),
+            (1024, 4096, 2048, "torch_topk", 7),
+            (1536, 4223, 4096, "torch_topk", 8),
+            (1024, 4224, 4096, "torch_topk", 8),
+            (1024, 5119, 4096, "torch_topk", 16),
+            (1024, 8191, 4096, "torch_topk", 1),
+            (2048, 8192, 4096, "torch_topk", 31),
+            (1024, 9216, 8192, "torch_topk", 32),
         ],
     )
-    @pytest.mark.parametrize("request_count", [1, 7, 8])
     @CUDA_REQUIRED
-    def test_formal_bucket_graph_matches_stage4_eager(self, width, budget, backend, request_count):
+    def test_dynamic_exact_graph_matches_stage4_eager(
+        self, prompt_len, width, budget, backend, request_count
+    ):
         device = torch.device("cuda")
-        prompt_len = 1024
         seq_len = prompt_len + width
         tokens_per_block = 128
         page_count = (seq_len + tokens_per_block) // tokens_per_block
-        total_pages = 8 * page_count
+        total_pages = request_count * page_count
         initial = torch.arange(
             total_pages * 2 * tokens_per_block * 2,
             dtype=torch.float32,
@@ -900,6 +1124,7 @@ class TestStandaloneGraphCuda:
             backend,
             request_count,
             initial,
+            prompt_len=prompt_len,
         )
         graphed = self._build_formal_path(
             width,
@@ -907,6 +1132,7 @@ class TestStandaloneGraphCuda:
             backend,
             request_count,
             initial,
+            prompt_len=prompt_len,
         )
         eager_pool, _, eager_selection, _, eager_stage, _, eager_body = eager
         graph_pool, _, graph_selection, graph_compaction, graph_stage, graph_body, _ = graphed
@@ -925,6 +1151,7 @@ class TestStandaloneGraphCuda:
         fingerprint = graph_compaction.pointer_fingerprint(stream)
         outcome = cache.execute(
             key=(width, budget, backend, request_count),
+            request_count=request_count,
             fingerprint=fingerprint,
             workspace=graph_compaction,
             capture_body=graph_body,
@@ -946,6 +1173,7 @@ class TestStandaloneGraphCuda:
         assert (
             cache.execute(
                 key=(width, budget, backend, request_count),
+                request_count=request_count,
                 fingerprint=fingerprint,
                 workspace=graph_compaction,
                 capture_body=graph_body,
@@ -967,6 +1195,9 @@ class TestStandaloneGraphCuda:
             ), f"request {request} prompt was modified"
         assert cache.snapshot()["capture"] == 1
         assert cache.snapshot()["replay"] == 2
+        assert cache.snapshot()["launch"] == 2
+        assert cache.snapshot()["cache_hit"] == 1
+        assert cache.snapshot()["covered_requests"] == 2 * request_count
         assert cache.snapshot()["fallback"] == 0
         assert cache.snapshot()["capture_failure"] == 0
         assert cache.snapshot()["replay_failure"] == 0
@@ -1042,6 +1273,7 @@ class TestStandaloneGraphCuda:
         assert (
             cache.execute(
                 key=("swa",),
+                request_count=request_count,
                 fingerprint=("swa",),
                 workspace=graphed,
                 capture_body=graphed.launch,

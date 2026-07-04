@@ -1189,16 +1189,6 @@ class TriAttention(BaseKVCacheCompressionManager):
     # retained set.
     _INDEXER_TOPK_MAX_K = 2048
     _INDEXER_TOPK_SUBBLOCK = 2048
-    _STANDALONE_GRAPH_BUCKETS = {
-        (8191, 4096): "torch_topk",
-        (8192, 4096): "torch_topk",
-        (4095, 2048): "indexer_topk",
-        (4096, 2048): "torch_topk",
-        (4223, 4096): "torch_topk",
-        (4224, 4096): "torch_topk",
-    }
-    _STANDALONE_GRAPH_REQUEST_COUNTS = frozenset((1, 7, 8))
-    _STANDALONE_GRAPH_PROMPT_LEN = 1024
 
     def __init__(
         self,
@@ -1355,6 +1345,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         # the Stage3 and Stage4 banks.
         self._standalone_graph_cache = None
         self._standalone_graph_arena_generation = 0
+        self._standalone_graph_runtime_counts = {}
 
     def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
         """Mark capacity-only decode and resolve calibration once.
@@ -3167,13 +3158,24 @@ class TriAttention(BaseKVCacheCompressionManager):
         score_workspace: Optional[_FixedScoreMetadataWorkspace],
         selection_workspace: Optional[_BatchedFixedUnionWorkspace],
     ) -> Optional[tuple]:
-        """Return the sealed graph bucket, or reject to the Stage4 path."""
+        """Return one ready exact-workspace graph bucket, or reject to Stage4."""
         request_count = len(prepared)
         if (
             not getattr(self, "_standalone_cuda_graph_enabled", False)
             or score_workspace is None
             or selection_workspace is None
-            or request_count not in self._STANDALONE_GRAPH_REQUEST_COUNTS
+            or request_count <= 0
+        ):
+            return None
+        prewarm_key = getattr(score_workspace, "prewarm_key", None)
+        if (
+            prewarm_key is None
+            or getattr(self, "_fixed_score_prewarm_states", {}).get(prewarm_key) != "ready"
+            or getattr(self, "_cross_request_selection_prewarm_states", {}).get(prewarm_key)
+            != "ready"
+            or getattr(self, "_fixed_score_workspaces", {}).get(prewarm_key) is not score_workspace
+            or getattr(self, "_cross_request_selection_workspaces", {}).get(prewarm_key)
+            is not selection_workspace
         ):
             return None
         seq_lens = {item["seq_len"] for item in prepared}
@@ -3181,33 +3183,42 @@ class TriAttention(BaseKVCacheCompressionManager):
             min(int(getattr(item["request"], "py_prompt_len", 0) or 0), item["seq_len"])
             for item in prepared
         }
-        if len(seq_lens) != 1 or prompt_lens != {self._STANDALONE_GRAPH_PROMPT_LEN}:
+        if len(seq_lens) != 1 or len(prompt_lens) != 1:
             return None
         seq_len = next(iter(seq_lens))
         prompt_len = next(iter(prompt_lens))
         width = seq_len - prompt_len
-        expected_backend = self._STANDALONE_GRAPH_BUCKETS.get((width, self.top_B))
+        expected_backend = (
+            "indexer_topk" if self._indexer_topk_supported(width, self.top_B) else "torch_topk"
+        )
         if (
-            expected_backend is None
-            or selection_workspace.selection_backend != expected_backend
+            selection_workspace.selection_backend != expected_backend
             or selection_workspace.prompt_len != prompt_len
             or selection_workspace.width != width
             or selection_workspace.keep_count != self.top_B
-            or getattr(score_workspace, "prewarm_key", None) is None
             or any(item.get("expected_keep_count") != prompt_len + self.top_B for item in prepared)
         ):
             return None
-        if selection_workspace.max_requests < request_count:
+        if min(score_workspace.max_requests, selection_workspace.max_requests) < request_count:
             return None
         return (
             "triattention.standalone-eviction-graph.bucket.v1",
-            getattr(score_workspace, "prewarm_key", None),
+            prewarm_key,
             request_count,
             seq_len,
             prompt_len,
             self.top_B,
             expected_backend,
         )
+
+    def _record_standalone_graph_runtime(self, outcome: str, request_count: int) -> None:
+        counts = getattr(self, "_standalone_graph_runtime_counts", None)
+        if counts is None:
+            self._standalone_graph_runtime_counts = {}
+            counts = self._standalone_graph_runtime_counts
+        counts[outcome] = counts.get(outcome, 0) + 1
+        request_key = f"{outcome}_requests"
+        counts[request_key] = counts.get(request_key, 0) + request_count
 
     def _standalone_graph_cache_for(self):
         cache = getattr(self, "_standalone_graph_cache", None)
@@ -3286,20 +3297,24 @@ class TriAttention(BaseKVCacheCompressionManager):
         fixed_perhead_segment_views,
     ) -> Optional[List[Tuple[int, int]]]:
         """Run an exact standalone eviction graph, or leave Stage4 untouched."""
+        request_count = len(prepared)
+        self._record_standalone_graph_runtime("attempt", request_count)
         key = self._standalone_graph_bucket_for(
             prepared,
             score_workspace,
             selection_workspace,
         )
         if key is None:
+            self._record_standalone_graph_runtime("admission_rejected", request_count)
             return None
         assert score_workspace is not None
         assert selection_workspace is not None
-        request_count = len(prepared)
-        seq_len = prepared[0]["seq_len"]
-        prompt_len = self._STANDALONE_GRAPH_PROMPT_LEN
+        seq_len = key[3]
+        prompt_len = key[4]
         cache = self._standalone_graph_cache_for()
         if cache.is_disabled(key):
+            cache.record_fallback(key=key, request_count=request_count)
+            self._record_standalone_graph_runtime("fallback", request_count)
             return None
         stream = torch.cuda.current_stream(score_workspace.device)
         staged_stream = score_workspace.stream
@@ -3331,6 +3346,9 @@ class TriAttention(BaseKVCacheCompressionManager):
                 "TriAttention standalone CUDA Graph workspace rejected; "
                 f"using Stage4 eager execution: {exc}"
             )
+            cache.record_fallback(key=key, request_count=request_count)
+            self._record_standalone_graph_runtime("workspace_rejected", request_count)
+            self._record_standalone_graph_runtime("fallback", request_count)
             return None
 
         def graph_body() -> None:
@@ -3368,21 +3386,28 @@ class TriAttention(BaseKVCacheCompressionManager):
             workspace.launch()
 
         expected_outcome = cache.classify(key, fingerprint)
-        with nvtx_range(f"triattention.cuda_graph.{expected_outcome}", color="green"):
-            outcome = cache.execute(
-                key=key,
-                fingerprint=fingerprint,
-                workspace=workspace,
-                capture_body=graph_body,
-            )
+        try:
+            with nvtx_range(f"triattention.cuda_graph.{expected_outcome}", color="green"):
+                outcome = cache.execute(
+                    key=key,
+                    request_count=request_count,
+                    fingerprint=fingerprint,
+                    workspace=workspace,
+                    capture_body=graph_body,
+                )
+        except RuntimeError:
+            self._record_standalone_graph_runtime("failure", request_count)
+            raise
         logger.debug(
             "TriAttention standalone CUDA Graph outcome: "
             f"outcome={outcome}, requests={request_count}, "
             f"width={seq_len - prompt_len}, budget={self.top_B}, "
-            f"backend={selection_workspace.selection_backend}, stats={cache.snapshot()}"
+            f"backend={selection_workspace.selection_backend}"
         )
         if outcome == "fallback":
+            self._record_standalone_graph_runtime("fallback", request_count)
             return None
+        self._record_standalone_graph_runtime("success", request_count)
 
         capacity_targets = []
         for item in prepared:
@@ -3399,7 +3424,16 @@ class TriAttention(BaseKVCacheCompressionManager):
     def _standalone_cuda_graph_stats(self) -> dict:
         """Return host-side counters used to seal graph-hit profiling windows."""
         cache = getattr(self, "_standalone_graph_cache", None)
-        return {} if cache is None else cache.snapshot()
+        enabled = bool(getattr(self, "_standalone_cuda_graph_enabled", False))
+        if cache is None:
+            if not enabled:
+                return {}
+            cache = self._standalone_graph_cache_for()
+        return {
+            **cache.snapshot(),
+            "enabled": enabled,
+            "runtime": dict(getattr(self, "_standalone_graph_runtime_counts", {})),
+        }
 
     def _evict_requests(self, evict_reqs, num_layers: int) -> List[Tuple[int, int]]:
         """Score and compact requests, returning ``(request_id, capacity)`` targets.
