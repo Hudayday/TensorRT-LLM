@@ -1143,17 +1143,29 @@ class _FixedScoreMetadataWorkspace:
             # orders the next device-buffer overwrite after every score consumer.
             self.copy_done.record(stream)
             self.copy_pending = True
-        torch.add(
-            self.round_starts_device.view(self.max_requests, 1, 1),
-            self.offsets.view(1, -1, 1),
-            out=self.phase_base,
-        )
-        torch.mul(self.phase_base, self.omega.view(1, 1, -1), out=self.phase)
-        torch.cos(self.phase, out=self.cos_phase)
-        torch.sin(self.phase, out=self.sin_phase)
-        torch.mean(self.cos_phase, dim=1, out=self.mean_cos)
-        torch.mean(self.sin_phase, dim=1, out=self.mean_sin)
         return True
+
+    def prepare_phase(self, request_count: int) -> None:
+        """Prepare round-dependent score tensors on the active execution stream."""
+        if request_count <= 0 or request_count > self.max_requests:
+            raise ValueError("phase preparation exceeds the fixed score workspace")
+        torch.add(
+            self.round_starts_device[:request_count].view(request_count, 1, 1),
+            self.offsets.view(1, -1, 1),
+            out=self.phase_base[:request_count],
+        )
+        phase = self.phase[:request_count]
+        cos_phase = self.cos_phase[:request_count]
+        sin_phase = self.sin_phase[:request_count]
+        torch.mul(
+            self.phase_base[:request_count],
+            self.omega.view(1, 1, -1),
+            out=phase,
+        )
+        torch.cos(phase, out=cos_phase)
+        torch.sin(phase, out=sin_phase)
+        torch.mean(cos_phase, dim=1, out=self.mean_cos[:request_count])
+        torch.mean(sin_phase, dim=1, out=self.mean_sin[:request_count])
 
 
 class TriAttention(BaseKVCacheCompressionManager):
@@ -1177,6 +1189,16 @@ class TriAttention(BaseKVCacheCompressionManager):
     # retained set.
     _INDEXER_TOPK_MAX_K = 2048
     _INDEXER_TOPK_SUBBLOCK = 2048
+    _STANDALONE_GRAPH_BUCKETS = {
+        (8191, 4096): "torch_topk",
+        (8192, 4096): "torch_topk",
+        (4095, 2048): "indexer_topk",
+        (4096, 2048): "torch_topk",
+        (4223, 4096): "torch_topk",
+        (4224, 4096): "torch_topk",
+    }
+    _STANDALONE_GRAPH_REQUEST_COUNTS = frozenset((1, 7, 8))
+    _STANDALONE_GRAPH_PROMPT_LEN = 1024
 
     def __init__(
         self,
@@ -1301,6 +1323,11 @@ class TriAttention(BaseKVCacheCompressionManager):
             and self.eviction_mode == "union"
             and os.environ.get("TRIATTN_CROSS_REQUEST_SELECTION", "0") == "1"
         )
+        self._standalone_cuda_graph_enabled = (
+            self._cross_request_selection_enabled
+            and self._fixed_union_compaction_enabled
+            and os.environ.get("TRIATTN_STANDALONE_CUDA_GRAPH", "0") == "1"
+        )
         self._fixed_union_workspaces = {}
         self._fixed_union_active = {}
         self._fixed_union_prewarm_states = {}
@@ -1324,6 +1351,10 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._cross_request_selection_materialization_state = (
             "pending" if self._cross_request_selection_enabled else "disabled"
         )
+        # Graph arenas are created only after a real due cohort materializes
+        # the Stage3 and Stage4 banks.
+        self._standalone_graph_cache = None
+        self._standalone_graph_arena_generation = 0
 
     def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
         """Mark capacity-only decode and resolve calibration once.
@@ -3130,6 +3161,246 @@ class TriAttention(BaseKVCacheCompressionManager):
                 )
         return False
 
+    def _standalone_graph_bucket_for(
+        self,
+        prepared: List[dict],
+        score_workspace: Optional[_FixedScoreMetadataWorkspace],
+        selection_workspace: Optional[_BatchedFixedUnionWorkspace],
+    ) -> Optional[tuple]:
+        """Return the sealed graph bucket, or reject to the Stage4 path."""
+        request_count = len(prepared)
+        if (
+            not getattr(self, "_standalone_cuda_graph_enabled", False)
+            or score_workspace is None
+            or selection_workspace is None
+            or request_count not in self._STANDALONE_GRAPH_REQUEST_COUNTS
+        ):
+            return None
+        seq_lens = {item["seq_len"] for item in prepared}
+        prompt_lens = {
+            min(int(getattr(item["request"], "py_prompt_len", 0) or 0), item["seq_len"])
+            for item in prepared
+        }
+        if len(seq_lens) != 1 or prompt_lens != {self._STANDALONE_GRAPH_PROMPT_LEN}:
+            return None
+        seq_len = next(iter(seq_lens))
+        prompt_len = next(iter(prompt_lens))
+        width = seq_len - prompt_len
+        expected_backend = self._STANDALONE_GRAPH_BUCKETS.get((width, self.top_B))
+        if (
+            expected_backend is None
+            or selection_workspace.selection_backend != expected_backend
+            or selection_workspace.prompt_len != prompt_len
+            or selection_workspace.width != width
+            or selection_workspace.keep_count != self.top_B
+            or getattr(score_workspace, "prewarm_key", None) is None
+            or any(item.get("expected_keep_count") != prompt_len + self.top_B for item in prepared)
+        ):
+            return None
+        if selection_workspace.max_requests < request_count:
+            return None
+        return (
+            "triattention.standalone-eviction-graph.bucket.v1",
+            getattr(score_workspace, "prewarm_key", None),
+            request_count,
+            seq_len,
+            prompt_len,
+            self.top_B,
+            expected_backend,
+        )
+
+    def _standalone_graph_cache_for(self):
+        cache = getattr(self, "_standalone_graph_cache", None)
+        if cache is None:
+            from .cuda_graph import StandaloneEvictionGraphCache
+
+            cache = StandaloneEvictionGraphCache(
+                max_entries=int(os.environ.get("TRIATTN_CUDA_GRAPH_MAX_ENTRIES", "8")),
+                max_bytes=int(os.environ.get("TRIATTN_CUDA_GRAPH_MAX_BYTES", str(4 * 1024**3))),
+            )
+            self._standalone_graph_cache = cache
+        return cache
+
+    def _standalone_graph_workspace_for(
+        self,
+        *,
+        key: tuple,
+        layer_pools: List[torch.Tensor],
+        dense_layers: List[int],
+        swa_layers: List[int],
+        layer_group_representative: Dict[int, int],
+        global_layers: List[int],
+        score_workspace: _FixedScoreMetadataWorkspace,
+        selection_workspace: _BatchedFixedUnionWorkspace,
+        request_count: int,
+        seq_len: int,
+        prompt_len: int,
+        swa_window: Optional[int],
+    ):
+        cache = self._standalone_graph_cache_for()
+        workspace = cache.workspace_for(key)
+        if workspace is not None and workspace.matches_runtime(
+            layer_pools=layer_pools,
+            dense_layers=dense_layers,
+            swa_layers=swa_layers,
+            layer_group_representative=layer_group_representative,
+            global_layers=global_layers,
+            score_workspace=score_workspace,
+            selection_workspace=selection_workspace,
+        ):
+            return workspace
+
+        from .cuda_graph import FixedBatchedCompactionWorkspace
+
+        self._standalone_graph_arena_generation += 1
+        workspace = FixedBatchedCompactionWorkspace(
+            layer_pools=layer_pools,
+            dense_layers=dense_layers,
+            swa_layers=swa_layers,
+            layer_group_representative=layer_group_representative,
+            global_layers=global_layers,
+            score_workspace=score_workspace,
+            selection_workspace=selection_workspace,
+            request_count=request_count,
+            seq_len=seq_len,
+            prompt_len=prompt_len,
+            decode_keep_count=self.top_B,
+            swa_window=swa_window,
+            arena_generation=self._standalone_graph_arena_generation,
+        )
+        return workspace
+
+    def _try_standalone_cuda_graph(
+        self,
+        *,
+        prepared: List[dict],
+        layer_pools: List[torch.Tensor],
+        dense_layers: List[int],
+        dense_groups: List[List[int]],
+        swa_layers: List[int],
+        swa_window: Optional[int],
+        layer_group_representative: Dict[int, int],
+        global_layers: List[int],
+        score_workspace: Optional[_FixedScoreMetadataWorkspace],
+        selection_workspace: Optional[_BatchedFixedUnionWorkspace],
+        fixed_perhead_segment_views,
+    ) -> Optional[List[Tuple[int, int]]]:
+        """Run an exact standalone eviction graph, or leave Stage4 untouched."""
+        key = self._standalone_graph_bucket_for(
+            prepared,
+            score_workspace,
+            selection_workspace,
+        )
+        if key is None:
+            return None
+        assert score_workspace is not None
+        assert selection_workspace is not None
+        request_count = len(prepared)
+        seq_len = prepared[0]["seq_len"]
+        prompt_len = self._STANDALONE_GRAPH_PROMPT_LEN
+        cache = self._standalone_graph_cache_for()
+        if cache.is_disabled(key):
+            return None
+        stream = torch.cuda.current_stream(score_workspace.device)
+        staged_stream = score_workspace.stream
+        if staged_stream is None or (stream.device, stream.cuda_stream) != (
+            staged_stream.device,
+            staged_stream.cuda_stream,
+        ):
+            raise _FixedScoreStreamMismatch(
+                "TriAttention graph replay must use the fixed staging CUDA stream"
+            )
+        try:
+            workspace = self._standalone_graph_workspace_for(
+                key=key,
+                layer_pools=layer_pools,
+                dense_layers=dense_layers,
+                swa_layers=swa_layers,
+                layer_group_representative=layer_group_representative,
+                global_layers=global_layers,
+                score_workspace=score_workspace,
+                selection_workspace=selection_workspace,
+                request_count=request_count,
+                seq_len=seq_len,
+                prompt_len=prompt_len,
+                swa_window=swa_window,
+            )
+            fingerprint = workspace.pointer_fingerprint(stream)
+        except (RuntimeError, ValueError) as exc:
+            logger.warning(
+                "TriAttention standalone CUDA Graph workspace rejected; "
+                f"using Stage4 eager execution: {exc}"
+            )
+            return None
+
+        def graph_body() -> None:
+            score_workspace.prepare_phase(request_count)
+            req_layer_scores = [dict() for _ in prepared]
+            for layers in dense_groups:
+                representative = layers[0]
+                per_head, _ = score_workspace.groups[representative].launch(
+                    request_count,
+                    score_workspace.round_starts_device,
+                    score_workspace.mean_cos,
+                    score_workspace.mean_sin,
+                    self.score_aggregation,
+                )
+                views = fixed_perhead_segment_views(
+                    per_head,
+                    request_count,
+                    len(layers),
+                    seq_len,
+                )
+                for request_index in range(request_count):
+                    for layer_slot, layer in enumerate(layers):
+                        req_layer_scores[request_index][layer] = views[:, request_index, layer_slot]
+            segments_by_request = [
+                [
+                    req_layer_scores[request_index][layer][:, prompt_len:seq_len]
+                    for layer in dense_layers
+                ]
+                for request_index in range(request_count)
+            ]
+            selection_workspace.select_requests(
+                segments_by_request,
+                normalize_scores=self.normalize_scores,
+            )
+            workspace.launch()
+
+        expected_outcome = cache.classify(key, fingerprint)
+        with nvtx_range(f"triattention.cuda_graph.{expected_outcome}", color="green"):
+            outcome = cache.execute(
+                key=key,
+                fingerprint=fingerprint,
+                workspace=workspace,
+                capture_body=graph_body,
+            )
+        logger.debug(
+            "TriAttention standalone CUDA Graph outcome: "
+            f"outcome={outcome}, requests={request_count}, "
+            f"width={seq_len - prompt_len}, budget={self.top_B}, "
+            f"backend={selection_workspace.selection_backend}, stats={cache.snapshot()}"
+        )
+        if outcome == "fallback":
+            return None
+
+        capacity_targets = []
+        for item in prepared:
+            keep_count = item["expected_keep_count"]
+            evicted = item["seq_len"] - keep_count
+            if evicted <= 0:
+                raise RuntimeError("standalone eviction graph captured an identity compaction")
+            request_id = item["request_id"]
+            self._evicted[request_id] = self._evicted.get(request_id, 0) + evicted
+            self._pre_forward_kv_lengths[request_id] = keep_count
+            capacity_targets.append((request_id, keep_count + 1))
+        return capacity_targets
+
+    def _standalone_cuda_graph_stats(self) -> dict:
+        """Return host-side counters used to seal graph-hit profiling windows."""
+        cache = getattr(self, "_standalone_graph_cache", None)
+        return {} if cache is None else cache.snapshot()
+
     def _evict_requests(self, evict_reqs, num_layers: int) -> List[Tuple[int, int]]:
         """Score and compact requests, returning ``(request_id, capacity)`` targets.
 
@@ -3248,6 +3519,23 @@ class TriAttention(BaseKVCacheCompressionManager):
             num_layers,
             global_layers,
         )
+        graph_capacity_targets = self._try_standalone_cuda_graph(
+            prepared=prepared,
+            layer_pools=layer_pools,
+            dense_layers=dense_layers,
+            dense_groups=dense_groups,
+            swa_layers=swa_layers,
+            swa_window=swa_window,
+            layer_group_representative=layer_group_representative,
+            global_layers=global_layers,
+            score_workspace=fixed_score_workspace if fixed_score_active else None,
+            selection_workspace=cross_request_selection,
+            fixed_perhead_segment_views=fixed_perhead_segment_views,
+        )
+        if graph_capacity_targets is not None:
+            return graph_capacity_targets
+        if fixed_score_active:
+            fixed_score_workspace.prepare_phase(len(prepared))
         # Score only dense layers, grouped by their backing storage.
         req_layer_scores = [dict() for _ in prepared]  # [req] -> {layer_idx: [H,seq]}
         for lids in storage_groups.values():

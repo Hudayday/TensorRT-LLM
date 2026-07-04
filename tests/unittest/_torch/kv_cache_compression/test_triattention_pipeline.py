@@ -415,6 +415,8 @@ class TestStepBeginHookRefactor:
         stage4.assert_not_called()
         evict.assert_not_called()
         assert mgr._gen_steps[7] == mgr.beta - 1
+        assert mgr._standalone_graph_cache is None
+        assert mgr._standalone_graph_arena_generation == 0
 
     def test_base_prepare_resources_fires_hook_pre_forward(self):
         import unittest.mock as mock
@@ -470,6 +472,8 @@ class TestStepBeginHookRefactor:
         mgr.top_B = 4096
         mgr.pin_prefill = True
         mgr.count_prompt_tokens = False
+        mgr._standalone_graph_cache = None
+        mgr._standalone_graph_arena_generation = 0
         return mgr, request, batch
 
     def test_identity_gate_skips_exact_decode_only_budget(self):
@@ -488,6 +492,8 @@ class TestStepBeginHookRefactor:
         stage4.assert_not_called()
         evict.assert_not_called()
         assert mgr._gen_steps[7] == 128
+        assert mgr._standalone_graph_cache is None
+        assert mgr._standalone_graph_arena_generation == 0
 
     def test_identity_gate_preserves_real_eviction_round(self):
         import contextlib
@@ -502,7 +508,7 @@ class TestStepBeginHookRefactor:
         cache = mgr.kv_cache_manager.kv_cache_map[7]
 
         def compact(*args):
-            timeline.append("compact")
+            timeline.append("stage5_dispatch")
             return [(7, 1024 + 4096 + 1)]
 
         def materialize_stage3():
@@ -547,7 +553,7 @@ class TestStepBeginHookRefactor:
         assert timeline == [
             "materialize_stage3",
             "materialize_stage4",
-            "compact",
+            "stage5_dispatch",
             "enter:triattention.publish",
             "event",
             "exit:triattention.publish",
@@ -578,6 +584,8 @@ class TestStepBeginHookRefactor:
         evict.assert_not_called()
         assert mgr._gen_steps[7] == 127
         assert mgr._pre_forward_kv_lengths[7] == 1024 + 4096 + 2
+        assert mgr._standalone_graph_cache is None
+        assert mgr._standalone_graph_arena_generation == 0
 
     def test_generation_only_request_is_initialized_once(self):
         from types import SimpleNamespace
@@ -1155,13 +1163,24 @@ class TestFixedScoreMetadata:
         with (
             mock.patch.object(torch.cuda, "current_stream", return_value=stream),
             mock.patch.object(torch, "as_tensor", return_value=buffer),
-            mock.patch.object(torch, "add"),
-            mock.patch.object(torch, "mul"),
-            mock.patch.object(torch, "cos"),
-            mock.patch.object(torch, "sin"),
-            mock.patch.object(torch, "mean"),
+            mock.patch.object(torch, "add") as add,
+            mock.patch.object(torch, "mul") as mul,
+            mock.patch.object(torch, "cos") as cos,
+            mock.patch.object(torch, "sin") as sin,
+            mock.patch.object(torch, "mean") as mean,
         ):
             assert workspace.stage(lambda request_ids, layer: [[3]], [7], [8.0])
+            add.assert_not_called()
+            mul.assert_not_called()
+            cos.assert_not_called()
+            sin.assert_not_called()
+            mean.assert_not_called()
+            workspace.prepare_phase(1)
+            add.assert_called_once()
+            mul.assert_called_once()
+            cos.assert_called_once()
+            sin.assert_called_once()
+            assert mean.call_count == 2
         assert workspace.stream is stream
         workspace.copy_done.record.assert_called_once_with(stream)
 
@@ -1550,6 +1569,7 @@ class TestFixedScoreMetadata:
                 return tables
 
             assert workspace.stage(get_batch_cache_indices, request_ids, round_starts)
+            workspace.prepare_phase(request_count)
             fixed, fixed_offsets = group.launch(
                 request_count,
                 workspace.round_starts_device,
@@ -1955,6 +1975,30 @@ class TestFixedUnionWorkspace:
         with mock.patch.dict(os.environ, env):
             manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
             assert manager._fixed_shape_selection_enabled
+
+    def test_standalone_cuda_graph_requires_every_cumulative_gate(self):
+        import os
+        from unittest import mock
+
+        env = {
+            "TRIATTN_FIXED_BUFFER_UNION": "1",
+            "TRIATTN_COMPACT_KEPT_ONLY": "1",
+            "TRIATTN_FIXED_PREWARM": "1",
+            "TRIATTN_FIXED_SCORE_METADATA": "1",
+            "TRIATTN_FIXED_SHAPE_SELECTION": "1",
+            "TRIATTN_CROSS_REQUEST_SELECTION": "1",
+            "TRIATTN_STANDALONE_CUDA_GRAPH": "1",
+        }
+        with mock.patch.dict(os.environ, env):
+            manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
+            assert manager._standalone_cuda_graph_enabled
+
+        for gate in env:
+            disabled = dict(env)
+            disabled[gate] = "0"
+            with mock.patch.dict(os.environ, disabled):
+                manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
+                assert not manager._standalone_cuda_graph_enabled
 
     def test_prewarm_shape_parser_is_exact_and_fail_closed(self):
         assert TriAttention._parse_fixed_prewarm_shapes("1024:8192, 0:4097,1024:8192") == [
@@ -3679,6 +3723,7 @@ class TestCrossRequestFixedUnionWorkspace:
             round_starts_device=torch.tensor([8.0, 8.0]),
             mean_cos=torch.empty(0),
             mean_sin=torch.empty(0),
+            prepare_phase=mock.Mock(),
         )
         manager = TriAttention.__new__(TriAttention)
         manager.kv_cache_manager = SimpleNamespace(get_buffers=lambda layer, **kwargs: pool)
@@ -3748,6 +3793,7 @@ class TestCrossRequestFixedUnionWorkspace:
         assert manager._pre_forward_kv_lengths == {7: 6, 8: 6}
         assert manager._fixed_union_active == {99: active_sentinel}
         select_requests.assert_called_once()
+        score_workspace.prepare_phase.assert_called_once_with(2)
         manager._fixed_shape_selection_for.assert_not_called()
         manager._evict_modes.assert_not_called()
         assert compact.call_count == 2
