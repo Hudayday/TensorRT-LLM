@@ -965,6 +965,30 @@ def flat_perhead_to_list(
     return [perhead_scores[:, off[s] : off[s + 1]] for s in range(len(off) - 1)]
 
 
+def fixed_perhead_segment_views(
+    perhead_scores: torch.Tensor,
+    request_count: int,
+    layer_count: int,
+    seq_len: int,
+) -> torch.Tensor:
+    """View fixed score output as ``[H, R, L, S]`` without reading offsets.
+
+    The fixed score launcher writes request-major, then layer-major segments of
+    one exact sequence length.  Its geometry is already known by the caller, so
+    materializing ``seg_offsets`` on the host would add a needless CUDA sync.
+    """
+    if min(request_count, layer_count, seq_len) <= 0:
+        raise ValueError("fixed score segment geometry must be positive")
+    expected_width = request_count * layer_count * seq_len
+    if perhead_scores.ndim != 2 or int(perhead_scores.shape[1]) != expected_width:
+        raise ValueError(
+            "fixed score output width does not match request/layer/sequence geometry"
+        )
+    return perhead_scores.view(
+        int(perhead_scores.shape[0]), request_count, layer_count, seq_len
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Standalone equivalence test                                                  #
 # --------------------------------------------------------------------------- #
