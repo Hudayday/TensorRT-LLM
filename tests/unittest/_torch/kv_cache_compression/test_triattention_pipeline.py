@@ -387,23 +387,30 @@ class TestStepBeginHookRefactor:
             mgr.on_generation_step_begin("BATCH")
             pe.assert_called_once_with("BATCH")
 
-    def test_first_real_generation_prepare_materializes_after_dummy_calls(self):
+    def test_dummy_and_arbitrary_non_due_steps_do_not_materialize(self):
         from types import SimpleNamespace
         from unittest import mock
 
-        mgr = TriAttention.__new__(TriAttention)
-        mgr._calibrated = True
-        mgr._capacity_only_request_ids = {7}
-        mgr.kv_cache_manager = SimpleNamespace(get_buffers=None)
-        mgr._materialize_fixed_shape_selection_banks = mock.Mock()
+        mgr, _, batch = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
+        mgr._gen_steps = {7: 0}
         dummy = SimpleNamespace(is_dummy=True, py_request_id=99)
-        request = SimpleNamespace(is_dummy=False, py_request_id=7)
+        allocation_error = AssertionError("non-eviction generation must not allocate a tensor")
 
-        mgr._periodic_evict(SimpleNamespace(generation_requests=[dummy]))
-        mgr._materialize_fixed_shape_selection_banks.assert_not_called()
+        with (
+            mock.patch.object(mgr, "_materialize_fixed_shape_selection_banks") as materialize,
+            mock.patch.object(mgr, "_evict_requests") as evict,
+            mock.patch.object(torch, "empty", side_effect=allocation_error),
+            mock.patch.object(torch, "empty_like", side_effect=allocation_error),
+            mock.patch.object(torch, "arange", side_effect=allocation_error),
+            mock.patch.object(torch, "full", side_effect=allocation_error),
+        ):
+            mgr._periodic_evict(SimpleNamespace(generation_requests=[dummy]))
+            for _ in range(mgr.beta - 1):
+                mgr._periodic_evict(batch)
 
-        mgr._periodic_evict(SimpleNamespace(generation_requests=[request]))
-        mgr._materialize_fixed_shape_selection_banks.assert_called_once_with()
+        materialize.assert_not_called()
+        evict.assert_not_called()
+        assert mgr._gen_steps[7] == mgr.beta - 1
 
     def test_base_prepare_resources_fires_hook_pre_forward(self):
         import unittest.mock as mock
@@ -466,9 +473,13 @@ class TestStepBeginHookRefactor:
 
         mgr, _, batch = self._make_due_decode_request(seq_len=1024 + 4096)
 
-        with mock.patch.object(mgr, "_evict_requests") as evict:
+        with (
+            mock.patch.object(mgr, "_materialize_fixed_shape_selection_banks") as materialize,
+            mock.patch.object(mgr, "_evict_requests") as evict,
+        ):
             mgr._periodic_evict(batch)
 
+        materialize.assert_not_called()
         evict.assert_not_called()
         assert mgr._gen_steps[7] == 128
 
@@ -488,6 +499,9 @@ class TestStepBeginHookRefactor:
             timeline.append("compact")
             return [(7, 1024 + 4096 + 1)]
 
+        def materialize():
+            timeline.append("materialize")
+
         @contextlib.contextmanager
         def track_range(name, **kwargs):
             timeline.append(f"enter:{name}")
@@ -495,12 +509,18 @@ class TestStepBeginHookRefactor:
             timeline.append(f"exit:{name}")
 
         with (
+            mock.patch.object(
+                mgr,
+                "_materialize_fixed_shape_selection_banks",
+                side_effect=materialize,
+            ) as materialize_banks,
             mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict,
             mock.patch.object(torch.cuda, "Event", return_value=event),
             mock.patch.object(tri_module, "nvtx_range", side_effect=track_range),
         ):
             mgr._periodic_evict(batch)
 
+        materialize_banks.assert_called_once_with()
         evict.assert_called_once_with([(request, 7)], 2)
         event.record.assert_called_once_with()
         cache.resize.assert_not_called()
@@ -510,6 +530,7 @@ class TestStepBeginHookRefactor:
             event,
         )
         assert timeline == [
+            "materialize",
             "compact",
             "enter:triattention.publish",
             "event",
@@ -529,9 +550,13 @@ class TestStepBeginHookRefactor:
         )
         cache.capacity += 1
 
-        with mock.patch.object(mgr, "_evict_requests") as evict:
+        with (
+            mock.patch.object(mgr, "_materialize_fixed_shape_selection_banks") as materialize,
+            mock.patch.object(mgr, "_evict_requests") as evict,
+        ):
             mgr._periodic_evict(batch)
 
+        materialize.assert_not_called()
         evict.assert_not_called()
         assert mgr._gen_steps[7] == 127
         assert mgr._pre_forward_kv_lengths[7] == 1024 + 4096 + 2

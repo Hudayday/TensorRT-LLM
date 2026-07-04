@@ -1059,7 +1059,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             active_requests.append(request)
         if not active_requests or not self._calibrated:
             return
-        self._materialize_fixed_shape_selection_banks()
         mgr = self.kv_cache_manager
         get_buffers = getattr(mgr, "get_buffers", None)
         if get_buffers is None:
@@ -1112,7 +1111,11 @@ class TriAttention(BaseKVCacheCompressionManager):
         # (2) Compact all affected dense and kernel-masked SWA layers, then publish
         # one target per request. V2 consumes it at its existing post-enqueue
         # update boundary, where host block-table mutation is overlap-safe.
-        capacity_targets = self._evict_requests(evict_now, num_layers) if evict_now else []
+        if evict_now:
+            self._materialize_fixed_shape_selection_banks()
+            capacity_targets = self._evict_requests(evict_now, num_layers)
+        else:
+            capacity_targets = []
         if capacity_targets:
             with nvtx_range("triattention.publish", color="red"):
                 compaction_event = torch.cuda.Event()
