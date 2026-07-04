@@ -595,6 +595,367 @@ class _FixedShapeSelectionPlan(NamedTuple):
     materialized_nbytes: int
 
 
+class _CrossRequestSelectionPlan(NamedTuple):
+    """Tensor-free request-major selection plan retained across graph capture."""
+
+    rows: int
+    width: int
+    keep_count: int
+    prompt_len: int
+    dtype: torch.dtype
+    device: torch.device
+    selection_backend: str
+    max_requests: int
+    materialized_nbytes: int
+
+
+class _BatchedFixedUnionWorkspace:
+    """Persistent request-major buffers for one exact union-selection bucket."""
+
+    _TENSOR_NAMES = (
+        "input_scores",
+        "row_mean",
+        "row_std",
+        "combined",
+        "combined_argmax",
+        "row_top_values",
+        "row_top_indices",
+        "union_mask",
+        "candidates",
+        "negative_inf",
+        "final_values",
+        "final_indices",
+        "sorted_indices",
+        "sort_order",
+        "keep",
+    )
+    _INDEXER_TENSOR_NAMES = (
+        "row_seq_lens",
+        "row_top_indices_i32",
+        "token_indices",
+        "width_sentinel",
+        "union_physical_indices",
+        "union_indices_sorted",
+        "union_sort_order",
+        "candidate_gather_indices",
+        "union_counts",
+        "final_indices_i32",
+        "final_relative_indices",
+    )
+
+    def __init__(
+        self,
+        rows: int,
+        width: int,
+        keep_count: int,
+        prompt_len: int,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+        selection_backend: str,
+        max_requests: int,
+    ) -> None:
+        if rows <= 0 or width <= keep_count or keep_count <= 0:
+            raise ValueError("cross-request selection requires rows > 0 and width > keep_count > 0")
+        if max_requests <= 0:
+            raise ValueError("cross-request selection requires a positive request capacity")
+        if selection_backend not in ("torch_topk", "indexer_topk"):
+            raise ValueError(f"unsupported cross-request selection backend: {selection_backend}")
+        self.max_requests = max_requests
+        self.selection_backend = selection_backend
+        self.rows = rows
+        self.width = width
+        self.keep_count = keep_count
+        self.prompt_len = prompt_len
+        self.total_keep = prompt_len + keep_count
+        self.dtype = dtype
+        self.device = _FixedUnionWorkspace._canonical_device(device)
+
+        shape = (max_requests, rows, width)
+        self.input_scores = torch.empty(shape, dtype=dtype, device=self.device)
+        self.row_mean = torch.empty((max_requests, rows, 1), dtype=dtype, device=self.device)
+        self.row_std = torch.empty_like(self.row_mean)
+        self.combined = torch.empty((max_requests, width), dtype=dtype, device=self.device)
+        self.combined_argmax = torch.empty(
+            (max_requests, width), dtype=torch.long, device=self.device
+        )
+        self.row_top_values = torch.empty(
+            (max_requests, rows, keep_count), dtype=dtype, device=self.device
+        )
+        self.row_top_indices = torch.empty(
+            (max_requests, rows, keep_count), dtype=torch.long, device=self.device
+        )
+        self.union_mask = torch.empty((max_requests, width), dtype=torch.bool, device=self.device)
+        self.candidates = torch.empty_like(self.combined)
+        self.negative_inf = torch.full((), float("-inf"), dtype=dtype, device=self.device)
+        self.final_values = torch.empty((max_requests, keep_count), dtype=dtype, device=self.device)
+        self.final_indices = torch.empty(
+            (max_requests, keep_count), dtype=torch.long, device=self.device
+        )
+        self.sorted_indices = torch.empty_like(self.final_indices)
+        self.sort_order = torch.empty_like(self.final_indices)
+        self.keep = torch.empty(
+            (max_requests, self.total_keep), dtype=torch.long, device=self.device
+        )
+        if prompt_len:
+            prompt = torch.arange(prompt_len, dtype=torch.long, device=self.device)
+            self.keep[:, :prompt_len].copy_(prompt.expand(max_requests, -1))
+        if selection_backend == "indexer_topk":
+            self.row_seq_lens = torch.full(
+                (max_requests * rows,), width, dtype=torch.int32, device=self.device
+            )
+            self.row_top_indices_i32 = torch.empty(
+                (max_requests, rows, keep_count), dtype=torch.int32, device=self.device
+            )
+            self.token_indices = torch.arange(width, dtype=torch.long, device=self.device)
+            self.width_sentinel = torch.full((), width, dtype=torch.long, device=self.device)
+            self.union_physical_indices = torch.empty(
+                (max_requests, width), dtype=torch.long, device=self.device
+            )
+            self.union_indices_sorted = torch.empty_like(self.union_physical_indices)
+            self.union_sort_order = torch.empty_like(self.union_physical_indices)
+            self.candidate_gather_indices = torch.empty_like(self.union_physical_indices)
+            self.union_counts = torch.empty(max_requests, dtype=torch.int32, device=self.device)
+            self.final_indices_i32 = torch.empty(
+                (max_requests, keep_count), dtype=torch.int32, device=self.device
+            )
+            self.final_relative_indices = torch.empty_like(self.final_indices)
+            self._tensor_names = self._TENSOR_NAMES + self._INDEXER_TENSOR_NAMES
+        else:
+            self._tensor_names = self._TENSOR_NAMES
+        self.request_workspaces = tuple(
+            self._request_workspace(request_index) for request_index in range(max_requests)
+        )
+
+    @staticmethod
+    def planned_selection_bank_nbytes(
+        rows: int,
+        width: int,
+        keep_count: int,
+        prompt_len: int,
+        dtype: torch.dtype,
+        selection_backend: str,
+        max_requests: int,
+    ) -> int:
+        """Compute request-major workspace bytes without allocating a tensor."""
+        dtype_bytes = torch.finfo(dtype).bits // 8
+        long_bytes = 8
+        int_bytes = 4
+        total_keep = prompt_len + keep_count
+        per_request = (
+            rows * width * dtype_bytes
+            + 2 * rows * dtype_bytes
+            + width * dtype_bytes
+            + width * long_bytes
+            + rows * keep_count * dtype_bytes
+            + rows * keep_count * long_bytes
+            + width
+            + width * dtype_bytes
+            + keep_count * dtype_bytes
+            + 3 * keep_count * long_bytes
+            + total_keep * long_bytes
+        )
+        total = max_requests * per_request + dtype_bytes
+        if selection_backend == "indexer_topk":
+            total += max_requests * (
+                rows * int_bytes
+                + rows * keep_count * int_bytes
+                + 4 * width * long_bytes
+                + int_bytes
+                + keep_count * int_bytes
+                + keep_count * long_bytes
+            )
+            total += (width + 1) * long_bytes
+        elif selection_backend != "torch_topk":
+            raise ValueError(f"unsupported cross-request selection backend: {selection_backend}")
+        return total
+
+    def _request_workspace(self, request_index: int) -> _FixedUnionWorkspace:
+        """Build a Stage3-compatible keep view over the request-major owner."""
+        workspace = _FixedUnionWorkspace.__new__(_FixedUnionWorkspace)
+        for name in (
+            "rows",
+            "width",
+            "keep_count",
+            "prompt_len",
+            "total_keep",
+            "dtype",
+            "device",
+            "selection_backend",
+        ):
+            setattr(workspace, name, getattr(self, name))
+        for name in self._TENSOR_NAMES:
+            tensor = getattr(self, name)
+            setattr(workspace, name, tensor if tensor.ndim == 0 else tensor[request_index])
+        workspace.selection_only = True
+        workspace._compaction_buffers = {}
+        workspace.prewarm_attempted = True
+        workspace.prewarmed = True
+        workspace.prewarm_failed = False
+        workspace._segment_buffers_prepared = True
+        return workspace
+
+    def selection_buffer_nbytes(self) -> int:
+        """Return unique bytes owned by the request-major selection workspace."""
+        return sum(
+            getattr(self, name).numel() * getattr(self, name).element_size()
+            for name in self._tensor_names
+        )
+
+    def pointer_snapshot(self) -> Dict[str, tuple]:
+        """Return stable addresses and geometry for runtime validation."""
+        return {
+            name: (
+                getattr(self, name).data_ptr(),
+                tuple(getattr(self, name).shape),
+                tuple(getattr(self, name).stride()),
+            )
+            for name in self._tensor_names
+        }
+
+    def _select_input_scores(
+        self, request_count: int, *, normalize_scores: bool
+    ) -> Tuple[_FixedUnionWorkspace, ...]:
+        input_scores = self.input_scores[:request_count]
+        if normalize_scores:
+            row_mean = self.row_mean[:request_count]
+            row_std = self.row_std[:request_count]
+            torch.mean(input_scores, dim=2, keepdim=True, out=row_mean)
+            torch.std(input_scores, dim=2, unbiased=False, keepdim=True, out=row_std)
+            row_std.clamp_min_(1e-6)
+            torch.sub(input_scores, row_mean, out=input_scores)
+            torch.div(input_scores, row_std, out=input_scores)
+
+        combined = self.combined[:request_count]
+        combined_argmax = self.combined_argmax[:request_count]
+        row_top_values = self.row_top_values[:request_count]
+        row_top_indices = self.row_top_indices[:request_count]
+        union_mask = self.union_mask[:request_count]
+        candidates = self.candidates[:request_count]
+        final_values = self.final_values[:request_count]
+        final_indices = self.final_indices[:request_count]
+        sorted_indices = self.sorted_indices[:request_count]
+        sort_order = self.sort_order[:request_count]
+
+        torch.max(input_scores, dim=1, out=(combined, combined_argmax))
+        if self.selection_backend == "indexer_topk":
+            row_count = request_count * self.rows
+            row_indices_i32 = self.row_top_indices_i32[:request_count]
+            torch.ops.trtllm.indexer_topk_decode(
+                input_scores.view(row_count, self.width),
+                self.row_seq_lens[:row_count],
+                row_indices_i32.view(row_count, self.keep_count),
+                1,
+                self.keep_count,
+            )
+            row_top_indices.copy_(row_indices_i32)
+        else:
+            torch.topk(
+                input_scores,
+                self.keep_count,
+                dim=2,
+                largest=True,
+                sorted=False,
+                out=(row_top_values, row_top_indices),
+            )
+        union_mask.zero_()
+        union_mask.scatter_(1, row_top_indices.reshape(request_count, -1), True)
+        if self.selection_backend == "indexer_topk":
+            union_physical_indices = self.union_physical_indices[:request_count]
+            union_indices_sorted = self.union_indices_sorted[:request_count]
+            union_sort_order = self.union_sort_order[:request_count]
+            candidate_gather_indices = self.candidate_gather_indices[:request_count]
+            union_counts = self.union_counts[:request_count]
+            final_indices_i32 = self.final_indices_i32[:request_count]
+            final_relative_indices = self.final_relative_indices[:request_count]
+            torch.where(
+                union_mask,
+                self.token_indices,
+                self.width_sentinel,
+                out=union_physical_indices,
+            )
+            torch.sort(
+                union_physical_indices,
+                dim=1,
+                out=(union_indices_sorted, union_sort_order),
+            )
+            torch.clamp(
+                union_indices_sorted,
+                max=self.width - 1,
+                out=candidate_gather_indices,
+            )
+            torch.gather(combined, 1, candidate_gather_indices, out=candidates)
+            torch.sum(union_mask, dim=1, dtype=torch.int32, out=union_counts)
+            torch.ops.trtllm.indexer_topk_decode(
+                candidates,
+                union_counts,
+                final_indices_i32,
+                1,
+                self.keep_count,
+            )
+            final_relative_indices.copy_(final_indices_i32)
+            torch.gather(
+                union_indices_sorted,
+                1,
+                final_relative_indices,
+                out=final_indices,
+            )
+        else:
+            torch.where(union_mask, combined, self.negative_inf, out=candidates)
+            torch.topk(
+                candidates,
+                self.keep_count,
+                dim=1,
+                largest=True,
+                sorted=False,
+                out=(final_values, final_indices),
+            )
+        torch.sort(final_indices, dim=1, out=(sorted_indices, sort_order))
+        torch.add(
+            sorted_indices,
+            self.prompt_len,
+            out=self.keep[:request_count, self.prompt_len :],
+        )
+        return self.request_workspaces[:request_count]
+
+    def warm(self, *, normalize_scores: bool) -> None:
+        """Warm the exact backend with one request and no caller-owned output."""
+        self.input_scores[0].zero_()
+        self._select_input_scores(1, normalize_scores=normalize_scores)
+
+    def select_requests(
+        self,
+        segments_by_request: List[List[torch.Tensor]],
+        *,
+        normalize_scores: bool,
+    ) -> Tuple[_FixedUnionWorkspace, ...]:
+        """Pack and select every request with one fixed-shape operation sequence."""
+        request_count = len(segments_by_request)
+        if request_count <= 0 or request_count > self.max_requests:
+            raise ValueError("request count exceeds the cross-request selection capacity")
+
+        flat_segments = []
+        for segments in segments_by_request:
+            if not segments or sum(int(segment.shape[0]) for segment in segments) != self.rows:
+                raise ValueError("cross-request segments do not match the workspace row count")
+            if any(
+                segment.ndim != 2
+                or int(segment.shape[1]) != self.width
+                or segment.dtype != self.dtype
+                or segment.device != self.device
+                for segment in segments
+            ):
+                raise ValueError("cross-request segment geometry no longer matches its bucket")
+            flat_segments.extend(segments)
+
+        torch.cat(
+            flat_segments,
+            dim=0,
+            out=self.input_scores[:request_count].view(request_count * self.rows, self.width),
+        )
+        return self._select_input_scores(request_count, normalize_scores=normalize_scores)
+
+
 class _FixedScoreStreamMismatch(RuntimeError):
     """Raised when a fixed score workspace is used from another CUDA stream."""
 
@@ -935,6 +1296,11 @@ class TriAttention(BaseKVCacheCompressionManager):
             self._fixed_score_metadata_enabled
             and os.environ.get("TRIATTN_FIXED_SHAPE_SELECTION", "0") == "1"
         )
+        self._cross_request_selection_enabled = (
+            self._fixed_shape_selection_enabled
+            and self.eviction_mode == "union"
+            and os.environ.get("TRIATTN_CROSS_REQUEST_SELECTION", "0") == "1"
+        )
         self._fixed_union_workspaces = {}
         self._fixed_union_active = {}
         self._fixed_union_prewarm_states = {}
@@ -949,6 +1315,14 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._fixed_shape_selection_runtime_counts = {}
         self._fixed_shape_selection_materialization_state = (
             "pending" if self._fixed_shape_selection_enabled else "disabled"
+        )
+        self._cross_request_selection_workspaces = {}
+        self._cross_request_selection_prewarm_states = {}
+        self._cross_request_selection_plans = {}
+        self._cross_request_selection_bank_bytes = {}
+        self._cross_request_selection_runtime_counts = {}
+        self._cross_request_selection_materialization_state = (
+            "pending" if self._cross_request_selection_enabled else "disabled"
         )
 
     def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
@@ -1113,6 +1487,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         # update boundary, where host block-table mutation is overlap-safe.
         if evict_now:
             self._materialize_fixed_shape_selection_banks()
+            self._materialize_cross_request_selection_banks()
             capacity_targets = self._evict_requests(evict_now, num_layers)
         else:
             capacity_targets = []
@@ -1654,10 +2029,68 @@ class TriAttention(BaseKVCacheCompressionManager):
         if not hasattr(self, "_fixed_shape_selection_materialization_state"):
             self._fixed_shape_selection_materialization_state = "pending"
         states[key] = "planned"
+        self._prewarm_cross_request_selection_bucket(key, plan)
         logger.info(
             "TriAttention fixed-shape selection plan is ready; persistent buffers "
             f"are deferred until the first real generation prepare: requests={max_requests}, "
             f"bytes={bank_bytes}"
+        )
+
+    def _prewarm_cross_request_selection_bucket(
+        self,
+        key: tuple,
+        stage3_plan: _FixedShapeSelectionPlan,
+    ) -> None:
+        """Record a tensor-free Stage4 plan for one exact Stage3 bucket."""
+        if (
+            not getattr(self, "_cross_request_selection_enabled", False)
+            or self.eviction_mode != "union"
+        ):
+            return
+        states = self._cross_request_selection_prewarm_states
+        if states.get(key) in ("running", "planned", "ready", "failed"):
+            return
+
+        states[key] = "running"
+        bank_bytes = None
+        try:
+            bank_bytes = _BatchedFixedUnionWorkspace.planned_selection_bank_nbytes(
+                stage3_plan.rows,
+                stage3_plan.width,
+                stage3_plan.keep_count,
+                stage3_plan.prompt_len,
+                stage3_plan.dtype,
+                stage3_plan.selection_backend,
+                stage3_plan.max_requests,
+            )
+            plan = _CrossRequestSelectionPlan(
+                rows=stage3_plan.rows,
+                width=stage3_plan.width,
+                keep_count=stage3_plan.keep_count,
+                prompt_len=stage3_plan.prompt_len,
+                dtype=stage3_plan.dtype,
+                device=stage3_plan.device,
+                selection_backend=stage3_plan.selection_backend,
+                max_requests=stage3_plan.max_requests,
+                materialized_nbytes=bank_bytes,
+            )
+        except Exception as exc:
+            states[key] = "failed"
+            self._cross_request_selection_plans.pop(key, None)
+            logger.warning(
+                "TriAttention cross-request selection planning failed; "
+                f"using the Stage3 path (estimated_bytes={bank_bytes}): {exc}"
+            )
+            return
+
+        self._cross_request_selection_plans[key] = plan
+        self._cross_request_selection_materialization_state = "pending"
+        states[key] = "planned"
+        logger.info(
+            "TriAttention cross-request selection plan is ready; persistent buffers "
+            "are deferred until the first real generation prepare: "
+            f"requests={plan.max_requests}, backend={plan.selection_backend}, "
+            f"bytes={plan.materialized_nbytes}"
         )
 
     def _warm_fixed_shape_selection_workspace(self, workspace: _FixedUnionWorkspace) -> None:
@@ -1737,6 +2170,57 @@ class TriAttention(BaseKVCacheCompressionManager):
             self._fixed_shape_selection_bank_bytes[key] = plan.materialized_nbytes
             states[key] = "ready"
         self._fixed_shape_selection_materialization_state = "done"
+
+    @staticmethod
+    def _build_cross_request_selection_workspace(
+        plan: _CrossRequestSelectionPlan,
+    ) -> _BatchedFixedUnionWorkspace:
+        """Allocate one request-major owner from a deferred exact-bucket plan."""
+        return _BatchedFixedUnionWorkspace(
+            plan.rows,
+            plan.width,
+            plan.keep_count,
+            plan.prompt_len,
+            dtype=plan.dtype,
+            device=plan.device,
+            selection_backend=plan.selection_backend,
+            max_requests=plan.max_requests,
+        )
+
+    def _materialize_cross_request_selection_banks(self) -> None:
+        """Allocate Stage4 banks once after Stage3 and model graph capture."""
+        state = getattr(self, "_cross_request_selection_materialization_state", "disabled")
+        if state in ("disabled", "running", "done"):
+            return
+        self._cross_request_selection_materialization_state = "running"
+        plans = getattr(self, "_cross_request_selection_plans", {})
+        states = self._cross_request_selection_prewarm_states
+        stage3_states = getattr(self, "_fixed_shape_selection_prewarm_states", {})
+        for key, plan in plans.items():
+            if states.get(key) != "planned":
+                continue
+            workspace = None
+            try:
+                if stage3_states.get(key) != "ready":
+                    raise RuntimeError("the corresponding Stage3 bank is not ready")
+                workspace = self._build_cross_request_selection_workspace(plan)
+                if workspace.selection_buffer_nbytes() != plan.materialized_nbytes:
+                    raise RuntimeError("materialized Stage4 workspace size differs from its plan")
+                workspace.warm(normalize_scores=self.normalize_scores)
+            except Exception as exc:
+                states[key] = "failed"
+                self._cross_request_selection_workspaces.pop(key, None)
+                self._cross_request_selection_bank_bytes.pop(key, None)
+                logger.warning(
+                    "TriAttention deferred cross-request selection materialization failed; "
+                    f"using the Stage3 path: {exc}"
+                )
+                continue
+
+            self._cross_request_selection_workspaces[key] = workspace
+            self._cross_request_selection_bank_bytes[key] = plan.materialized_nbytes
+            states[key] = "ready"
+        self._cross_request_selection_materialization_state = "done"
 
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
         """Drop this request's per-request length and eviction state."""
@@ -2152,6 +2636,75 @@ class TriAttention(BaseKVCacheCompressionManager):
         if counts is not None:
             counts.setdefault(key, {"hit": 0, "fallback": 0})["hit"] += 1
         return workspaces[:request_count]
+
+    def _cross_request_selection_for(
+        self,
+        score_workspace: Optional[_FixedScoreMetadataWorkspace],
+        request_count: int,
+    ) -> Optional[_BatchedFixedUnionWorkspace]:
+        """Return a ready exact-bucket Stage4 owner or preserve Stage3 fallback."""
+        if (
+            not getattr(self, "_cross_request_selection_enabled", False)
+            or self.eviction_mode != "union"
+            or score_workspace is None
+            or request_count <= 0
+        ):
+            return None
+        key = getattr(score_workspace, "prewarm_key", None)
+        workspace = getattr(self, "_cross_request_selection_workspaces", {}).get(key)
+        states = getattr(self, "_cross_request_selection_prewarm_states", {})
+        stage3_states = getattr(self, "_fixed_shape_selection_prewarm_states", {})
+        counts = getattr(self, "_cross_request_selection_runtime_counts", None)
+        if (
+            states.get(key) != "ready"
+            or stage3_states.get(key) != "ready"
+            or workspace is None
+            or request_count > workspace.max_requests
+        ):
+            if counts is not None:
+                counts.setdefault(key, {"hit": 0, "fallback": 0})["fallback"] += 1
+            return None
+        if counts is not None:
+            counts.setdefault(key, {"hit": 0, "fallback": 0})["hit"] += 1
+        return workspace
+
+    def _select_cross_request_union(
+        self,
+        workspace: _BatchedFixedUnionWorkspace,
+        prepared: List[dict],
+        req_layer_scores: List[dict],
+        dense_layers: List[int],
+    ) -> Tuple[_FixedUnionWorkspace, ...]:
+        """Select every exact-bucket request before any request is compacted."""
+        if self.eviction_mode != "union":
+            raise RuntimeError("cross-request selection requires union eviction mode")
+        segments_by_request = []
+        for request_index, item in enumerate(prepared):
+            seq_len = item["seq_len"]
+            prompt_len = min(
+                int(getattr(item["request"], "py_prompt_len", 0) or 0),
+                seq_len,
+            )
+            if (
+                prompt_len != workspace.prompt_len
+                or seq_len - prompt_len != workspace.width
+                or item["expected_keep_count"] != workspace.total_keep
+            ):
+                raise ValueError("cross-request selection geometry no longer matches its bucket")
+            segments = []
+            for layer in dense_layers:
+                scores = req_layer_scores[request_index].get(layer)
+                if scores is None:
+                    raise RuntimeError(
+                        "cross-request selection is missing a completed dense-layer score"
+                    )
+                segments.append(scores[:, prompt_len:seq_len])
+            segments_by_request.append(segments)
+
+        return workspace.select_requests(
+            segments_by_request,
+            normalize_scores=self.normalize_scores,
+        )
 
     def _get_fixed_union_workspace(
         self,
@@ -2676,11 +3229,17 @@ class TriAttention(BaseKVCacheCompressionManager):
             global_layers,
             fixed_score_workspace,
         )
-        fixed_selection_workspaces = (
-            self._fixed_shape_selection_for(fixed_score_workspace, len(prepared))
+        cross_request_selection = (
+            self._cross_request_selection_for(fixed_score_workspace, len(prepared))
             if fixed_score_active
             else None
         )
+        fixed_selection_workspaces = None
+        if fixed_score_active and cross_request_selection is None:
+            fixed_selection_workspaces = self._fixed_shape_selection_for(
+                fixed_score_workspace,
+                len(prepared),
+            )
         seq_lens = [item["seq_len"] for item in prepared]
         round_starts = [item["round_start"] for item in prepared]
         if self._offsets is None:
@@ -2733,6 +3292,16 @@ class TriAttention(BaseKVCacheCompressionManager):
             seg_list = flat_perhead_to_list(ph, so)
             for scores, (request, layer) in zip(seg_list, segments):
                 req_layer_scores[request][layer] = scores
+        cross_request_workspaces = None
+        if cross_request_selection is not None:
+            with nvtx_range("triattention.select", color="yellow"):
+                with nvtx_range("triattention.select.cross_request", color="orange"):
+                    cross_request_workspaces = self._select_cross_request_union(
+                        cross_request_selection,
+                        prepared,
+                        req_layer_scores,
+                        dense_layers,
+                    )
         # Per request: select from the precomputed scores. All scores were taken
         # before any compaction; requests touch disjoint pages, so compacting one
         # does not disturb another's (already-read) scores.
@@ -2753,43 +3322,52 @@ class TriAttention(BaseKVCacheCompressionManager):
             precomputed = [req_layer_scores[r].get(layer) for layer in range(num_layers)]
             if any(precomputed[layer] is None for layer in dense_layers):
                 continue
-            fixed_union_prewarm_key = None
-            fixed_union_workspace = (
-                fixed_selection_workspaces[r] if fixed_selection_workspaces is not None else None
-            )
-            if (
-                is_union
-                and len(prepared) == 1
-                and fixed_union_workspace is None
-                and getattr(self, "_fixed_union_prewarm_enabled", False)
-            ):
-                prompt_len = min(int(getattr(request, "py_prompt_len", 0) or 0), seq_len)
-                fixed_union_prewarm_key = self._fixed_union_prewarm_key(
-                    layer_pools,
-                    dense_layers,
-                    list(storage_groups.values()),
-                    num_layers,
-                    seq_len,
-                    prompt_len,
+            if cross_request_workspaces is not None:
+                keep_count = cross_request_workspaces[r].keep
+            else:
+                fixed_union_prewarm_key = None
+                fixed_union_workspace = (
+                    fixed_selection_workspaces[r]
+                    if fixed_selection_workspaces is not None
+                    else None
                 )
-            with nvtx_range("triattention.select", color="yellow"):
-                keep_count = self._evict_modes(
-                    request,
-                    num_layers,
-                    seq_len,
-                    precomputed=precomputed,
-                    use_fixed_union=(
-                        is_union and len(prepared) == 1 and fixed_union_workspace is None
-                    ),
-                    fixed_union_prewarm_key=fixed_union_prewarm_key,
-                    fixed_union_workspace=fixed_union_workspace,
-                )
+                if (
+                    is_union
+                    and len(prepared) == 1
+                    and fixed_union_workspace is None
+                    and getattr(self, "_fixed_union_prewarm_enabled", False)
+                ):
+                    prompt_len = min(int(getattr(request, "py_prompt_len", 0) or 0), seq_len)
+                    fixed_union_prewarm_key = self._fixed_union_prewarm_key(
+                        layer_pools,
+                        dense_layers,
+                        list(storage_groups.values()),
+                        num_layers,
+                        seq_len,
+                        prompt_len,
+                    )
+                with nvtx_range("triattention.select", color="yellow"):
+                    keep_count = self._evict_modes(
+                        request,
+                        num_layers,
+                        seq_len,
+                        precomputed=precomputed,
+                        use_fixed_union=(
+                            is_union and len(prepared) == 1 and fixed_union_workspace is None
+                        ),
+                        fixed_union_prewarm_key=fixed_union_prewarm_key,
+                        fixed_union_workspace=fixed_union_workspace,
+                    )
             if keep_count is None:
                 continue
             if is_union and isinstance(keep_count, torch.Tensor):
                 keep = keep_count
                 keep_count = int(keep.numel())
-                workspace = getattr(self, "_fixed_union_active", {}).get(rid)
+                workspace = (
+                    cross_request_workspaces[r]
+                    if cross_request_workspaces is not None
+                    else getattr(self, "_fixed_union_active", {}).get(rid)
+                )
                 can_use_fixed_compaction = (
                     len(prepared) == 1
                     and getattr(self, "_fixed_union_compaction_enabled", False)
