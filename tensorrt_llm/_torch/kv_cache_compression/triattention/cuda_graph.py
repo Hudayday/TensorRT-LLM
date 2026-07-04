@@ -391,6 +391,7 @@ class StandaloneEvictionGraphCache:
             "replay_failure": 0,
             "retired": 0,
         }
+        self.last_error: Optional[dict[str, str]] = None
 
     @staticmethod
     def _event_complete(event: Optional[object]) -> bool:
@@ -443,6 +444,7 @@ class StandaloneEvictionGraphCache:
             "retired_entries": len(self.retired),
             "disabled_buckets": len(self.disabled),
             "owned_bytes": self._resident_bytes(),
+            "last_error": self.last_error,
         }
 
     def _make_room(self, nbytes: int) -> bool:
@@ -532,10 +534,15 @@ class StandaloneEvictionGraphCache:
                 return "fallback"
             try:
                 graph, capture_stream, graph_bytes = self._capture_graph(workspace, capture_body)
-            except RuntimeError:
+            except RuntimeError as exc:
                 self.disabled.add(key)
                 self.counts["capture_failure"] += 1
                 self.counts["fallback"] += 1
+                self.last_error = {
+                    "phase": "capture",
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
                 return "fallback"
             entry_bytes = workspace.nbytes + graph_bytes
             if not self._make_room(entry_bytes):
@@ -560,7 +567,7 @@ class StandaloneEvictionGraphCache:
 
         try:
             entry.graph.replay()
-        except RuntimeError:
+        except RuntimeError as exc:
             self.entries.pop(key, None)
             self.disabled.add(key)
             # A replay error does not prove that no graph nodes were submitted.
@@ -569,6 +576,11 @@ class StandaloneEvictionGraphCache:
             self.retired.append(entry)
             self.counts["retired"] += 1
             self.counts["replay_failure"] += 1
+            self.last_error = {
+                "phase": "replay",
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
             raise
         entry.last_use_event = self._record_last_use(workspace)
         self.counts["replay"] += 1

@@ -116,6 +116,11 @@ class TestStandaloneEvictionGraphCache:
         eager.assert_called_once_with()
         assert cache.counts["capture_failure"] == 1
         assert cache.counts["replay"] == 0
+        assert cache.snapshot()["last_error"] == {
+            "phase": "capture",
+            "type": "RuntimeError",
+            "message": "capture failed",
+        }
         assert (
             cache.execute(
                 key=("bucket",),
