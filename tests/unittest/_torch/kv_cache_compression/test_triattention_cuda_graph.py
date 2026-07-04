@@ -62,6 +62,56 @@ class _FakeGraph:
         self.resets += 1
 
 
+class _FakeStorage:
+    def __init__(self, *, cdata, data_ptr=4096, nbytes=64):
+        self._cdata = cdata
+        self._data_ptr = data_ptr
+        self._nbytes = nbytes
+
+    def data_ptr(self):
+        return self._data_ptr
+
+    def nbytes(self):
+        return self._nbytes
+
+
+class _FakeTensor:
+    def __init__(
+        self,
+        *,
+        storage_cdata,
+        storage_data_ptr=4096,
+        storage_nbytes=64,
+        data_ptr=4096,
+        storage_offset=0,
+        shape=(8,),
+        stride=(1,),
+    ):
+        self._storage = _FakeStorage(
+            cdata=storage_cdata,
+            data_ptr=storage_data_ptr,
+            nbytes=storage_nbytes,
+        )
+        self._data_ptr = data_ptr
+        self._storage_offset = storage_offset
+        self.shape = shape
+        self._stride = stride
+        self.dtype = torch.float16
+        self.device = torch.device("cuda")
+
+    def untyped_storage(self):
+        return self._storage
+
+    def data_ptr(self):
+        return self._data_ptr
+
+    def storage_offset(self):
+        return self._storage_offset
+
+    def stride(self):
+        return self._stride
+
+
 def _cache_workspace(nbytes=64):
     return SimpleNamespace(nbytes=nbytes, device=torch.device("cpu"))
 
@@ -670,6 +720,52 @@ class TestFixedBatchedCompactionWorkspace:
 
         original = _tensor_fingerprint(base)
         assert all(original != _tensor_fingerprint(tensor) for tensor in mutations)
+
+    def test_tensor_fingerprint_ignores_storage_wrapper_identity(self):
+        captured = _FakeTensor(storage_cdata=1)
+        rebound = _FakeTensor(storage_cdata=2)
+
+        assert captured.untyped_storage()._cdata != rebound.untyped_storage()._cdata
+        assert _tensor_fingerprint(captured) == _tensor_fingerprint(rebound)
+
+    def test_runtime_match_uses_allocation_pointer_not_storage_wrapper(self):
+        captured = _FakeTensor(storage_cdata=1)
+        rebound = _FakeTensor(storage_cdata=2)
+        moved = _FakeTensor(
+            storage_cdata=3,
+            storage_data_ptr=8192,
+            data_ptr=8192,
+        )
+        score_workspace = object()
+        selection_workspace = object()
+        workspace = object.__new__(FixedBatchedCompactionWorkspace)
+        workspace.score_workspace = score_workspace
+        workspace.selection_workspace = selection_workspace
+        workspace.layer_pools = (captured,)
+        workspace.dense_layers = (0,)
+        workspace.swa_layers = ()
+        workspace.global_layers = (0,)
+        workspace.storage_groups = ((0, 0),)
+
+        runtime = dict(
+            dense_layers=[0],
+            swa_layers=[],
+            layer_group_representative={0: 0},
+            global_layers=[0],
+            score_workspace=score_workspace,
+            selection_workspace=selection_workspace,
+        )
+        assert workspace.matches_runtime(layer_pools=[rebound], **runtime)
+        assert not workspace.matches_runtime(layer_pools=[moved], **runtime)
+
+    @CUDA_REQUIRED
+    def test_cuda_alias_with_new_storage_wrapper_keeps_fingerprint(self):
+        captured = torch.arange(16, device="cuda")
+        rebound = torch.from_dlpack(captured)
+
+        assert captured.data_ptr() == rebound.data_ptr()
+        assert captured.untyped_storage()._cdata != rebound.untyped_storage()._cdata
+        assert _tensor_fingerprint(captured) == _tensor_fingerprint(rebound)
 
 
 class TestStandaloneGraphCuda:

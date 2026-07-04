@@ -28,10 +28,9 @@ import torch
 
 
 def _tensor_fingerprint(tensor: torch.Tensor) -> tuple:
-    """Return every tensor/storage field that can invalidate captured pointers."""
+    """Return allocation-address and tensor-layout fields used by a graph."""
     storage = tensor.untyped_storage()
     return (
-        int(getattr(storage, "_cdata", 0)),
         int(storage.data_ptr()),
         int(storage.nbytes()),
         int(tensor.data_ptr()),
