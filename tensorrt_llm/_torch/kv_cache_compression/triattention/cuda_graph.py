@@ -483,7 +483,10 @@ class StandaloneEvictionGraphCache:
                     stream=capture_stream,
                     capture_error_mode="thread_local",
                 ):
-                    capture_body()
+                    # Fixed buffers may be inference tensors, while resource
+                    # preparation runs outside ModelEngine.forward's scope.
+                    with torch.inference_mode():
+                        capture_body()
         except RuntimeError:
             reset = getattr(graph, "reset", None)
             if reset is not None:

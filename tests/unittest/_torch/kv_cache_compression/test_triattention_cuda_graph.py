@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -66,6 +67,41 @@ def _cache_workspace(nbytes=64):
 
 
 class TestStandaloneEvictionGraphCache:
+    def test_capture_body_can_update_inference_tensors(self):
+        with torch.inference_mode():
+            fixed_buffer = torch.zeros(1)
+        assert fixed_buffer.is_inference()
+        assert not torch.is_inference_mode_enabled()
+        with pytest.raises(RuntimeError, match="Inplace update to inference tensor"):
+            fixed_buffer.fill_(1)
+
+        current_stream = mock.Mock()
+        capture_stream = mock.Mock()
+        graph = mock.Mock()
+        workspace = SimpleNamespace(device=torch.device("cpu"))
+
+        def capture_body():
+            assert torch.is_inference_mode_enabled()
+            fixed_buffer.fill_(1)
+
+        with (
+            mock.patch.object(torch.cuda, "current_stream", return_value=current_stream),
+            mock.patch.object(torch.cuda, "Stream", return_value=capture_stream),
+            mock.patch.object(torch.cuda, "CUDAGraph", return_value=graph),
+            mock.patch.object(torch.cuda, "memory_allocated", side_effect=(0, 0)),
+            mock.patch.object(torch.cuda, "stream", return_value=nullcontext()),
+            mock.patch.object(torch.cuda, "graph", return_value=nullcontext()),
+        ):
+            captured_graph, captured_stream, graph_bytes = (
+                StandaloneEvictionGraphCache._capture_graph(workspace, capture_body)
+            )
+
+        assert captured_graph is graph
+        assert captured_stream is capture_stream
+        assert graph_bytes == 0
+        assert fixed_buffer.item() == 1
+        assert not torch.is_inference_mode_enabled()
+
     def test_capture_then_hit_replays_and_records_each_use(self):
         cache = StandaloneEvictionGraphCache(max_entries=2, max_bytes=1024)
         graph = _FakeGraph()
