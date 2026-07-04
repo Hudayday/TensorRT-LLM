@@ -80,6 +80,14 @@ class TestStandaloneEvictionGraphCache:
         graph = mock.Mock()
         workspace = SimpleNamespace(device=torch.device("cpu"))
 
+        class GraphContext:
+            def __enter__(self):
+                assert torch.is_inference_mode_enabled()
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                assert torch.is_inference_mode_enabled()
+                fixed_buffer.fill_(2)
+
         def capture_body():
             assert torch.is_inference_mode_enabled()
             fixed_buffer.fill_(1)
@@ -90,7 +98,7 @@ class TestStandaloneEvictionGraphCache:
             mock.patch.object(torch.cuda, "CUDAGraph", return_value=graph),
             mock.patch.object(torch.cuda, "memory_allocated", side_effect=(0, 0)),
             mock.patch.object(torch.cuda, "stream", return_value=nullcontext()),
-            mock.patch.object(torch.cuda, "graph", return_value=nullcontext()),
+            mock.patch.object(torch.cuda, "graph", return_value=GraphContext()),
         ):
             captured_graph, captured_stream, graph_bytes = (
                 StandaloneEvictionGraphCache._capture_graph(workspace, capture_body)
@@ -99,6 +107,23 @@ class TestStandaloneEvictionGraphCache:
         assert captured_graph is graph
         assert captured_stream is capture_stream
         assert graph_bytes == 0
+        assert fixed_buffer.item() == 2
+        assert not torch.is_inference_mode_enabled()
+
+    @CUDA_REQUIRED
+    def test_capture_graph_can_update_cuda_inference_tensor(self):
+        with torch.inference_mode():
+            fixed_buffer = torch.zeros(1, device="cuda")
+        assert fixed_buffer.is_inference()
+        assert not torch.is_inference_mode_enabled()
+
+        workspace = SimpleNamespace(device=fixed_buffer.device)
+        graph, _capture_stream, _graph_bytes = StandaloneEvictionGraphCache._capture_graph(
+            workspace, lambda: fixed_buffer.fill_(1)
+        )
+        graph.replay()
+        torch.cuda.synchronize(fixed_buffer.device)
+
         assert fixed_buffer.item() == 1
         assert not torch.is_inference_mode_enabled()
 

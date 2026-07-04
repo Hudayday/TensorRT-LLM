@@ -478,14 +478,16 @@ class StandaloneEvictionGraphCache:
         allocated_before = int(torch.cuda.memory_allocated(workspace.device))
         try:
             with torch.cuda.stream(capture_stream):
-                with torch.cuda.graph(
-                    graph,
-                    stream=capture_stream,
-                    capture_error_mode="thread_local",
-                ):
-                    # Fixed buffers may be inference tensors, while resource
-                    # preparation runs outside ModelEngine.forward's scope.
-                    with torch.inference_mode():
+                # Fixed buffers may be inference tensors, while resource
+                # preparation runs outside ModelEngine.forward's scope. Keep
+                # graph setup and capture_end in the same inference context as
+                # the captured body because both may update inference tensors.
+                with torch.inference_mode():
+                    with torch.cuda.graph(
+                        graph,
+                        stream=capture_stream,
+                        capture_error_mode="thread_local",
+                    ):
                         capture_body()
         except RuntimeError:
             reset = getattr(graph, "reset", None)
