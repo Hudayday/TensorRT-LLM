@@ -387,6 +387,24 @@ class TestStepBeginHookRefactor:
             mgr.on_generation_step_begin("BATCH")
             pe.assert_called_once_with("BATCH")
 
+    def test_first_real_generation_prepare_materializes_after_dummy_calls(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        mgr = TriAttention.__new__(TriAttention)
+        mgr._calibrated = True
+        mgr._capacity_only_request_ids = {7}
+        mgr.kv_cache_manager = SimpleNamespace(get_buffers=None)
+        mgr._materialize_fixed_shape_selection_banks = mock.Mock()
+        dummy = SimpleNamespace(is_dummy=True, py_request_id=99)
+        request = SimpleNamespace(is_dummy=False, py_request_id=7)
+
+        mgr._periodic_evict(SimpleNamespace(generation_requests=[dummy]))
+        mgr._materialize_fixed_shape_selection_banks.assert_not_called()
+
+        mgr._periodic_evict(SimpleNamespace(generation_requests=[request]))
+        mgr._materialize_fixed_shape_selection_banks.assert_called_once_with()
+
     def test_base_prepare_resources_fires_hook_pre_forward(self):
         import unittest.mock as mock
 
@@ -1457,9 +1475,7 @@ class TestFixedScoreMetadata:
         group = workspace.groups[0]
         stable_workspace_pointers = tensor_pointers(workspace)
         stable_group_pointers = tensor_pointers(group)
-        stable_selection_pointers = [
-            tensor_pointers(item) for item in selection_bank
-        ]
+        stable_selection_pointers = [tensor_pointers(item) for item in selection_bank]
         previous_by_request_count = {}
 
         # Ninety-five full 7->1 cohort transitions reproduce the lifetime pattern
@@ -1469,20 +1485,13 @@ class TestFixedScoreMetadata:
             workspace.page_ids_host.fill_(-1)
             workspace.round_starts_host.fill_(float("nan"))
             shift = iteration % total_pages
-            request_ids = [
-                (iteration * 5 + slot) % max_requests
-                for slot in range(request_count)
-            ]
+            request_ids = [(iteration * 5 + slot) % max_requests for slot in range(request_count)]
             tables = [
-                [
-                    (2 * request_id + shift + slot) % total_pages
-                    for slot in range(page_count)
-                ]
+                [(2 * request_id + shift + slot) % total_pages for slot in range(page_count)]
                 for request_id in request_ids
             ]
             round_starts = [
-                float(5000 + iteration * 128 + request_id)
-                for request_id in request_ids
+                float(5000 + iteration * 128 + request_id) for request_id in request_ids
             ]
 
             previous = previous_by_request_count.get(request_count)
@@ -1505,9 +1514,7 @@ class TestFixedScoreMetadata:
                 workspace.mean_sin,
                 "mean",
             )
-            eager_page_ids = [
-                torch.tensor(row, dtype=torch.int64, device=device) for row in tables
-            ]
+            eager_page_ids = [torch.tensor(row, dtype=torch.int64, device=device) for row in tables]
             eager, eager_offsets, eager_meta = triton_tri_score_perhead(
                 pools,
                 eager_page_ids,
@@ -1538,8 +1545,8 @@ class TestFixedScoreMetadata:
                 len(pools),
                 seq_len,
             )
+            selection_bank[0].input_scores.fill_(float("nan"))
             for item in selection_bank:
-                item.input_scores.fill_(float("nan"))
                 item.keep[1:].fill_(-1)
             active_selection = selection_manager._fixed_shape_selection_for(
                 workspace,
@@ -1566,9 +1573,7 @@ class TestFixedScoreMetadata:
                     py_request_id=request_ids[request],
                     py_prompt_len=1,
                 )
-                precomputed = [
-                    fixed_views[:, request, layer] for layer in range(len(pools))
-                ]
+                precomputed = [fixed_views[:, request, layer] for layer in range(len(pools))]
                 fixed_keep = selection_manager._evict_modes(
                     request_state,
                     len(pools),
@@ -1589,7 +1594,6 @@ class TestFixedScoreMetadata:
                 assert torch.equal(fixed_keep, oracle_keep)
 
             for item in selection_bank[request_count:]:
-                assert torch.isnan(item.input_scores).all()
                 assert torch.equal(item.keep[1:], torch.full_like(item.keep[1:], -1))
 
             expected_tables = torch.tensor(tables, dtype=torch.int64, device=device)
@@ -1606,13 +1610,12 @@ class TestFixedScoreMetadata:
                 assert torch.isnan(workspace.round_starts_device[request_count:]).all()
             assert tensor_pointers(workspace) == stable_workspace_pointers
             assert tensor_pointers(group) == stable_group_pointers
-            assert [tensor_pointers(item) for item in selection_bank] == (
-                stable_selection_pointers
-            )
+            assert [tensor_pointers(item) for item in selection_bank] == (stable_selection_pointers)
 
-        assert selection_manager._fixed_shape_selection_runtime_counts[
-            selection_key
-        ] == {"hit": 190, "fallback": 0}
+        assert selection_manager._fixed_shape_selection_runtime_counts[selection_key] == {
+            "hit": 190,
+            "fallback": 0,
+        }
 
     @CUDA_REQUIRED
     def test_gptoss_dense_swa_rebase_and_capacity_match_staging_fallback(self):
@@ -2590,12 +2593,8 @@ class TestFixedUnionWorkspace:
             ),
             mock.patch.object(torch, "cat", wraps=torch.cat) as cat,
         ):
-            first = workspace.select_segments(
-                segments, normalize_scores=normalize_scores
-            ).clone()
-            second = workspace.select_segments(
-                segments, normalize_scores=normalize_scores
-            ).clone()
+            first = workspace.select_segments(segments, normalize_scores=normalize_scores).clone()
+            second = workspace.select_segments(segments, normalize_scores=normalize_scores).clone()
 
         assert torch.equal(first, second)
         assert torch.equal(first[:prompt_len], torch.arange(prompt_len, device=device))
@@ -2609,7 +2608,7 @@ class TestFixedUnionWorkspace:
             if isinstance(value, torch.Tensor)
         }
 
-    def test_fixed_shape_workspace_bank_has_independent_stable_slots(self):
+    def test_fixed_shape_workspace_bank_shares_scratch_and_keeps_stable_outputs(self):
         from types import SimpleNamespace
 
         base = _FixedUnionWorkspace(
@@ -2641,6 +2640,21 @@ class TestFixedUnionWorkspace:
 
         assert selected == workspaces[:2]
         assert len({item.keep.data_ptr() for item in workspaces}) == 3
+        for name in _FixedUnionWorkspace._SELECTION_SCRATCH_NAMES:
+            assert len({getattr(item, name).data_ptr() for item in workspaces}) == 1
+        keep_bytes = base.keep.numel() * base.keep.element_size()
+        shared_bank_bytes = base.selection_buffer_nbytes() + keep_bytes * (len(workspaces) - 1)
+        legacy_bank_bytes = base.selection_buffer_nbytes() * len(workspaces)
+        assert shared_bank_bytes == _FixedUnionWorkspace.planned_selection_bank_nbytes(
+            base.rows,
+            base.width,
+            base.keep_count,
+            base.prompt_len,
+            base.dtype,
+            base.selection_backend,
+            len(workspaces),
+        )
+        assert shared_bank_bytes < legacy_bank_bytes
         assert all(item.prewarmed for item in workspaces)
         assert manager._fixed_shape_selection_runtime_counts == {
             ("bucket",): {"hit": 1, "fallback": 1}
@@ -2654,9 +2668,7 @@ class TestFixedUnionWorkspace:
         "device",
         ["cpu", pytest.param("cuda", marks=CUDA_REQUIRED)],
     )
-    def test_fixed_shape_prewarm_executes_new_route_and_isolates_failure(
-        self, device
-    ):
+    def test_fixed_shape_prewarm_records_plan_and_defers_exactly_once(self, device):
         from types import SimpleNamespace
         from unittest import mock
 
@@ -2672,23 +2684,33 @@ class TestFixedUnionWorkspace:
         )
         scores_by_layer = {
             0: torch.arange(2 * 19, dtype=torch.float32, device=device).view(2, 19),
-            1: torch.arange(2 * 19, dtype=torch.float32, device=device)
-            .view(2, 19)
-            .flip(1),
+            1: torch.arange(2 * 19, dtype=torch.float32, device=device).view(2, 19).flip(1),
         }
         score_workspace = SimpleNamespace(max_requests=3)
         manager = TriAttention.__new__(TriAttention)
+        manager.top_B = 8
         manager.normalize_scores = True
+        manager._indexer_topk_supported = lambda width, keep: False
         manager._fixed_shape_selection_enabled = True
         manager._fixed_shape_selection_prewarm_states = {}
         manager._fixed_shape_selection_workspaces = {}
+        manager._fixed_shape_selection_plans = {}
         manager._fixed_shape_selection_bank_bytes = {}
+        manager._fixed_union_prewarmed_workspaces = {key: base}
+        manager._fixed_shape_selection_materialization_state = "pending"
 
-        with mock.patch.object(
-            base,
-            "select_segments",
-            wraps=base.select_segments,
-        ) as select_segments:
+        allocation_error = AssertionError("Stage3 prewarm must not allocate a tensor")
+        with (
+            mock.patch.object(
+                _FixedUnionWorkspace,
+                "__init__",
+                side_effect=AssertionError("Stage3 prewarm must not allocate a workspace"),
+            ) as workspace_init,
+            mock.patch.object(torch, "empty", side_effect=allocation_error),
+            mock.patch.object(torch, "empty_like", side_effect=allocation_error),
+            mock.patch.object(torch, "arange", side_effect=allocation_error),
+            mock.patch.object(torch, "full", side_effect=allocation_error),
+        ):
             manager._prewarm_fixed_shape_selection_bucket(
                 key,
                 base,
@@ -2698,14 +2720,42 @@ class TestFixedUnionWorkspace:
                 2,
                 19,
             )
+        workspace_init.assert_not_called()
+
+        assert manager._fixed_shape_selection_prewarm_states[key] == "planned"
+        plan = manager._fixed_shape_selection_plans[key]
+        assert not any(isinstance(field, torch.Tensor) for field in plan)
+        assert key not in manager._fixed_shape_selection_workspaces
+        assert key not in manager._fixed_shape_selection_bank_bytes
+        assert not base._segment_buffers_prepared
+        assert not hasattr(base, "input_scores")
+
+        with (
+            mock.patch.object(
+                manager,
+                "_build_fixed_shape_selection_workspaces",
+                wraps=manager._build_fixed_shape_selection_workspaces,
+            ) as build_bank,
+            mock.patch.object(
+                manager,
+                "_warm_fixed_shape_selection_workspace",
+                wraps=manager._warm_fixed_shape_selection_workspace,
+            ) as warm_bank,
+        ):
+            manager._materialize_fixed_shape_selection_banks()
+            manager._materialize_fixed_shape_selection_banks()
 
         bank = manager._fixed_shape_selection_workspaces[key]
-        assert select_segments.call_count == 1
+        assert build_bank.call_count == 1
+        assert warm_bank.call_count == 1
         assert len(bank) == score_workspace.max_requests
+        assert bank[0] is base
         assert all(item.prewarm_attempted and item.prewarmed for item in bank)
         assert manager._fixed_shape_selection_prewarm_states[key] == "ready"
+        assert manager._fixed_shape_selection_materialization_state == "done"
+        keep_bytes = base.keep.numel() * base.keep.element_size()
         assert manager._fixed_shape_selection_bank_bytes[key] == (
-            base.selection_buffer_nbytes() * score_workspace.max_requests
+            base.selection_buffer_nbytes() + keep_bytes * (score_workspace.max_requests - 1)
         )
 
         stage2_workspace = object()
@@ -2718,16 +2768,18 @@ class TestFixedUnionWorkspace:
             device=device,
         )
         failed = TriAttention.__new__(TriAttention)
+        failed.top_B = 8
         failed.normalize_scores = True
+        failed._indexer_topk_supported = lambda width, keep: False
         failed._fixed_shape_selection_enabled = True
         failed._fixed_shape_selection_prewarm_states = {}
         failed._fixed_shape_selection_workspaces = {}
+        failed._fixed_shape_selection_plans = {}
         failed._fixed_shape_selection_bank_bytes = {}
         failed._fixed_score_workspaces = {key: stage2_workspace}
         failed._fixed_score_prewarm_states = {key: "ready"}
-        failed._build_fixed_shape_selection_workspaces = mock.Mock(
-            side_effect=torch.cuda.OutOfMemoryError("sealed Stage3 bank")
-        )
+        failed._fixed_union_prewarmed_workspaces = {key: failed_base}
+        failed._fixed_shape_selection_materialization_state = "pending"
 
         failed._prewarm_fixed_shape_selection_bucket(
             key,
@@ -2738,6 +2790,10 @@ class TestFixedUnionWorkspace:
             2,
             19,
         )
+        failed._build_fixed_shape_selection_workspaces = mock.Mock(
+            side_effect=torch.cuda.OutOfMemoryError("sealed Stage3 bank")
+        )
+        failed._materialize_fixed_shape_selection_banks()
 
         assert failed._fixed_shape_selection_prewarm_states[key] == "failed"
         assert key not in failed._fixed_shape_selection_workspaces
@@ -2747,13 +2803,195 @@ class TestFixedUnionWorkspace:
         assert not failed_base._segment_buffers_prepared
         assert not hasattr(failed_base, "input_scores")
 
+    def test_indexer_bucket_prewarm_builds_exact_shared_workspace(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        key = ("indexer-bucket",)
+        scores_by_layer = {
+            0: torch.arange(2 * 19, dtype=torch.float32).view(2, 19),
+            1: torch.arange(2 * 19, dtype=torch.float32).view(2, 19).flip(1),
+        }
+        manager = TriAttention.__new__(TriAttention)
+        manager.top_B = 8
+        manager.count_prompt_tokens = False
+        manager.normalize_scores = False
+        manager._fixed_shape_selection_enabled = True
+        manager._fixed_shape_selection_prewarm_states = {}
+        manager._fixed_shape_selection_workspaces = {}
+        manager._fixed_shape_selection_plans = {}
+        manager._fixed_shape_selection_bank_bytes = {}
+        manager._fixed_union_prewarmed_workspaces = {}
+        manager._fixed_shape_selection_materialization_state = "pending"
+        manager._indexer_topk_supported = lambda width, keep: True
+
+        def fake_indexer(scores, seq_lens, output, _num_experts, top_k):
+            for row in range(int(scores.shape[0])):
+                seq_len = int(seq_lens[row])
+                selected = torch.topk(scores[row, :seq_len], top_k, sorted=False).indices
+                output[row].copy_(selected.to(torch.int32))
+
+        original_init = _FixedUnionWorkspace.__init__
+        with (
+            mock.patch.object(
+                _FixedUnionWorkspace,
+                "__init__",
+                autospec=True,
+                side_effect=original_init,
+            ) as workspace_init,
+            mock.patch.object(
+                torch.ops.trtllm,
+                "indexer_topk_decode",
+                side_effect=fake_indexer,
+            ) as indexer,
+            mock.patch.object(
+                manager,
+                "_warm_fixed_shape_selection_workspace",
+                wraps=manager._warm_fixed_shape_selection_workspace,
+            ) as warm_bank,
+        ):
+            manager._prewarm_fixed_shape_selection_bucket(
+                key,
+                None,
+                SimpleNamespace(max_requests=3),
+                scores_by_layer,
+                [0, 1],
+                2,
+                19,
+            )
+            assert workspace_init.call_count == 0
+            assert manager._fixed_shape_selection_prewarm_states[key] == "planned"
+            assert key in manager._fixed_shape_selection_plans
+            assert key not in manager._fixed_shape_selection_workspaces
+            assert key not in manager._fixed_shape_selection_bank_bytes
+            manager._materialize_fixed_shape_selection_banks()
+            manager._materialize_fixed_shape_selection_banks()
+
+        assert workspace_init.call_count == 1
+        assert warm_bank.call_count == 1
+        assert indexer.call_count == 2
+        bank = manager._fixed_shape_selection_workspaces[key]
+        assert manager._fixed_shape_selection_prewarm_states[key] == "ready"
+        assert len(bank) == 3
+        assert all(item.selection_backend == "indexer_topk" for item in bank)
+        assert len({item.keep.data_ptr() for item in bank}) == 3
+        keep_bytes = bank[0].keep.numel() * bank[0].keep.element_size()
+        assert manager._fixed_shape_selection_bank_bytes[key] == (
+            bank[0].selection_buffer_nbytes() + keep_bytes * (len(bank) - 1)
+        )
+        for name in (
+            *_FixedUnionWorkspace._SELECTION_SCRATCH_NAMES,
+            *_FixedUnionWorkspace._INDEXER_SCRATCH_NAMES,
+        ):
+            assert len({getattr(item, name).data_ptr() for item in bank}) == 1
+
+    def test_singleton_indexer_selection_cannot_allocate_fixed_compaction(self):
+        from types import SimpleNamespace
+
+        workspace = _FixedUnionWorkspace(
+            4,
+            31,
+            8,
+            2,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            selection_backend="indexer_topk",
+        )
+        workspace.selection_only = True
+        pool = SimpleNamespace(is_cuda=True, device=workspace.device, ndim=5)
+        page_ids = SimpleNamespace(
+            ndim=1,
+            device=workspace.device,
+            dtype=torch.int64,
+        )
+
+        assert not workspace.can_compact(pool, page_ids, seq_len=33)
+        with pytest.raises(ValueError, match="no longer matches"):
+            workspace.prepare_compaction(pool, page_ids, seq_len=33)
+        assert not workspace._compaction_buffers
+
+    def test_indexer_fixed_selection_matches_eager_subset_without_nonzero(self):
+        from unittest import mock
+
+        width = 31
+        keep_count = 8
+        prompt_len = 2
+        token = torch.arange(width, dtype=torch.float32)
+        segments = [
+            torch.stack((torch.sin(token * 0.07), torch.cos(token * 0.11))),
+            torch.stack((torch.sin(token * 0.17), torch.cos(token * 0.19))),
+        ]
+        scores = torch.cat(segments, dim=0)
+        workspace = _FixedUnionWorkspace(
+            4,
+            width,
+            keep_count,
+            prompt_len,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            allocate_segment_buffers=True,
+            selection_backend="indexer_topk",
+        )
+
+        def fake_indexer(values, seq_lens, output, _num_experts, top_k):
+            for row in range(int(values.shape[0])):
+                seq_len = int(seq_lens[row])
+                selected = torch.topk(values[row, :seq_len], top_k, sorted=False).indices
+                output[row].copy_(selected.to(torch.int32))
+
+        with (
+            mock.patch.object(
+                torch.ops.trtllm,
+                "indexer_topk_decode",
+                side_effect=fake_indexer,
+            ) as indexer,
+            mock.patch.object(
+                torch,
+                "nonzero",
+                side_effect=AssertionError("fixed selection must not call nonzero"),
+            ),
+        ):
+            selected = workspace.select_segments(segments, normalize_scores=False).clone()
+
+        assert indexer.call_count == 2
+        combined = scores.max(dim=0).values
+        row_top = torch.topk(scores, keep_count, dim=1, sorted=False).indices
+        union_mask = torch.zeros(width, dtype=torch.bool)
+        union_mask.scatter_(0, row_top.reshape(-1), True)
+        union_indices = torch.arange(width)[union_mask]
+        relative = torch.topk(
+            combined.index_select(0, union_indices), keep_count, sorted=False
+        ).indices
+        expected_decode = torch.sort(union_indices.index_select(0, relative)).values
+        expected = torch.cat((torch.arange(prompt_len), expected_decode + prompt_len))
+        assert torch.equal(selected, expected)
+
+    def test_gptoss_stage3_shared_bank_removes_gib_scale_lane_duplication(self):
+        workspace = _FixedUnionWorkspace(
+            1152,
+            8192,
+            4096,
+            1024,
+            dtype=torch.float32,
+            device=torch.device("meta"),
+            allocate_segment_buffers=True,
+        )
+        max_requests = 8
+        bucket_count = 2
+        slot_bytes = workspace.keep.numel() * workspace.keep.element_size()
+        legacy_bytes = workspace.selection_buffer_nbytes() * max_requests * bucket_count
+        shared_bytes = (
+            workspace.selection_buffer_nbytes() + slot_bytes * (max_requests - 1)
+        ) * bucket_count
+
+        assert legacy_bytes > 1 << 30
+        assert shared_bytes * 4 < legacy_bytes
+
     @pytest.mark.parametrize(
         "device",
         ["cpu", pytest.param("cuda", marks=CUDA_REQUIRED)],
     )
-    def test_fixed_shape_selection_alternates_r7_r1_without_stale_slots(
-        self, device
-    ):
+    def test_fixed_shape_selection_alternates_r7_r1_r8_without_stale_slots(self, device):
         from types import SimpleNamespace
 
         device = torch.device(device)
@@ -2788,9 +3026,7 @@ class TestFixedUnionWorkspace:
             manager.count_prompt_tokens = False
             manager.eviction_mode = "union"
             manager.normalize_scores = True
-            manager.kv_cache_manager = SimpleNamespace(
-                get_buffers=lambda layer, kv_layout: pool
-            )
+            manager.kv_cache_manager = SimpleNamespace(get_buffers=lambda layer, kv_layout: pool)
             manager._dense_layers = lambda num_layers: [0, 1]
             manager._global_layer_id = lambda layer, num_layers: layer
             manager._indexer_topk_supported = lambda width, k: False
@@ -2798,9 +3034,7 @@ class TestFixedUnionWorkspace:
             manager._fixed_union_active = {}
             manager._fixed_shape_selection_enabled = fixed
             manager._fixed_shape_selection_workspaces = {key: bank} if fixed else {}
-            manager._fixed_shape_selection_prewarm_states = (
-                {key: "ready"} if fixed else {}
-            )
+            manager._fixed_shape_selection_prewarm_states = {key: "ready"} if fixed else {}
             manager._fixed_shape_selection_runtime_counts = {}
             return manager
 
@@ -2817,26 +3051,20 @@ class TestFixedUnionWorkspace:
         ]
         previous_metadata = None
 
-        for iteration, request_count in enumerate((7, 1) * 95):
-            request_order = [
-                (iteration * 5 + slot) % max_requests
-                for slot in range(request_count)
-            ]
+        for iteration, request_count in enumerate((7, 1, 8) * 64):
+            request_order = [(iteration * 5 + slot) % max_requests for slot in range(request_count)]
             page_tables = [
                 ((request_id + iteration) % 23, (request_id + iteration + 7) % 23)
                 for request_id in request_order
             ]
-            round_starts = [
-                5000.0 + iteration * 128.0 + request_id
-                for request_id in request_order
-            ]
+            round_starts = [5000.0 + iteration * 128.0 + request_id for request_id in request_order]
             metadata = (tuple(request_order), tuple(page_tables), tuple(round_starts))
             if previous_metadata is not None:
                 assert metadata != previous_metadata
             previous_metadata = metadata
 
+            base.input_scores.fill_(float("nan"))
             for workspace in bank:
-                workspace.input_scores.fill_(float("nan"))
                 workspace.keep[prompt_len:].fill_(-1)
             fixed_workspaces = fixed_manager._fixed_shape_selection_for(
                 score_workspace,
@@ -2844,6 +3072,7 @@ class TestFixedUnionWorkspace:
             )
             assert fixed_workspaces == bank[:request_count]
 
+            pending_keeps = []
             for slot, (request_id, pages, round_start) in enumerate(
                 zip(request_order, page_tables, round_starts)
             ):
@@ -2870,7 +3099,7 @@ class TestFixedUnionWorkspace:
                     seq_len,
                     precomputed,
                     fixed_union_workspace=fixed_workspaces[slot],
-                ).clone()
+                )
                 eager_keep = eager_manager._evict_modes(
                     request,
                     2,
@@ -2878,11 +3107,13 @@ class TestFixedUnionWorkspace:
                     precomputed,
                 ).clone()
 
+                pending_keeps.append((fixed_keep, eager_keep))
+
+            for fixed_keep, eager_keep in pending_keeps:
                 assert torch.equal(fixed_keep, eager_keep)
-                assert torch.isfinite(fixed_workspaces[slot].input_scores).all()
+            assert torch.isfinite(base.input_scores).all()
 
             for workspace in bank[request_count:]:
-                assert torch.isnan(workspace.input_scores).all()
                 assert torch.equal(
                     workspace.keep[prompt_len:],
                     torch.full_like(workspace.keep[prompt_len:], -1),
@@ -2897,21 +3128,24 @@ class TestFixedUnionWorkspace:
             ]
 
         assert fixed_manager._fixed_shape_selection_runtime_counts[key] == {
-            "hit": 190,
+            "hit": 192,
             "fallback": 0,
         }
-        assert fixed_manager._fixed_shape_selection_for(
-            score_workspace,
-            max_requests + 1,
-        ) is None
+        assert (
+            fixed_manager._fixed_shape_selection_for(
+                score_workspace,
+                max_requests + 1,
+            )
+            is None
+        )
         assert fixed_manager._fixed_shape_selection_runtime_counts[key] == {
-            "hit": 190,
+            "hit": 192,
             "fallback": 1,
         }
         fixed_manager._fixed_shape_selection_prewarm_states[key] = "failed"
         assert fixed_manager._fixed_shape_selection_for(score_workspace, 1) is None
         assert fixed_manager._fixed_shape_selection_runtime_counts[key] == {
-            "hit": 190,
+            "hit": 192,
             "fallback": 2,
         }
 
@@ -2919,9 +3153,7 @@ class TestFixedUnionWorkspace:
         "device",
         ["cpu", pytest.param("cuda", marks=CUDA_REQUIRED)],
     )
-    def test_fixed_segment_ties_preserve_union_and_selected_value_multiset(
-        self, device
-    ):
+    def test_fixed_segment_ties_preserve_union_and_selected_value_multiset(self, device):
         device = torch.device(device)
         width = 41
         keep_count = 8

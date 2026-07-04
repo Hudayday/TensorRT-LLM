@@ -49,7 +49,7 @@ The scoring math follows the same upstream reference (``methods/pruning_utils.py
 """
 
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -153,6 +153,36 @@ class _FixedUnionWorkspace:
     tie contract. Non-finite scores remain unsupported.
     """
 
+    _SELECTION_SCRATCH_NAMES = (
+        "input_scores",
+        "row_mean",
+        "row_std",
+        "combined",
+        "combined_argmax",
+        "row_top_values",
+        "row_top_indices",
+        "union_mask",
+        "candidates",
+        "negative_inf",
+        "final_values",
+        "final_indices",
+        "sorted_indices",
+        "sort_order",
+    )
+    _INDEXER_SCRATCH_NAMES = (
+        "row_seq_lens",
+        "row_top_indices_i32",
+        "token_indices",
+        "width_sentinel",
+        "union_physical_indices",
+        "union_indices_sorted",
+        "union_sort_order",
+        "candidate_gather_indices",
+        "union_count",
+        "final_indices_i32",
+        "final_relative_indices",
+    )
+
     @staticmethod
     def _canonical_device(device: torch.device) -> torch.device:
         device = torch.device(device)
@@ -177,9 +207,12 @@ class _FixedUnionWorkspace:
         dtype: torch.dtype,
         device: torch.device,
         allocate_segment_buffers: bool = False,
+        selection_backend: str = "torch_topk",
     ) -> None:
         if rows <= 0 or width <= keep_count or keep_count <= 0:
             raise ValueError("fixed union workspace requires rows > 0 and width > keep_count > 0")
+        if selection_backend not in ("torch_topk", "indexer_topk"):
+            raise ValueError(f"unsupported fixed union selection backend: {selection_backend}")
         self.rows = rows
         self.width = width
         self.keep_count = keep_count
@@ -188,6 +221,8 @@ class _FixedUnionWorkspace:
         self.dtype = dtype
         device = self._canonical_device(device)
         self.device = device
+        self.selection_backend = selection_backend
+        self.selection_only = False
 
         self.combined = torch.empty(width, dtype=dtype, device=device)
         self.combined_argmax = torch.empty(width, dtype=torch.long, device=device)
@@ -202,6 +237,20 @@ class _FixedUnionWorkspace:
         self.sort_order = torch.empty_like(self.final_indices)
         self.keep = torch.empty(self.total_keep, dtype=torch.long, device=device)
         self.keep[:prompt_len].copy_(torch.arange(prompt_len, dtype=torch.long, device=device))
+        if selection_backend == "indexer_topk":
+            self.row_seq_lens = torch.full((rows,), width, dtype=torch.int32, device=device)
+            self.row_top_indices_i32 = torch.empty(
+                (rows, keep_count), dtype=torch.int32, device=device
+            )
+            self.token_indices = torch.arange(width, dtype=torch.long, device=device)
+            self.width_sentinel = torch.full((), width, dtype=torch.long, device=device)
+            self.union_physical_indices = torch.empty(width, dtype=torch.long, device=device)
+            self.union_indices_sorted = torch.empty_like(self.union_physical_indices)
+            self.union_sort_order = torch.empty_like(self.union_physical_indices)
+            self.candidate_gather_indices = torch.empty_like(self.union_physical_indices)
+            self.union_count = torch.empty(1, dtype=torch.int32, device=device)
+            self.final_indices_i32 = torch.empty(keep_count, dtype=torch.int32, device=device)
+            self.final_relative_indices = torch.empty_like(self.final_indices)
         self._compaction_buffers = {}
         self.prewarm_attempted = False
         self.prewarmed = False
@@ -277,24 +326,86 @@ class _FixedUnionWorkspace:
         """Return bytes owned by the fixed selection path, excluding compaction."""
         if not self._segment_buffers_prepared:
             raise RuntimeError("fixed union segment buffers were not preallocated")
-        tensors = (
-            self.input_scores,
-            self.row_mean,
-            self.row_std,
-            self.combined,
-            self.combined_argmax,
-            self.row_top_values,
-            self.row_top_indices,
-            self.union_mask,
-            self.candidates,
-            self.negative_inf,
-            self.final_values,
-            self.final_indices,
-            self.sorted_indices,
-            self.sort_order,
-            self.keep,
-        )
+        names = self._SELECTION_SCRATCH_NAMES
+        if self.selection_backend == "indexer_topk":
+            names += self._INDEXER_SCRATCH_NAMES
+        tensors = tuple(getattr(self, name) for name in names) + (self.keep,)
         return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+
+    @staticmethod
+    def planned_selection_bank_nbytes(
+        rows: int,
+        width: int,
+        keep_count: int,
+        prompt_len: int,
+        dtype: torch.dtype,
+        selection_backend: str,
+        max_requests: int,
+    ) -> int:
+        """Compute the deferred bank size without allocating a tensor."""
+        dtype_bytes = torch.finfo(dtype).bits // 8
+        long_bytes = 8
+        int_bytes = 4
+        total_keep = prompt_len + keep_count
+        scratch_bytes = (
+            rows * width * dtype_bytes
+            + 2 * rows * dtype_bytes
+            + width * dtype_bytes
+            + width * long_bytes
+            + rows * keep_count * dtype_bytes
+            + rows * keep_count * long_bytes
+            + width
+            + width * dtype_bytes
+            + dtype_bytes
+            + keep_count * dtype_bytes
+            + 3 * keep_count * long_bytes
+        )
+        if selection_backend == "indexer_topk":
+            scratch_bytes += (
+                rows * int_bytes
+                + rows * keep_count * int_bytes
+                + width * long_bytes
+                + long_bytes
+                + 4 * width * long_bytes
+                + int_bytes
+                + keep_count * int_bytes
+                + keep_count * long_bytes
+            )
+        elif selection_backend != "torch_topk":
+            raise ValueError(f"unsupported fixed union selection backend: {selection_backend}")
+        return scratch_bytes + max_requests * total_keep * long_bytes
+
+    def shared_selection_slot(self) -> "_FixedUnionWorkspace":
+        """Allocate one stable keep output that aliases this bucket's scratch."""
+        if not self._segment_buffers_prepared:
+            raise RuntimeError("fixed union segment buffers were not preallocated")
+        slot = _FixedUnionWorkspace.__new__(_FixedUnionWorkspace)
+        for name in (
+            "rows",
+            "width",
+            "keep_count",
+            "prompt_len",
+            "total_keep",
+            "dtype",
+            "device",
+            "selection_backend",
+            "selection_only",
+        ):
+            setattr(slot, name, getattr(self, name))
+        names = self._SELECTION_SCRATCH_NAMES
+        if self.selection_backend == "indexer_topk":
+            names += self._INDEXER_SCRATCH_NAMES
+        for name in names:
+            setattr(slot, name, getattr(self, name))
+        slot.keep = torch.empty_like(self.keep)
+        if self.prompt_len:
+            slot.keep[: self.prompt_len].copy_(self.keep[: self.prompt_len])
+        slot._compaction_buffers = {}
+        slot.prewarm_attempted = False
+        slot.prewarmed = False
+        slot.prewarm_failed = False
+        slot._segment_buffers_prepared = True
+        return slot
 
     def select(self, per_head_scores: torch.Tensor) -> torch.Tensor:
         """Return a persistent sorted keep tensor without dynamic output shapes."""
@@ -306,29 +417,82 @@ class _FixedUnionWorkspace:
             dim=0,
             out=(self.combined, self.combined_argmax),
         )
-        torch.topk(
-            per_head_scores,
-            self.keep_count,
-            dim=1,
-            largest=True,
-            sorted=False,
-            out=(self.row_top_values, self.row_top_indices),
-        )
+        if self.selection_backend == "indexer_topk":
+            torch.ops.trtllm.indexer_topk_decode(
+                per_head_scores,
+                self.row_seq_lens,
+                self.row_top_indices_i32,
+                1,
+                self.keep_count,
+            )
+            self.row_top_indices.copy_(self.row_top_indices_i32)
+        else:
+            torch.topk(
+                per_head_scores,
+                self.keep_count,
+                dim=1,
+                largest=True,
+                sorted=False,
+                out=(self.row_top_values, self.row_top_indices),
+            )
         self.union_mask.zero_()
         self.union_mask.scatter_(0, self.row_top_indices.reshape(-1), True)
-        torch.where(
-            self.union_mask,
-            self.combined,
-            self.negative_inf,
-            out=self.candidates,
-        )
-        torch.topk(
-            self.candidates,
-            self.keep_count,
-            largest=True,
-            sorted=False,
-            out=(self.final_values, self.final_indices),
-        )
+        if self.selection_backend == "indexer_topk":
+            torch.where(
+                self.union_mask,
+                self.token_indices,
+                self.width_sentinel,
+                out=self.union_physical_indices,
+            )
+            torch.sort(
+                self.union_physical_indices,
+                out=(self.union_indices_sorted, self.union_sort_order),
+            )
+            torch.clamp(
+                self.union_indices_sorted,
+                max=self.width - 1,
+                out=self.candidate_gather_indices,
+            )
+            torch.gather(
+                self.combined,
+                0,
+                self.candidate_gather_indices,
+                out=self.candidates,
+            )
+            torch.sum(
+                self.union_mask,
+                dim=0,
+                dtype=torch.int32,
+                out=self.union_count[0],
+            )
+            torch.ops.trtllm.indexer_topk_decode(
+                self.candidates.view(1, self.width),
+                self.union_count,
+                self.final_indices_i32.view(1, self.keep_count),
+                1,
+                self.keep_count,
+            )
+            self.final_relative_indices.copy_(self.final_indices_i32)
+            torch.gather(
+                self.union_indices_sorted,
+                0,
+                self.final_relative_indices,
+                out=self.final_indices,
+            )
+        else:
+            torch.where(
+                self.union_mask,
+                self.combined,
+                self.negative_inf,
+                out=self.candidates,
+            )
+            torch.topk(
+                self.candidates,
+                self.keep_count,
+                largest=True,
+                sorted=False,
+                out=(self.final_values, self.final_indices),
+            )
         torch.sort(
             self.final_indices,
             out=(self.sorted_indices, self.sort_order),
@@ -343,7 +507,8 @@ class _FixedUnionWorkspace:
     def can_compact(self, pool: torch.Tensor, page_ids: torch.Tensor, seq_len: int) -> bool:
         """Whether the fixed one-request compact launcher supports this pool."""
         return (
-            pool.is_cuda
+            not self.selection_only
+            and pool.is_cuda
             and pool.device == self.device
             and pool.ndim == 5
             and page_ids.ndim == 1
@@ -414,6 +579,20 @@ class _FixedUnionWorkspace:
             page_base,
             scratch,
         )
+
+
+class _FixedShapeSelectionPlan(NamedTuple):
+    """Tensor-free exact-bucket plan retained across model graph capture."""
+
+    rows: int
+    width: int
+    keep_count: int
+    prompt_len: int
+    dtype: torch.dtype
+    device: torch.device
+    selection_backend: str
+    max_requests: int
+    materialized_nbytes: int
 
 
 class _FixedScoreStreamMismatch(RuntimeError):
@@ -765,8 +944,12 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._fixed_score_runtime_counts = {}
         self._fixed_shape_selection_workspaces = {}
         self._fixed_shape_selection_prewarm_states = {}
+        self._fixed_shape_selection_plans = {}
         self._fixed_shape_selection_bank_bytes = {}
         self._fixed_shape_selection_runtime_counts = {}
+        self._fixed_shape_selection_materialization_state = (
+            "pending" if self._fixed_shape_selection_enabled else "disabled"
+        )
 
     def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
         """Mark capacity-only decode and resolve calibration once.
@@ -876,6 +1059,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             active_requests.append(request)
         if not active_requests or not self._calibrated:
             return
+        self._materialize_fixed_shape_selection_banks()
         mgr = self.kv_cache_manager
         get_buffers = getattr(mgr, "get_buffers", None)
         if get_buffers is None:
@@ -1392,50 +1576,66 @@ class TriAttention(BaseKVCacheCompressionManager):
         prompt_len: int,
         seq_len: int,
     ) -> None:
-        """Build and validate an optional fixed-selection bank without poisoning Stage2."""
+        """Record a tensor-free Stage3 plan before model graph capture."""
         if not getattr(self, "_fixed_shape_selection_enabled", False):
             return
         states = self._fixed_shape_selection_prewarm_states
-        if workspace is None:
-            states[key] = "unsupported"
-            return
-        if states.get(key) in ("running", "ready", "failed"):
+        if states.get(key) in ("running", "planned", "ready", "failed"):
             return
 
         states[key] = "running"
         max_requests = None
         bank_bytes = None
         try:
-            # The sealed score bucket fixes this upper bound. Runtime may use any
-            # prefix of the bank, but never grows it or allocates request slots.
             max_requests = int(score_workspace.max_requests)
-            workspace.prepare_segment_buffers()
-            bank_bytes = workspace.selection_buffer_nbytes() * max_requests
-            logger.info(
-                "TriAttention is allocating a sealed fixed-shape selection bank: "
-                f"requests={max_requests}, estimated_bytes={bank_bytes}"
+            decode_width = seq_len - prompt_len
+            configured_budget = int(
+                getattr(self, "top_B", workspace.keep_count if workspace is not None else 0)
             )
-            workspaces = self._build_fixed_shape_selection_workspaces(
-                workspace,
+            decode_budget = (
+                configured_budget - prompt_len
+                if getattr(self, "count_prompt_tokens", False)
+                else configured_budget
+            )
+            if decode_budget <= 0 or decode_width <= decode_budget:
+                raise ValueError("fixed shape selection bucket has no eviction work")
+            selection_backend = (
+                "indexer_topk"
+                if self._indexer_topk_supported(decode_width, decode_budget)
+                else "torch_topk"
+            )
+            rows = sum(int(scores_by_layer[layer].shape[0]) for layer in dense_layers)
+            first_scores = scores_by_layer[dense_layers[0]]
+            bank_bytes = _FixedUnionWorkspace.planned_selection_bank_nbytes(
+                rows,
+                decode_width,
+                decode_budget,
+                prompt_len,
+                first_scores.dtype,
+                selection_backend,
                 max_requests,
             )
-            segments = [
-                scores_by_layer[layer][:, prompt_len:seq_len] for layer in dense_layers
-            ]
-            # Execute the new cat/out + normalization + fixed-select path once.
-            # All slots have identical shape and preallocated outputs, so one real
-            # execution validates the APIs and warms the shared same-shape kernels.
-            workspaces[0].select_segments(
-                segments,
-                normalize_scores=self.normalize_scores,
+            logger.info(
+                "TriAttention is recording a tensor-free fixed-shape selection plan: "
+                f"requests={max_requests}, backend={selection_backend}, "
+                f"estimated_bytes={bank_bytes}"
+            )
+            plan = _FixedShapeSelectionPlan(
+                rows=rows,
+                width=decode_width,
+                keep_count=decode_budget,
+                prompt_len=prompt_len,
+                dtype=first_scores.dtype,
+                device=first_scores.device,
+                selection_backend=selection_backend,
+                max_requests=max_requests,
+                materialized_nbytes=bank_bytes,
             )
         except Exception as exc:
-            # Stage3 is optional. Its allocation/JIT/API failure must preserve the
-            # already-ready fixed-score workspace and fall back exactly to Stage2.
             states[key] = "failed"
+            getattr(self, "_fixed_shape_selection_plans", {}).pop(key, None)
             self._fixed_shape_selection_workspaces.pop(key, None)
             self._fixed_shape_selection_bank_bytes.pop(key, None)
-            workspace.release_segment_buffers()
             logger.warning(
                 "TriAttention fixed-shape selection prewarm failed; "
                 "using the Stage2 fixed-score path "
@@ -1443,16 +1643,97 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
             return
 
-        for item in workspaces:
-            item.prewarm_attempted = True
-            item.prewarmed = True
-        self._fixed_shape_selection_workspaces[key] = workspaces
-        self._fixed_shape_selection_bank_bytes[key] = bank_bytes
-        states[key] = "ready"
+        plans = getattr(self, "_fixed_shape_selection_plans", None)
+        if plans is None:
+            self._fixed_shape_selection_plans = {}
+            plans = self._fixed_shape_selection_plans
+        plans[key] = plan
+        if not hasattr(self, "_fixed_shape_selection_materialization_state"):
+            self._fixed_shape_selection_materialization_state = "pending"
+        states[key] = "planned"
         logger.info(
-            "TriAttention fixed-shape selection bank is ready: "
-            f"requests={max_requests}, bytes={bank_bytes}"
+            "TriAttention fixed-shape selection plan is ready; persistent buffers "
+            f"are deferred until the first real generation prepare: requests={max_requests}, "
+            f"bytes={bank_bytes}"
         )
+
+    def _warm_fixed_shape_selection_workspace(self, workspace: _FixedUnionWorkspace) -> None:
+        """Warm the materialized exact backend without allocating an output."""
+        workspace.input_scores.zero_()
+        if self.normalize_scores:
+            torch.mean(workspace.input_scores, dim=1, keepdim=True, out=workspace.row_mean)
+            torch.std(
+                workspace.input_scores,
+                dim=1,
+                unbiased=False,
+                keepdim=True,
+                out=workspace.row_std,
+            )
+            workspace.row_std.clamp_min_(1e-6)
+            torch.sub(workspace.input_scores, workspace.row_mean, out=workspace.input_scores)
+            torch.div(workspace.input_scores, workspace.row_std, out=workspace.input_scores)
+        workspace.select(workspace.input_scores)
+
+    def _materialize_fixed_shape_selection_banks(self) -> None:
+        """Allocate planned banks once, after model graph capture and before eviction."""
+        state = getattr(self, "_fixed_shape_selection_materialization_state", "disabled")
+        if state in ("disabled", "running", "done"):
+            return
+        self._fixed_shape_selection_materialization_state = "running"
+        plans = getattr(self, "_fixed_shape_selection_plans", {})
+        states = self._fixed_shape_selection_prewarm_states
+        for key, plan in plans.items():
+            if states.get(key) != "planned":
+                continue
+            workspace = None
+            try:
+                candidate = getattr(self, "_fixed_union_prewarmed_workspaces", {}).get(key)
+                if (
+                    candidate is not None
+                    and candidate.rows == plan.rows
+                    and candidate.width == plan.width
+                    and candidate.keep_count == plan.keep_count
+                    and candidate.prompt_len == plan.prompt_len
+                    and candidate.dtype == plan.dtype
+                    and candidate.device == plan.device
+                    and candidate.selection_backend == plan.selection_backend
+                ):
+                    workspace = candidate
+                else:
+                    workspace = _FixedUnionWorkspace(
+                        plan.rows,
+                        plan.width,
+                        plan.keep_count,
+                        plan.prompt_len,
+                        dtype=plan.dtype,
+                        device=plan.device,
+                        selection_backend=plan.selection_backend,
+                    )
+                    workspace.selection_only = True
+                workspaces = self._build_fixed_shape_selection_workspaces(
+                    workspace,
+                    plan.max_requests,
+                )
+                self._warm_fixed_shape_selection_workspace(workspace)
+            except Exception as exc:
+                states[key] = "failed"
+                self._fixed_shape_selection_workspaces.pop(key, None)
+                self._fixed_shape_selection_bank_bytes.pop(key, None)
+                if workspace is not None:
+                    workspace.release_segment_buffers()
+                logger.warning(
+                    "TriAttention deferred fixed-shape selection materialization failed; "
+                    f"using the Stage2 fixed-score path: {exc}"
+                )
+                continue
+
+            for item in workspaces:
+                item.prewarm_attempted = True
+                item.prewarmed = True
+            self._fixed_shape_selection_workspaces[key] = workspaces
+            self._fixed_shape_selection_bank_bytes[key] = plan.materialized_nbytes
+            states[key] = "ready"
+        self._fixed_shape_selection_materialization_state = "done"
 
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
         """Drop this request's per-request length and eviction state."""
@@ -1830,23 +2111,13 @@ class TriAttention(BaseKVCacheCompressionManager):
         workspace: _FixedUnionWorkspace,
         max_requests: int,
     ) -> Tuple[_FixedUnionWorkspace, ...]:
-        """Allocate one stable selection slot per request in an exact bucket."""
+        """Share one exact-bucket scratch while keeping request outputs stable."""
         if max_requests <= 0:
             raise ValueError("fixed shape selection requires a positive request capacity")
         workspace.prepare_segment_buffers()
         workspaces = [workspace]
         for _ in range(1, max_requests):
-            workspaces.append(
-                _FixedUnionWorkspace(
-                    workspace.rows,
-                    workspace.width,
-                    workspace.keep_count,
-                    workspace.prompt_len,
-                    dtype=workspace.dtype,
-                    device=workspace.device,
-                    allocate_segment_buffers=True,
-                )
-            )
+            workspaces.append(workspace.shared_selection_slot())
         return tuple(workspaces)
 
     def _fixed_shape_selection_for(
@@ -2437,9 +2708,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                     )
                     for request in range(len(prepared)):
                         for layer_slot, layer in enumerate(lids):
-                            req_layer_scores[request][layer] = fixed_views[
-                                :, request, layer_slot
-                            ]
+                            req_layer_scores[request][layer] = fixed_views[:, request, layer_slot]
                     continue
                 else:
                     ph, so, sm = triton_tri_score_perhead(
@@ -2483,9 +2752,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 continue
             fixed_union_prewarm_key = None
             fixed_union_workspace = (
-                fixed_selection_workspaces[r]
-                if fixed_selection_workspaces is not None
-                else None
+                fixed_selection_workspaces[r] if fixed_selection_workspaces is not None else None
             )
             if (
                 is_union
@@ -2524,6 +2791,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                     len(prepared) == 1
                     and getattr(self, "_fixed_union_compaction_enabled", False)
                     and workspace is not None
+                    and not workspace.selection_only
                     and workspace.keep is keep
                     and all(
                         workspace.can_compact(
