@@ -2503,9 +2503,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
                 else kv_cache.capacity - req.py_rewind_len
             )
-            capacity_only = getattr(req, "py_kv_cache_generation_capacity_only", False) is True
+            capacity_only = req.py_kv_cache_generation_capacity_only
             history_length = None if capacity_only else req.max_beam_num_tokens - 1
-            compaction = getattr(req, "py_kv_cache_compaction", None)
+            compaction = req.py_kv_cache_compaction
             consume_compaction = capacity_only and compaction is not None
             if consume_compaction:
                 target_capacity, published_capacity, event = compaction

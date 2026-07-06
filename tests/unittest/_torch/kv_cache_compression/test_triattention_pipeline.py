@@ -33,6 +33,10 @@ These tests do not run real eviction or attention; that needs model weights and
 is covered by the NIAH end-to-end run.
 """
 
+import ast
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 import torch
 from pydantic import TypeAdapter, ValidationError
@@ -82,12 +86,50 @@ def flat_calibration_pt(tmp_path):
 
 
 def _make_fake_v2(enable_block_reuse=False):
-    """A KVCacheManagerV2 with only the attribute the base guard reads."""
+    """Build an unallocated V2 double with TriAttention's production contract."""
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 
     fake_v2 = KVCacheManagerV2.__new__(KVCacheManagerV2)
     fake_v2.enable_block_reuse = enable_block_reuse
+    fake_v2.mapping = SimpleNamespace(enable_attention_dp=False)
+    fake_v2.is_disagg = False
+    fake_v2.max_beam_width = 1
+    fake_v2.num_extra_kv_tokens = 0
+    fake_v2.max_total_draft_tokens = 0
+    fake_v2._kv_reserve_draft_tokens = 0
+    fake_v2.max_attention_window_vec = []
+    fake_v2.kv_cache_manager_py_config = SimpleNamespace(layers=[])
+    fake_v2.pp_layers = []
+    fake_v2.layer_offsets = {}
+    fake_v2.layer_to_pool_mapping_dict = {}
     return fake_v2
+
+
+def _make_triattention(**overrides):
+    """Construct a fully initialized manager for method-level unit tests."""
+    options = {"top_B": 8, "skip_swa": False}
+    options.update(overrides)
+    return TriAttention(_make_fake_v2(), **options)
+
+
+def _make_request(request_id, **overrides):
+    """Build the explicit request fields consumed by TriAttention."""
+    fields = {
+        "py_request_id": request_id,
+        "py_prompt_len": 0,
+        "py_draft_tokens": [],
+        "py_kv_cache_generation_capacity_only": False,
+        "py_kv_cache_compaction": None,
+        "is_dummy": False,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _make_hf_config(**values):
+    """Expose the normalized Hugging Face text-config contract."""
+    text_config = SimpleNamespace(to_dict=lambda: dict(values))
+    return SimpleNamespace(get_text_config=lambda: text_config)
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +138,25 @@ def _make_fake_v2(enable_block_reuse=False):
 
 
 class TestPackageSurface:
+    def test_implementation_has_no_dynamic_attribute_probes(self):
+        repo_root = Path(__file__).resolve().parents[4]
+        package_root = (
+            repo_root / "tensorrt_llm" / "_torch" / "kv_cache_compression" / "triattention"
+        )
+        violations = []
+        for source_path in package_root.rglob("*.py"):
+            tree = ast.parse(source_path.read_text(), filename=str(source_path))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in {"getattr", "hasattr"}
+                ):
+                    violations.append(
+                        f"{source_path.relative_to(repo_root)}:{node.lineno}:{node.func.id}"
+                    )
+        assert not violations, "dynamic attribute probes:\n" + "\n".join(violations)
+
     def test_public_symbols_importable_from_package(self):
         import tensorrt_llm._torch.kv_cache_compression.triattention as pkg
 
@@ -205,8 +266,17 @@ class TestTriAttentionClass:
     def test_is_compression_manager(self):
         assert issubclass(TriAttention, BaseKVCacheCompressionManager)
 
+    def test_constructor_initializes_optional_runtime_state(self):
+        manager = _make_triattention()
+
+        assert manager._local_to_global_layers_cache is None
+        assert manager._attention_layer_partition_cache is None
+        assert manager._fixed_union_active == {}
+        assert manager._fixed_score_runtime_counts == {}
+        assert manager._standalone_graph_cache is None
+
     def test_resolve_requires_calibration_path(self):
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr.calibration_path = None
         with pytest.raises(ValueError, match="calibration_path"):
             mgr._resolve_calibration()
@@ -227,75 +297,69 @@ class TestTriAttentionClass:
             )
 
     def test_request_init_registers_capacity_only_for_every_request(self):
-        from types import SimpleNamespace
-
         manager = _make_fake_v2()
         triattention = TriAttention(manager, top_B=8, skip_swa=False)
         triattention._calibrated = True
-        first = SimpleNamespace(py_request_id=11)
-        second = SimpleNamespace(py_request_id=12)
+        first = _make_request(11)
+        second = _make_request(12)
 
         triattention.on_request_init(first)
         triattention.on_request_init(second)
 
         assert first.py_kv_cache_generation_capacity_only
         assert second.py_kv_cache_generation_capacity_only
+        assert first.py_kv_cache_compaction is None
+        assert second.py_kv_cache_compaction is None
 
     def test_request_init_rejects_native_v2_swa(self):
-        from types import SimpleNamespace
-
         manager = _make_fake_v2()
         manager.max_attention_window_vec = [128]
         triattention = TriAttention(manager, top_B=128, skip_swa=False)
         triattention._calibrated = True
-        request = SimpleNamespace(py_request_id=11)
+        request = _make_request(11)
 
         with pytest.raises(ValueError, match="full-attention V2 lifecycles"):
             triattention.on_request_init(request)
-        assert not hasattr(request, "py_kv_cache_generation_capacity_only")
+        assert request.py_kv_cache_generation_capacity_only is False
 
     def test_request_init_rejects_attention_dp(self):
-        from types import SimpleNamespace
-
         manager = _make_fake_v2()
         manager.mapping = SimpleNamespace(enable_attention_dp=True)
         triattention = TriAttention(manager, top_B=8, skip_swa=False)
         triattention._calibrated = True
 
         with pytest.raises(ValueError, match="attention DP"):
-            triattention.on_request_init(SimpleNamespace(py_request_id=11))
+            triattention.on_request_init(_make_request(11))
 
     def test_request_init_rejects_speculative_capacity(self):
-        from types import SimpleNamespace
-
         manager = _make_fake_v2()
         manager.num_extra_kv_tokens = 4
         triattention = TriAttention(manager, top_B=8, skip_swa=False)
         triattention._calibrated = True
 
         with pytest.raises(ValueError, match="single-token"):
-            triattention.on_request_init(SimpleNamespace(py_request_id=11))
+            triattention.on_request_init(_make_request(11))
 
     def test_skip_swa_requires_model_path(self):
         with pytest.raises(ValueError, match="skip_swa=True requires model_path"):
             TriAttention(_make_fake_v2(), top_B=8)
 
     def test_validate_rejects_missing_keys(self):
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         with pytest.raises(ValueError, match="missing keys"):
             mgr._validate_calibration({"E_q": torch.zeros(1)})
 
     def test_resolve_rejects_unrecognized_pt(self, tmp_path):
         path = tmp_path / "junk.pt"
         torch.save({"E_q": torch.zeros(1)}, path)
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr.calibration_path = str(path)
         with pytest.raises(ValueError, match="Unrecognized calibration"):
             mgr._resolve_calibration()
 
     @CUDA_REQUIRED
     def test_resolve_accepts_flat_pt(self, flat_calibration_pt):
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr.calibration_path = flat_calibration_pt
         mgr.model_path = None
         loaded = mgr._resolve_calibration()
@@ -334,7 +398,7 @@ class TestAttentionMetadataReconcile:
         assert meta.kv_cache_params.num_cached_tokens_per_seq == [100]
 
     def test_authoritative_pre_forward_length_replaces_logical_length(self):
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr._pre_forward_kv_lengths = {7: 91}
         meta = _FakeMetadata([100], [50], [7])
         mgr.adjust_attention_metadata(meta)
@@ -343,7 +407,7 @@ class TestAttentionMetadataReconcile:
 
     def test_prompt_len_clamped_to_compacted_cache(self):
         # A prompt longer than the whole compacted cache is clamped to num_cached.
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr._pre_forward_kv_lengths = {7: 91}
         meta = _FakeMetadata([100], [200], [7])
         mgr.adjust_attention_metadata(meta)
@@ -351,16 +415,37 @@ class TestAttentionMetadataReconcile:
         assert meta.prompt_lens == [91]
 
     def test_request_without_authoritative_length_is_untouched(self):
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr._pre_forward_kv_lengths = {}
         meta = _FakeMetadata([100], [50], [7])
         mgr.adjust_attention_metadata(meta)
         assert meta.kv_cache_params.num_cached_tokens_per_seq == [100]
         assert meta.prompt_lens == [50]
 
+    def test_none_kv_cache_params_is_a_noop(self):
+        mgr = _make_triattention()
+        mgr._pre_forward_kv_lengths = {7: 91}
+        meta = _FakeMetadata([100], [50], [7])
+        meta.kv_cache_params = None
+
+        mgr.adjust_attention_metadata(meta)
+
+        assert meta.prompt_lens == [50]
+
+    def test_none_prompt_lens_still_reconciles_cache_length(self):
+        mgr = _make_triattention()
+        mgr._pre_forward_kv_lengths = {7: 91}
+        meta = _FakeMetadata([100], [50], [7])
+        meta.prompt_lens = None
+
+        mgr.adjust_attention_metadata(meta)
+
+        assert meta.kv_cache_params.num_cached_tokens_per_seq == [91]
+        assert meta.prompt_lens is None
+
     def test_context_requests_skipped(self):
         # Only generation requests (index >= num_contexts) are reconciled.
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr._pre_forward_kv_lengths = {1: 80, 2: 91}
         meta = _FakeMetadata([100, 100], [50, 50], [1, 2], num_contexts=1)
         mgr.adjust_attention_metadata(meta)
@@ -384,7 +469,7 @@ class TestStepBeginHookRefactor:
     def test_hook_runs_periodic_evict(self):
         import unittest.mock as mock
 
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         with mock.patch.object(TriAttention, "_periodic_evict") as pe:
             mgr.on_generation_step_begin("BATCH")
             pe.assert_called_once_with("BATCH")
@@ -395,7 +480,7 @@ class TestStepBeginHookRefactor:
 
         mgr, _, batch = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
         mgr._gen_steps = {7: 0}
-        dummy = SimpleNamespace(is_dummy=True, py_request_id=99)
+        dummy = _make_request(99, is_dummy=True)
         allocation_error = AssertionError("non-eviction generation must not allocate a tensor")
 
         with (
@@ -444,13 +529,13 @@ class TestStepBeginHookRefactor:
         from types import SimpleNamespace
         from unittest import mock
 
-        request = SimpleNamespace(
-            py_request_id=7,
+        request = _make_request(
+            7,
             py_prompt_len=1024,
             max_beam_num_tokens=seq_len + 1,
         )
         batch = SimpleNamespace(generation_requests=[request])
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr._calibrated = True
         cache = SimpleNamespace(
             capacity=seq_len + 1,
@@ -461,6 +546,7 @@ class TestStepBeginHookRefactor:
         mgr.kv_cache_manager = SimpleNamespace(
             get_buffers=lambda *args, **kwargs: None,
             kv_cache_map={7: cache},
+            pp_layers=[0, 1],
             _stream=mock.Mock(),
         )
         mgr._L = 2
@@ -588,18 +674,13 @@ class TestStepBeginHookRefactor:
         assert mgr._standalone_graph_arena_generation == 0
 
     def test_generation_only_request_is_initialized_once(self):
-        from types import SimpleNamespace
-
-        manager = SimpleNamespace(
-            enable_block_reuse=False,
-            get_buffers=lambda *args, **kwargs: None,
-            kv_cache_map={7: SimpleNamespace(capacity=11, history_length=2, is_active=True)},
-        )
-        request = SimpleNamespace(
-            py_request_id=7,
+        manager = _make_fake_v2()
+        manager.get_buffers = lambda *args, **kwargs: None
+        manager.kv_cache_map = {7: SimpleNamespace(capacity=11, history_length=2, is_active=True)}
+        request = _make_request(
+            7,
             py_prompt_len=2,
             max_beam_num_tokens=999,
-            is_dummy=False,
         )
         mgr = TriAttention(manager, top_B=8, beta=4, skip_swa=False)
         mgr._calibrated = True
@@ -613,16 +694,14 @@ class TestStepBeginHookRefactor:
         assert mgr._capacity_only_request_ids == {7}
 
     def test_generation_dummy_is_skipped(self):
-        from types import SimpleNamespace
-
-        manager = SimpleNamespace(enable_block_reuse=False)
-        request = SimpleNamespace(py_request_id=7, is_dummy=True)
+        manager = _make_fake_v2()
+        request = _make_request(7, is_dummy=True)
         mgr = TriAttention(manager, top_B=8, beta=4, skip_swa=False)
         mgr._calibrated = True
 
         mgr._periodic_evict(SimpleNamespace(generation_requests=[request]))
 
-        assert not hasattr(request, "py_kv_cache_generation_capacity_only")
+        assert request.py_kv_cache_generation_capacity_only is False
         assert mgr._capacity_only_request_ids == set()
 
     def test_request_finish_orders_unconsumed_compaction_before_free(self):
@@ -636,7 +715,7 @@ class TestStepBeginHookRefactor:
             py_kv_cache_generation_capacity_only=True,
             py_kv_cache_compaction=(129, 256, event),
         )
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr.kv_cache_manager = manager
         mgr._gen_steps = {7: 1}
         mgr._evicted = {7: 127}
@@ -659,9 +738,13 @@ class TestStepBeginHookRefactor:
         # The reserved-but-unwritten slot may contain nonzero data from a reused
         # page. Length accounting must use request metadata, not pool contents.
         pools = [torch.ones(2, 2, 1, 8, 2), torch.ones(2, 2, 1, 8, 2)]
-        manager = SimpleNamespace(get_buffers=lambda layer, **kwargs: pools[layer])
-        request = SimpleNamespace(py_request_id=7, py_prompt_len=2, max_beam_num_tokens=999)
-        mgr = TriAttention.__new__(TriAttention)
+        manager = SimpleNamespace(
+            get_buffers=lambda layer, **kwargs: pools[layer],
+            get_batch_cache_indices=lambda *args, **kwargs: [],
+            pp_layers=[0, 1],
+        )
+        request = _make_request(7, py_prompt_len=2, max_beam_num_tokens=999)
+        mgr = _make_triattention()
         mgr.kv_cache_manager = manager
         mgr._evicted = {7: 5}
         mgr._pre_forward_kv_lengths = {7: 8}
@@ -718,14 +801,7 @@ class TestStepBeginHookRefactor:
         assert swa_call.kwargs["dest_list"][0].tolist() == [4, 5]
         assert swa_call.args[2][0].numel() == 2
 
-    @pytest.mark.parametrize(
-        "draft_fields",
-        [
-            {"py_draft_tokens": [101, 102]},
-            {"py_draft_tokens": [], "num_draft_tokens": 2},
-        ],
-    )
-    def test_evict_requests_rejects_speculative_decode(self, draft_fields):
+    def test_evict_requests_rejects_speculative_decode(self):
         from types import SimpleNamespace
         from unittest import mock
 
@@ -734,10 +810,14 @@ class TestStepBeginHookRefactor:
             py_request_id=7,
             py_prompt_len=2,
             max_beam_num_tokens=9,
-            **draft_fields,
+            py_draft_tokens=[101, 102],
         )
-        mgr = TriAttention.__new__(TriAttention)
-        mgr.kv_cache_manager = SimpleNamespace(get_buffers=lambda *args, **kwargs: pool)
+        mgr = _make_triattention()
+        mgr.kv_cache_manager = SimpleNamespace(
+            get_buffers=lambda *args, **kwargs: pool,
+            get_batch_cache_indices=lambda *args, **kwargs: [],
+            pp_layers=[0],
+        )
         mgr._evicted = {}
         mgr._attention_layer_partition = mock.Mock(return_value=([0], [], None))
 
@@ -753,9 +833,13 @@ class TestStepBeginHookRefactor:
         import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels as kernels
 
         pools = [torch.zeros(2, 2, 1, 8, 2), torch.zeros(2, 2, 1, 8, 2)]
-        request = SimpleNamespace(py_request_id=7, py_prompt_len=2, max_beam_num_tokens=9)
-        mgr = TriAttention.__new__(TriAttention)
-        mgr.kv_cache_manager = SimpleNamespace(get_buffers=lambda layer, **kwargs: pools[layer])
+        request = _make_request(7, py_prompt_len=2, max_beam_num_tokens=9)
+        mgr = _make_triattention()
+        mgr.kv_cache_manager = SimpleNamespace(
+            get_buffers=lambda layer, **kwargs: pools[layer],
+            get_batch_cache_indices=lambda *args, **kwargs: [],
+            pp_layers=[0, 1],
+        )
         mgr._evicted = {}
         mgr._pre_forward_kv_lengths = {7: 8}
         mgr.top_B = 4
@@ -822,7 +906,7 @@ class TestStepBeginHookRefactor:
 
 class TestTopKRouting:
     def test_indexer_route_predicate_preserves_prior_dispatch_domain(self):
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
 
         for width in (1, 4095, 4096, 8191):
             for k in (1, 2048, 2049, 4096):
@@ -834,7 +918,7 @@ class TestTopKRouting:
     def test_score_width_4095_k2048_routes_to_native_indexer_topk(self):
         from unittest import mock
 
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         scores = torch.arange(2 * 4095, dtype=torch.float32).reshape(2, 4095)
 
         def fake_indexer(values, seq_lens, output, next_n, k):
@@ -868,7 +952,7 @@ class TestTopKRouting:
     def test_score_width_4096_k2048_routes_to_torch_topk(self):
         from unittest import mock
 
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         scores = torch.arange(2 * 4096, dtype=torch.float32).reshape(2, 4096)
         real_topk = torch.topk
 
@@ -986,7 +1070,7 @@ class TestFixedScoreMetadata:
             _FixedScoreMetadataWorkspace,
         )
 
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager.kv_cache_manager = SimpleNamespace(
             layer_offsets={10: 100, 11: 101, 12: 102},
             layer_to_pool_mapping_dict={100: 3, 101: 3, 102: 4},
@@ -1005,16 +1089,12 @@ class TestFixedScoreMetadata:
         assert unique_global == (10, 12)
         assert slots == {0: 0, 1: 0, 2: 1}
 
-    def test_page_table_pool_keys_fall_back_to_unique_layers(self):
-        from types import SimpleNamespace
+    def test_page_table_pool_keys_reject_missing_v2_mapping(self):
+        manager = _make_triattention()
+        manager.kv_cache_manager = _make_fake_v2()
 
-        manager = TriAttention.__new__(TriAttention)
-        manager.kv_cache_manager = SimpleNamespace()
-
-        assert manager._page_table_pool_keys([0, 2], [10, 11, 12]) == [
-            ("layer", 10),
-            ("layer", 12),
-        ]
+        with pytest.raises(RuntimeError, match="invalid layer-to-pool mapping"):
+            manager._page_table_pool_keys([0, 2], [10, 11, 12])
 
     def test_v2_batch_indices_only_convert_live_or_requested_blocks(self):
         from types import SimpleNamespace
@@ -1032,12 +1112,10 @@ class TestFixedScoreMetadata:
             )
         }
 
-        assert manager._get_batch_cache_indices_by_pool_id([7]) == [
-            [8, BAD_PAGE_INDEX, 16]
+        assert manager._get_batch_cache_indices_by_pool_id([7]) == [[8, BAD_PAGE_INDEX, 16]]
+        assert manager._get_batch_cache_indices_by_pool_id([7], num_blocks_per_seq=[2]) == [
+            [8, BAD_PAGE_INDEX]
         ]
-        assert manager._get_batch_cache_indices_by_pool_id(
-            [7], num_blocks_per_seq=[2]
-        ) == [[8, BAD_PAGE_INDEX]]
 
     def test_fixed_stage_rejects_bad_page_in_active_prefix_without_compacting_ordinals(self):
         from unittest import mock
@@ -1063,9 +1141,7 @@ class TestFixedScoreMetadata:
         ):
             assert not workspace.stage(get_batch, [42], [8.0])
 
-        get_batch.assert_called_once_with(
-            [42], 10, num_blocks_per_seq=[workspace.page_count]
-        )
+        get_batch.assert_called_once_with([42], 10, num_blocks_per_seq=[workspace.page_count])
         as_tensor.assert_not_called()
         workspace.copy_done.record.assert_not_called()
 
@@ -1100,7 +1176,7 @@ class TestFixedScoreMetadata:
         from types import SimpleNamespace
         from unittest import mock
 
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager._fixed_score_metadata_enabled = True
         manager._fixed_union_prewarm_key = mock.Mock(return_value=("bucket",))
         workspace = SimpleNamespace(
@@ -1187,7 +1263,7 @@ class TestFixedScoreMetadata:
             _FixedScoreStreamMismatch,
         )
 
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         get_batch = mock.Mock()
         manager.kv_cache_manager = SimpleNamespace(get_batch_cache_indices=get_batch)
         manager._fixed_score_runtime_counts = {}
@@ -1286,7 +1362,7 @@ class TestFixedScoreMetadata:
         from types import SimpleNamespace
         from unittest import mock
 
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         get_batch = mock.Mock()
         manager.kv_cache_manager = SimpleNamespace(get_batch_cache_indices=get_batch)
         manager._fixed_score_runtime_counts = {}
@@ -1384,6 +1460,7 @@ class TestFixedScoreMetadata:
             12: [[2 * request + 1, 2 * request] for request in range(request_count)],
             13: [[15 - 2 * request, 14 - 2 * request] for request in range(request_count)],
         }
+
         def get_batch_side_effect(request_ids, layer, num_blocks_per_seq=None):
             assert num_blocks_per_seq == [page_count] * request_count
             return tables[layer]
@@ -1610,7 +1687,7 @@ class TestFixedScoreMetadata:
             item.prewarmed = True
 
         def build_selection_manager(fixed_shape):
-            manager = TriAttention.__new__(TriAttention)
+            manager = _make_triattention()
             manager.top_B = 3
             manager.pin_prefill = True
             manager.count_prompt_tokens = False
@@ -1665,9 +1742,7 @@ class TestFixedScoreMetadata:
                 assert round_starts != previous_round_starts
             previous_by_request_count[request_count] = (tables, round_starts)
 
-            def get_batch_cache_indices(
-                observed_ids, global_layer, num_blocks_per_seq=None
-            ):
+            def get_batch_cache_indices(observed_ids, global_layer, num_blocks_per_seq=None):
                 assert observed_ids == request_ids
                 assert global_layer == 10
                 assert num_blocks_per_seq == [page_count] * request_count
@@ -2242,7 +2317,7 @@ class TestFixedUnionWorkspace:
             storage.as_strided(shape, stride, storage_offset=0),
             storage.as_strided(shape, stride, storage_offset=32),
         ]
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager.kv_cache_manager = SimpleNamespace(get_buffers=lambda layer, **kwargs: pools[layer])
         manager.top_B = 4
         manager._INDEXER_TOPK_MAX_K = 2
@@ -2816,7 +2891,7 @@ class TestFixedUnionWorkspace:
         assert not hasattr(base, "input_scores")
         workspaces = TriAttention._build_fixed_shape_selection_workspaces(base, 3)
         assert all(item._segment_buffers_prepared for item in workspaces)
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager._fixed_shape_selection_enabled = True
         manager._fixed_shape_selection_workspaces = {("bucket",): workspaces}
         manager._fixed_shape_selection_prewarm_states = {("bucket",): "ready"}
@@ -2880,7 +2955,7 @@ class TestFixedUnionWorkspace:
             1: torch.arange(2 * 19, dtype=torch.float32, device=device).view(2, 19).flip(1),
         }
         score_workspace = SimpleNamespace(max_requests=3)
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager.top_B = 8
         manager.normalize_scores = True
         manager._indexer_topk_supported = lambda width, keep: False
@@ -2960,7 +3035,7 @@ class TestFixedUnionWorkspace:
             dtype=torch.float32,
             device=device,
         )
-        failed = TriAttention.__new__(TriAttention)
+        failed = _make_triattention()
         failed.top_B = 8
         failed.normalize_scores = True
         failed._indexer_topk_supported = lambda width, keep: False
@@ -3005,7 +3080,7 @@ class TestFixedUnionWorkspace:
             0: torch.arange(2 * 19, dtype=torch.float32).view(2, 19),
             1: torch.arange(2 * 19, dtype=torch.float32).view(2, 19).flip(1),
         }
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager.top_B = 8
         manager.count_prompt_tokens = False
         manager.normalize_scores = False
@@ -3213,7 +3288,7 @@ class TestFixedUnionWorkspace:
         pool = torch.empty(1, 2, 1, 1, 1, device=device)
 
         def build_manager(fixed):
-            manager = TriAttention.__new__(TriAttention)
+            manager = _make_triattention()
             manager.top_B = keep_count
             manager.pin_prefill = True
             manager.count_prompt_tokens = False
@@ -3412,7 +3487,7 @@ class TestFixedUnionWorkspace:
     def test_manager_routes_only_large_torch_topk_bucket(self):
         from types import SimpleNamespace
 
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr._fixed_union_enabled = True
         mgr._fixed_union_workspaces = {}
         mgr._fixed_union_active = {}
@@ -3439,7 +3514,7 @@ class TestFixedUnionWorkspace:
         assert mgr._get_fixed_union_workspace(7, large[:, :128], keep_count, 4) is None
 
     def test_request_cleanup_does_not_drop_other_request_bucket(self):
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr._fixed_union_workspaces = {
             (7, "shape-a"): object(),
             (7, "shape-b"): object(),
@@ -3483,7 +3558,7 @@ class TestCrossRequestFixedUnionWorkspace:
 
     @staticmethod
     def _manager():
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager.eviction_mode = "union"
         manager.normalize_scores = True
         manager._cross_request_selection_enabled = True
@@ -3586,6 +3661,36 @@ class TestCrossRequestFixedUnionWorkspace:
         assert manager._cross_request_selection_bank_bytes[key] == (owner.selection_buffer_nbytes())
         assert len(owner.request_workspaces) == stage3_plan.max_requests
         assert all(item.prewarm_attempted and item.prewarmed for item in owner.request_workspaces)
+
+    def test_indexer_request_views_preserve_row_and_shared_token_geometry(self):
+        rows = 3
+        width = 17
+        max_requests = 4
+        owner = _BatchedFixedUnionWorkspace(
+            rows,
+            width,
+            8,
+            2,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            selection_backend="indexer_topk",
+            max_requests=max_requests,
+        )
+
+        assert owner.row_seq_lens.shape == (max_requests * rows,)
+        assert owner.union_counts.shape == (max_requests,)
+        for request_index, workspace in enumerate(owner.request_workspaces):
+            row_start = request_index * rows
+            assert workspace.row_seq_lens.shape == (rows,)
+            assert workspace.row_seq_lens.tolist() == [width] * rows
+            assert workspace.row_seq_lens.data_ptr() == owner.row_seq_lens[row_start:].data_ptr()
+            assert workspace.token_indices is owner.token_indices
+            assert workspace.token_indices.shape == (width,)
+            assert workspace.union_count.shape == (1,)
+            assert (
+                workspace.union_count.data_ptr()
+                == owner.union_counts[request_index : request_index + 1].data_ptr()
+            )
 
     def test_materialization_failure_is_key_sticky_and_preserves_stage3_fallback(self):
         from types import SimpleNamespace
@@ -3807,9 +3912,7 @@ class TestCrossRequestFixedUnionWorkspace:
         import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels as kernels
 
         pool = torch.zeros(8, 2, 1, 4, 2)
-        requests = [
-            SimpleNamespace(py_request_id=request_id, py_prompt_len=2) for request_id in (7, 8)
-        ]
+        requests = [_make_request(request_id, py_prompt_len=2) for request_id in (7, 8)]
         key = ("cross-request",)
         selection = _BatchedFixedUnionWorkspace(
             2,
@@ -3831,7 +3934,7 @@ class TestCrossRequestFixedUnionWorkspace:
             mean_sin=torch.empty(0),
             prepare_phase=mock.Mock(),
         )
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager.kv_cache_manager = SimpleNamespace(get_buffers=lambda layer, **kwargs: pool)
         manager._evicted = {}
         manager._pre_forward_kv_lengths = {7: 8, 8: 8}
@@ -3965,15 +4068,14 @@ class TestKernelMaskedSwa:
             _build_swa_rebase_keep(seq_len=10, keep_count=3, window_size=4)
 
     def test_layer_partition_uses_local_model_config(self):
-        from types import SimpleNamespace
         from unittest import mock
 
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr.skip_swa = True
         mgr.model_path = "/models/gpt-oss"
         mgr.top_B = 128
-        mgr.kv_cache_manager = SimpleNamespace(num_layers=4)
-        config = SimpleNamespace(
+        mgr.kv_cache_manager = SimpleNamespace(pp_layers=[0, 1, 2, 3])
+        config = _make_hf_config(
             layer_types=[
                 "sliding_attention",
                 "full_attention",
@@ -3994,15 +4096,14 @@ class TestKernelMaskedSwa:
         assert window == 128
 
     def test_layer_partition_rejects_decode_budget_smaller_than_window(self):
-        from types import SimpleNamespace
         from unittest import mock
 
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr.skip_swa = True
         mgr.model_path = "/models/gpt-oss"
         mgr.top_B = 127
-        mgr.kv_cache_manager = SimpleNamespace(num_layers=2)
-        config = SimpleNamespace(
+        mgr.kv_cache_manager = SimpleNamespace(pp_layers=[0, 1])
+        config = _make_hf_config(
             layer_types=["sliding_attention", "full_attention"],
             sliding_window=128,
         )
@@ -4014,15 +4115,14 @@ class TestKernelMaskedSwa:
             mgr._attention_layer_partition(2)
 
     def test_layer_partition_uses_pp_local_to_global_mapping(self):
-        from types import SimpleNamespace
         from unittest import mock
 
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr.skip_swa = True
         mgr.model_path = "/models/gpt-oss"
         mgr.top_B = 128
-        mgr.kv_cache_manager = SimpleNamespace(pp_layers=[1, 2], num_layers=4)
-        config = SimpleNamespace(
+        mgr.kv_cache_manager = SimpleNamespace(pp_layers=[1, 2])
+        config = _make_hf_config(
             layer_types=[
                 "sliding_attention",
                 "full_attention",
@@ -4040,15 +4140,14 @@ class TestKernelMaskedSwa:
         assert window == 128
 
     def test_layer_partition_rejects_ambiguous_window_metadata(self):
-        from types import SimpleNamespace
         from unittest import mock
 
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr.skip_swa = True
         mgr.model_path = "/models/ambiguous"
         mgr.top_B = 128
-        mgr.kv_cache_manager = SimpleNamespace(num_layers=2)
-        config = SimpleNamespace(layer_types=None, sliding_window=128)
+        mgr.kv_cache_manager = SimpleNamespace(pp_layers=[0, 1])
+        config = _make_hf_config(layer_types=None, sliding_window=128)
 
         with (
             mock.patch("transformers.AutoConfig.from_pretrained", return_value=config),
@@ -4057,15 +4156,14 @@ class TestKernelMaskedSwa:
             mgr._attention_layer_partition(2)
 
     def test_layer_partition_honors_explicit_disabled_sliding_window(self):
-        from types import SimpleNamespace
         from unittest import mock
 
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr.skip_swa = True
         mgr.model_path = "/models/qwen3"
         mgr.top_B = 128
-        mgr.kv_cache_manager = SimpleNamespace(num_layers=2)
-        config = SimpleNamespace(
+        mgr.kv_cache_manager = SimpleNamespace(pp_layers=[0, 1])
+        config = _make_hf_config(
             layer_types=None,
             sliding_window=None,
             max_window_layers=36,
@@ -4084,7 +4182,7 @@ class TestKernelMaskedSwa:
         from unittest import mock
 
         get_batch = mock.Mock(return_value=[[10, 11]])
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr.kv_cache_manager = SimpleNamespace(
             pp_layers=[9, 10],
             num_layers=36,
@@ -4100,7 +4198,7 @@ class TestKernelMaskedSwa:
         from unittest import mock
 
         get_batch = mock.Mock(return_value=[[10, -1]])
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr.kv_cache_manager = SimpleNamespace(
             pp_layers=[9],
             num_layers=36,
@@ -4116,7 +4214,7 @@ class TestKernelMaskedSwa:
         from unittest import mock
 
         get_batch = mock.Mock(side_effect=KeyError("missing pool"))
-        mgr = TriAttention.__new__(TriAttention)
+        mgr = _make_triattention()
         mgr.kv_cache_manager = SimpleNamespace(
             pp_layers=[9],
             num_layers=36,
@@ -4163,6 +4261,33 @@ class TestFactory:
     def test_returns_none_for_unregistered_algorithm(self):
         cfg = KvCacheCompressionConfig(algorithm="made_up_algorithm")
         assert create_kv_cache_compression_manager(cfg, kv_cache_manager=None) is None
+
+    def test_triattention_algorithm_normalizes_base_config(self):
+        from unittest.mock import patch
+
+        cfg = KvCacheCompressionConfig(algorithm="triattention")
+        kv_cache_manager = _make_fake_v2()
+        expected = object()
+        with patch(
+            "tensorrt_llm._torch.kv_cache_compression.triattention.TriAttention",
+            return_value=expected,
+        ) as triattention_cls:
+            manager = create_kv_cache_compression_manager(cfg, kv_cache_manager)
+
+        assert manager is expected
+        triattention_cls.assert_called_once_with(
+            kv_cache_manager,
+            top_B=2048,
+            beta=128,
+            model_path=None,
+            calibration_path=None,
+            window_size=128,
+            eviction_mode="union",
+            normalize_scores=True,
+            pin_prefill=True,
+            skip_swa=True,
+            count_prompt_tokens=False,
+        )
 
     def test_block_reuse_rejected(self, flat_calibration_pt):
         # TriAttention rewrites stored keys; the base guard rejects a cache

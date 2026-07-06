@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 
 
 def _manager() -> KVCacheManagerV2:
@@ -67,14 +67,22 @@ def test_capacity_only_is_request_scoped() -> None:
     compacted_cache.resize.assert_called_once_with(251, None)
 
 
-def test_missing_capacity_only_flag_is_fail_closed() -> None:
+def test_llm_request_initializes_compression_contract() -> None:
+    request = LlmRequest(
+        request_id=1,
+        max_new_tokens=1,
+        input_tokens=[1],
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+
+    assert request.py_kv_cache_generation_capacity_only is False
+    assert request.py_kv_cache_compaction is None
+
+
+def test_default_capacity_only_flag_preserves_history() -> None:
     manager = _manager()
-    request = MagicMock()
-    request.py_request_id = 1
-    request.py_rewind_len = 3
-    request.max_beam_num_tokens = 201
-    request.py_kv_cache_compaction = None
-    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request = _request(1, rewind=3)
     cache = _cache()
     manager.kv_cache_map[1] = cache
 

@@ -19,7 +19,7 @@ from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
     KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig, PeftCacheConfig,
     SamplerType, SchedulerConfig, SparseAttentionConfig, SpeculativeConfig,
-    TorchLlmArgs, WaitingQueuePolicy)
+    TorchLlmArgs, TriAttentionKvCacheCompressionConfig, WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -1868,21 +1868,22 @@ def create_kv_cache_compression_manager(
         from tensorrt_llm._torch.kv_cache_compression.triattention import \
             TriAttention
 
-        # Read tuning knobs off the config defensively (getattr defaults) so a
-        # base KvCacheCompressionConfig coerced down from the TriAttention
-        # subclass still builds with the documented defaults.
+        triattention_config = (
+            config if isinstance(config, TriAttentionKvCacheCompressionConfig)
+            else TriAttentionKvCacheCompressionConfig.model_validate(
+                config.model_dump()))
         return TriAttention(
             kv_cache_manager,
-            top_B=getattr(config, "top_B", 2048),
-            beta=getattr(config, "beta", 128),
-            model_path=getattr(config, "model_path", None),
-            calibration_path=getattr(config, "calibration_path", None),
-            window_size=getattr(config, "window_size", 128),
-            eviction_mode=getattr(config, "eviction_mode", "union"),
-            normalize_scores=getattr(config, "normalize_scores", True),
-            pin_prefill=getattr(config, "pin_prefill", True),
-            skip_swa=getattr(config, 'skip_swa', True),
-            count_prompt_tokens=getattr(config, 'count_prompt_tokens', False),
+            top_B=triattention_config.top_B,
+            beta=triattention_config.beta,
+            model_path=triattention_config.model_path,
+            calibration_path=triattention_config.calibration_path,
+            window_size=triattention_config.window_size,
+            eviction_mode=triattention_config.eviction_mode,
+            normalize_scores=triattention_config.normalize_scores,
+            pin_prefill=triattention_config.pin_prefill,
+            skip_swa=triattention_config.skip_swa,
+            count_prompt_tokens=triattention_config.count_prompt_tokens,
         )
     logger.warning(
         "KV-cache compression algorithm '%s' is not registered; running without "

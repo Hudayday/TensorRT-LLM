@@ -116,6 +116,26 @@ def _cache_workspace(nbytes=64):
     return SimpleNamespace(nbytes=nbytes, device=torch.device("cpu"))
 
 
+def _make_triattention():
+    """Construct a fully initialized manager for graph-orchestration tests."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+
+    kv_cache_manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    kv_cache_manager.enable_block_reuse = False
+    kv_cache_manager.mapping = SimpleNamespace(enable_attention_dp=False)
+    kv_cache_manager.is_disagg = False
+    kv_cache_manager.max_beam_width = 1
+    kv_cache_manager.num_extra_kv_tokens = 0
+    kv_cache_manager.max_total_draft_tokens = 0
+    kv_cache_manager._kv_reserve_draft_tokens = 0
+    kv_cache_manager.max_attention_window_vec = []
+    kv_cache_manager.kv_cache_manager_py_config = SimpleNamespace(layers=[])
+    kv_cache_manager.pp_layers = []
+    kv_cache_manager.layer_offsets = {}
+    kv_cache_manager.layer_to_pool_mapping_dict = {}
+    return TriAttention(kv_cache_manager, top_B=8, skip_swa=False)
+
+
 class TestStandaloneEvictionGraphCache:
     def test_capture_body_can_update_inference_tensors(self):
         with torch.inference_mode():
@@ -475,7 +495,7 @@ class TestStandaloneGraphBuckets:
     def test_ready_dynamic_exact_bucket_is_accepted(
         self, prompt_len, width, budget, backend, request_count
     ):
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager.top_B = budget
         manager._standalone_cuda_graph_enabled = True
         prepared = [
@@ -523,7 +543,7 @@ class TestStandaloneGraphBuckets:
     def test_unready_capacity_or_backend_mismatch_falls_back(
         self, request_count, prompt_len, width, budget, backend, ready
     ):
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager.top_B = budget
         manager._standalone_cuda_graph_enabled = True
         prepared = [
@@ -548,7 +568,7 @@ class TestStandaloneGraphBuckets:
         assert manager._standalone_graph_bucket_for(prepared, score, selection) is None
 
     def test_mixed_geometry_or_stale_workspace_falls_back(self):
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager.top_B = 2048
         manager._standalone_cuda_graph_enabled = True
         prepared = [
@@ -581,7 +601,7 @@ class TestStandaloneGraphBuckets:
     def test_stats_are_zero_filled_before_first_eviction(self, monkeypatch):
         monkeypatch.setenv("TRIATTN_CUDA_GRAPH_MAX_ENTRIES", "2")
         monkeypatch.setenv("TRIATTN_CUDA_GRAPH_MAX_BYTES", "1024")
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager._standalone_cuda_graph_enabled = True
         manager._standalone_graph_cache = None
         manager._standalone_graph_runtime_counts = {}
@@ -600,7 +620,7 @@ class TestStandaloneGraphBuckets:
         assert stats["runtime"] == {}
 
     def test_unready_eviction_records_admission_rejection_without_cache(self):
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager._standalone_cuda_graph_enabled = True
         manager._standalone_graph_runtime_counts = {}
         prepared = [
@@ -638,7 +658,7 @@ class TestStandaloneGraphBuckets:
 
         import tensorrt_llm._torch.kv_cache_compression.triattention.triattention as tri_module
 
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager.top_B = 2048
         manager.normalize_scores = True
         manager.score_aggregation = "mean"
@@ -742,7 +762,7 @@ class TestStandaloneGraphBuckets:
         }
 
     def test_graph_fallback_does_not_publish_or_execute_eager_inside_helper(self):
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager.top_B = 4096
         manager._standalone_cuda_graph_enabled = True
         manager._evicted = {}
@@ -804,7 +824,7 @@ class TestStandaloneGraphBuckets:
 
         import tensorrt_llm._torch.kv_cache_compression.triattention.triattention as tri_module
 
-        manager = TriAttention.__new__(TriAttention)
+        manager = _make_triattention()
         manager.top_B = 4096
         manager._standalone_cuda_graph_enabled = True
         manager._evicted = {}
@@ -948,6 +968,67 @@ class TestFixedBatchedCompactionWorkspace:
 
         assert captured.untyped_storage()._cdata != rebound.untyped_storage()._cdata
         assert _tensor_fingerprint(captured) == _tensor_fingerprint(rebound)
+
+    def test_graph_fingerprint_detects_named_selection_tensor_rebind(self):
+        captured = _FakeTensor(storage_cdata=1)
+        rebound = _FakeTensor(
+            storage_cdata=2,
+            storage_data_ptr=8192,
+            data_ptr=captured.data_ptr(),
+        )
+
+        def weak_snapshot(tensor):
+            return tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride())
+
+        assert weak_snapshot(captured) == weak_snapshot(rebound)
+        assert _tensor_fingerprint(captured) != _tensor_fingerprint(rebound)
+
+        selection = SimpleNamespace(selection_backend="torch_topk", keep=captured)
+
+        def named_tensors():
+            return (("keep", selection.keep),)
+
+        selection.named_tensors = named_tensors
+        score_tensor = _FakeTensor(
+            storage_cdata=3,
+            storage_data_ptr=12288,
+            data_ptr=12288,
+        )
+        score = SimpleNamespace(
+            page_ids_device=score_tensor,
+            round_starts_device=score_tensor,
+            phase_base=score_tensor,
+            phase=score_tensor,
+            cos_phase=score_tensor,
+            sin_phase=score_tensor,
+            mean_cos=score_tensor,
+            mean_sin=score_tensor,
+            offsets=score_tensor,
+            omega=score_tensor,
+            groups={},
+        )
+        workspace = object.__new__(FixedBatchedCompactionWorkspace)
+        workspace.selection_workspace = selection
+        workspace.score_workspace = score
+        workspace.request_count = 1
+        workspace.seq_len = 8
+        workspace.prompt_len = 2
+        workspace.decode_keep_count = 4
+        workspace.dense_layers = ()
+        workspace.swa_layers = ()
+        workspace.global_layers = ()
+        workspace.storage_groups = ()
+        workspace.arena_generation = 1
+        workspace.layer_pools = ()
+        workspace._tensor_refs = ()
+        stream = SimpleNamespace(device=torch.device("cuda"), cuda_stream=9)
+
+        with mock.patch.object(torch.cuda, "current_blas_handle", return_value=17):
+            before = workspace.pointer_fingerprint(stream)
+            selection.keep = rebound
+            after = workspace.pointer_fingerprint(stream)
+
+        assert before != after
 
     def test_runtime_match_uses_allocation_pointer_not_storage_wrapper(self):
         captured = _FakeTensor(storage_cdata=1)
@@ -1233,7 +1314,7 @@ class TestStandaloneGraphCuda:
                 width=6,
                 keep=keep.clone(),
                 selection_backend="torch_topk",
-                _tensor_names=(),
+                named_tensors=lambda: (),
             )
             return FixedBatchedCompactionWorkspace(
                 layer_pools=pools,

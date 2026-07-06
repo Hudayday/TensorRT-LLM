@@ -294,25 +294,25 @@ class FixedBatchedCompactionWorkspace:
         )
 
     def pointer_fingerprint(self, stream: torch.cuda.Stream) -> tuple:
-        selection_names = getattr(self.selection_workspace, "_tensor_names", ())
         selection_tensors = tuple(
-            (name, _tensor_fingerprint(getattr(self.selection_workspace, name)))
-            for name in selection_names
+            (name, _tensor_fingerprint(tensor))
+            for name, tensor in self.selection_workspace.named_tensors()
         )
-        score_tensors = []
-        for name in (
-            "page_ids_device",
-            "round_starts_device",
-            "phase_base",
-            "phase",
-            "cos_phase",
-            "sin_phase",
-            "mean_cos",
-            "mean_sin",
-            "offsets",
-            "omega",
-        ):
-            score_tensors.append((name, _tensor_fingerprint(getattr(self.score_workspace, name))))
+        score_tensors = [
+            ("page_ids_device", _tensor_fingerprint(self.score_workspace.page_ids_device)),
+            (
+                "round_starts_device",
+                _tensor_fingerprint(self.score_workspace.round_starts_device),
+            ),
+            ("phase_base", _tensor_fingerprint(self.score_workspace.phase_base)),
+            ("phase", _tensor_fingerprint(self.score_workspace.phase)),
+            ("cos_phase", _tensor_fingerprint(self.score_workspace.cos_phase)),
+            ("sin_phase", _tensor_fingerprint(self.score_workspace.sin_phase)),
+            ("mean_cos", _tensor_fingerprint(self.score_workspace.mean_cos)),
+            ("mean_sin", _tensor_fingerprint(self.score_workspace.mean_sin)),
+            ("offsets", _tensor_fingerprint(self.score_workspace.offsets)),
+            ("omega", _tensor_fingerprint(self.score_workspace.omega)),
+        ]
         for representative, group in self.score_workspace.groups.items():
             group_tensors = (
                 *group.pointer_prefix,
@@ -348,7 +348,7 @@ class FixedBatchedCompactionWorkspace:
 
 @dataclass
 class _GraphEntry:
-    graph: object
+    graph: torch.cuda.CUDAGraph
     capture_stream: object
     fingerprint: tuple
     workspace: FixedBatchedCompactionWorkspace
@@ -447,9 +447,7 @@ class StandaloneEvictionGraphCache:
 
     @staticmethod
     def _reset_graph(entry: _GraphEntry) -> None:
-        reset = getattr(entry.graph, "reset", None)
-        if reset is not None:
-            reset()
+        entry.graph.reset()
 
     def _collect_retired(self) -> None:
         pending = []
@@ -527,7 +525,9 @@ class StandaloneEvictionGraphCache:
         )
 
     @staticmethod
-    def _capture_graph(workspace, capture_body: Callable[[], None]) -> Tuple[object, object, int]:
+    def _capture_graph(
+        workspace, capture_body: Callable[[], None]
+    ) -> Tuple[torch.cuda.CUDAGraph, torch.cuda.Stream, int]:
         current_stream = torch.cuda.current_stream(workspace.device)
         capture_stream = torch.cuda.Stream(device=workspace.device)
         capture_stream.wait_stream(current_stream)
@@ -547,9 +547,7 @@ class StandaloneEvictionGraphCache:
                     ):
                         capture_body()
         except RuntimeError:
-            reset = getattr(graph, "reset", None)
-            if reset is not None:
-                reset()
+            graph.reset()
             raise
         current_stream.wait_stream(capture_stream)
         graph_bytes = max(
@@ -614,9 +612,7 @@ class StandaloneEvictionGraphCache:
                 return "fallback"
             entry_bytes = workspace.nbytes + graph_bytes
             if not self._make_room(entry_bytes):
-                reset = getattr(graph, "reset", None)
-                if reset is not None:
-                    reset()
+                graph.reset()
                 self._record_fallback(bucket)
                 return "fallback"
             entry = _GraphEntry(
