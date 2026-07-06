@@ -1053,7 +1053,7 @@ class TestStandaloneGraphCuda:
             runtime_tables = [list(reversed(row)) if reverse_pages else list(row) for row in tables]
             round_starts = [float(seq_len + round_shift + request * 17) for request in request_ids]
             assert score.stage(
-                lambda _ids, _layer: runtime_tables,
+                lambda _ids, _layer, num_blocks_per_seq=None: runtime_tables,
                 request_ids,
                 round_starts,
             )

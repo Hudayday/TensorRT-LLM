@@ -679,7 +679,9 @@ class TestStepBeginHookRefactor:
         mgr.score_aggregation = "mean"
         mgr._attention_layer_partition = mock.Mock(return_value=([1], [0], 2))
         mgr._resolve_page_ids = mock.Mock(
-            side_effect=lambda request, layer: [10, 11] if layer == 1 else [20, 21]
+            side_effect=lambda request, layer, page_count=None: (
+                [10, 11] if layer == 1 else [20, 21]
+            )
         )
         mgr._evict_modes = mock.Mock(return_value=torch.arange(6))
         segment = SimpleNamespace(request_index=0, layer_index=1)
@@ -703,8 +705,8 @@ class TestStepBeginHookRefactor:
         assert score.call_args.args[2] == [8]
         assert score.call_args.args[3] == [13.0]
         assert mgr._resolve_page_ids.call_args_list == [
-            mock.call(request, 1),
-            mock.call(request, 0),
+            mock.call(request, 1, 2),
+            mock.call(request, 0, 2),
         ]
         assert compact.call_count == 2
         dense_call, swa_call = compact.call_args_list
@@ -770,7 +772,9 @@ class TestStepBeginHookRefactor:
         mgr.score_aggregation = "mean"
         mgr._attention_layer_partition = mock.Mock(return_value=([0, 1], [], None))
         mgr._resolve_page_ids = mock.Mock(
-            side_effect=lambda request, layer: [10, 11] if layer == 0 else [20, 21]
+            side_effect=lambda request, layer, page_count=None: (
+                [10, 11] if layer == 0 else [20, 21]
+            )
         )
         mgr._evict_modes = mock.Mock(return_value=torch.arange(6))
 
@@ -975,6 +979,96 @@ def _torch_union_keep(head_scores, prompt_len, budget):
 
 
 class TestFixedScoreMetadata:
+    def test_page_table_pool_keys_and_slots_deduplicate_only_identical_v2_pools(self):
+        from types import SimpleNamespace
+
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            _FixedScoreMetadataWorkspace,
+        )
+
+        manager = TriAttention.__new__(TriAttention)
+        manager.kv_cache_manager = SimpleNamespace(
+            layer_offsets={10: 100, 11: 101, 12: 102},
+            layer_to_pool_mapping_dict={100: 3, 101: 3, 102: 4},
+        )
+        representatives = [0, 1, 2]
+        global_layers = [10, 11, 12]
+
+        keys = manager._page_table_pool_keys(representatives, global_layers)
+        unique_global, slots = _FixedScoreMetadataWorkspace._page_table_slot_layout(
+            representatives,
+            global_layers,
+            keys,
+        )
+
+        assert keys == [("pool", 3), ("pool", 3), ("pool", 4)]
+        assert unique_global == (10, 12)
+        assert slots == {0: 0, 1: 0, 2: 1}
+
+    def test_page_table_pool_keys_fall_back_to_unique_layers(self):
+        from types import SimpleNamespace
+
+        manager = TriAttention.__new__(TriAttention)
+        manager.kv_cache_manager = SimpleNamespace()
+
+        assert manager._page_table_pool_keys([0, 2], [10, 11, 12]) == [
+            ("layer", 10),
+            ("layer", 12),
+        ]
+
+    def test_v2_batch_indices_only_convert_live_or_requested_blocks(self):
+        from types import SimpleNamespace
+
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+        from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
+
+        manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+        manager.kv_factor = 2
+        manager.index_scales = [4]
+        manager.kv_cache_map = {
+            7: SimpleNamespace(
+                num_blocks=3,
+                get_base_page_indices=lambda pool_id: [4, BAD_PAGE_INDEX, 8, 99, 100],
+            )
+        }
+
+        assert manager._get_batch_cache_indices_by_pool_id([7]) == [
+            [8, BAD_PAGE_INDEX, 16]
+        ]
+        assert manager._get_batch_cache_indices_by_pool_id(
+            [7], num_blocks_per_seq=[2]
+        ) == [[8, BAD_PAGE_INDEX]]
+
+    def test_fixed_stage_rejects_bad_page_in_active_prefix_without_compacting_ordinals(self):
+        from unittest import mock
+
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            _FixedScoreMetadataWorkspace,
+        )
+
+        workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
+        workspace.device = torch.device("cuda")
+        workspace.max_requests = 1
+        workspace.stream = None
+        workspace.copy_pending = False
+        workspace.copy_done = mock.Mock()
+        workspace.global_representatives = (10,)
+        workspace.page_count = 2
+        stream = object()
+        get_batch = mock.Mock(return_value=[[7, -1]])
+
+        with (
+            mock.patch.object(torch.cuda, "current_stream", return_value=stream),
+            mock.patch.object(torch, "as_tensor") as as_tensor,
+        ):
+            assert not workspace.stage(get_batch, [42], [8.0])
+
+        get_batch.assert_called_once_with(
+            [42], 10, num_blocks_per_seq=[workspace.page_count]
+        )
+        as_tensor.assert_not_called()
+        workspace.copy_done.record.assert_not_called()
+
     def test_stage2_gate_requires_stage1_prewarm(self):
         import os
         from unittest import mock
@@ -1169,7 +1263,11 @@ class TestFixedScoreMetadata:
             mock.patch.object(torch, "sin") as sin,
             mock.patch.object(torch, "mean") as mean,
         ):
-            assert workspace.stage(lambda request_ids, layer: [[3]], [7], [8.0])
+            assert workspace.stage(
+                lambda request_ids, layer, num_blocks_per_seq=None: [[3]],
+                [7],
+                [8.0],
+            )
             add.assert_not_called()
             mul.assert_not_called()
             cos.assert_not_called()
@@ -1286,7 +1384,11 @@ class TestFixedScoreMetadata:
             12: [[2 * request + 1, 2 * request] for request in range(request_count)],
             13: [[15 - 2 * request, 14 - 2 * request] for request in range(request_count)],
         }
-        get_batch = mock.Mock(side_effect=lambda request_ids, layer: tables[layer])
+        def get_batch_side_effect(request_ids, layer, num_blocks_per_seq=None):
+            assert num_blocks_per_seq == [page_count] * request_count
+            return tables[layer]
+
+        get_batch = mock.Mock(side_effect=get_batch_side_effect)
         request_ids = list(range(request_count))
         round_starts = [float(9 + request) for request in request_ids]
 
@@ -1563,9 +1665,12 @@ class TestFixedScoreMetadata:
                 assert round_starts != previous_round_starts
             previous_by_request_count[request_count] = (tables, round_starts)
 
-            def get_batch_cache_indices(observed_ids, global_layer):
+            def get_batch_cache_indices(
+                observed_ids, global_layer, num_blocks_per_seq=None
+            ):
                 assert observed_ids == request_ids
                 assert global_layer == 10
+                assert num_blocks_per_seq == [page_count] * request_count
                 return tables
 
             assert workspace.stage(get_batch_cache_indices, request_ids, round_starts)
@@ -1721,7 +1826,8 @@ class TestFixedScoreMetadata:
             cache.batch_calls = []
             cache.get_buffers = lambda layer, **kwargs: pools[layer]
 
-            def get_batch(request_ids, layer):
+            def get_batch(request_ids, layer, num_blocks_per_seq=None):
+                assert num_blocks_per_seq == [3] * len(request_ids)
                 cache.batch_calls.append((tuple(request_ids), layer))
                 return [list(page_lists[layer]) for _ in request_ids]
 
@@ -3986,8 +4092,24 @@ class TestKernelMaskedSwa:
         )
         request = SimpleNamespace(py_request_id=7)
 
-        assert mgr._resolve_page_ids(request, 0) == [10, 11]
-        get_batch.assert_called_once_with([7], 9)
+        assert mgr._resolve_page_ids(request, 0, page_count=2) == [10, 11]
+        get_batch.assert_called_once_with([7], 9, num_blocks_per_seq=[2])
+
+    def test_page_lookup_rejects_bad_page_inside_required_prefix(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        get_batch = mock.Mock(return_value=[[10, -1]])
+        mgr = TriAttention.__new__(TriAttention)
+        mgr.kv_cache_manager = SimpleNamespace(
+            pp_layers=[9],
+            num_layers=36,
+            get_batch_cache_indices=get_batch,
+        )
+        request = SimpleNamespace(py_request_id=7)
+
+        assert mgr._resolve_page_ids(request, 0, page_count=2) is None
+        get_batch.assert_called_once_with([7], 9, num_blocks_per_seq=[2])
 
     def test_page_lookup_failure_is_not_hidden(self):
         from types import SimpleNamespace

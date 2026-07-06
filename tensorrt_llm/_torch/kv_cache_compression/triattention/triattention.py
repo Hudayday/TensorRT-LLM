@@ -963,6 +963,26 @@ class _FixedScoreStreamMismatch(RuntimeError):
 class _FixedScoreMetadataWorkspace:
     """Pool-bound fixed score metadata with one nonblocking page-table upload."""
 
+    @staticmethod
+    def _page_table_slot_layout(
+        page_representatives: List[int],
+        global_layers: List[int],
+        page_table_keys: List[object],
+    ) -> Tuple[Tuple[int, ...], Dict[int, int]]:
+        if len(page_table_keys) != len(page_representatives):
+            raise ValueError("page-table keys must match the representative count")
+        unique_global_representatives = []
+        key_to_slot = {}
+        representative_slots = {}
+        for representative, key in zip(page_representatives, page_table_keys):
+            slot = key_to_slot.get(key)
+            if slot is None:
+                slot = len(key_to_slot)
+                key_to_slot[key] = slot
+                unique_global_representatives.append(global_layers[representative])
+            representative_slots[representative] = slot
+        return tuple(unique_global_representatives), representative_slots
+
     def __init__(
         self,
         layer_pools: List[torch.Tensor],
@@ -979,6 +999,7 @@ class _FixedScoreMetadataWorkspace:
         freq_scale_sq: torch.Tensor,
         offsets: torch.Tensor,
         omega: torch.Tensor,
+        page_table_keys: Optional[List[object]] = None,
     ) -> None:
         from .triattention_kernels import _FixedScoreGroup
 
@@ -996,11 +1017,20 @@ class _FixedScoreMetadataWorkspace:
         freq_scale_sq = freq_scale_sq.to(device=self.device, dtype=torch.float32).contiguous()
         offsets = offsets.to(device=self.device, dtype=torch.float32).contiguous()
         omega = omega.to(device=self.device, dtype=torch.float32).contiguous()
-        self.global_representatives = tuple(global_layers[layer] for layer in page_representatives)
-        self.representative_slots = {
-            representative: slot for slot, representative in enumerate(page_representatives)
-        }
-        self.signature = self._signature(layer_pools, dense_groups, page_representatives)
+        if page_table_keys is None:
+            page_table_keys = list(range(len(page_representatives)))
+        self.global_representatives, self.representative_slots = (
+            self._page_table_slot_layout(
+                page_representatives,
+                global_layers,
+                page_table_keys,
+            )
+        )
+        self.page_table_keys = tuple(page_table_keys)
+        self.signature = (
+            self.page_table_keys,
+            self._signature(layer_pools, dense_groups, page_representatives),
+        )
         tokens_per_block = int(layer_pools[page_representatives[0]].shape[3])
         self.page_count = (seq_len + tokens_per_block) // tokens_per_block
         if any(
@@ -1009,7 +1039,7 @@ class _FixedScoreMetadataWorkspace:
             for layer in page_representatives
         ):
             raise ValueError("fixed score metadata requires a uniform page count")
-        page_shape = (len(page_representatives), max_requests, self.page_count)
+        page_shape = (len(self.global_representatives), max_requests, self.page_count)
         self.page_ids_host = torch.empty(
             page_shape, dtype=torch.int64, device="cpu", pin_memory=True
         )
@@ -1091,7 +1121,10 @@ class _FixedScoreMetadataWorkspace:
         representatives: List[int],
     ) -> bool:
         try:
-            return self.signature == self._signature(layer_pools, dense_groups, representatives)
+            return self.signature == (
+                self.page_table_keys,
+                self._signature(layer_pools, dense_groups, representatives),
+            )
         except (AttributeError, IndexError, KeyError):
             return False
 
@@ -1122,10 +1155,16 @@ class _FixedScoreMetadataWorkspace:
         if self.copy_pending and not self.copy_done.query():
             return False
         rows_by_group = []
+        num_blocks_per_seq = [self.page_count] * request_count
         for global_layer in self.global_representatives:
-            rows = get_batch_cache_indices(request_ids, global_layer)
-            rows = [[int(page) for page in row if int(page) >= 0] for row in rows]
-            if len(rows) != request_count or any(len(row) != self.page_count for row in rows):
+            rows = get_batch_cache_indices(
+                request_ids,
+                global_layer,
+                num_blocks_per_seq=num_blocks_per_seq,
+            )
+            if len(rows) != request_count or any(
+                len(row) != self.page_count or any(page < 0 for page in row) for row in rows
+            ):
                 return False
             rows_by_group.append(rows)
 
@@ -1929,11 +1968,12 @@ class TriAttention(BaseKVCacheCompressionManager):
                 representatives.extend(
                     layer for layer in swa_layers if layer not in representatives
                 )
+                global_layers = self._local_to_global_layers(num_layers)
                 score_workspace = _FixedScoreMetadataWorkspace(
                     layer_pools,
                     storage_groups,
                     representatives,
-                    self._local_to_global_layers(num_layers),
+                    global_layers,
                     int(self.kv_cache_manager.max_batch_size),
                     seq_len,
                     int(self._H),
@@ -1944,6 +1984,10 @@ class TriAttention(BaseKVCacheCompressionManager):
                     self._freq_scale_sq,
                     self._offsets,
                     self.calibration["omega"],
+                    page_table_keys=self._page_table_pool_keys(
+                        representatives,
+                        global_layers,
+                    ),
                 )
                 score_workspace.prewarm_key = key
                 self._fixed_score_workspaces[key] = score_workspace
@@ -2519,9 +2563,14 @@ class TriAttention(BaseKVCacheCompressionManager):
         for layer_idx in layer_indices:
             global_layer = self._global_layer_id(layer_idx, num_layers)
             pool = get_buffers(global_layer, kv_layout="HND")
-            page_ids = self._resolve_page_ids(request, layer_idx)
             if pool is None:
                 raise RuntimeError(f"Missing KV pool for attention layer {global_layer}")
+            tokens_per_block = int(pool.shape[3])
+            page_ids = self._resolve_page_ids(
+                request,
+                layer_idx,
+                (seq_len + tokens_per_block) // tokens_per_block,
+            )
             if not page_ids:
                 raise RuntimeError(
                     f"Missing KV page ids for attention layer {global_layer} "
@@ -3008,12 +3057,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         get_buffers = getattr(mgr, "get_buffers", None)
         if get_buffers is None:
             raise RuntimeError("TriAttention requires KVCacheManagerV2.get_buffers()")
-        page_ids = self._resolve_page_ids(request, layer_idx)
-        if not page_ids:
-            raise RuntimeError(
-                f"Missing KV page ids for local attention layer {layer_idx} "
-                f"of request {request.py_request_id}"
-            )
         num_layers = self._num_layers_from_manager()
         if num_layers is None:
             raise RuntimeError("TriAttention could not resolve the local attention layer count")
@@ -3021,7 +3064,17 @@ class TriAttention(BaseKVCacheCompressionManager):
         pool = get_buffers(global_layer, kv_layout="HND")
         if pool is None:
             raise RuntimeError(f"Missing KV pool for attention layer {global_layer}")
-        tokens_per_block = pool.shape[3]
+        tokens_per_block = int(pool.shape[3])
+        page_ids = self._resolve_page_ids(
+            request,
+            layer_idx,
+            (seq_len + tokens_per_block) // tokens_per_block,
+        )
+        if not page_ids:
+            raise RuntimeError(
+                f"Missing KV page ids for local attention layer {layer_idx} "
+                f"of request {request.py_request_id}"
+            )
         page_ids_t = torch.as_tensor(page_ids, device=pool.device, dtype=torch.long)
         request_pages = pool[page_ids_t]
         num_pages, kv_factor, num_kv_heads, _, head_dim = request_pages.shape
@@ -3097,6 +3150,25 @@ class TriAttention(BaseKVCacheCompressionManager):
             return None
         return workspace
 
+    def _page_table_pool_keys(
+        self,
+        representatives: List[int],
+        global_layers: List[int],
+    ) -> List[object]:
+        """Return stable V2-pool keys, or unique layer keys when unavailable."""
+        manager = self.kv_cache_manager
+        layer_offsets = getattr(manager, "layer_offsets", None)
+        layer_to_pool = getattr(manager, "layer_to_pool_mapping_dict", None)
+        if layer_offsets is None or layer_to_pool is None:
+            return [("layer", global_layers[layer]) for layer in representatives]
+        try:
+            return [
+                ("pool", int(layer_to_pool[layer_offsets[global_layers[layer]]]))
+                for layer in representatives
+            ]
+        except (IndexError, KeyError, TypeError, ValueError):
+            return [("layer", global_layers[layer]) for layer in representatives]
+
     def _attach_page_ids(
         self,
         prepared: List[dict],
@@ -3141,7 +3213,12 @@ class TriAttention(BaseKVCacheCompressionManager):
             request_id = item["request_id"]
             item["page_ids"] = {}
             for layer in required_layers:
-                page_ids = self._resolve_page_ids(request, layer)
+                tokens_per_block = int(layer_pools[layer].shape[3])
+                page_ids = self._resolve_page_ids(
+                    request,
+                    layer,
+                    (item["seq_len"] + tokens_per_block) // tokens_per_block,
+                )
                 if not page_ids:
                     raise RuntimeError(
                         f"Missing KV page ids for attention layer {global_layers[layer]} "
@@ -3774,7 +3851,12 @@ class TriAttention(BaseKVCacheCompressionManager):
     # V2-manager cache access + physical eviction (HND physical layout)  #
     # ------------------------------------------------------------------ #
 
-    def _resolve_page_ids(self, request: "LlmRequest", layer_idx: int) -> Optional[List[int]]:
+    def _resolve_page_ids(
+        self,
+        request: "LlmRequest",
+        layer_idx: int,
+        page_count: Optional[int] = None,
+    ) -> Optional[List[int]]:
         """Return the page (block) ids that hold THIS request's KV for one layer.
 
         The V2 KV cache is PAGED: a request's tokens live in several (possibly
@@ -3787,8 +3869,10 @@ class TriAttention(BaseKVCacheCompressionManager):
         returns; the key/value split is a SEPARATE axis (kv_factor, dim 1) that
         callers index on their own. We do NOT divide or rescale the ids here.
 
-        Returns ``None`` when V2 has no page metadata for the request. Negative
-        ids (unallocated slots) are filtered out.
+        Returns ``None`` when V2 has no valid page metadata for the request.
+        Padded tail slots are excluded by V2's live/requested-block bound. A
+        negative id inside the required prefix is an invariant violation; it
+        must not be removed because that would shift every later block ordinal.
         """
         mgr = self.kv_cache_manager
         get_batch = getattr(mgr, "get_batch_cache_indices", None)
@@ -3798,14 +3882,23 @@ class TriAttention(BaseKVCacheCompressionManager):
                 if num_layers is None:
                     return None
                 global_layer = self._global_layer_id(layer_idx, num_layers)
-                batch = get_batch([request.py_request_id], global_layer)
+                kwargs = (
+                    {"num_blocks_per_seq": [page_count]}
+                    if page_count is not None
+                    else {}
+                )
+                batch = get_batch([request.py_request_id], global_layer, **kwargs)
             except Exception as exc:
                 raise RuntimeError(
                     f"Failed to resolve KV pages for local layer {layer_idx} "
                     f"of request {request.py_request_id}"
                 ) from exc
             if batch:
-                page_ids = [int(p) for p in batch[0] if int(p) >= 0]
+                page_ids = batch[0]
+                if page_count is not None and len(page_ids) != page_count:
+                    return None
+                if any(page < 0 for page in page_ids):
+                    return None
                 return page_ids or None
         return None
 
