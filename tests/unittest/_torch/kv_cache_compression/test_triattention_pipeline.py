@@ -963,7 +963,7 @@ class TestStepEndHookRefactor:
         manager._validate_v2_compatibility()
 
     @pytest.mark.parametrize("mode", ["draft_target", "pard"])
-    def test_other_paged_draft_length_contracts_are_not_rejected(self, mode):
+    def test_unvalidated_paged_draft_tail_contracts_remain_fail_closed(self, mode):
         from tensorrt_llm.llmapi.llm_args import DraftTargetDecodingConfig, PARDDecodingConfig
 
         if mode == "draft_target":
@@ -981,7 +981,8 @@ class TestStepEndHookRefactor:
             draft_kv_cache_manager=_make_fake_v2(is_draft=True),
         )
 
-        manager._validate_v2_compatibility()
+        with pytest.raises(ValueError, match="has not validated.*target-tail"):
+            manager._validate_v2_compatibility()
 
     def test_linear_eagle3_one_model_target_only_contract_is_accepted(self):
         from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig
@@ -1005,7 +1006,7 @@ class TestStepEndHookRefactor:
         [
             (
                 {"eagle3_one_model": False},
-                "requires DFlash private context K/V or standard paged draft attention",
+                "has not validated.*target-tail",
             ),
             (
                 {"use_dynamic_tree": True, "dynamic_tree_max_topK": 2},
