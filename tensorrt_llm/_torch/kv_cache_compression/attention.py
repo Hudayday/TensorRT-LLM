@@ -144,6 +144,11 @@ class KVCacheCompressionTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self.target_host_total_kv_lens is not None:
             self.host_total_kv_lens = self.target_host_total_kv_lens
         super().prepare()
+        # Older TRT-LLM bases bind these views directly in prepare() instead of
+        # routing through _bind_runtime_views(). Capture the authoritative views
+        # after the base call so the compression metadata works with both paths.
+        self.target_kv_lens_cuda_runtime = self.kv_lens_cuda_runtime
+        self.target_kv_lens_runtime = self.kv_lens_runtime
         self.target_host_total_kv_lens = self.host_total_kv_lens
         delta = self.draft_kv_length_delta
         if delta is None:
@@ -162,16 +167,21 @@ class KVCacheCompressionTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         self._refresh_draft_kv_length_domain(refresh_host=True)
 
+    def on_update_kv_lens(self) -> None:
+        """Follow in-place KV-length mutations from vanilla speculative decoding."""
+        super().on_update_kv_lens()
+        self._refresh_device_kv_length_domain()
+
     def update_for_spec_dec(self) -> None:
         """Follow native speculative mutations of ``kv_lens_cuda``."""
         super().update_for_spec_dec()
-        if self.draft_kv_length_delta is None:
-            return
-        self.target_kv_lens_cuda_runtime = self.kv_lens_cuda[: self.num_seqs]
-        self._refresh_draft_kv_length_domain(refresh_host=False)
+        self._refresh_device_kv_length_domain()
 
     def restore_from_spec_dec(self) -> None:
         super().restore_from_spec_dec()
+        self._refresh_device_kv_length_domain()
+
+    def _refresh_device_kv_length_domain(self) -> None:
         if self.draft_kv_length_delta is None:
             return
         self.target_kv_lens_cuda_runtime = self.kv_lens_cuda[: self.num_seqs]

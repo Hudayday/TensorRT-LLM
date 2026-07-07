@@ -6,7 +6,7 @@ from unittest import mock
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.kv_cache_compression.attention import (
     KVCacheCompressionTrtllmAttention,
     KVCacheCompressionTrtllmAttentionMetadata,
@@ -146,6 +146,30 @@ def test_complete_target_and_draft_length_domains_are_independent():
     assert metadata.host_total_kv_lens is metadata.target_host_total_kv_lens
 
 
+def test_prepare_captures_runtime_views_from_legacy_base_path():
+    metadata, _, _ = _metadata_with_separate_draft_cache()
+    target_cuda = torch.tensor([10, 20], dtype=torch.int32)
+    target_host = torch.tensor([10, 20], dtype=torch.int32)
+    target_total = torch.tensor([10, 20], dtype=torch.int32)
+    metadata.target_kv_lens_cuda_runtime = None
+    metadata.target_kv_lens_runtime = None
+
+    def legacy_prepare(instance):
+        instance.kv_lens_cuda_runtime = target_cuda
+        instance.kv_lens_runtime = target_host
+        instance.host_total_kv_lens = target_total
+
+    with mock.patch.object(TrtllmAttentionMetadata, "prepare", legacy_prepare):
+        metadata.prepare()
+
+    assert metadata.target_kv_lens_cuda_runtime is target_cuda
+    assert metadata.target_kv_lens_runtime is target_host
+    assert metadata.target_host_total_kv_lens is target_total
+    assert metadata.draft_kv_lens_cuda_runtime.tolist() == [10, 57]
+    assert metadata.draft_kv_lens_runtime.tolist() == [10, 57]
+    assert metadata.draft_host_total_kv_lens.tolist() == [10, 57]
+
+
 def test_native_spec_update_refreshes_device_domain_once():
     metadata, _, draft_manager = _metadata_with_separate_draft_cache()
     metadata._refresh_draft_kv_length_domain(refresh_host=True)
@@ -153,6 +177,21 @@ def test_native_spec_update_refreshes_device_domain_once():
     metadata.kv_lens_cuda[1].add_(1)
 
     metadata.update_for_spec_dec()
+    metadata.kv_cache_manager = draft_manager
+    metadata.activate_kv_length_domain()
+
+    assert metadata.target_kv_lens_cuda_runtime.data_ptr() == metadata.kv_lens_cuda.data_ptr()
+    assert metadata.kv_lens_cuda_runtime.tolist() == [41, 130]
+    assert metadata.kv_lens_runtime.tolist() == [41, 129]
+
+
+def test_vanilla_spec_update_refreshes_device_domain_once():
+    metadata, _, draft_manager = _metadata_with_separate_draft_cache()
+    metadata._refresh_draft_kv_length_domain(refresh_host=True)
+    metadata.kv_lens_cuda = metadata.kv_lens_cuda.clone()
+    metadata.kv_lens_cuda[1].add_(1)
+
+    metadata.on_update_kv_lens()
     metadata.kv_cache_manager = draft_manager
     metadata.activate_kv_length_domain()
 
