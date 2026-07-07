@@ -58,8 +58,9 @@ class FilteredTopKKernelVarlen:
         self.num_ctas_per_row = num_ctas_per_row
         self.merge_blocks = merge_blocks
 
-        # Note: now we only support top_k <= 2048, we could change the code here to support larger top_k.
-        self.filtered_topk_max_k = 2048
+        # The filtered-candidate staging supports top_k <= 4096. At that bound,
+        # the Uint16 index buffer occupies 8 KiB of shared memory.
+        self.filtered_topk_max_k = 4096
         # 8 bits for radix-based filter.
         self.radix = 256
 

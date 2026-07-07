@@ -130,6 +130,27 @@ def _build_swa_rebase_copy(
     return source, destination
 
 
+def _topk_indices_into(
+    backend: str,
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    indices_i32: torch.Tensor,
+    keep_count: int,
+) -> None:
+    """Write per-row top-k indices into ``indices_i32`` via the backend op.
+
+    ``cute_dsl_topk`` reuses the exact indexer_topk dataflow (int32 output
+    buffer written in place) with the Blackwell CuTE-DSL kernel, which after
+    raising ``filtered_topk_max_k`` to 4096 supports our budget range.
+    """
+    if backend == "cute_dsl_topk":
+        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+            scores, seq_lens, indices_i32, keep_count, 1
+        )
+    else:
+        torch.ops.trtllm.indexer_topk_decode(scores, seq_lens, indices_i32, 1, keep_count)
+
+
 class _FixedUnionWorkspace:
     """Persistent buffers for one request's fixed-shape union eviction.
 
@@ -200,7 +221,7 @@ class _FixedUnionWorkspace:
     ) -> None:
         if rows <= 0 or width <= keep_count or keep_count <= 0:
             raise ValueError("fixed union workspace requires rows > 0 and width > keep_count > 0")
-        if selection_backend not in ("torch_topk", "indexer_topk"):
+        if selection_backend not in ("torch_topk", "indexer_topk", "cute_dsl_topk"):
             raise ValueError(f"unsupported fixed union selection backend: {selection_backend}")
         self.rows = rows
         self.width = width
@@ -226,7 +247,7 @@ class _FixedUnionWorkspace:
         self.sort_order = torch.empty_like(self.final_indices)
         self.keep = torch.empty(self.total_keep, dtype=torch.long, device=device)
         self.keep[:prompt_len].copy_(torch.arange(prompt_len, dtype=torch.long, device=device))
-        if selection_backend == "indexer_topk":
+        if selection_backend in ("indexer_topk", "cute_dsl_topk"):
             self.row_seq_lens = torch.full((rows,), width, dtype=torch.int32, device=device)
             self.row_top_indices_i32 = torch.empty(
                 (rows, keep_count), dtype=torch.int32, device=device
@@ -335,7 +356,7 @@ class _FixedUnionWorkspace:
             self.sorted_indices,
             self.sort_order,
         )
-        if self.selection_backend == "indexer_topk":
+        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
             tensors += (
                 self.row_seq_lens,
                 self.row_top_indices_i32,
@@ -379,7 +400,7 @@ class _FixedUnionWorkspace:
             + keep_count * dtype_bytes
             + 3 * keep_count * long_bytes
         )
-        if selection_backend == "indexer_topk":
+        if selection_backend in ("indexer_topk", "cute_dsl_topk"):
             scratch_bytes += (
                 rows * int_bytes
                 + rows * keep_count * int_bytes
@@ -422,7 +443,7 @@ class _FixedUnionWorkspace:
         slot.final_indices = self.final_indices
         slot.sorted_indices = self.sorted_indices
         slot.sort_order = self.sort_order
-        if self.selection_backend == "indexer_topk":
+        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
             slot.row_seq_lens = self.row_seq_lens
             slot.row_top_indices_i32 = self.row_top_indices_i32
             slot.token_indices = self.token_indices
@@ -454,12 +475,12 @@ class _FixedUnionWorkspace:
             dim=0,
             out=(self.combined, self.combined_argmax),
         )
-        if self.selection_backend == "indexer_topk":
-            torch.ops.trtllm.indexer_topk_decode(
+        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
+            _topk_indices_into(
+                self.selection_backend,
                 per_head_scores,
                 self.row_seq_lens,
                 self.row_top_indices_i32,
-                1,
                 self.keep_count,
             )
             self.row_top_indices.copy_(self.row_top_indices_i32)
@@ -474,7 +495,7 @@ class _FixedUnionWorkspace:
             )
         self.union_mask.zero_()
         self.union_mask.scatter_(0, self.row_top_indices.reshape(-1), True)
-        if self.selection_backend == "indexer_topk":
+        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
             torch.where(
                 self.union_mask,
                 self.token_indices,
@@ -502,11 +523,11 @@ class _FixedUnionWorkspace:
                 dtype=torch.int32,
                 out=self.union_count[0],
             )
-            torch.ops.trtllm.indexer_topk_decode(
+            _topk_indices_into(
+                self.selection_backend,
                 self.candidates.view(1, self.width),
                 self.union_count,
                 self.final_indices_i32.view(1, self.keep_count),
-                1,
                 self.keep_count,
             )
             self.final_relative_indices.copy_(self.final_indices_i32)
@@ -699,7 +720,7 @@ class _BatchedFixedUnionWorkspace:
             raise ValueError("cross-request selection requires rows > 0 and width > keep_count > 0")
         if max_requests <= 0:
             raise ValueError("cross-request selection requires a positive request capacity")
-        if selection_backend not in ("torch_topk", "indexer_topk"):
+        if selection_backend not in ("torch_topk", "indexer_topk", "cute_dsl_topk"):
             raise ValueError(f"unsupported cross-request selection backend: {selection_backend}")
         self.max_requests = max_requests
         self.selection_backend = selection_backend
@@ -748,7 +769,7 @@ class _BatchedFixedUnionWorkspace:
         if prompt_len:
             prompt = torch.arange(prompt_len, dtype=torch.long, device=self.device)
             self.keep[:, :prompt_len].copy_(prompt.expand(max_requests, -1))
-        if selection_backend == "indexer_topk":
+        if selection_backend in ("indexer_topk", "cute_dsl_topk"):
             self.row_seq_lens = torch.full(
                 (max_requests * rows,), width, dtype=torch.int32, device=self.device
             )
@@ -803,7 +824,7 @@ class _BatchedFixedUnionWorkspace:
             + width
         )
         total = max_requests * per_request + dtype_bytes + width * long_bytes
-        if selection_backend == "indexer_topk":
+        if selection_backend in ("indexer_topk", "cute_dsl_topk"):
             total += max_requests * (
                 rows * int_bytes
                 + rows * keep_count * int_bytes
@@ -843,7 +864,7 @@ class _BatchedFixedUnionWorkspace:
         workspace.sorted_indices = self.sorted_indices[request_index]
         workspace.sort_order = self.sort_order[request_index]
         workspace.keep = self.keep[request_index]
-        if self.selection_backend == "indexer_topk":
+        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
             row_start = request_index * self.rows
             workspace.row_seq_lens = self.row_seq_lens[row_start : row_start + self.rows]
             workspace.row_top_indices_i32 = self.row_top_indices_i32[request_index]
@@ -891,7 +912,7 @@ class _BatchedFixedUnionWorkspace:
             ("token_indices", self.token_indices),
             ("invalid_mask", self.invalid_mask),
         )
-        if self.selection_backend == "indexer_topk":
+        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
             tensors += (
                 ("row_seq_lens", self.row_seq_lens),
                 ("row_top_indices_i32", self.row_top_indices_i32),
@@ -982,17 +1003,17 @@ class _BatchedFixedUnionWorkspace:
         sort_order = self.sort_order[:request_count]
 
         torch.max(input_scores, dim=1, out=(combined, combined_argmax))
-        if self.selection_backend == "indexer_topk":
+        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
             row_count = request_count * self.rows
             row_indices_i32 = self.row_top_indices_i32[:request_count]
             self.row_seq_lens[:row_count].view(request_count, self.rows).copy_(
                 valid_widths.view(request_count, 1).expand(-1, self.rows)
             )
-            torch.ops.trtllm.indexer_topk_decode(
+            _topk_indices_into(
+                self.selection_backend,
                 input_scores.view(row_count, self.width),
                 self.row_seq_lens[:row_count],
                 row_indices_i32.view(row_count, self.keep_count),
-                1,
                 self.keep_count,
             )
             row_top_indices.copy_(row_indices_i32)
@@ -1007,7 +1028,7 @@ class _BatchedFixedUnionWorkspace:
             )
         union_mask.zero_()
         union_mask.scatter_(1, row_top_indices.reshape(request_count, -1), True)
-        if self.selection_backend == "indexer_topk":
+        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
             union_physical_indices = self.union_physical_indices[:request_count]
             union_indices_sorted = self.union_indices_sorted[:request_count]
             union_sort_order = self.union_sort_order[:request_count]
@@ -1033,11 +1054,11 @@ class _BatchedFixedUnionWorkspace:
             )
             torch.gather(combined, 1, candidate_gather_indices, out=candidates)
             torch.sum(union_mask, dim=1, dtype=torch.int32, out=union_counts)
-            torch.ops.trtllm.indexer_topk_decode(
+            _topk_indices_into(
+                self.selection_backend,
                 candidates,
                 union_counts,
                 final_indices_i32,
-                1,
                 self.keep_count,
             )
             final_relative_indices.copy_(final_indices_i32)
@@ -1250,6 +1271,8 @@ class _FixedScoreMetadataWorkspace:
         self.copy_done = torch.cuda.Event()
         self.copy_pending = False
         self.stream = None
+        self._bulk_offsets_dst: Optional[torch.Tensor] = None
+        self._bulk_stage_logged = False
         self.prewarm_key: Optional[tuple] = None
 
     def _signature(
@@ -1295,7 +1318,7 @@ class _FixedScoreMetadataWorkspace:
 
     def stage(
         self,
-        get_batch_cache_indices,
+        cache_source,
         request_ids: List[int],
         round_starts: List[float],
         seq_lens: Optional[List[int]] = None,
@@ -1326,35 +1349,53 @@ class _FixedScoreMetadataWorkspace:
             seq_len <= 0 or seq_len > self.bucket_seq_len for seq_len in seq_lens
         ):
             return False
-        rows_by_group = []
         num_blocks_per_seq = [
             (seq_len + self.tokens_per_block - 1) // self.tokens_per_block for seq_len in seq_lens
         ]
-        for global_layer in self.global_representatives:
-            rows = get_batch_cache_indices(
-                request_ids,
-                global_layer,
-                num_blocks_per_seq=num_blocks_per_seq,
-            )
-            if len(rows) != request_count:
-                return False
-            padded_rows = []
-            for row, live_page_count in zip(rows, num_blocks_per_seq):
-                pages = [int(page) for page in row]
-                if len(pages) != live_page_count or not pages or any(page < 0 for page in pages):
+        if callable(cache_source):
+            manager = None
+            get_batch_cache_indices = cache_source
+        else:
+            manager = cache_source
+            get_batch_cache_indices = manager.get_batch_cache_indices
+        staged_bulk = False
+        if manager is not None:
+            staged_bulk = self._stage_page_tables_bulk(manager, request_ids)
+            if staged_bulk and os.environ.get("TRIATTN_PAGE_TABLE_CHECK") == "1":
+                self._assert_bulk_matches_legacy(manager, request_ids, num_blocks_per_seq)
+        if not staged_bulk:
+            rows_by_group = []
+            for global_layer in self.global_representatives:
+                rows = get_batch_cache_indices(
+                    request_ids,
+                    global_layer,
+                    num_blocks_per_seq=num_blocks_per_seq,
+                )
+                if len(rows) != request_count:
                     return False
-                padded_rows.append(pages + [pages[-1]] * (self.page_count - live_page_count))
-            rows_by_group.append(padded_rows)
-
-        self.page_ids_host[:, :request_count].copy_(
-            torch.as_tensor(rows_by_group, dtype=torch.int64)
-        )
+                padded_rows = []
+                for row, live_page_count in zip(rows, num_blocks_per_seq):
+                    pages = [int(page) for page in row]
+                    if (
+                        len(pages) != live_page_count
+                        or not pages
+                        or any(page < 0 for page in pages)
+                    ):
+                        return False
+                    padded_rows.append(
+                        pages + [pages[-1]] * (self.page_count - live_page_count)
+                    )
+                rows_by_group.append(padded_rows)
+            self.page_ids_host[:, :request_count].copy_(
+                torch.as_tensor(rows_by_group, dtype=torch.int64)
+            )
         self.round_starts_host[:request_count].copy_(
             torch.as_tensor(round_starts, dtype=torch.float32)
         )
         self.valid_seq_lens_host[:request_count].copy_(torch.as_tensor(seq_lens, dtype=torch.int32))
         try:
-            self.page_ids_device.copy_(self.page_ids_host, non_blocking=True)
+            if not staged_bulk:
+                self.page_ids_device.copy_(self.page_ids_host, non_blocking=True)
             self.round_starts_device.copy_(self.round_starts_host, non_blocking=True)
             self.valid_seq_lens_device.copy_(self.valid_seq_lens_host, non_blocking=True)
             self.fused_group.stage_lengths(self.valid_seq_lens_device, request_count)
@@ -1364,6 +1405,91 @@ class _FixedScoreMetadataWorkspace:
             self.copy_done.record(stream)
             self.copy_pending = True
         return True
+
+    def _stage_page_tables_bulk(self, manager, request_ids: List[int]) -> bool:
+        """ONE bulk block-offset copy replaces 36 x R host round-trips.
+
+        Reuses the exact attention-backend path (copy_batch_block_offsets over
+        the manager's persistent pinned host table): dst[pool, r, 0(K), :] holds
+        base_page * index_scales; our HND page index is that value // kv_factor
+        (the same formula _get_batch_cache_indices_by_pool_id applies on host).
+        """
+        try:
+            host_table = manager.host_kv_cache_block_offsets
+            kv_factor = int(manager.kv_factor)
+            layer_offsets = manager.layer_offsets
+            pool_of = manager.layer_to_pool_mapping_dict
+        except AttributeError:
+            return False
+        num_pools, _, _, max_blocks = host_table.shape
+        if max_blocks < self.page_count:
+            return False
+        request_count = len(request_ids)
+        bulk = self._bulk_offsets_dst
+        if bulk is None or bulk.shape[1] < self.max_requests:
+            bulk = torch.zeros(
+                num_pools,
+                self.max_requests,
+                2,
+                max_blocks,
+                dtype=host_table.dtype,
+                device=self.device,
+            )
+            self._bulk_offsets_dst = bulk
+        try:
+            manager.copy_batch_block_offsets(bulk, request_ids, 1, 0, request_count)
+            for slot, global_layer in enumerate(self.global_representatives):
+                pool_id = pool_of[layer_offsets[global_layer]]
+                self.page_ids_device[slot, :request_count].copy_(
+                    bulk[pool_id, :request_count, 0, : self.page_count] // kv_factor
+                )
+        except (AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+            logger.warning(
+                f"TriAttention bulk page-table staging failed; using the host path: {exc}"
+            )
+            return False
+        if not self._bulk_stage_logged:
+            self._bulk_stage_logged = True
+            logger.info(
+                "TriAttention bulk page-table staging engaged (copy_batch_block_offsets)"
+            )
+        return True
+
+    def _assert_bulk_matches_legacy(
+        self,
+        manager,
+        request_ids: List[int],
+        num_blocks_per_seq: List[int],
+    ) -> None:
+        """TRIATTN_PAGE_TABLE_CHECK=1: prove the bulk formula against the host
+        path on live data (used by validation runs, not production)."""
+        request_count = len(request_ids)
+        for slot, global_layer in enumerate(self.global_representatives):
+            rows = manager.get_batch_cache_indices(
+                request_ids,
+                global_layer,
+                num_blocks_per_seq=num_blocks_per_seq,
+            )
+            if len(rows) != request_count:
+                raise RuntimeError("legacy page-table staging returned the wrong request count")
+            for request_index, (row, live_page_count) in enumerate(
+                zip(rows, num_blocks_per_seq)
+            ):
+                pages = [int(page) for page in row]
+                if (
+                    len(pages) != live_page_count
+                    or not pages
+                    or any(page < 0 for page in pages)
+                ):
+                    raise RuntimeError("legacy page table contains BAD in its live prefix")
+                expected = torch.as_tensor(pages, dtype=torch.int64, device=self.device)
+                got = self.page_ids_device[
+                    slot, request_index, :live_page_count
+                ]
+                if not torch.equal(got, expected):
+                    raise RuntimeError(
+                        f"bulk page-table staging mismatch at representative {global_layer}"
+                    )
 
     def prepare_phase(self, request_count: int) -> None:
         """Prepare round-dependent score tensors on the active execution stream."""
@@ -1408,6 +1534,27 @@ class TriAttention(BaseKVCacheCompressionManager):
     # unsupported cases, so either boundary can fall back without changing the
     # retained set.
     _INDEXER_TOPK_MAX_K = 2048
+    _CUTE_DSL_TOPK_MAX_K = 4096  # filtered_topk_max_k staging raised 2048 -> 4096
+
+    def _selection_backend_for(self, width: int, keep_count: int) -> str:
+        """One decision point for the union-select backend.
+
+        ``TRIATTN_SELECT_BACKEND=cute_dsl`` opts into the Blackwell CuTE-DSL
+        radix top-k (correct + 3-5x vs torch.topk up to k=4096 after the
+        staging raise); otherwise the established indexer/torch routing.
+        """
+        if (
+            os.environ.get("TRIATTN_SELECT_BACKEND") == "cute_dsl"
+            and keep_count <= self._CUTE_DSL_TOPK_MAX_K
+            and hasattr(torch.ops.trtllm, "cute_dsl_indexer_topk_decode")
+        ):
+            return "cute_dsl_topk"
+        return (
+            "indexer_topk"
+            if self._indexer_topk_supported(width, keep_count)
+            else "torch_topk"
+        )
+
     _INDEXER_TOPK_SUBBLOCK = 2048
 
     def __init__(
@@ -1830,10 +1977,9 @@ class TriAttention(BaseKVCacheCompressionManager):
                         seq_len = self._confirmed_kv_lengths[rid]
                         prompt_len = min(int(request.py_prompt_len), seq_len)
                         keep_count = self._minimum_evictable_length(request, seq_len)
-                        selection_backend = (
-                            "indexer_topk"
-                            if self._indexer_topk_supported(seq_len - prompt_len, self.top_B)
-                            else "torch_topk"
+                        selection_backend = self._selection_backend_for(
+                            seq_len - prompt_len,
+                            self.top_B,
                         )
                         key = (prompt_len, keep_count, selection_backend)
                         graph_groups.setdefault(key, []).append((request, rid))
@@ -1930,12 +2076,10 @@ class TriAttention(BaseKVCacheCompressionManager):
         """Return a provenance key containing geometry but no request identity."""
         decode_width = future_seq_len - prompt_len
         use_fixed_workspace = self.top_B > self._INDEXER_TOPK_MAX_K
-        if use_fixed_workspace:
-            selection_backend = "fixed_union.torch_topk"
-        elif self._indexer_topk_supported(decode_width, self.top_B):
-            selection_backend = "eager_union.indexer_topk"
-        else:
-            selection_backend = "eager_union.torch_topk"
+        selection_backend = (
+            f"{'fixed_union' if use_fixed_workspace else 'eager_union'}."
+            f"{self._selection_backend_for(decode_width, self.top_B)}"
+        )
         if use_fixed_workspace:
             compaction_backend = (
                 "triton_tri_compact_fixed" if self._fixed_union_compaction_enabled else "disabled"
@@ -2373,11 +2517,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
             if decode_budget <= 0 or decode_width <= decode_budget:
                 raise ValueError("fixed shape selection bucket has no eviction work")
-            selection_backend = (
-                "indexer_topk"
-                if self._indexer_topk_supported(decode_width, decode_budget)
-                else "torch_topk"
-            )
+            selection_backend = self._selection_backend_for(decode_width, decode_budget)
             rows = sum(int(scores_by_layer[layer].shape[0]) for layer in dense_layers)
             first_scores = scores_by_layer[dense_layers[0]]
             bank_bytes = _FixedUnionWorkspace.planned_selection_bank_nbytes(
@@ -3090,7 +3230,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             valid_widths.append(valid_width)
 
         actual_backends = {
-            "indexer_topk" if self._indexer_topk_supported(width, self.top_B) else "torch_topk"
+            self._selection_backend_for(width, self.top_B)
             for width in valid_widths
         }
         if actual_backends != {workspace.selection_backend}:
@@ -3436,9 +3576,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         prompt_len = next(iter(prompt_lens))
         max_seq_len = max(seq_lens)
         actual_backends = {
-            "indexer_topk"
-            if self._indexer_topk_supported(seq_len - prompt_len, self.top_B)
-            else "torch_topk"
+            self._selection_backend_for(seq_len - prompt_len, self.top_B)
             for seq_len in seq_lens
         }
         if len(actual_backends) != 1:
@@ -3500,7 +3638,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         if workspace is not None:
             try:
                 fixed = workspace.stage(
-                    get_batch,
+                    self.kv_cache_manager,
                     [item["request_id"] for item in prepared],
                     [item["round_start"] for item in prepared],
                     [item["seq_len"] for item in prepared],
@@ -3577,9 +3715,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         bucket_seq_len = score_workspace.bucket_seq_len
         width = bucket_seq_len - prompt_len
         actual_backends = {
-            "indexer_topk"
-            if self._indexer_topk_supported(seq_len - prompt_len, self.top_B)
-            else "torch_topk"
+            self._selection_backend_for(seq_len - prompt_len, self.top_B)
             for seq_len in seq_lens
         }
         if len(actual_backends) != 1:
@@ -4140,7 +4276,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             # Backend "cpp" reuses the upstream single-pass attention compact
             # kernel (1x memory traffic, wins at high batch); anything it
             # cannot take (kv_factor != 2, missing op) falls back to Triton.
-            use_cpp = getattr(self, "_compact_backend", "torch") == "cpp"
+            use_cpp = self._compact_backend == "cpp"
             for lid, (pl, kl, sl) in union_by_layer.items():
                 with nvtx_range("triattention.compact", color="purple"):
                     if use_cpp and cpp_sparse_compact_supported(layer_pools[lid]):

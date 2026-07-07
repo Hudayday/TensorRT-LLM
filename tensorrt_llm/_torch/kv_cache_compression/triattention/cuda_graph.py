@@ -20,6 +20,8 @@ selection, and physical compaction. Scheduler decisions, page-table uploads,
 request bookkeeping, and KV-cache resize remain on the host path.
 """
 
+import os
+
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
@@ -160,6 +162,57 @@ class FixedBatchedCompactionWorkspace:
                 )
             )
 
+        # Optional cpp backend: ONE sparse_kv_cache_compact op launch per dense
+        # layer replaces the two-phase Triton pair. Uses the FULL keep list
+        # (prompt tokens have src == dst and the upstream kernel skips them),
+        # so no destination remap is needed. All buffers are fixed-shape and
+        # owned here; the launch path only issues copies + op calls (capture-safe).
+        first_dense_pool = layer_pools[self.dense_layers[0]]
+        cpp_num_kv_heads = int(first_dense_pool.shape[2]) if first_dense_pool.ndim == 5 else -1
+        self.cpp_backend = (
+            os.environ.get("TRIATTN_COMPACT_BACKEND") == "cpp"
+            and hasattr(torch.ops.trtllm, "sparse_kv_cache_compact")
+            and all(
+                layer_pools[layer].ndim == 5
+                and layer_pools[layer].shape[1] == 2
+                and int(layer_pools[layer].shape[2]) == cpp_num_kv_heads
+                and layer_pools[layer].is_contiguous()
+                for layer in self.dense_layers
+            )
+        )
+        if self.cpp_backend:
+            self.cpp_num_kv_heads = cpp_num_kv_heads
+            self.cpp_indices = torch.empty(
+                cpp_num_kv_heads,
+                self.request_count * self.keep_count,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.cpp_offsets = (
+                torch.arange(self.request_count + 1, dtype=torch.int32, device=self.device)
+                * self.keep_count
+            )
+            self.cpp_page_tables = {}
+            self.cpp_dense_ops = []
+            for layer in self.dense_layers:
+                representative = layer_group_representative[layer]
+                if representative not in self.cpp_page_tables:
+                    # 2-D [request_count, page_count] (the op's page-table shape;
+                    # the Triton fixed path flattens this same plane to 1-D).
+                    source_pages = score_workspace.page_ids_device[
+                        score_workspace.representative_slots[representative],
+                        : self.request_count,
+                    ]
+                    self.cpp_page_tables[representative] = (
+                        source_pages,
+                        torch.empty(
+                            source_pages.shape, dtype=torch.int32, device=self.device
+                        ).contiguous(),
+                    )
+                self.cpp_dense_ops.append(
+                    (layer_pools[layer], self.cpp_page_tables[representative][1])
+                )
+
         self.swa_launches = []
         self.swa_source = None
         self.swa_destination = None
@@ -206,6 +259,20 @@ class FixedBatchedCompactionWorkspace:
         if self.swa_source_offsets is not None:
             owned_tensors.append(self.swa_source_offsets)
         strong_refs = [*owned_tensors, *layer_pools]
+        if self.cpp_backend:
+            cpp_page_sources = [source for source, _ in self.cpp_page_tables.values()]
+            cpp_page_staging = [staging for _, staging in self.cpp_page_tables.values()]
+            owned_tensors.extend(
+                (self.cpp_indices, self.cpp_offsets, *cpp_page_staging)
+            )
+            strong_refs.extend(
+                (
+                    self.cpp_indices,
+                    self.cpp_offsets,
+                    *cpp_page_sources,
+                    *cpp_page_staging,
+                )
+            )
         for launch in (*self.dense_launches, *self.swa_launches):
             strong_refs.extend(
                 (
@@ -262,8 +329,6 @@ class FixedBatchedCompactionWorkspace:
 
     def launch(self) -> None:
         """Copy dynamic keep indices, then run fixed dense and SWA launches."""
-        selected_decode = self.selection_workspace.keep[: self.request_count, self.prompt_len :]
-        self.dense_source.view(self.request_count, self.decode_keep_count).copy_(selected_decode)
         if self.swa_source is not None:
             assert self.swa_source_offsets is not None
             torch.add(
@@ -273,8 +338,28 @@ class FixedBatchedCompactionWorkspace:
                 self.swa_source_offsets.view(1, -1),
                 out=self.swa_source.view(self.request_count, -1),
             )
-        for launch in self.dense_launches:
-            launch.run()
+        if self.cpp_backend:
+            # FULL keep list (prompt + selected decode), replicated per KV head
+            # with an int64 -> int32 cast in one captured copy.
+            keep_full = self.selection_workspace.keep[: self.request_count]
+            self.cpp_indices.copy_(
+                keep_full.reshape(1, -1).expand(self.cpp_num_kv_heads, -1)
+            )
+            for source_pages, staged_i32 in self.cpp_page_tables.values():
+                staged_i32.copy_(source_pages)
+            for pool, page_table in self.cpp_dense_ops:
+                torch.ops.trtllm.sparse_kv_cache_compact(
+                    pool, page_table, self.cpp_indices, self.cpp_offsets
+                )
+        else:
+            selected_decode = self.selection_workspace.keep[
+                : self.request_count, self.prompt_len :
+            ]
+            self.dense_source.view(self.request_count, self.decode_keep_count).copy_(
+                selected_decode
+            )
+            for launch in self.dense_launches:
+                launch.run()
         for launch in self.swa_launches:
             launch.run()
 

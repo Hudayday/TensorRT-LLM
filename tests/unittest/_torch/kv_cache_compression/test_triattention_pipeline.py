@@ -1749,7 +1749,7 @@ class TestFixedScoreMetadata:
         workspace.round_starts_device = mock.Mock()
         workspace.valid_seq_lens_device = mock.Mock()
         group = mock.Mock()
-        workspace.groups = {0: group}
+        workspace.fused_group = group
         stream = object()
         get_batch = mock.Mock(return_value=[[10, 11], [20, 21, 22]])
 
@@ -1913,7 +1913,7 @@ class TestFixedScoreMetadata:
                 global_layers=[0],
                 workspace=workspace,
             )
-        workspace.stage.assert_called_once_with(get_batch, [7], [8.0], [8])
+        workspace.stage.assert_called_once_with(manager.kv_cache_manager, [7], [8.0], [8])
         manager._resolve_page_ids.assert_not_called()
         assert manager._fixed_score_runtime_counts[("bucket",)]["rejected"] == 1
 
@@ -1944,7 +1944,7 @@ class TestFixedScoreMetadata:
         workspace.page_ids_device = buffer
         workspace.round_starts_device = buffer
         workspace.valid_seq_lens_device = buffer
-        workspace.groups = {}
+        workspace.fused_group = mock.Mock()
         workspace.offsets = buffer
         workspace.omega = buffer
         workspace.phase_base = buffer
@@ -2024,7 +2024,9 @@ class TestFixedScoreMetadata:
         )
 
         assert result
-        workspace.stage.assert_called_once_with(get_batch, [7, 8], [8.0, 9.0], [8, 9])
+        workspace.stage.assert_called_once_with(
+            manager.kv_cache_manager, [7, 8], [8.0, 9.0], [8, 9]
+        )
         manager._resolve_page_ids.assert_not_called()
         assert manager._fixed_score_runtime_counts[("bucket",)]["hit"] == 1
         assert prepared[1]["page_ids"][0].tolist() == [12, 13]

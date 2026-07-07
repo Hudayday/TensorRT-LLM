@@ -1166,6 +1166,13 @@ class TestFixedBatchedCompactionWorkspace:
             storage_data_ptr=12288,
             data_ptr=12288,
         )
+        fused_group = SimpleNamespace(
+            pointer_prefix=(score_tensor,),
+            pointer_middle=(score_tensor,),
+            pointer_tail=(score_tensor,),
+            output=score_tensor,
+            seg_offsets=score_tensor,
+        )
         score = SimpleNamespace(
             page_ids_device=score_tensor,
             round_starts_device=score_tensor,
@@ -1178,7 +1185,7 @@ class TestFixedBatchedCompactionWorkspace:
             mean_sin=score_tensor,
             offsets=score_tensor,
             omega=score_tensor,
-            groups={},
+            fused_group=fused_group,
         )
         workspace = object.__new__(FixedBatchedCompactionWorkspace)
         workspace.selection_workspace = selection
