@@ -73,7 +73,7 @@ class _FixedCompactLaunch:
 
 
 class FixedBatchedCompactionWorkspace:
-    """Caller-owned exact-cohort buffers for graph-captured compaction.
+    """Caller-owned upper-bucket buffers for graph-captured compaction.
 
     Dense layers move only selected decode slots. The finalized prompt is never
     a destination and therefore remains byte-untouched. Kernel-masked SWA
@@ -164,13 +164,14 @@ class FixedBatchedCompactionWorkspace:
         self.swa_source = None
         self.swa_destination = None
         self.swa_page_base = None
+        self.swa_source_offsets = None
         if self.swa_layers:
             if swa_window is None or swa_window <= 0 or self.keep_count < swa_window:
                 raise ValueError("fixed graph SWA compaction requires a valid retained window")
             total_swa = self.request_count * int(swa_window)
-            source = torch.arange(
-                self.seq_len - int(swa_window),
-                self.seq_len,
+            self.swa_source_offsets = torch.arange(
+                -int(swa_window),
+                0,
                 dtype=torch.int64,
                 device=self.device,
             )
@@ -180,7 +181,7 @@ class FixedBatchedCompactionWorkspace:
                 dtype=torch.int64,
                 device=self.device,
             )
-            self.swa_source = source.repeat(self.request_count)
+            self.swa_source = torch.empty(total_swa, dtype=torch.int64, device=self.device)
             self.swa_destination = destination.repeat(self.request_count)
             self.swa_page_base = request_page_base.repeat_interleave(int(swa_window))
             for layer in self.swa_layers:
@@ -202,6 +203,8 @@ class FixedBatchedCompactionWorkspace:
             self.dense_destination,
             self.dense_page_base,
         ]
+        if self.swa_source_offsets is not None:
+            owned_tensors.append(self.swa_source_offsets)
         strong_refs = [*owned_tensors, *layer_pools]
         for launch in (*self.dense_launches, *self.swa_launches):
             strong_refs.extend(
@@ -261,6 +264,15 @@ class FixedBatchedCompactionWorkspace:
         """Copy dynamic keep indices, then run fixed dense and SWA launches."""
         selected_decode = self.selection_workspace.keep[: self.request_count, self.prompt_len :]
         self.dense_source.view(self.request_count, self.decode_keep_count).copy_(selected_decode)
+        if self.swa_source is not None:
+            assert self.swa_source_offsets is not None
+            torch.add(
+                self.score_workspace.valid_seq_lens_device[: self.request_count].view(
+                    self.request_count, 1
+                ),
+                self.swa_source_offsets.view(1, -1),
+                out=self.swa_source.view(self.request_count, -1),
+            )
         for launch in self.dense_launches:
             launch.run()
         for launch in self.swa_launches:
@@ -304,6 +316,10 @@ class FixedBatchedCompactionWorkspace:
                 "round_starts_device",
                 _tensor_fingerprint(self.score_workspace.round_starts_device),
             ),
+            (
+                "valid_seq_lens_device",
+                _tensor_fingerprint(self.score_workspace.valid_seq_lens_device),
+            ),
             ("phase_base", _tensor_fingerprint(self.score_workspace.phase_base)),
             ("phase", _tensor_fingerprint(self.score_workspace.phase)),
             ("cos_phase", _tensor_fingerprint(self.score_workspace.cos_phase)),
@@ -327,7 +343,7 @@ class FixedBatchedCompactionWorkspace:
             )
         context_token = int(torch.cuda.current_blas_handle())
         return (
-            "triattention.standalone-eviction-graph.v1",
+            "triattention.standalone-eviction-graph.v2",
             self.request_count,
             self.seq_len,
             self.prompt_len,

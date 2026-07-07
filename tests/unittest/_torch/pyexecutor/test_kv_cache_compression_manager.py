@@ -6,7 +6,7 @@
 ``BaseResourceManager``-based single-manager design.
 
 Covers:
-- :class:`BaseKVCacheCompressionManager` contract: the four lifecycle hooks
+- :class:`BaseKVCacheCompressionManager` contract: the five lifecycle hooks
   default to no-op, zero resource counts, and it inherits
   :class:`BaseResourceManager` (so PyExecutor auto-drives it once registered).
 - The resource-manager API -> lifecycle-hook translation, gated on PyExecutor's
@@ -25,12 +25,15 @@ lives in ``_util.py`` next to ``_create_kv_cache_manager``.
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseKVCacheCompressionManager,
     BaseResourceManager,
+    ResourceManager,
+    ResourceManagerType,
 )
 
 # ---------------------------------------------------------------------- #
@@ -52,7 +55,7 @@ class _RecordingMixin:
 
 
 class _MockCompressionManager(_RecordingMixin, BaseKVCacheCompressionManager):
-    """Mock manager that records the four lifecycle hooks."""
+    """Mock manager that records the lifecycle hooks used by these tests."""
 
     def on_request_init(self, request):
         self._record("on_request_init")
@@ -91,6 +94,16 @@ def _batch(context=(), generation=(), last_chunk=()):
     return b
 
 
+def _role_kv_cache_manager(*, is_draft):
+    manager = MagicMock()
+    manager.enable_block_reuse = False
+    manager.is_draft = is_draft
+    manager.impl = object()
+    manager.kv_cache_map = {}
+    manager.host_kv_cache_block_offsets = torch.empty(1, dtype=torch.int64)
+    return manager
+
+
 # ---------------------------------------------------------------------- #
 # 1. BaseKVCacheCompressionManager contract                               #
 # ---------------------------------------------------------------------- #
@@ -101,11 +114,12 @@ class TestBaseABC:
         # So PyExecutor's main loop auto-invokes prepare/update/free_resources.
         assert issubclass(BaseKVCacheCompressionManager, BaseResourceManager)
 
-    def test_four_hooks_default_noop(self, fake_kv_cache_manager):
+    def test_five_hooks_default_noop(self, fake_kv_cache_manager):
         m = BaseKVCacheCompressionManager(fake_kv_cache_manager)
         meta = MagicMock()
         assert m.on_request_init(MagicMock()) is None
         assert m.on_context_step_end(MagicMock(), meta) is None
+        assert m.on_generation_step_begin(MagicMock(), meta) is None
         assert m.on_generation_step_end(MagicMock(), meta) is None
         assert m.on_request_finish(MagicMock()) is None
 
@@ -123,6 +137,39 @@ class TestBaseABC:
         assert m.get_max_resource_count() == 0
         assert m.get_needed_resource_to_completion(MagicMock()) == 0
 
+    def test_framework_owns_independent_target_and_draft_roles(self):
+        target = _role_kv_cache_manager(is_draft=False)
+        draft = _role_kv_cache_manager(is_draft=True)
+
+        manager = BaseKVCacheCompressionManager(target, draft)
+
+        assert manager.kv_cache_manager is target
+        assert manager.draft_kv_cache_manager is draft
+        assert manager.has_independent_draft_kv_cache
+
+    def test_framework_rejects_shared_target_and_draft_state(self):
+        target = _role_kv_cache_manager(is_draft=False)
+        draft = _role_kv_cache_manager(is_draft=True)
+        draft.impl = target.impl
+
+        with pytest.raises(ValueError, match="share physical state"):
+            BaseKVCacheCompressionManager(target, draft)
+
+    def test_framework_publishes_typed_draft_length_delta(self):
+        class Metadata:
+            def set_draft_kv_length_delta(self, delta):
+                self.delta = list(delta)
+
+        manager = BaseKVCacheCompressionManager(
+            _role_kv_cache_manager(is_draft=False),
+            _role_kv_cache_manager(is_draft=True),
+        )
+        metadata = Metadata()
+
+        manager.publish_draft_kv_length_delta(metadata, [0, 37])
+
+        assert metadata.delta == [0, 37]
+
 
 # ---------------------------------------------------------------------- #
 # 2. Resource-manager API -> lifecycle-hook translation                   #
@@ -131,6 +178,55 @@ class TestBaseABC:
 
 
 class TestResourceManagerAPI:
+    def test_native_kv_updates_precede_final_compression_with_metadata(self):
+        calls = []
+        metadata = MagicMock(name="attention_metadata")
+        target = MagicMock(name="target_kv_cache")
+        draft = MagicMock(name="draft_kv_cache")
+        compression = MagicMock(name="compression")
+        target.update_resources.side_effect = lambda *args: calls.append(("target", args))
+        draft.update_resources.side_effect = lambda *args: calls.append(("draft", args))
+        compression.update_resources.side_effect = lambda *args: calls.append(("compression", args))
+        manager = ResourceManager(
+            {
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft,
+                ResourceManagerType.KV_CACHE_MANAGER: target,
+                ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER: compression,
+            }
+        )
+        batch = _batch(generation=[_req(1)])
+
+        manager.update_resources(batch, metadata, 2.0)
+
+        assert calls == [
+            ("draft", (batch,)),
+            ("target", (batch, metadata, 2.0)),
+            ("compression", (batch,)),
+        ]
+
+    def test_real_v2_target_receives_relocation_metadata_and_dtype(self):
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+
+        target = KVCacheManagerV2.__new__(KVCacheManagerV2)
+        target.is_draft = False
+        target.generation_capacity_only = False
+        target.kv_cache_map = {}
+        request = _req(1)
+        request.state = util_mod.LlmRequestState.GENERATION_IN_PROGRESS
+        request.py_num_accepted_draft_tokens = 1
+        request.py_num_accepted_draft_tokens_indices = [2]
+        batch = _batch(generation=[request])
+        metadata = MagicMock(name="attention_metadata")
+        manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: target})
+
+        with patch(
+            "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2."
+            "_update_kv_cache_draft_token_location"
+        ) as relocate:
+            manager.update_resources(batch, metadata, 2.0)
+
+        relocate.assert_called_once_with(target, batch, metadata, 2.0)
+
     def test_prepare_fires_init_on_first_chunk_only(self, fake_kv_cache_manager):
         rec = []
         m = _MockCompressionManager(fake_kv_cache_manager, rec, "s")

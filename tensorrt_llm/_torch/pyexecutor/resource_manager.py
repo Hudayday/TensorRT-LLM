@@ -19,8 +19,8 @@ import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Tuple,
-                    Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Protocol,
+                    Sequence, Set, Tuple, Union, runtime_checkable)
 
 import torch
 from mpi4py import MPI
@@ -2277,6 +2277,14 @@ class BlockManager:
 # --------------------------------------------------------------------- #
 
 
+@runtime_checkable
+class KVCacheCompressionMetadata(Protocol):
+    """Attention-metadata contract used by cache-compression managers."""
+
+    def set_draft_kv_length_delta(self, delta: Sequence[int]) -> None:
+        """Publish ``dense draft length - compressed target length`` per row."""
+
+
 class BaseKVCacheCompressionManager(BaseResourceManager):
     """Framework-level base class for all KV-cache compression managers.
 
@@ -2293,8 +2301,13 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
     *what* physical KV exists. Subclasses hold ``KVCacheManagerV2`` as a tool.
     """
 
-    def __init__(self, kv_cache_manager: "KVCacheManagerV2"):
+    def __init__(
+        self,
+        kv_cache_manager: "KVCacheManagerV2",
+        draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None,
+    ):
         self.kv_cache_manager = kv_cache_manager
+        self.draft_kv_cache_manager = draft_kv_cache_manager
         # Compression evicts/rewrites stored keys and values, so a shared prefix
         # block is no longer safe to reuse (same constraint as RocketKVCacheManager).
         if kv_cache_manager.enable_block_reuse:
@@ -2302,6 +2315,45 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
                 f"{type(self).__name__} changes stored keys and values and cannot "
                 f"run with KV-cache block reuse. Set "
                 f"KvCacheConfig.enable_block_reuse to False.")
+        self._validate_kv_cache_ownership()
+
+    def _validate_kv_cache_ownership(self) -> None:
+        """Verify that an optional draft KVCM owns independent physical state."""
+        draft = self.draft_kv_cache_manager
+        if draft is None:
+            return
+        target = self.kv_cache_manager
+        if target is draft:
+            raise ValueError(
+                "target and draft KV cache managers must be distinct")
+        if target.is_draft or not draft.is_draft:
+            raise ValueError(
+                "target and draft KV cache manager roles are inconsistent")
+        if target.impl is draft.impl or target.kv_cache_map is draft.kv_cache_map:
+            raise ValueError(
+                "target and draft KV cache managers share physical state")
+        if (target.host_kv_cache_block_offsets.data_ptr() ==
+                draft.host_kv_cache_block_offsets.data_ptr()):
+            raise ValueError(
+                "target and draft KV cache managers share a page table")
+
+    @property
+    def has_independent_draft_kv_cache(self) -> bool:
+        return self.draft_kv_cache_manager is not None
+
+    def publish_draft_kv_length_delta(
+        self,
+        attn_metadata: "AttentionMetadata",
+        delta: Sequence[int],
+    ) -> None:
+        """Publish the dense-draft length domain through the framework contract."""
+        if not self.has_independent_draft_kv_cache:
+            return
+        if not isinstance(attn_metadata, KVCacheCompressionMetadata):
+            raise TypeError(
+                "separate draft KV cache compression requires compatible "
+                "attention metadata")
+        attn_metadata.set_draft_kv_length_delta(delta)
 
     # ================================================================== #
     # Optional startup callback. This is not a request-lifecycle hook.    #
@@ -2343,17 +2395,12 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         attn_metadata: Optional["AttentionMetadata"] = None,
         **kwargs,
     ) -> None:
-        """Fired once per generation step, BEFORE this step's forward (from
-        ``prepare_resources``). Override for eviction that must mutate the KV
-        *before* the forward + attention metadata read it -- a post-forward hook
-        (``on_generation_step_end``) races the overlap scheduler, which enqueues
-        the next forward before the hook runs.
-        """
+        """Fired once per generation step before this step's forward."""
 
     def on_generation_step_end(
         self,
         scheduled_batch: "ScheduledRequests",
-        attn_metadata: "AttentionMetadata",
+        attn_metadata: Optional["AttentionMetadata"] = None,
         **kwargs,
     ) -> None:
         """Fired once per generation step, after every layer's forward
@@ -2396,11 +2443,11 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         return 0
 
     def prepare_resources(self, scheduled_batch: "ScheduledRequests") -> None:
-        """Fire :meth:`on_request_init` once per request (on its first prefill
-        chunk -- same ``is_first_context_chunk`` gate ``KVCacheManager`` uses),
-        then :meth:`on_generation_step_begin` (pre-forward) every iteration.
-        PyExecutor calls this BEFORE ``_forward_step``, so the step-begin hook is
-        the sanctioned place for eviction that must mutate the KV pre-forward.
+        """Fire request init and the pre-forward generation hook.
+
+        Algorithms that mutate data needed by the imminent forward may use
+        :meth:`on_generation_step_begin`; final-update algorithms may leave it
+        as the default no-op.
         """
         for req in scheduled_batch.context_requests:
             if req.is_first_context_chunk:
@@ -2421,9 +2468,10 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         request-state transitions: it is iteration-exact and immune to a
         short-output request going straight to ``GENERATION_TO_COMPLETE``
         (which, under the overlap scheduler, never passes through
-        ``GENERATION_IN_PROGRESS``). Signature matches the other resource
-        managers so PyExecutor passes ``attn_metadata`` /
-        ``kv_cache_dtype_byte_size`` through transparently.
+        ``GENERATION_IN_PROGRESS``). The generic resource dispatcher invokes
+        compression managers with the scheduled batch only; algorithms that
+        need attention metadata use :meth:`adjust_attention_metadata` at the
+        model-engine boundary.
         """
         for req in scheduled_batch.context_requests_last_chunk:
             self.on_context_step_end(req, attn_metadata)
@@ -2464,9 +2512,9 @@ class ResourceManager:
         attn_metadata: Optional["AttentionMetadata"] = None,
         kv_cache_dtype_byte_size: Optional[float] = None,
     ):
-        for _, resource_manager in self.resource_managers.items():
+        for resource_type, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "update_resources"):
-                if isinstance(resource_manager, KVCacheManager):
+                if resource_type == ResourceManagerType.KV_CACHE_MANAGER:
                     resource_manager.update_resources(scheduled_batch,
                                                       attn_metadata,
                                                       kv_cache_dtype_byte_size)

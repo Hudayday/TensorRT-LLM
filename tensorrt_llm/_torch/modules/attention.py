@@ -542,6 +542,10 @@ class Attention(nn.Module):
 
         attn_cls = get_attention_backend(
             self.attn_backend, sparse_attention_config=sparse_attn_cfg)
+        from ..kv_cache_compression import \
+            get_model_kv_cache_compression_attention_backend
+        attn_cls = get_model_kv_cache_compression_attention_backend(
+            config, attn_cls)
 
         self.is_marlin_enabled: bool = is_nvfp4_marlin_enabled()
 

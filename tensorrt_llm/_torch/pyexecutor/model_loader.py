@@ -1032,6 +1032,19 @@ class ModelLoader:
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
 
+        if self.llm_args.kv_cache_compression_config is not None:
+            from ..kv_cache_compression import (
+                configure_kv_cache_compression_attention_backend,
+                requires_kv_cache_compression_attention_backend)
+
+            configure_kv_cache_compression_attention_backend(
+                config,
+                enabled=requires_kv_cache_compression_attention_backend(
+                    self.llm_args.kv_cache_compression_config,
+                    self.spec_config,
+                ),
+            )
+
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
