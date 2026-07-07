@@ -8,9 +8,8 @@ framework's ``adjust_attention_metadata`` hook.
 
 Public surface:
   - ``TriAttention`` -- the ``BaseKVCacheCompressionManager`` (the eviction
-    manager; snapshots allocations pre-forward and compacts in the final update
-    hook). It uses target-only V2 capacity history, so there is no KV-cache-manager
-    subclass.
+    manager; runs in the pre-forward ``on_generation_step_begin`` hook). It uses
+    the V2 capacity-only decode API, so there is no KV-cache-manager subclass.
 """
 
 from .triattention import TriAttention

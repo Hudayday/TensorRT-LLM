@@ -503,7 +503,6 @@ class TestStandaloneGraphBuckets:
                 "seq_len": prompt_len + width,
                 "request": SimpleNamespace(py_prompt_len=prompt_len),
                 "expected_keep_count": prompt_len + budget,
-                "protected_tail": 0,
             }
             for _ in range(request_count)
         ]
@@ -532,34 +531,6 @@ class TestStandaloneGraphBuckets:
             backend,
         )
 
-    def test_protected_tail_does_not_change_stable_graph_bucket(self):
-        manager = _make_triattention()
-        manager.top_B = 2048
-        manager._standalone_cuda_graph_enabled = True
-        score = SimpleNamespace(prewarm_key=(3072, 2048), max_requests=32)
-        selection = SimpleNamespace(
-            selection_backend="indexer_topk",
-            max_requests=32,
-            prompt_len=256,
-            width=3072,
-            keep_count=2048,
-        )
-        self._mark_ready(manager, score, selection)
-
-        def prepared(protected_tail):
-            return [
-                {
-                    "seq_len": 3328,
-                    "request": SimpleNamespace(py_prompt_len=256),
-                    "expected_keep_count": 2304,
-                    "protected_tail": protected_tail,
-                }
-            ]
-
-        assert manager._standalone_graph_bucket_for(
-            prepared(0), score, selection
-        ) == manager._standalone_graph_bucket_for(prepared(2), score, selection)
-
     @pytest.mark.parametrize(
         "request_count,prompt_len,width,budget,backend,ready",
         [
@@ -580,7 +551,6 @@ class TestStandaloneGraphBuckets:
                 "seq_len": prompt_len + width,
                 "request": SimpleNamespace(py_prompt_len=prompt_len),
                 "expected_keep_count": prompt_len + budget,
-                "protected_tail": 0,
             }
             for _ in range(request_count)
         ]
@@ -606,13 +576,11 @@ class TestStandaloneGraphBuckets:
                 "seq_len": 5119,
                 "request": SimpleNamespace(py_prompt_len=1024),
                 "expected_keep_count": 3072,
-                "protected_tail": 0,
             },
             {
                 "seq_len": 5375,
                 "request": SimpleNamespace(py_prompt_len=1280),
                 "expected_keep_count": 3328,
-                "protected_tail": 0,
             },
         ]
         score = SimpleNamespace(prewarm_key=("mixed",), max_requests=32)
@@ -660,7 +628,6 @@ class TestStandaloneGraphBuckets:
                 "seq_len": 5119,
                 "request": SimpleNamespace(py_prompt_len=1024),
                 "expected_keep_count": 3072,
-                "protected_tail": 0,
             }
         ]
 
@@ -686,8 +653,7 @@ class TestStandaloneGraphBuckets:
             "admission_rejected_requests": 1,
         }
 
-    @pytest.mark.parametrize("protected_tail", [0, 2])
-    def test_capture_body_covers_phase_score_select_compact_then_publishes(self, protected_tail):
+    def test_capture_body_covers_phase_score_select_compact_then_publishes(self):
         import contextlib
 
         import tensorrt_llm._torch.kv_cache_compression.triattention.triattention as tri_module
@@ -705,7 +671,6 @@ class TestStandaloneGraphBuckets:
                 "request_id": 7,
                 "seq_len": 3328,
                 "expected_keep_count": 2304,
-                "protected_tail": protected_tail,
             }
         ]
         score_output = torch.zeros(1, 3328)
@@ -753,7 +718,6 @@ class TestStandaloneGraphBuckets:
 
         manager._standalone_graph_workspace_for = mock.Mock(return_value=workspace)
         manager._standalone_graph_cache_for = mock.Mock(return_value=ExecutingCache())
-        manager._copy_protected_suffixes = mock.Mock()
         views = torch.zeros(1, 1, 1, 3328)
         fixed_views = mock.Mock(return_value=views)
         stream = SimpleNamespace(device=torch.device("cpu"), cuda_stream=9)
@@ -782,18 +746,14 @@ class TestStandaloneGraphBuckets:
                 fixed_perhead_segment_views=fixed_views,
             )
 
-        assert targets == [(7, 2304 + protected_tail)]
+        assert targets == [(7, 2305)]
         score.prepare_phase.assert_called_once_with(1)
         group.launch.assert_called_once()
         selected_segments = selection.select_requests.call_args.args[0]
         assert selected_segments[0][0].shape == (1, 3072)
         workspace.launch.assert_called_once_with()
         assert manager._evicted == {7: 1024}
-        assert manager._pre_forward_kv_lengths == {7: 2304 + protected_tail}
-        if protected_tail:
-            manager._copy_protected_suffixes.assert_called_once()
-        else:
-            manager._copy_protected_suffixes.assert_not_called()
+        assert manager._pre_forward_kv_lengths == {7: 2304}
         assert manager._standalone_graph_runtime_counts == {
             "attempt": 1,
             "attempt_requests": 1,
@@ -813,7 +773,6 @@ class TestStandaloneGraphBuckets:
                 "request_id": 7,
                 "seq_len": 9215,
                 "expected_keep_count": 5120,
-                "protected_tail": 0,
             }
         ]
         score = SimpleNamespace(prewarm_key=("formal-a-first",), max_requests=8)
@@ -876,7 +835,6 @@ class TestStandaloneGraphBuckets:
                 "request_id": 7,
                 "seq_len": 9215,
                 "expected_keep_count": 5120,
-                "protected_tail": 0,
             }
         ]
         stream = SimpleNamespace(device=torch.device("cpu"), cuda_stream=9)
@@ -1118,7 +1076,7 @@ class TestStandaloneGraphCuda:
         device = initial_pool.device
         seq_len = prompt_len + width
         tokens_per_block = int(initial_pool.shape[3])
-        page_count = (seq_len + tokens_per_block - 1) // tokens_per_block
+        page_count = (seq_len + tokens_per_block) // tokens_per_block
         pool = initial_pool.clone()
         q_real = torch.tensor([[[0.75]]], dtype=torch.float32, device=device)
         q_imag = torch.tensor([[[0.25]]], dtype=torch.float32, device=device)
@@ -1234,7 +1192,7 @@ class TestStandaloneGraphCuda:
         device = torch.device("cuda")
         seq_len = prompt_len + width
         tokens_per_block = 128
-        page_count = (seq_len + tokens_per_block - 1) // tokens_per_block
+        page_count = (seq_len + tokens_per_block) // tokens_per_block
         total_pages = request_count * page_count
         initial = torch.arange(
             total_pages * 2 * tokens_per_block * 2,
@@ -1377,36 +1335,21 @@ class TestStandaloneGraphCuda:
         eager_pools = [pool.clone() for pool in base_pools]
         graph_pools = [pool.clone() for pool in base_pools]
         graphed = build(graph_pools)
+        triton_tri_compact(
+            eager_pools[0],
+            [dense_tables[request] for request in range(request_count)],
+            [keep[request] for request in range(request_count)],
+            [8] * request_count,
+        )
         swa_source = torch.tensor([6, 7], dtype=torch.int64, device=device)
         swa_destination = torch.tensor([4, 5], dtype=torch.int64, device=device)
-        prepared = [
-            {"protected_tail": 0},
-            {
-                "protected_tail": 2,
-                "page_ids": {0: dense_tables[1], 1: swa_tables[1]},
-                "tail_source": torch.tensor([8, 9], dtype=torch.int64, device=device),
-                "tail_destination": torch.tensor([6, 7], dtype=torch.int64, device=device),
-                "compaction_length": 10,
-            },
-        ]
-
-        def run_eager(pools):
-            triton_tri_compact(
-                pools[0],
-                [dense_tables[request] for request in range(request_count)],
-                [keep[request] for request in range(request_count)],
-                [8] * request_count,
-            )
-            triton_tri_compact(
-                pools[1],
-                [swa_tables[request] for request in range(request_count)],
-                [swa_source] * request_count,
-                [8] * request_count,
-                dest_list=[swa_destination] * request_count,
-            )
-            TriAttention._copy_protected_suffixes(prepared, pools, [0], [1], {0: 0})
-
-        run_eager(eager_pools)
+        triton_tri_compact(
+            eager_pools[1],
+            [swa_tables[request] for request in range(request_count)],
+            [swa_source] * request_count,
+            [8] * request_count,
+            dest_list=[swa_destination] * request_count,
+        )
         cache = StandaloneEvictionGraphCache(max_entries=1, max_bytes=1024**3)
         assert (
             cache.execute(
@@ -1418,7 +1361,6 @@ class TestStandaloneGraphCuda:
             )
             == "capture"
         )
-        TriAttention._copy_protected_suffixes(prepared, graph_pools, [0], [1], {0: 0})
         torch.cuda.synchronize(device)
 
         for eager_pool, graph_pool in zip(eager_pools, graph_pools):
@@ -1433,156 +1375,3 @@ class TestStandaloneGraphCuda:
             assert torch.equal(dense_after[:, :, :2], dense_before[:, :, :2])
             assert torch.equal(swa_after[:, :, :2], swa_before[:, :, :2])
             assert torch.equal(swa_after[:, :, 4:6], swa_before[:, :, 6:8])
-        dense_after = graph_pools[0][dense_tables[1]].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
-        dense_before = base_pools[0][dense_tables[1]].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
-        swa_after = graph_pools[1][swa_tables[1]].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
-        swa_before = base_pools[1][swa_tables[1]].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
-        assert torch.equal(dense_after[:, :, 6:8], dense_before[:, :, 8:10])
-        assert torch.equal(swa_after[:, :, 6:8], swa_before[:, :, 8:10])
-
-        for pool, base in zip(eager_pools, base_pools):
-            pool.copy_(base)
-        for pool, base in zip(graph_pools, base_pools):
-            pool.copy_(base)
-        torch.cuda.synchronize(device)
-        run_eager(eager_pools)
-        assert (
-            cache.execute(
-                key=("swa",),
-                request_count=request_count,
-                fingerprint=("swa",),
-                workspace=graphed,
-                capture_body=graphed.launch,
-            )
-            == "replay"
-        )
-        TriAttention._copy_protected_suffixes(prepared, graph_pools, [0], [1], {0: 0})
-        torch.cuda.synchronize(device)
-        for eager_pool, graph_pool in zip(eager_pools, graph_pools):
-            assert torch.equal(eager_pool.view(torch.uint8), graph_pool.view(torch.uint8))
-        assert cache.snapshot()["capture"] == 1
-        assert cache.snapshot()["cache_hit"] == 1
-
-    @pytest.mark.parametrize(
-        "stable_len,prompt_len,keep,protected_tail",
-        [
-            (7, 1, [0, 1, 3, 5, 6], 1),
-            (8, 2, [0, 1, 2, 4, 5, 7], 2),
-            (8, 2, [0, 1, 2, 4, 5, 7], 4),
-        ],
-    )
-    @CUDA_REQUIRED
-    def test_graph_prefix_then_suffix_copy_capture_and_replay_are_byte_exact(
-        self, stable_len, prompt_len, keep, protected_tail
-    ):
-        device = torch.device("cuda")
-        tokens_per_block = 4
-        stable_pages = (stable_len + tokens_per_block - 1) // tokens_per_block
-        total_pages = (stable_len + protected_tail + tokens_per_block - 1) // tokens_per_block
-        page_ids = torch.tensor([2, 0, 3][:total_pages], dtype=torch.int64, device=device)
-        base_pool = torch.arange(
-            4 * 2 * 1 * tokens_per_block * 2,
-            dtype=torch.float32,
-            device=device,
-        ).view(4, 2, 1, tokens_per_block, 2)
-        eager_pool = base_pool.clone()
-        graph_pool = base_pool.clone()
-        keep_tensor = torch.tensor([keep], dtype=torch.int64, device=device)
-        score = SimpleNamespace(
-            page_count=stable_pages,
-            representative_slots={0: 0},
-            page_ids_device=page_ids[:stable_pages].view(1, 1, stable_pages),
-        )
-        selection = SimpleNamespace(
-            max_requests=1,
-            prompt_len=prompt_len,
-            keep_count=len(keep) - prompt_len,
-            width=stable_len - prompt_len,
-            keep=keep_tensor,
-            selection_backend="torch_topk",
-            named_tensors=lambda: (),
-        )
-        workspace = FixedBatchedCompactionWorkspace(
-            layer_pools=[graph_pool],
-            dense_layers=[0],
-            swa_layers=[],
-            layer_group_representative={0: 0},
-            global_layers=[0],
-            score_workspace=score,
-            selection_workspace=selection,
-            request_count=1,
-            seq_len=stable_len,
-            prompt_len=prompt_len,
-            decode_keep_count=len(keep) - prompt_len,
-            swa_window=None,
-            arena_generation=1,
-        )
-        tail_source = torch.arange(
-            stable_len,
-            stable_len + protected_tail,
-            dtype=torch.int64,
-            device=device,
-        )
-        tail_destination = torch.arange(
-            len(keep),
-            len(keep) + protected_tail,
-            dtype=torch.int64,
-            device=device,
-        )
-        prepared = [
-            {
-                "protected_tail": protected_tail,
-                "page_ids": {0: page_ids},
-                "tail_source": tail_source,
-                "tail_destination": tail_destination,
-                "compaction_length": stable_len + protected_tail,
-            }
-        ]
-        stream = torch.cuda.Stream(device=device)
-
-        # Compile both graph-owned and graph-external kernels before capture.
-        with torch.cuda.stream(stream):
-            workspace.launch()
-            TriAttention._copy_protected_suffixes(prepared, [graph_pool], [0], [], {0: 0})
-        stream.synchronize()
-        graph_pool.copy_(base_pool)
-        torch.cuda.synchronize(device)
-
-        cache = StandaloneEvictionGraphCache(max_entries=1, max_bytes=1024**3)
-        for expected_outcome in ("capture", "replay"):
-            eager_pool.copy_(base_pool)
-            graph_pool.copy_(base_pool)
-            torch.cuda.synchronize(device)
-
-            triton_tri_compact(
-                eager_pool,
-                [page_ids[:stable_pages]],
-                [keep_tensor[0]],
-                [stable_len],
-            )
-            TriAttention._copy_protected_suffixes(prepared, [eager_pool], [0], [], {0: 0})
-            with torch.cuda.stream(stream):
-                outcome = cache.execute(
-                    key=(stable_len, prompt_len, len(keep)),
-                    request_count=1,
-                    fingerprint=("stable-prefix", stable_len, prompt_len, len(keep)),
-                    workspace=workspace,
-                    capture_body=workspace.launch,
-                )
-                TriAttention._copy_protected_suffixes(
-                    prepared,
-                    [graph_pool],
-                    [0],
-                    [],
-                    {0: 0},
-                )
-            stream.synchronize()
-            torch.cuda.synchronize(device)
-
-            assert outcome == expected_outcome
-            assert torch.equal(eager_pool.view(torch.uint8), graph_pool.view(torch.uint8))
-
-        stats = cache.snapshot()
-        assert stats["capture"] == 1
-        assert stats["cache_hit"] == 1
-        assert stats["launch"] == 2

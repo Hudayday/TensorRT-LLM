@@ -2356,11 +2356,8 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         attn_metadata: "AttentionMetadata",
         **kwargs,
     ) -> None:
-        """Fired once per generation step after its forward has been enqueued.
-
-        With overlap scheduling this receives the previous batch after the next
-        batch is already enqueued. GPU completion is guaranteed only by stream
-        dependencies; implementations must not assume the CPU is synchronized.
+        """Fired once per generation step, after every layer's forward
+        completes. Override for periodic or budget-triggered eviction.
         """
 
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
@@ -2402,9 +2399,8 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         """Fire :meth:`on_request_init` once per request (on its first prefill
         chunk -- same ``is_first_context_chunk`` gate ``KVCacheManager`` uses),
         then :meth:`on_generation_step_begin` (pre-forward) every iteration.
-        PyExecutor calls this before ``_forward_step``. Algorithms may use the
-        hook to snapshot the exact in-flight allocation even when physical
-        mutation is deferred to the final update hook.
+        PyExecutor calls this BEFORE ``_forward_step``, so the step-begin hook is
+        the sanctioned place for eviction that must mutate the KV pre-forward.
         """
         for req in scheduled_batch.context_requests:
             if req.is_first_context_chunk:
@@ -2468,9 +2464,9 @@ class ResourceManager:
         attn_metadata: Optional["AttentionMetadata"] = None,
         kv_cache_dtype_byte_size: Optional[float] = None,
     ):
-        for resource_type, resource_manager in self.resource_managers.items():
+        for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "update_resources"):
-                if resource_type is ResourceManagerType.KV_CACHE_MANAGER:
+                if isinstance(resource_manager, KVCacheManager):
                     resource_manager.update_resources(scheduled_batch,
                                                       attn_metadata,
                                                       kv_cache_dtype_byte_size)

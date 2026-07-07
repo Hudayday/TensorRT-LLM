@@ -79,108 +79,73 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
                                            draft_kv_cache_manager):
     """
     Prepare attention metadata for CUDA graph replay when using separate draft KV cache.
-    Swaps to the draft manager, page table, and length domain and (for DSA)
-    re-prepares indexer slot mappings for the current batch. Call
-    restore_attn_metadata_after_draft_replay after replay in a finally block.
+    Swaps to draft manager and (for DSA) re-prepares indexer slot mappings for the current
+    batch. Call restore_attn_metadata_after_draft_replay after replay in a finally block.
     Returns saved state or None if no-op.
     """
     if draft_kv_cache_manager is None:
-        if (isinstance(attn_metadata, TrtllmAttentionMetadata)
-                and attn_metadata.use_distinct_draft_kv_lengths):
-            raise RuntimeError(
-                "Distinct draft KV lengths require a draft KV cache manager for replay"
-            )
         return None
     if not isinstance(attn_metadata, TrtllmAttentionMetadata):
         return None
-    draft_block_offsets = attn_metadata.draft_kv_cache_block_offsets
+    draft_block_offsets = getattr(attn_metadata, 'draft_kv_cache_block_offsets',
+                                  None)
     if draft_block_offsets is None:
-        if attn_metadata.use_distinct_draft_kv_lengths:
-            raise RuntimeError(
-                "Distinct draft KV lengths require draft KV cache block offsets"
-            )
         return None
-    if attn_metadata.draft_kv_cache_manager is not draft_kv_cache_manager:
-        raise RuntimeError(
-            "Attention metadata was prepared for a different draft KV cache manager"
-        )
 
-    target_kv_cache_manager = attn_metadata.kv_cache_manager
-    target_kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets
-    target_host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets
-    target_kv_length_state = None
-    saved = None
-    try:
-        target_kv_length_state = (
-            attn_metadata.activate_draft_kv_length_domain()
-            if attn_metadata.use_distinct_draft_kv_lengths else None)
-        saved = {
-            'target_kv_cache_manager': target_kv_cache_manager,
-            'target_kv_cache_block_offsets': target_kv_cache_block_offsets,
-            'target_host_kv_cache_block_offsets':
-            target_host_kv_cache_block_offsets,
-            'target_kv_length_state': target_kv_length_state,
+    saved = {
+        'target_kv_cache_manager':
+        attn_metadata.kv_cache_manager,
+        'target_kv_cache_block_offsets':
+        attn_metadata.kv_cache_block_offsets,
+        'target_host_kv_cache_block_offsets':
+        attn_metadata.host_kv_cache_block_offsets,
+    }
+    attn_metadata.kv_cache_manager = draft_kv_cache_manager
+    attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
+    attn_metadata.host_kv_cache_block_offsets = (
+        draft_kv_cache_manager.host_kv_cache_block_offsets)
+
+    from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
+                                                Indexer)
+    if (isinstance(attn_metadata, DSAtrtllmAttentionMetadata)
+            and hasattr(draft_kv_cache_manager, 'index_head_dim')):
+        m = attn_metadata
+        saved['saved_dsa_state'] = {
+            'host_indexer_k_cache_block_offsets':
+            m.host_indexer_k_cache_block_offsets.clone(),
+            'indexer_k_cache_block_offsets':
+            m.indexer_k_cache_block_offsets.clone(),
+            'host_slot_mapping_fp8':
+            m.host_slot_mapping_fp8.clone(),
+            'host_slot_mapping_scale':
+            m.host_slot_mapping_scale.clone(),
+            'slot_mapping_fp8':
+            m.slot_mapping_fp8.clone(),
+            'slot_mapping_scale':
+            m.slot_mapping_scale.clone(),
         }
-        attn_metadata.kv_cache_manager = draft_kv_cache_manager
-        attn_metadata.kv_cache_block_offsets = (
-            attn_metadata.draft_kv_cache_block_offsets)
-        attn_metadata.host_kv_cache_block_offsets = (
-            draft_kv_cache_manager.host_kv_cache_block_offsets)
-
-        from ..attention_backend.sparse.dsa import (DSACacheManager,
-                                                    DSAtrtllmAttentionMetadata,
-                                                    Indexer)
-        if isinstance(attn_metadata, DSAtrtllmAttentionMetadata) and isinstance(
-                draft_kv_cache_manager, DSACacheManager):
-            m = attn_metadata
-            saved['saved_dsa_state'] = {
-                'host_indexer_k_cache_block_offsets':
-                m.host_indexer_k_cache_block_offsets.clone(),
-                'indexer_k_cache_block_offsets':
-                m.indexer_k_cache_block_offsets.clone(),
-                'host_slot_mapping_fp8':
-                m.host_slot_mapping_fp8.clone(),
-                'host_slot_mapping_scale':
-                m.host_slot_mapping_scale.clone(),
-                'slot_mapping_fp8':
-                m.slot_mapping_fp8.clone(),
-                'slot_mapping_scale':
-                m.slot_mapping_scale.clone(),
-            }
-            # Derive pool indices from the draft manager's encoded block
-            # offsets (via _get_pool_block_indices) instead of using raw block
-            # IDs.  With host cache offload, block IDs can exceed
-            # blocks_in_primary_pool after offload swaps (the block keeps its
-            # original high ID even though its memory now lives in the primary
-            # GPU pool).  Using raw block IDs as pool indices causes OOB access
-            # in the indexer k-cache buffers.  _get_pool_block_indices correctly
-            # decodes memPoolBlockIndex from the C++ encoded offsets.
-            # Note: kv_cache_manager was already swapped to draft above (line 67).
-            pool_indices = m._get_pool_block_indices()
-            num_blocks = pool_indices.shape[1]
-            m.host_indexer_k_cache_block_offsets[:m.num_seqs, :
-                                                 num_blocks].copy_(pool_indices)
-            m.indexer_k_cache_block_offsets[:m.num_seqs].copy_(
-                m.host_indexer_k_cache_block_offsets[:m.num_seqs],
-                non_blocking=True)
-            # Safety clamp: sanitize stale padding entries beyond num_seqs
-            # that may contain negative or out-of-range values, matching the
-            # regular DSA prepare() flow.
-            m.indexer_k_cache_block_offsets.clamp_(min=0)
-            Indexer.recompute_slot_mappings(m)
-        return saved
-    except Exception:
-        if saved is not None:
-            restore_attn_metadata_after_draft_replay(attn_metadata, saved)
-        else:
-            attn_metadata.kv_cache_manager = target_kv_cache_manager
-            attn_metadata.kv_cache_block_offsets = target_kv_cache_block_offsets
-            attn_metadata.host_kv_cache_block_offsets = (
-                target_host_kv_cache_block_offsets)
-            if target_kv_length_state is not None:
-                attn_metadata.restore_target_kv_length_domain(
-                    target_kv_length_state)
-        raise
+        # Derive pool indices from the draft manager's encoded block
+        # offsets (via _get_pool_block_indices) instead of using raw block
+        # IDs.  With host cache offload, block IDs can exceed
+        # blocks_in_primary_pool after offload swaps (the block keeps its
+        # original high ID even though its memory now lives in the primary
+        # GPU pool).  Using raw block IDs as pool indices causes OOB access
+        # in the indexer k-cache buffers.  _get_pool_block_indices correctly
+        # decodes memPoolBlockIndex from the C++ encoded offsets.
+        # Note: kv_cache_manager was already swapped to draft above (line 67).
+        pool_indices = m._get_pool_block_indices()
+        num_blocks = pool_indices.shape[1]
+        m.host_indexer_k_cache_block_offsets[:m.num_seqs, :num_blocks].copy_(
+            pool_indices)
+        m.indexer_k_cache_block_offsets[:m.num_seqs].copy_(
+            m.host_indexer_k_cache_block_offsets[:m.num_seqs],
+            non_blocking=True)
+        # Safety clamp: sanitize stale padding entries beyond num_seqs
+        # that may contain negative or out-of-range values, matching the
+        # regular DSA prepare() flow.
+        m.indexer_k_cache_block_offsets.clamp_(min=0)
+        Indexer.recompute_slot_mappings(m)
+    return saved
 
 
 def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
@@ -192,9 +157,6 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
         saved_state['target_kv_cache_block_offsets'])
     attn_metadata.host_kv_cache_block_offsets = (
         saved_state['target_host_kv_cache_block_offsets'])
-    target_kv_length_state = saved_state['target_kv_length_state']
-    if target_kv_length_state is not None:
-        attn_metadata.restore_target_kv_length_domain(target_kv_length_state)
     saved_dsa = saved_state.get('saved_dsa_state')
     if saved_dsa is not None:
         m = attn_metadata
@@ -1579,18 +1541,12 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         Context manager to temporarily switch to draft KV cache manager in one-engine speculative decoding.
 
-        This swaps the manager, block offsets, and all kernel-visible KV length
-        views because target and draft caches may have different layouts and
-        retained prefix lengths.
+        This swaps both the kv_cache_manager reference AND the block offset tensors,
+        since the target and draft KV caches have different block layouts.
         """
 
         # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
         if draft_kv_cache_manager is None:
-            if (isinstance(attn_metadata, TrtllmAttentionMetadata)
-                    and attn_metadata.use_distinct_draft_kv_lengths):
-                raise RuntimeError(
-                    "Distinct draft KV lengths require a draft KV cache manager in the draft context"
-                )
             yield
             return
 
@@ -1600,47 +1556,30 @@ class SpecWorkerBase(nn.Module, ABC):
             return
 
         # Check if draft KV cache block offsets are allocated
-        draft_block_offsets = attn_metadata.draft_kv_cache_block_offsets
+        draft_block_offsets = getattr(attn_metadata,
+                                      'draft_kv_cache_block_offsets', None)
         if draft_block_offsets is None:
-            if attn_metadata.use_distinct_draft_kv_lengths:
-                raise RuntimeError(
-                    "Distinct draft KV lengths require draft KV cache block offsets"
-                )
-            # Native paths without a separate draft table keep the target domain.
+            # Draft KV cache block offsets not allocated, skip switching
             yield
             return
-        if attn_metadata.draft_kv_cache_manager is not draft_kv_cache_manager:
-            raise RuntimeError(
-                "Attention metadata was prepared for a different draft KV cache manager"
-            )
 
-        # Save main KV cache manager, block offsets, and target length domain.
+        # Save main KV cache manager and block offsets
         target_kv_cache_manager = attn_metadata.kv_cache_manager
         target_kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets
         target_host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets
-        target_kv_length_state = None
-        try:
-            target_kv_length_state = (
-                attn_metadata.activate_draft_kv_length_domain()
-                if attn_metadata.use_distinct_draft_kv_lengths else None)
 
-            # Switch to draft KV cache manager and its block offsets. Keep all
-            # setup inside the transaction because resolving the draft host
-            # table can itself fail before the caller enters the context body.
-            attn_metadata.kv_cache_manager = draft_kv_cache_manager
-            attn_metadata.kv_cache_block_offsets = (
-                attn_metadata.draft_kv_cache_block_offsets)
-            attn_metadata.host_kv_cache_block_offsets = (
-                draft_kv_cache_manager.host_kv_cache_block_offsets)
+        # Switch to draft KV cache manager and its block offsets
+        attn_metadata.kv_cache_manager = draft_kv_cache_manager
+        attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
+        attn_metadata.host_kv_cache_block_offsets = draft_kv_cache_manager.host_kv_cache_block_offsets
+
+        try:
             yield
         finally:
             # Restore main KV cache manager and block offsets
             attn_metadata.kv_cache_manager = target_kv_cache_manager
             attn_metadata.kv_cache_block_offsets = target_kv_cache_block_offsets
             attn_metadata.host_kv_cache_block_offsets = target_host_kv_cache_block_offsets
-            if target_kv_length_state is not None:
-                attn_metadata.restore_target_kv_length_domain(
-                    target_kv_length_state)
 
     def _sample_tokens_for_batch(
         self,

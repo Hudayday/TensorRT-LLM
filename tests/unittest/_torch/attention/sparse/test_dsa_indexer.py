@@ -2903,9 +2903,6 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
 
         meta = self._make_mock_metadata()
         mgr = self._make_mock_draft_manager()
-        meta.draft_kv_cache_manager = mgr
-        target_kv_length_state = Mock(name="target_kv_length_state")
-        meta.activate_draft_kv_length_domain.return_value = target_kv_length_state
         original_kv_mgr = meta.kv_cache_manager
         original_offsets = meta.kv_cache_block_offsets.clone()
         original_host_offsets = meta.host_kv_cache_block_offsets.clone()
@@ -2921,7 +2918,6 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         assert saved['target_kv_cache_manager'] is original_kv_mgr
         assert meta.kv_cache_manager is mgr
         assert 'saved_dsa_state' not in saved
-        assert saved['target_kv_length_state'] is target_kv_length_state
 
         restore_attn_metadata_after_draft_replay(meta, saved)
 
@@ -2930,5 +2926,3 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
                                    original_offsets)
         torch.testing.assert_close(meta.host_kv_cache_block_offsets,
                                    original_host_offsets)
-        meta.restore_target_kv_length_domain.assert_called_once_with(
-            target_kv_length_state)
