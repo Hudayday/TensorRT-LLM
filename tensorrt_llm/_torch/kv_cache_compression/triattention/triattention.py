@@ -1627,10 +1627,10 @@ class TriAttention(BaseKVCacheCompressionManager):
                     "TriAttention does not yet support dynamic speculative draft lengths"
                 )
             mode = self.spec_config.spec_dec_mode
-            if not (mode.is_dflash() or requires_paged_draft_kv_length_domain(self.spec_config)):
+            if not (mode.is_dflash() or mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
                 raise ValueError(
-                    "TriAttention target-only speculative compatibility currently "
-                    "requires DFlash private context K/V or standard paged draft attention"
+                    "TriAttention has not validated this speculative mode's target-tail "
+                    "compaction lifecycle"
                 )
             if (
                 self.spec_config.acceptance_window is not None
