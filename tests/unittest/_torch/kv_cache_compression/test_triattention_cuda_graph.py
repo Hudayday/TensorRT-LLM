@@ -472,6 +472,13 @@ class TestStandaloneGraphBuckets:
     @staticmethod
     def _mark_ready(manager, score, selection):
         key = score.prewarm_key
+        score.bucket_seq_len = selection.prompt_len + selection.width
+        score.valid_seq_lens_device = torch.full(
+            (score.max_requests,),
+            score.bucket_seq_len,
+            dtype=torch.int32,
+        )
+        selection.stage_valid_widths_from_seq_lens = mock.Mock()
         manager._fixed_score_prewarm_states = {key: "ready"}
         manager._fixed_score_workspaces = {key: score}
         manager._cross_request_selection_prewarm_states = {key: "ready"}
@@ -492,7 +499,7 @@ class TestStandaloneGraphBuckets:
             (1024, 9216, 8192, "torch_topk", 32),
         ],
     )
-    def test_ready_dynamic_exact_bucket_is_accepted(
+    def test_ready_upper_bucket_is_accepted(
         self, prompt_len, width, budget, backend, request_count
     ):
         manager = _make_triattention()
@@ -529,6 +536,163 @@ class TestStandaloneGraphBuckets:
             prompt_len,
             budget,
             backend,
+        )
+
+    def test_different_valid_lengths_share_one_upper_bucket(self):
+        manager = _make_triattention()
+        manager.top_B = 8
+        manager._standalone_cuda_graph_enabled = True
+        prepared = [
+            {
+                "seq_len": seq_len,
+                "request": SimpleNamespace(py_prompt_len=2),
+                "expected_keep_count": 10,
+            }
+            for seq_len in (11, 13)
+        ]
+        score = SimpleNamespace(prewarm_key=("upper",), max_requests=8)
+        selection = SimpleNamespace(
+            selection_backend="indexer_topk",
+            max_requests=8,
+            prompt_len=2,
+            width=12,
+            keep_count=8,
+        )
+        self._mark_ready(manager, score, selection)
+
+        key = manager._standalone_graph_bucket_for(prepared, score, selection)
+
+        assert key is not None
+        assert key[2:7] == (2, 14, 2, 8, "indexer_topk")
+
+    def test_actual_backend_boundary_cannot_share_one_upper_bucket(self):
+        manager = _make_triattention()
+        manager.top_B = 2048
+        manager._standalone_cuda_graph_enabled = True
+        prepared = [
+            {
+                "seq_len": width,
+                "request": SimpleNamespace(py_prompt_len=0),
+                "expected_keep_count": 2048,
+            }
+            for width in (4095, 4096)
+        ]
+        score = SimpleNamespace(prewarm_key=("torch-upper",), max_requests=8)
+        selection = SimpleNamespace(
+            selection_backend="torch_topk",
+            max_requests=8,
+            prompt_len=0,
+            width=4096,
+            keep_count=2048,
+        )
+        self._mark_ready(manager, score, selection)
+
+        assert manager._standalone_graph_bucket_for(prepared, score, selection) is None
+
+    @pytest.mark.parametrize(
+        "budget,beta,bucket_width,valid_widths,backend",
+        [
+            (32, 4, 36, [34, 36], "indexer_topk"),
+            (4096, 128, 4228, [4225, 4228], "torch_topk"),
+            (4096, 4096, 8196, [8193, 8196], "torch_topk"),
+        ],
+    )
+    def test_budget_beta_k4_graph_key_is_shape_stable_and_overflow_rejected(
+        self, budget, beta, bucket_width, valid_widths, backend
+    ):
+        prompt_len = 1024
+        manager = _make_triattention()
+        manager.top_B = budget
+        manager.beta = beta
+        manager._standalone_cuda_graph_enabled = True
+        score = SimpleNamespace(
+            prewarm_key=("configured-upper", budget, beta, bucket_width),
+            max_requests=8,
+        )
+        selection = SimpleNamespace(
+            selection_backend=backend,
+            max_requests=8,
+            prompt_len=prompt_len,
+            width=bucket_width,
+            keep_count=budget,
+        )
+        self._mark_ready(manager, score, selection)
+
+        def prepared(widths):
+            return [
+                {
+                    "seq_len": prompt_len + width,
+                    "request": SimpleNamespace(py_prompt_len=prompt_len),
+                    "expected_keep_count": prompt_len + budget,
+                }
+                for width in widths
+            ]
+
+        first_key = manager._standalone_graph_bucket_for(prepared(valid_widths), score, selection)
+        second_key = manager._standalone_graph_bucket_for(
+            prepared([width - 1 for width in valid_widths]), score, selection
+        )
+
+        assert first_key == second_key
+        assert first_key[3:7] == (
+            prompt_len + bucket_width,
+            prompt_len,
+            budget,
+            backend,
+        )
+        assert (
+            manager._standalone_graph_bucket_for(prepared([bucket_width + 1]), score, selection)
+            is None
+        )
+
+    def test_budget2048_k4_uses_distinct_indexer_and_torch_graph_keys(self):
+        prompt_len = 1024
+        budget = 2048
+        manager = _make_triattention()
+        manager.top_B = budget
+        manager.beta = 2048
+        manager._standalone_cuda_graph_enabled = True
+
+        def key_for(bucket_width, valid_widths, backend):
+            score = SimpleNamespace(
+                prewarm_key=("configured-upper", budget, backend, bucket_width),
+                max_requests=8,
+            )
+            selection = SimpleNamespace(
+                selection_backend=backend,
+                max_requests=8,
+                prompt_len=prompt_len,
+                width=bucket_width,
+                keep_count=budget,
+            )
+            self._mark_ready(manager, score, selection)
+            prepared = [
+                {
+                    "seq_len": prompt_len + width,
+                    "request": SimpleNamespace(py_prompt_len=prompt_len),
+                    "expected_keep_count": prompt_len + budget,
+                }
+                for width in valid_widths
+            ]
+            return manager._standalone_graph_bucket_for(prepared, score, selection)
+
+        indexer_key = key_for(4095, [4092, 4095], "indexer_topk")
+        torch_key = key_for(4100, [4096, 4100], "torch_topk")
+
+        assert indexer_key is not None
+        assert torch_key is not None
+        assert indexer_key != torch_key
+        assert indexer_key[3:7] == (
+            prompt_len + 4095,
+            prompt_len,
+            budget,
+            "indexer_topk",
+        )
+        assert torch_key[3:7] == (
+            prompt_len + 4100,
+            prompt_len,
+            budget,
+            "torch_topk",
         )
 
     @pytest.mark.parametrize(
@@ -664,7 +828,7 @@ class TestStandaloneGraphBuckets:
         manager.score_aggregation = "mean"
         manager._standalone_cuda_graph_enabled = True
         manager._evicted = {}
-        manager._pre_forward_kv_lengths = {7: 3328}
+        manager._confirmed_kv_lengths = {7: 3328}
         prepared = [
             {
                 "request": SimpleNamespace(py_prompt_len=256),
@@ -746,14 +910,18 @@ class TestStandaloneGraphBuckets:
                 fixed_perhead_segment_views=fixed_views,
             )
 
-        assert targets == [(7, 2305)]
+        assert targets == [(7, 2304)]
         score.prepare_phase.assert_called_once_with(1)
         group.launch.assert_called_once()
+        selection.stage_valid_widths_from_seq_lens.assert_called_once_with(
+            score.valid_seq_lens_device,
+            1,
+        )
         selected_segments = selection.select_requests.call_args.args[0]
         assert selected_segments[0][0].shape == (1, 3072)
         workspace.launch.assert_called_once_with()
         assert manager._evicted == {7: 1024}
-        assert manager._pre_forward_kv_lengths == {7: 2304}
+        assert manager._confirmed_kv_lengths == {7: 2304}
         assert manager._standalone_graph_runtime_counts == {
             "attempt": 1,
             "attempt_requests": 1,
@@ -766,7 +934,7 @@ class TestStandaloneGraphBuckets:
         manager.top_B = 4096
         manager._standalone_cuda_graph_enabled = True
         manager._evicted = {}
-        manager._pre_forward_kv_lengths = {7: 9215}
+        manager._confirmed_kv_lengths = {7: 9215}
         prepared = [
             {
                 "request": SimpleNamespace(py_prompt_len=1024),
@@ -817,7 +985,7 @@ class TestStandaloneGraphBuckets:
 
         assert result is None
         assert manager._evicted == {}
-        assert manager._pre_forward_kv_lengths == {7: 9215}
+        assert manager._confirmed_kv_lengths == {7: 9215}
 
     def test_capture_failure_disables_semantic_bucket_before_new_arena(self):
         import contextlib
@@ -828,7 +996,7 @@ class TestStandaloneGraphBuckets:
         manager.top_B = 4096
         manager._standalone_cuda_graph_enabled = True
         manager._evicted = {}
-        manager._pre_forward_kv_lengths = {7: 9215}
+        manager._confirmed_kv_lengths = {7: 9215}
         prepared = [
             {
                 "request": SimpleNamespace(py_prompt_len=1024),
@@ -911,6 +1079,7 @@ class TestFixedBatchedCompactionWorkspace:
             page_count=2,
             representative_slots={0: 0, 1: 1},
             page_ids_device=torch.tensor([[[3, 1]], [[2, 0]]], dtype=torch.int64),
+            valid_seq_lens_device=torch.tensor([8], dtype=torch.int32),
         )
         selection = SimpleNamespace(
             max_requests=1,
@@ -997,6 +1166,7 @@ class TestFixedBatchedCompactionWorkspace:
         score = SimpleNamespace(
             page_ids_device=score_tensor,
             round_starts_device=score_tensor,
+            valid_seq_lens_device=score_tensor,
             phase_base=score_tensor,
             phase=score_tensor,
             cos_phase=score_tensor,
@@ -1076,7 +1246,7 @@ class TestStandaloneGraphCuda:
         device = initial_pool.device
         seq_len = prompt_len + width
         tokens_per_block = int(initial_pool.shape[3])
-        page_count = (seq_len + tokens_per_block) // tokens_per_block
+        page_count = (seq_len + tokens_per_block - 1) // tokens_per_block
         pool = initial_pool.clone()
         q_real = torch.tensor([[[0.75]]], dtype=torch.float32, device=device)
         q_imag = torch.tensor([[[0.25]]], dtype=torch.float32, device=device)
@@ -1130,13 +1300,26 @@ class TestStandaloneGraphCuda:
             list(range(request * page_count, (request + 1) * page_count)) for request in request_ids
         ]
 
-        def stage(round_shift=0, reverse_pages=False):
-            runtime_tables = [list(reversed(row)) if reverse_pages else list(row) for row in tables]
+        active_seq_lens = [seq_len] * request_count
+
+        def stage(round_shift=0, reverse_pages=False, valid_seq_lens=None):
+            if valid_seq_lens is None:
+                valid_seq_lens = [seq_len] * request_count
+            active_seq_lens[:] = valid_seq_lens
+            full_tables = [list(reversed(row)) if reverse_pages else list(row) for row in tables]
+            live_page_counts = [
+                (valid_seq_len + tokens_per_block - 1) // tokens_per_block
+                for valid_seq_len in valid_seq_lens
+            ]
+            runtime_tables = [
+                row[:live_page_count] for row, live_page_count in zip(full_tables, live_page_counts)
+            ]
             round_starts = [float(seq_len + round_shift + request * 17) for request in request_ids]
             assert score.stage(
                 lambda _ids, _layer, num_blocks_per_seq=None: runtime_tables,
                 request_ids,
                 round_starts,
+                valid_seq_lens,
             )
             return runtime_tables
 
@@ -1153,6 +1336,10 @@ class TestStandaloneGraphCuda:
             segments = [
                 [views[:, request, 0, prompt_len:seq_len]] for request in range(request_count)
             ]
+            selection.stage_valid_widths_from_seq_lens(
+                score.valid_seq_lens_device,
+                request_count,
+            )
             selection.select_requests(segments, normalize_scores=True)
 
         def body():
@@ -1165,7 +1352,7 @@ class TestStandaloneGraphCuda:
                 pool,
                 [score.page_ids_device[0, request] for request in range(request_count)],
                 [selection.keep[request] for request in range(request_count)],
-                [seq_len] * request_count,
+                active_seq_lens,
             )
 
         return pool, score, selection, compaction, stage, body, stage4_body
@@ -1192,7 +1379,7 @@ class TestStandaloneGraphCuda:
         device = torch.device("cuda")
         seq_len = prompt_len + width
         tokens_per_block = 128
-        page_count = (seq_len + tokens_per_block) // tokens_per_block
+        page_count = (seq_len + tokens_per_block - 1) // tokens_per_block
         total_pages = request_count * page_count
         initial = torch.arange(
             total_pages * 2 * tokens_per_block * 2,
@@ -1284,6 +1471,82 @@ class TestStandaloneGraphCuda:
         assert cache.snapshot()["replay_failure"] == 0
 
     @CUDA_REQUIRED
+    def test_ragged_upper_graph_matches_stage4_eager_across_replay(self):
+        device = torch.device("cuda")
+        prompt_len = 16
+        width = 4224
+        budget = 4096
+        request_count = 2
+        tokens_per_block = 128
+        seq_len = prompt_len + width
+        page_count = (seq_len + tokens_per_block - 1) // tokens_per_block
+        initial = torch.arange(
+            request_count * page_count * 2 * tokens_per_block * 2,
+            dtype=torch.float32,
+            device=device,
+        ).view(request_count * page_count, 2, 1, tokens_per_block, 2)
+        eager = self._build_formal_path(
+            width,
+            budget,
+            "torch_topk",
+            request_count,
+            initial,
+            prompt_len=prompt_len,
+        )
+        graphed = self._build_formal_path(
+            width,
+            budget,
+            "torch_topk",
+            request_count,
+            initial,
+            prompt_len=prompt_len,
+        )
+        eager_pool, _, eager_selection, _, eager_stage, _, eager_body = eager
+        graph_pool, _, graph_selection, graph_compaction, graph_stage, graph_body, _ = graphed
+        cache = StandaloneEvictionGraphCache(max_entries=1, max_bytes=1024**3)
+        stream = torch.cuda.current_stream(device)
+
+        for replay, valid_widths in enumerate(((4097, 4160), (4110, 4200))):
+            valid_seq_lens = [prompt_len + valid_width for valid_width in valid_widths]
+            eager_pool.copy_(initial)
+            graph_pool.copy_(initial)
+            eager_tables = eager_stage(
+                round_shift=37 * replay,
+                reverse_pages=bool(replay),
+                valid_seq_lens=valid_seq_lens,
+            )
+            assert (
+                graph_stage(
+                    round_shift=37 * replay,
+                    reverse_pages=bool(replay),
+                    valid_seq_lens=valid_seq_lens,
+                )
+                == eager_tables
+            )
+            eager_body()
+            fingerprint = graph_compaction.pointer_fingerprint(stream)
+            assert cache.execute(
+                key=("ragged-upper",),
+                request_count=request_count,
+                fingerprint=fingerprint,
+                workspace=graph_compaction,
+                capture_body=graph_body,
+            ) == ("capture" if replay == 0 else "replay")
+            torch.cuda.synchronize(device)
+
+            assert torch.equal(
+                eager_selection.keep[:request_count],
+                graph_selection.keep[:request_count],
+            )
+            assert torch.equal(eager_pool.view(torch.uint8), graph_pool.view(torch.uint8))
+            for request_index, valid_seq_len in enumerate(valid_seq_lens):
+                assert int(graph_selection.keep[request_index].max()) < valid_seq_len
+
+        assert cache.snapshot()["capture"] == 1
+        assert cache.snapshot()["cache_hit"] == 1
+        assert cache.snapshot()["fallback"] == 0
+
+    @CUDA_REQUIRED
     def test_graph_compaction_preserves_prompt_and_rebases_swa_latest_window(self):
         device = torch.device("cuda")
         request_count = 2
@@ -1296,16 +1559,18 @@ class TestStandaloneGraphCuda:
             + 1000.0,
         ]
         keep = torch.tensor(
-            [[0, 1, 2, 4, 5, 7], [0, 1, 3, 4, 6, 7]],
+            [[0, 1, 2, 4, 5, 7], [0, 1, 2, 3, 5, 6]],
             dtype=torch.int64,
             device=device,
         )
+        valid_seq_lens = torch.tensor([8, 7], dtype=torch.int32, device=device)
 
         def build(pools):
             score = SimpleNamespace(
                 page_count=page_count,
                 representative_slots={0: 0, 1: 1},
                 page_ids_device=torch.stack((dense_tables, swa_tables)),
+                valid_seq_lens_device=valid_seq_lens,
             )
             selection = SimpleNamespace(
                 max_requests=request_count,
@@ -1339,15 +1604,23 @@ class TestStandaloneGraphCuda:
             eager_pools[0],
             [dense_tables[request] for request in range(request_count)],
             [keep[request] for request in range(request_count)],
-            [8] * request_count,
+            valid_seq_lens.tolist(),
         )
-        swa_source = torch.tensor([6, 7], dtype=torch.int64, device=device)
+        swa_sources = [
+            torch.arange(
+                int(valid_seq_len) - 2,
+                int(valid_seq_len),
+                dtype=torch.int64,
+                device=device,
+            )
+            for valid_seq_len in valid_seq_lens
+        ]
         swa_destination = torch.tensor([4, 5], dtype=torch.int64, device=device)
         triton_tri_compact(
             eager_pools[1],
             [swa_tables[request] for request in range(request_count)],
-            [swa_source] * request_count,
-            [8] * request_count,
+            swa_sources,
+            valid_seq_lens.tolist(),
             dest_list=[swa_destination] * request_count,
         )
         cache = StandaloneEvictionGraphCache(max_entries=1, max_bytes=1024**3)
@@ -1374,4 +1647,8 @@ class TestStandaloneGraphCuda:
             swa_after = graph_pools[1][swa_ids].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
             assert torch.equal(dense_after[:, :, :2], dense_before[:, :, :2])
             assert torch.equal(swa_after[:, :, :2], swa_before[:, :, :2])
-            assert torch.equal(swa_after[:, :, 4:6], swa_before[:, :, 6:8])
+            valid_seq_len = int(valid_seq_lens[request])
+            assert torch.equal(
+                swa_after[:, :, 4:6],
+                swa_before[:, :, valid_seq_len - 2 : valid_seq_len],
+            )

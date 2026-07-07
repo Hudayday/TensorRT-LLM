@@ -3278,13 +3278,16 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "prompt tokens are always preserved on top).")
     beta: int = Field(
         default=128,
-        description="Eviction period in generation steps (upstream "
-        "`divide_length`): the eviction hook fires once every `beta` steps.")
+        description="Eviction period in confirmed generation tokens (upstream "
+        "`divide_length`): one speculative iteration may advance the counter "
+        "by multiple accepted tokens; at most one eviction is coalesced per update."
+    )
     model_path: Optional[str] = Field(
         default=None,
         description="Checkpoint path used to derive RoPE tables when converting "
         "the official calibration and, when `skip_swa=True`, to classify "
-        "kernel-masked sliding-attention layers. Required when `skip_swa=True`.")
+        "kernel-masked sliding-attention layers. Required when `skip_swa=True`."
+    )
     calibration_path: Optional[str] = Field(
         default=None,
         description="Path to the official TriAttention calibration `.pt` "

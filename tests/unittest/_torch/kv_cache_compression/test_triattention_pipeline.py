@@ -55,6 +55,7 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
 # Framework base class lives in pyexecutor.resource_manager; the factory lives
 # in pyexecutor._util (next to _create_kv_cache_manager), matching #15106.
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import BaseKVCacheCompressionManager
 from tensorrt_llm.llmapi.llm_args import (
     DeepSeekSparseAttentionConfig,
@@ -85,12 +86,13 @@ def flat_calibration_pt(tmp_path):
     return str(path)
 
 
-def _make_fake_v2(enable_block_reuse=False):
+def _make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     """Build an unallocated V2 double with TriAttention's production contract."""
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 
     fake_v2 = KVCacheManagerV2.__new__(KVCacheManagerV2)
     fake_v2.enable_block_reuse = enable_block_reuse
+    fake_v2.is_draft = is_draft
     fake_v2.mapping = SimpleNamespace(enable_attention_dp=False)
     fake_v2.is_disagg = False
     fake_v2.max_beam_width = 1
@@ -99,6 +101,9 @@ def _make_fake_v2(enable_block_reuse=False):
     fake_v2._kv_reserve_draft_tokens = 0
     fake_v2.max_attention_window_vec = []
     fake_v2.kv_cache_manager_py_config = SimpleNamespace(layers=[])
+    fake_v2.impl = object()
+    fake_v2.kv_cache_map = {}
+    fake_v2.host_kv_cache_block_offsets = torch.empty(1, dtype=torch.int64)
     fake_v2.pp_layers = []
     fake_v2.layer_offsets = {}
     fake_v2.layer_to_pool_mapping_dict = {}
@@ -118,9 +123,9 @@ def _make_request(request_id, **overrides):
         "py_request_id": request_id,
         "py_prompt_len": 0,
         "py_draft_tokens": [],
-        "py_kv_cache_generation_capacity_only": False,
-        "py_kv_cache_compaction": None,
+        "py_num_accepted_draft_tokens": 0,
         "is_dummy": False,
+        "state": LlmRequestState.GENERATION_IN_PROGRESS,
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -296,7 +301,7 @@ class TestTriAttentionClass:
                 count_prompt_tokens=count_prompt_tokens,
             )
 
-    def test_request_init_registers_capacity_only_for_every_request(self):
+    def test_triattention_enables_capacity_only_on_target_manager(self):
         manager = _make_fake_v2()
         triattention = TriAttention(manager, top_B=8, skip_swa=False)
         triattention._calibrated = True
@@ -306,10 +311,8 @@ class TestTriAttentionClass:
         triattention.on_request_init(first)
         triattention.on_request_init(second)
 
-        assert first.py_kv_cache_generation_capacity_only
-        assert second.py_kv_cache_generation_capacity_only
-        assert first.py_kv_cache_compaction is None
-        assert second.py_kv_cache_compaction is None
+        assert manager.generation_capacity_only
+        assert triattention._initialized_request_ids == {11, 12}
 
     def test_request_init_rejects_native_v2_swa(self):
         manager = _make_fake_v2()
@@ -320,7 +323,7 @@ class TestTriAttentionClass:
 
         with pytest.raises(ValueError, match="full-attention V2 lifecycles"):
             triattention.on_request_init(request)
-        assert request.py_kv_cache_generation_capacity_only is False
+        assert triattention._initialized_request_ids == set()
 
     def test_request_init_rejects_attention_dp(self):
         manager = _make_fake_v2()
@@ -331,14 +334,19 @@ class TestTriAttentionClass:
         with pytest.raises(ValueError, match="attention DP"):
             triattention.on_request_init(_make_request(11))
 
-    def test_request_init_rejects_speculative_capacity(self):
+    def test_request_init_accepts_speculative_capacity(self):
         manager = _make_fake_v2()
         manager.num_extra_kv_tokens = 4
+        manager.max_total_draft_tokens = 4
+        manager._kv_reserve_draft_tokens = 4
         triattention = TriAttention(manager, top_B=8, skip_swa=False)
         triattention._calibrated = True
+        request = _make_request(11)
 
-        with pytest.raises(ValueError, match="single-token"):
-            triattention.on_request_init(_make_request(11))
+        triattention.on_request_init(request)
+
+        assert manager.generation_capacity_only
+        assert triattention._initialized_request_ids == {11}
 
     def test_skip_swa_requires_model_path(self):
         with pytest.raises(ValueError, match="skip_swa=True requires model_path"):
@@ -368,8 +376,8 @@ class TestTriAttentionClass:
 
 
 # ---------------------------------------------------------------------------
-# adjust_attention_metadata: use V2's authoritative pre-forward physical length
-# and clamp prompt_lens to that compacted prefix.
+# adjust_attention_metadata: preserve native scheduling semantics and subtract
+# only the cumulative physically evicted length.
 # ---------------------------------------------------------------------------
 
 
@@ -386,6 +394,9 @@ class _FakeMetadata:
         self.num_contexts = num_contexts
         self.num_generations = len(request_ids) - num_contexts
 
+    def set_draft_kv_length_delta(self, delta):
+        self.draft_kv_length_delta = list(delta)
+
 
 class TestAttentionMetadataReconcile:
     def test_base_hook_is_noop(self):
@@ -397,26 +408,32 @@ class TestAttentionMetadataReconcile:
         mgr.adjust_attention_metadata(meta)  # must not raise / mutate
         assert meta.kv_cache_params.num_cached_tokens_per_seq == [100]
 
-    def test_authoritative_pre_forward_length_replaces_logical_length(self):
+    def test_no_eviction_preserves_native_first_draft_length(self):
         mgr = _make_triattention()
-        mgr._pre_forward_kv_lengths = {7: 91}
+        meta = _FakeMetadata([63], [50], [7])
+        mgr.adjust_attention_metadata(meta)
+        assert meta.kv_cache_params.num_cached_tokens_per_seq == [63]
+        assert meta.prompt_lens == [50]
+
+    def test_cumulative_eviction_is_subtracted_from_native_length(self):
+        mgr = _make_triattention()
+        mgr._evicted = {7: 9}
         meta = _FakeMetadata([100], [50], [7])
         mgr.adjust_attention_metadata(meta)
-        assert meta.kv_cache_params.num_cached_tokens_per_seq[0] == 91
-        assert meta.prompt_lens == [50]  # 50 <= 91, not clamped
+        assert meta.kv_cache_params.num_cached_tokens_per_seq == [91]
+        assert meta.prompt_lens == [50]
 
     def test_prompt_len_clamped_to_compacted_cache(self):
         # A prompt longer than the whole compacted cache is clamped to num_cached.
         mgr = _make_triattention()
-        mgr._pre_forward_kv_lengths = {7: 91}
+        mgr._evicted = {7: 9}
         meta = _FakeMetadata([100], [200], [7])
         mgr.adjust_attention_metadata(meta)
         assert meta.kv_cache_params.num_cached_tokens_per_seq[0] == 91
         assert meta.prompt_lens == [91]
 
-    def test_request_without_authoritative_length_is_untouched(self):
+    def test_request_without_eviction_is_untouched(self):
         mgr = _make_triattention()
-        mgr._pre_forward_kv_lengths = {}
         meta = _FakeMetadata([100], [50], [7])
         mgr.adjust_attention_metadata(meta)
         assert meta.kv_cache_params.num_cached_tokens_per_seq == [100]
@@ -424,7 +441,6 @@ class TestAttentionMetadataReconcile:
 
     def test_none_kv_cache_params_is_a_noop(self):
         mgr = _make_triattention()
-        mgr._pre_forward_kv_lengths = {7: 91}
         meta = _FakeMetadata([100], [50], [7])
         meta.kv_cache_params = None
 
@@ -434,7 +450,7 @@ class TestAttentionMetadataReconcile:
 
     def test_none_prompt_lens_still_reconciles_cache_length(self):
         mgr = _make_triattention()
-        mgr._pre_forward_kv_lengths = {7: 91}
+        mgr._evicted = {7: 9}
         meta = _FakeMetadata([100], [50], [7])
         meta.prompt_lens = None
 
@@ -446,32 +462,73 @@ class TestAttentionMetadataReconcile:
     def test_context_requests_skipped(self):
         # Only generation requests (index >= num_contexts) are reconciled.
         mgr = _make_triattention()
-        mgr._pre_forward_kv_lengths = {1: 80, 2: 91}
+        mgr._evicted = {1: 20, 2: 9}
         meta = _FakeMetadata([100, 100], [50, 50], [1, 2], num_contexts=1)
         mgr.adjust_attention_metadata(meta)
         # request 1 is a context request -> untouched; request 2 is generation.
         assert meta.kv_cache_params.num_cached_tokens_per_seq == [100, 91]
 
+    def test_vanilla_mtp_publishes_dense_draft_length_delta(self):
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
-class TestStepBeginHookRefactor:
-    """Periodic eviction runs via the framework's pre-forward
-    ``on_generation_step_begin`` hook, not a ``prepare_resources`` override."""
-
-    def test_base_has_pre_forward_hook(self):
-        assert hasattr(BaseKVCacheCompressionManager, "on_generation_step_begin")
-
-    def test_triattention_uses_hook_not_prepare_resources_override(self):
-        assert "prepare_resources" not in TriAttention.__dict__, (
-            "prepare_resources override should be gone (use the base + the hook)"
+        mgr = _make_triattention(
+            spec_config=MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True),
+            draft_kv_cache_manager=_make_fake_v2(is_draft=True),
         )
-        assert "on_generation_step_begin" in TriAttention.__dict__
+        mgr._evicted = {2: 37}
+        meta = _FakeMetadata([40, 100], [40, 50], [1, 2], num_contexts=1)
+
+        mgr.adjust_attention_metadata(meta)
+
+        assert meta.kv_cache_params.num_cached_tokens_per_seq == [40, 63]
+        assert meta.draft_kv_length_delta == [0, 37]
+
+    @pytest.mark.parametrize("mode", ["dflash", "eagle3_one_model"])
+    def test_separate_draft_modes_publish_dense_draft_length_delta(self, mode):
+        from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig, Eagle3DecodingConfig
+
+        if mode == "dflash":
+            spec_config = DFlashDecodingConfig(max_draft_len=4)
+        else:
+            spec_config = Eagle3DecodingConfig(
+                max_draft_len=4,
+                speculative_model="/tmp/qwen3-eagle3-draft",
+            )
+        mgr = _make_triattention(
+            spec_config=spec_config,
+            draft_kv_cache_manager=_make_fake_v2(is_draft=True),
+        )
+        mgr._evicted = {2: 37}
+        meta = _FakeMetadata([40, 100], [40, 50], [1, 2], num_contexts=1)
+
+        mgr.adjust_attention_metadata(meta)
+
+        assert meta.kv_cache_params.num_cached_tokens_per_seq == [40, 63]
+        assert meta.draft_kv_length_delta == [0, 37]
+
+    def test_eviction_cannot_exceed_native_cached_length(self):
+        mgr = _make_triattention()
+        mgr._evicted = {7: 101}
+        meta = _FakeMetadata([100], [50], [7])
+
+        with pytest.raises(RuntimeError, match="below its cumulative eviction count"):
+            mgr.adjust_attention_metadata(meta)
+
+
+class TestStepEndHookRefactor:
+    """Periodic eviction runs through the framework's final update hook."""
+
+    def test_triattention_prepare_only_snapshots_and_update_uses_final_hook(self):
+        assert "prepare_resources" in TriAttention.__dict__
+        assert "update_resources" not in TriAttention.__dict__
+        assert "on_generation_step_end" in TriAttention.__dict__
 
     def test_hook_runs_periodic_evict(self):
         import unittest.mock as mock
 
         mgr = _make_triattention()
         with mock.patch.object(TriAttention, "_periodic_evict") as pe:
-            mgr.on_generation_step_begin("BATCH")
+            mgr.on_generation_step_end("BATCH")
             pe.assert_called_once_with("BATCH")
 
     def test_dummy_and_arbitrary_non_due_steps_do_not_materialize(self):
@@ -503,22 +560,21 @@ class TestStepBeginHookRefactor:
         assert mgr._standalone_graph_cache is None
         assert mgr._standalone_graph_arena_generation == 0
 
-    def test_base_prepare_resources_fires_hook_pre_forward(self):
+    def test_base_update_resources_fires_hook_after_native_managers(self):
         import unittest.mock as mock
 
         mgr = BaseKVCacheCompressionManager.__new__(BaseKVCacheCompressionManager)
         batch = mock.MagicMock()
-        batch.context_requests = []
-        with mock.patch.object(BaseKVCacheCompressionManager, "on_generation_step_begin") as sb:
-            mgr.prepare_resources(batch)
-            sb.assert_called_once_with(batch)
+        batch.context_requests_last_chunk = []
+        with mock.patch.object(BaseKVCacheCompressionManager, "on_generation_step_end") as se:
+            mgr.update_resources(batch)
+            se.assert_called_once_with(batch, None)
 
-    def test_step_begin_hook_documents_deferred_v2_resize_boundary(self):
-        doc = TriAttention.on_generation_step_begin.__doc__
+    def test_step_end_hook_documents_direct_resize_boundary(self):
+        doc = TriAttention.on_generation_step_end.__doc__
 
-        assert "publish a K+1 target" in doc
-        assert "post-forward update boundary" in doc
-        assert "resize V2 to the compacted capacity" not in doc
+        assert "after native KV-cache updates" in doc
+        assert "resize happens only after compaction" in doc
 
     def test_evicted_count_default_zero(self):
         mgr = TriAttention(_make_fake_v2(), top_B=8, beta=4, skip_swa=False)
@@ -538,7 +594,7 @@ class TestStepBeginHookRefactor:
         mgr = _make_triattention()
         mgr._calibrated = True
         cache = SimpleNamespace(
-            capacity=seq_len + 1,
+            capacity=seq_len,
             history_length=1024,
             is_active=True,
             resize=mock.Mock(return_value=True),
@@ -548,12 +604,13 @@ class TestStepBeginHookRefactor:
             kv_cache_map={7: cache},
             pp_layers=[0, 1],
             _stream=mock.Mock(),
+            num_extra_kv_tokens=0,
         )
         mgr._L = 2
         mgr._gen_steps = {7: 127}
         mgr._evicted = {}
-        mgr._pre_forward_kv_lengths = {}
-        mgr._capacity_only_request_ids = {7}
+        mgr._confirmed_kv_lengths = {}
+        mgr._initialized_request_ids = {7}
         mgr.beta = 128
         mgr.top_B = 4096
         mgr.pin_prefill = True
@@ -591,11 +648,12 @@ class TestStepBeginHookRefactor:
         timeline = []
         event = mock.Mock()
         event.record.side_effect = lambda: timeline.append("event")
+        event.synchronize.side_effect = lambda: timeline.append("sync")
         cache = mgr.kv_cache_manager.kv_cache_map[7]
 
         def compact(*args):
             timeline.append("stage5_dispatch")
-            return [(7, 1024 + 4096 + 1)]
+            return [(7, 1024 + 4096)]
 
         def materialize_stage3():
             timeline.append("materialize_stage3")
@@ -630,48 +688,424 @@ class TestStepBeginHookRefactor:
         materialize_stage4_banks.assert_called_once_with()
         evict.assert_called_once_with([(request, 7)], 2)
         event.record.assert_called_once_with()
-        cache.resize.assert_not_called()
-        assert request.py_kv_cache_compaction == (
-            1024 + 4096 + 1,
-            1024 + 4096 + 2,
-            event,
-        )
+        event.synchronize.assert_called_once_with()
+        cache.resize.assert_called_once_with(1024 + 4096, None)
         assert timeline == [
             "materialize_stage3",
             "materialize_stage4",
             "stage5_dispatch",
-            "enter:triattention.publish",
+            "enter:triattention.resize",
             "event",
-            "exit:triattention.publish",
+            "sync",
+            "exit:triattention.resize",
         ]
 
-    def test_pending_compaction_uses_effective_length_and_defers_eviction(self):
+    def test_standalone_graph_coalesces_different_lengths_in_one_upper_bucket(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        mgr, request_a, _ = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
+        request_b = _make_request(
+            8,
+            py_prompt_len=1024,
+            max_beam_num_tokens=1024 + 4096 + 3,
+        )
+        request_c = _make_request(
+            9,
+            py_prompt_len=1024,
+            max_beam_num_tokens=1024 + 4096 + 3,
+        )
+        batch = SimpleNamespace(generation_requests=[request_a, request_b, request_c])
+        cache_b = SimpleNamespace(
+            capacity=1024 + 4096 + 2,
+            history_length=1024,
+            is_active=True,
+            resize=mock.Mock(return_value=True),
+        )
+        cache_c = SimpleNamespace(
+            capacity=1024 + 4096 + 2,
+            history_length=1024,
+            is_active=True,
+            resize=mock.Mock(return_value=True),
+        )
+        mgr.kv_cache_manager.kv_cache_map[8] = cache_b
+        mgr.kv_cache_manager.kv_cache_map[9] = cache_c
+        mgr._initialized_request_ids.update((8, 9))
+        mgr._gen_steps[8] = 127
+        mgr._gen_steps[9] = 127
+        mgr._standalone_cuda_graph_enabled = True
+        event = mock.Mock()
+
+        def compact(group, _num_layers):
+            return [
+                (rid, mgr._minimum_evictable_length(request, mgr._confirmed_kv_lengths[rid]))
+                for request, rid in group
+            ]
+
+        with (
+            mock.patch.object(mgr, "_materialize_fixed_shape_selection_banks"),
+            mock.patch.object(mgr, "_materialize_cross_request_selection_banks"),
+            mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict,
+            mock.patch.object(torch.cuda, "Event", return_value=event),
+        ):
+            mgr._periodic_evict(batch)
+
+        evict.assert_called_once_with([(request_a, 7), (request_b, 8), (request_c, 9)], 2)
+        mgr.kv_cache_manager.kv_cache_map[7].resize.assert_called_once_with(1024 + 4096, None)
+        cache_b.resize.assert_called_once_with(1024 + 4096, None)
+        cache_c.resize.assert_called_once_with(1024 + 4096, None)
+
+    def test_cross_request_selection_splits_actual_backend_boundary(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        prompt_len = 1024
+        mgr, request_a, _ = self._make_due_decode_request(seq_len=prompt_len + 4095)
+        request_b = _make_request(
+            8,
+            py_prompt_len=prompt_len,
+            max_beam_num_tokens=prompt_len + 4096 + 1,
+        )
+        batch = SimpleNamespace(generation_requests=[request_a, request_b])
+        cache_b = SimpleNamespace(
+            capacity=prompt_len + 4096,
+            history_length=prompt_len,
+            is_active=True,
+            resize=mock.Mock(return_value=True),
+        )
+        mgr.kv_cache_manager.kv_cache_map[8] = cache_b
+        mgr._initialized_request_ids.add(8)
+        mgr._gen_steps[8] = 127
+        mgr.top_B = 2048
+        mgr._cross_request_selection_enabled = True
+        event = mock.Mock()
+
+        def compact(group, _num_layers):
+            return [(rid, prompt_len + mgr.top_B) for _, rid in group]
+
+        with (
+            mock.patch.object(mgr, "_materialize_fixed_shape_selection_banks"),
+            mock.patch.object(mgr, "_materialize_cross_request_selection_banks"),
+            mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict,
+            mock.patch.object(torch.cuda, "Event", return_value=event),
+        ):
+            mgr._periodic_evict(batch)
+
+        assert evict.call_args_list == [
+            mock.call([(request_a, 7)], 2),
+            mock.call([(request_b, 8)], 2),
+        ]
+
+    def test_resize_failure_is_reported(self):
         from unittest import mock
 
         mgr, request, batch = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
         cache = mgr.kv_cache_manager.kv_cache_map[7]
-        published_capacity = cache.capacity
-        request.py_kv_cache_compaction = (
-            published_capacity,
-            published_capacity,
-            mock.Mock(),
-        )
-        cache.capacity += 1
+        cache.resize.return_value = False
+        event = mock.Mock()
 
         with (
-            mock.patch.object(mgr, "_materialize_fixed_shape_selection_banks") as stage3,
-            mock.patch.object(mgr, "_materialize_cross_request_selection_banks") as stage4,
-            mock.patch.object(mgr, "_evict_requests") as evict,
+            mock.patch.object(mgr, "_materialize_fixed_shape_selection_banks"),
+            mock.patch.object(mgr, "_materialize_cross_request_selection_banks"),
+            mock.patch.object(mgr, "_evict_requests", return_value=[(7, 1024 + 4096)]),
+            mock.patch.object(torch.cuda, "Event", return_value=event),
+        ):
+            with pytest.raises(RuntimeError, match="Failed to resize compacted KV cache"):
+                mgr._periodic_evict(batch)
+
+        event.synchronize.assert_called_once_with()
+
+    @pytest.mark.parametrize("accepted", [0, 1, 2, 3])
+    def test_overlap_exact_allocation_tail_is_excluded_rebased_and_retained(self, accepted):
+        from unittest import mock
+
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+        confirmed = 1024 + 4096 + 1 + accepted
+        reserve = 2
+        current_growth = 4
+        tail = reserve + current_growth
+        retained = 1024 + 4096
+        mgr, request, batch = self._make_due_decode_request(seq_len=confirmed)
+        request.py_num_accepted_draft_tokens = accepted
+        cache = mgr.kv_cache_manager.kv_cache_map[7]
+        cache.capacity = confirmed + tail
+        mgr.kv_cache_manager.num_extra_kv_tokens = reserve
+        mgr._prepared_generation_growth = {7: current_growth}
+        mgr._prepared_batch = SimpleNamespace(generation_requests=[request])
+        mgr.spec_config = MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True)
+        mgr.draft_kv_cache_manager = _make_fake_v2(is_draft=True)
+        event = mock.Mock()
+
+        with (
+            mock.patch.object(mgr, "_materialize_fixed_shape_selection_banks"),
+            mock.patch.object(mgr, "_materialize_cross_request_selection_banks"),
+            mock.patch.object(mgr, "_evict_requests", return_value=[(7, retained)]) as evict,
+            mock.patch.object(mgr, "_rebase_protected_tail") as rebase,
+            mock.patch.object(torch.cuda, "Event", return_value=event),
         ):
             mgr._periodic_evict(batch)
 
-        stage3.assert_not_called()
-        stage4.assert_not_called()
-        evict.assert_not_called()
-        assert mgr._gen_steps[7] == 127
-        assert mgr._pre_forward_kv_lengths[7] == 1024 + 4096 + 2
-        assert mgr._standalone_graph_cache is None
-        assert mgr._standalone_graph_arena_generation == 0
+        evict.assert_called_once_with([(request, 7)], 2)
+        assert mgr._confirmed_kv_lengths[7] == retained
+        rebase.assert_called_once_with(
+            request,
+            source_start=confirmed,
+            destination_start=retained,
+            token_count=tail,
+        )
+        cache.resize.assert_called_once_with(retained + tail, None)
+
+    @CUDA_REQUIRED
+    def test_protected_tail_rebase_preserves_exact_cross_page_bytes(self):
+        tokens_per_block = 4
+        pool = torch.arange(
+            3 * 2 * 1 * tokens_per_block * 2,
+            dtype=torch.float32,
+            device="cuda",
+        ).view(3, 2, 1, tokens_per_block, 2)
+        manager = _make_fake_v2()
+        manager.pp_layers = [0]
+        manager.get_buffers = lambda layer, kv_layout: pool
+        manager.get_batch_cache_indices = lambda request_ids, layer, num_blocks_per_seq: [[0, 1, 2]]
+        triattention = TriAttention(manager, top_B=2, skip_swa=False)
+        source_start = 6
+        destination_start = 3
+        token_count = 5
+        before = pool.permute(1, 2, 0, 3, 4).contiguous().reshape(2, 1, 3 * tokens_per_block, 2)
+        expected = before[:, :, source_start : source_start + token_count].clone()
+
+        triattention._rebase_protected_tail(
+            _make_request(7),
+            source_start=source_start,
+            destination_start=destination_start,
+            token_count=token_count,
+        )
+        torch.cuda.synchronize()
+
+        after = pool.permute(1, 2, 0, 3, 4).contiguous().reshape(2, 1, 3 * tokens_per_block, 2)
+        torch.testing.assert_close(
+            after[:, :, destination_start : destination_start + token_count],
+            expected,
+            rtol=0,
+            atol=0,
+        )
+
+    def test_confirmed_length_comes_from_capacity_ledger_not_logical_length(self):
+        from unittest import mock
+
+        physical_confirmed = 6100
+        manager = _make_triattention(beta=128)
+        manager._calibrated = True
+        manager._L = 2
+        manager._gen_steps = {7: 0}
+        manager._evicted = {7: 100}
+        manager._initialized_request_ids = {7}
+        cache = SimpleNamespace(
+            capacity=physical_confirmed,
+            history_length=1024,
+            is_active=True,
+            resize=mock.Mock(return_value=True),
+        )
+        manager.kv_cache_manager.kv_cache_map = {7: cache}
+        manager.kv_cache_manager.pp_layers = [0, 1]
+        manager.kv_cache_manager.num_extra_kv_tokens = 0
+        request = _make_request(
+            7,
+            py_prompt_len=1024,
+            max_beam_num_tokens=999999,
+            py_draft_tokens=[1, 2, 3, 4],
+        )
+
+        manager._periodic_evict(SimpleNamespace(generation_requests=[request]))
+
+        assert manager._confirmed_kv_lengths[7] == physical_confirmed
+        cache.resize.assert_not_called()
+
+    def test_one_model_mtp_target_only_contract_is_accepted(self):
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+        spec_config = MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True)
+        manager = TriAttention(
+            _make_fake_v2(),
+            top_B=8,
+            skip_swa=False,
+            spec_config=spec_config,
+            draft_kv_cache_manager=_make_fake_v2(is_draft=True),
+        )
+
+        manager._validate_v2_compatibility()
+        assert manager.kv_cache_manager.generation_capacity_only is True
+
+    def test_mtp_eagle_remains_fail_closed(self):
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+        spec_config = MTPDecodingConfig(max_draft_len=1)
+        manager = TriAttention(
+            _make_fake_v2(),
+            top_B=8,
+            skip_swa=False,
+            spec_config=spec_config,
+            draft_kv_cache_manager=_make_fake_v2(is_draft=True),
+        )
+
+        with pytest.raises(ValueError, match="supports DFlash, vanilla MTP"):
+            manager._validate_v2_compatibility()
+
+    def test_linear_eagle3_one_model_target_only_contract_is_accepted(self):
+        from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig
+
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=4,
+            speculative_model="/tmp/qwen3-eagle3-draft",
+        )
+        manager = TriAttention(
+            _make_fake_v2(),
+            top_B=8,
+            skip_swa=False,
+            spec_config=spec_config,
+            draft_kv_cache_manager=_make_fake_v2(is_draft=True),
+        )
+
+        manager._validate_v2_compatibility()
+
+    @pytest.mark.parametrize(
+        "config_overrides,error",
+        [
+            ({"eagle3_one_model": False}, "supports DFlash, vanilla MTP"),
+            (
+                {"use_dynamic_tree": True, "dynamic_tree_max_topK": 2},
+                "requires linear drafting",
+            ),
+        ],
+    )
+    def test_eagle3_separate_model_and_tree_modes_remain_fail_closed(self, config_overrides, error):
+        from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig
+
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=4,
+            speculative_model="/tmp/qwen3-eagle3-draft",
+            **config_overrides,
+        )
+        manager = TriAttention(
+            _make_fake_v2(),
+            top_B=8,
+            skip_swa=False,
+            spec_config=spec_config,
+            draft_kv_cache_manager=_make_fake_v2(is_draft=True),
+        )
+
+        with pytest.raises(ValueError, match=error):
+            manager._validate_v2_compatibility()
+
+    def test_dflash_target_only_contract_is_accepted(self):
+        from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
+
+        spec_config = DFlashDecodingConfig(max_draft_len=3)
+        manager = TriAttention(
+            _make_fake_v2(),
+            top_B=8,
+            skip_swa=False,
+            spec_config=spec_config,
+            draft_kv_cache_manager=_make_fake_v2(is_draft=True),
+        )
+
+        manager._validate_v2_compatibility()
+
+    def test_dflash_requires_actual_separate_draft_manager(self):
+        from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
+
+        manager = TriAttention(
+            _make_fake_v2(),
+            top_B=8,
+            skip_swa=False,
+            spec_config=DFlashDecodingConfig(max_draft_len=3),
+        )
+
+        with pytest.raises(ValueError, match="requires a separate draft KV cache"):
+            manager._validate_v2_compatibility()
+
+    def test_dflash_shared_target_draft_cache_is_rejected(self):
+        from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
+
+        spec_config = DFlashDecodingConfig(max_draft_len=3)
+        spec_config._allow_separate_draft_kv_cache = False
+        manager = TriAttention(
+            _make_fake_v2(),
+            top_B=8,
+            skip_swa=False,
+            spec_config=spec_config,
+        )
+
+        with pytest.raises(ValueError, match="requires a separate draft KV cache"):
+            manager._validate_v2_compatibility()
+
+    def test_dflash_runtime_acceptance_gate_is_rejected(self):
+        from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
+
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=3,
+            acceptance_window=16,
+            acceptance_length_threshold=1.0,
+        )
+        manager = TriAttention(
+            _make_fake_v2(),
+            top_B=8,
+            skip_swa=False,
+            spec_config=spec_config,
+        )
+
+        with pytest.raises(ValueError, match="runtime speculative acceptance gating"):
+            manager._validate_v2_compatibility()
+
+    def test_prepare_snapshots_fixed_linear_generation_growth(self):
+        manager = _make_fake_v2()
+        manager.num_extra_kv_tokens = 2
+        manager.kv_cache_map = {
+            7: SimpleNamespace(capacity=106, is_active=True),
+        }
+        triattention = TriAttention(manager, top_B=8, skip_swa=False)
+        batch = SimpleNamespace(
+            context_requests=[],
+            generation_requests=[_make_request(7, py_draft_tokens=[1, 2, 3])],
+        )
+
+        triattention.prepare_resources(batch)
+
+        assert triattention._prepared_batch is batch
+        assert triattention._prepared_generation_growth == {7: 4}
+
+    @pytest.mark.parametrize("native_cached", [63, 69, 104])
+    def test_overlap_metadata_preserves_native_length_without_eviction(self, native_cached):
+        triattention = TriAttention(_make_fake_v2(), top_B=8, skip_swa=False)
+        metadata = _FakeMetadata([native_cached], [10], [7])
+
+        triattention.adjust_attention_metadata(metadata)
+
+        assert metadata.kv_cache_params.num_cached_tokens_per_seq == [native_cached]
+
+    def test_terminal_request_is_ignored(self):
+        manager = _make_fake_v2()
+        terminal = _make_request(7, state=LlmRequestState.GENERATION_COMPLETE)
+        triattention = TriAttention(manager, top_B=8, beta=1, skip_swa=False)
+        triattention._calibrated = True
+
+        triattention._periodic_evict(SimpleNamespace(generation_requests=[terminal]))
+
+        assert triattention._initialized_request_ids == set()
+        assert triattention._gen_steps == {}
+        assert triattention._confirmed_kv_lengths == {}
+
+    def test_suspended_target_cache_fails_closed(self):
+        manager = _make_fake_v2()
+        request = _make_request(7)
+        cache = SimpleNamespace(capacity=20, history_length=0, is_active=False)
+        manager.kv_cache_map = {7: cache}
+        triattention = TriAttention(manager, top_B=100, beta=8, skip_swa=False)
+        triattention._calibrated = True
+
+        with pytest.raises(RuntimeError, match="suspended target KV cache"):
+            triattention._periodic_evict(SimpleNamespace(generation_requests=[request]))
 
     def test_generation_only_request_is_initialized_once(self):
         manager = _make_fake_v2()
@@ -680,7 +1114,7 @@ class TestStepBeginHookRefactor:
         request = _make_request(
             7,
             py_prompt_len=2,
-            max_beam_num_tokens=999,
+            max_beam_num_tokens=12,
         )
         mgr = TriAttention(manager, top_B=8, beta=4, skip_swa=False)
         mgr._calibrated = True
@@ -689,9 +1123,9 @@ class TestStepBeginHookRefactor:
         mgr._periodic_evict(SimpleNamespace(generation_requests=[request]))
         mgr._periodic_evict(SimpleNamespace(generation_requests=[request]))
 
-        assert request.py_kv_cache_generation_capacity_only
-        assert mgr._pre_forward_kv_lengths == {7: 10}
-        assert mgr._capacity_only_request_ids == {7}
+        assert manager.generation_capacity_only
+        assert mgr._confirmed_kv_lengths == {7: 11}
+        assert mgr._initialized_request_ids == {7}
 
     def test_generation_dummy_is_skipped(self):
         manager = _make_fake_v2()
@@ -701,33 +1135,29 @@ class TestStepBeginHookRefactor:
 
         mgr._periodic_evict(SimpleNamespace(generation_requests=[request]))
 
-        assert request.py_kv_cache_generation_capacity_only is False
-        assert mgr._capacity_only_request_ids == set()
+        assert mgr._initialized_request_ids == set()
+        assert mgr._gen_steps == {}
+        assert mgr._evicted == {}
+        assert mgr._confirmed_kv_lengths == {}
 
-    def test_request_finish_orders_unconsumed_compaction_before_free(self):
+    def test_request_finish_clears_compression_state(self):
         from types import SimpleNamespace
-        from unittest import mock
 
-        event = mock.Mock()
-        manager = SimpleNamespace(_stream=mock.Mock())
-        request = SimpleNamespace(
-            py_request_id=7,
-            py_kv_cache_generation_capacity_only=True,
-            py_kv_cache_compaction=(129, 256, event),
-        )
+        request = SimpleNamespace(py_request_id=7)
         mgr = _make_triattention()
-        mgr.kv_cache_manager = manager
         mgr._gen_steps = {7: 1}
         mgr._evicted = {7: 127}
-        mgr._pre_forward_kv_lengths = {7: 128}
-        mgr._capacity_only_request_ids = {7}
+        mgr._confirmed_kv_lengths = {7: 128}
+        mgr._prepared_generation_growth = {7: 1}
+        mgr._initialized_request_ids = {7}
 
         mgr.on_request_finish(request)
 
-        manager._stream.wait_event.assert_called_once_with(event)
-        assert not request.py_kv_cache_generation_capacity_only
-        assert request.py_kv_cache_compaction is None
-        assert mgr._capacity_only_request_ids == set()
+        assert mgr._initialized_request_ids == set()
+        assert mgr._gen_steps == {}
+        assert mgr._evicted == {}
+        assert mgr._confirmed_kv_lengths == {}
+        assert mgr._prepared_generation_growth == {}
 
     def test_evict_requests_returns_exact_post_forward_capacity(self):
         from types import SimpleNamespace
@@ -747,7 +1177,7 @@ class TestStepBeginHookRefactor:
         mgr = _make_triattention()
         mgr.kv_cache_manager = manager
         mgr._evicted = {7: 5}
-        mgr._pre_forward_kv_lengths = {7: 8}
+        mgr._confirmed_kv_lengths = {7: 8}
         mgr.top_B = 4
         mgr.pin_prefill = True
         mgr.count_prompt_tokens = False
@@ -762,9 +1192,7 @@ class TestStepBeginHookRefactor:
         mgr.score_aggregation = "mean"
         mgr._attention_layer_partition = mock.Mock(return_value=([1], [0], 2))
         mgr._resolve_page_ids = mock.Mock(
-            side_effect=lambda request, layer, page_count=None: (
-                [10, 11] if layer == 1 else [20, 21]
-            )
+            side_effect=lambda request, layer, page_count=None: ([10] if layer == 1 else [20])
         )
         mgr._evict_modes = mock.Mock(return_value=torch.arange(6))
         segment = SimpleNamespace(request_index=0, layer_index=1)
@@ -780,49 +1208,26 @@ class TestStepBeginHookRefactor:
         ):
             targets = mgr._evict_requests([(request, 7)], num_layers=2)
 
-        assert targets == [(7, 7)]
+        assert targets == [(7, 6)]
         assert mgr._evicted == {7: 7}
-        assert mgr._pre_forward_kv_lengths == {7: 6}
+        assert mgr._confirmed_kv_lengths == {7: 6}
         assert score.call_args.kwargs["layer_indices"] == [1]
-        assert score.call_args.args[1][0].tolist() == [10, 11]
+        assert score.call_args.args[1][0].tolist() == [10]
         assert score.call_args.args[2] == [8]
         assert score.call_args.args[3] == [13.0]
         assert mgr._resolve_page_ids.call_args_list == [
-            mock.call(request, 1, 2),
-            mock.call(request, 0, 2),
+            mock.call(request, 1, 1),
+            mock.call(request, 0, 1),
         ]
         assert compact.call_count == 2
         dense_call, swa_call = compact.call_args_list
         assert dense_call.args[0] is pools[1]
-        assert dense_call.args[1][0].tolist() == [10, 11]
+        assert dense_call.args[1][0].tolist() == [10]
         assert swa_call.args[0] is pools[0]
-        assert swa_call.args[1][0].tolist() == [20, 21]
+        assert swa_call.args[1][0].tolist() == [20]
         assert swa_call.args[2][0].tolist() == [6, 7]
         assert swa_call.kwargs["dest_list"][0].tolist() == [4, 5]
         assert swa_call.args[2][0].numel() == 2
-
-    def test_evict_requests_rejects_speculative_decode(self):
-        from types import SimpleNamespace
-        from unittest import mock
-
-        pool = torch.zeros(2, 2, 1, 8, 2)
-        request = SimpleNamespace(
-            py_request_id=7,
-            py_prompt_len=2,
-            max_beam_num_tokens=9,
-            py_draft_tokens=[101, 102],
-        )
-        mgr = _make_triattention()
-        mgr.kv_cache_manager = SimpleNamespace(
-            get_buffers=lambda *args, **kwargs: pool,
-            get_batch_cache_indices=lambda *args, **kwargs: [],
-            pp_layers=[0],
-        )
-        mgr._evicted = {}
-        mgr._attention_layer_partition = mock.Mock(return_value=([0], [], None))
-
-        with pytest.raises(ValueError, match="does not support speculative decoding"):
-            mgr._evict_requests([(request, 7)], num_layers=1)
 
     def test_dense_storage_groups_use_their_own_page_ids(self):
         import contextlib
@@ -841,7 +1246,7 @@ class TestStepBeginHookRefactor:
             pp_layers=[0, 1],
         )
         mgr._evicted = {}
-        mgr._pre_forward_kv_lengths = {7: 8}
+        mgr._confirmed_kv_lengths = {7: 8}
         mgr.top_B = 4
         mgr.pin_prefill = True
         mgr.count_prompt_tokens = False
@@ -856,9 +1261,7 @@ class TestStepBeginHookRefactor:
         mgr.score_aggregation = "mean"
         mgr._attention_layer_partition = mock.Mock(return_value=([0, 1], [], None))
         mgr._resolve_page_ids = mock.Mock(
-            side_effect=lambda request, layer, page_count=None: (
-                [10, 11] if layer == 0 else [20, 21]
-            )
+            side_effect=lambda request, layer, page_count=None: ([10] if layer == 0 else [20])
         )
         mgr._evict_modes = mock.Mock(return_value=torch.arange(6))
 
@@ -881,19 +1284,19 @@ class TestStepBeginHookRefactor:
         ):
             targets = mgr._evict_requests([(request, 7)], num_layers=2)
 
-        assert targets == [(7, 7)]
+        assert targets == [(7, 6)]
         assert score.call_count == 2
         first_score, second_score = score.call_args_list
         assert first_score.kwargs["layer_indices"] == [0]
-        assert first_score.args[1][0].tolist() == [10, 11]
+        assert first_score.args[1][0].tolist() == [10]
         assert second_score.kwargs["layer_indices"] == [1]
-        assert second_score.args[1][0].tolist() == [20, 21]
+        assert second_score.args[1][0].tolist() == [20]
         assert compact.call_count == 2
         first_compact, second_compact = compact.call_args_list
         assert first_compact.args[0] is pools[0]
-        assert first_compact.args[1][0].tolist() == [10, 11]
+        assert first_compact.args[1][0].tolist() == [10]
         assert second_compact.args[0] is pools[1]
-        assert second_compact.args[1][0].tolist() == [20, 21]
+        assert second_compact.args[1][0].tolist() == [20]
         assert [call.args[0] for call in nvtx.call_args_list] == [
             "triattention.metadata",
             "triattention.score",
@@ -1132,6 +1535,8 @@ class TestFixedScoreMetadata:
         workspace.copy_done = mock.Mock()
         workspace.global_representatives = (10,)
         workspace.page_count = 2
+        workspace.bucket_seq_len = 8
+        workspace.tokens_per_block = 4
         stream = object()
         get_batch = mock.Mock(return_value=[[7, -1]])
 
@@ -1144,6 +1549,43 @@ class TestFixedScoreMetadata:
         get_batch.assert_called_once_with([42], 10, num_blocks_per_seq=[workspace.page_count])
         as_tensor.assert_not_called()
         workspace.copy_done.record.assert_not_called()
+
+    def test_fixed_stage_pads_only_after_each_requests_live_page_prefix(self):
+        from unittest import mock
+
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            _FixedScoreMetadataWorkspace,
+        )
+
+        workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
+        workspace.device = torch.device("cuda")
+        workspace.max_requests = 2
+        workspace.stream = None
+        workspace.copy_pending = False
+        workspace.copy_done = mock.Mock()
+        workspace.global_representatives = (10,)
+        workspace.page_count = 3
+        workspace.bucket_seq_len = 12
+        workspace.tokens_per_block = 4
+        workspace.page_ids_host = torch.empty((1, 2, 3), dtype=torch.int64)
+        workspace.round_starts_host = torch.empty(2, dtype=torch.float32)
+        workspace.valid_seq_lens_host = torch.empty(2, dtype=torch.int32)
+        workspace.page_ids_device = mock.Mock()
+        workspace.round_starts_device = mock.Mock()
+        workspace.valid_seq_lens_device = mock.Mock()
+        group = mock.Mock()
+        workspace.groups = {0: group}
+        stream = object()
+        get_batch = mock.Mock(return_value=[[10, 11], [20, 21, 22]])
+
+        with mock.patch.object(torch.cuda, "current_stream", return_value=stream):
+            assert workspace.stage(get_batch, [42, 43], [8.0, 9.0], [5, 9])
+
+        get_batch.assert_called_once_with([42, 43], 10, num_blocks_per_seq=[2, 3])
+        assert workspace.page_ids_host.tolist() == [[[10, 11, 11], [20, 21, 22]]]
+        assert workspace.valid_seq_lens_host.tolist() == [5, 9]
+        group.stage_lengths.assert_called_once_with(workspace.valid_seq_lens_device, 2)
+        workspace.copy_done.record.assert_called_once_with(stream)
 
     def test_stage2_gate_requires_stage1_prewarm(self):
         import os
@@ -1172,15 +1614,16 @@ class TestFixedScoreMetadata:
             assert manager._fixed_score_metadata_enabled
 
     @pytest.mark.parametrize("request_count", [1, 7, 8])
-    def test_ready_workspace_requires_uniform_exact_runtime_geometry(self, request_count):
+    def test_ready_workspace_selects_smallest_covering_upper_bucket(self, request_count):
         from types import SimpleNamespace
         from unittest import mock
 
         manager = _make_triattention()
         manager._fixed_score_metadata_enabled = True
-        manager._fixed_union_prewarm_key = mock.Mock(return_value=("bucket",))
         workspace = SimpleNamespace(
             max_requests=8,
+            prompt_len=2,
+            bucket_seq_len=10,
             matches=mock.Mock(return_value=True),
             prewarm_key=("bucket",),
         )
@@ -1189,8 +1632,11 @@ class TestFixedScoreMetadata:
         manager._fixed_score_runtime_counts = {}
         pools = [torch.empty(1), torch.empty(1)]
         prepared = [
-            {"request": SimpleNamespace(py_prompt_len=2), "seq_len": 8}
-            for _ in range(request_count)
+            {
+                "request": SimpleNamespace(py_prompt_len=2),
+                "seq_len": 8 + request_index % 3,
+            }
+            for request_index in range(request_count)
         ]
 
         result = manager._fixed_score_workspace_for(pools, [0, 1], [[0], [1]], [], 2, prepared)
@@ -1201,13 +1647,11 @@ class TestFixedScoreMetadata:
         assert (
             manager._fixed_score_workspace_for(pools, [0, 1], [[0], [1]], [], 2, prepared) is None
         )
-        assert manager._fixed_score_runtime_counts[("bucket",)]["fallback"] == 1
         workspace.matches.return_value = True
         manager._fixed_score_prewarm_states[("bucket",)] = "failed"
         assert (
             manager._fixed_score_workspace_for(pools, [0, 1], [[0], [1]], [], 2, prepared) is None
         )
-        assert manager._fixed_score_runtime_counts[("bucket",)]["fallback"] == 2
 
     def test_busy_pinned_staging_falls_back_without_querying_page_tables(self):
         from types import SimpleNamespace
@@ -1281,6 +1725,7 @@ class TestFixedScoreMetadata:
                 "request": SimpleNamespace(),
                 "request_id": 7,
                 "round_start": 8.0,
+                "seq_len": 8,
             }
         ]
 
@@ -1293,7 +1738,7 @@ class TestFixedScoreMetadata:
                 global_layers=[0],
                 workspace=workspace,
             )
-        workspace.stage.assert_called_once_with(get_batch, [7], [8.0])
+        workspace.stage.assert_called_once_with(get_batch, [7], [8.0], [8])
         manager._resolve_page_ids.assert_not_called()
         assert manager._fixed_score_runtime_counts[("bucket",)]["rejected"] == 1
 
@@ -1312,14 +1757,19 @@ class TestFixedScoreMetadata:
         workspace.copy_done = mock.Mock()
         workspace.global_representatives = (0,)
         workspace.page_count = 1
+        workspace.bucket_seq_len = 4
+        workspace.tokens_per_block = 4
         buffer = mock.MagicMock()
         buffer.__getitem__.return_value = buffer
         buffer.copy_.return_value = buffer
         buffer.view.return_value = buffer
         workspace.page_ids_host = buffer
         workspace.round_starts_host = buffer
+        workspace.valid_seq_lens_host = buffer
         workspace.page_ids_device = buffer
         workspace.round_starts_device = buffer
+        workspace.valid_seq_lens_device = buffer
+        workspace.groups = {}
         workspace.offsets = buffer
         workspace.omega = buffer
         workspace.phase_base = buffer
@@ -1375,8 +1825,18 @@ class TestFixedScoreMetadata:
             prewarm_key=("bucket",),
         )
         prepared = [
-            {"request": SimpleNamespace(), "request_id": 7, "round_start": 8.0},
-            {"request": SimpleNamespace(), "request_id": 8, "round_start": 9.0},
+            {
+                "request": SimpleNamespace(),
+                "request_id": 7,
+                "round_start": 8.0,
+                "seq_len": 8,
+            },
+            {
+                "request": SimpleNamespace(),
+                "request_id": 8,
+                "round_start": 9.0,
+                "seq_len": 9,
+            },
         ]
 
         result = manager._attach_page_ids(
@@ -1389,7 +1849,7 @@ class TestFixedScoreMetadata:
         )
 
         assert result
-        workspace.stage.assert_called_once_with(get_batch, [7, 8], [8.0, 9.0])
+        workspace.stage.assert_called_once_with(get_batch, [7, 8], [8.0, 9.0], [8, 9])
         manager._resolve_page_ids.assert_not_called()
         assert manager._fixed_score_runtime_counts[("bucket",)]["hit"] == 1
         assert prepared[1]["page_ids"][0].tolist() == [12, 13]
@@ -1872,7 +2332,7 @@ class TestFixedScoreMetadata:
         torch.manual_seed(731)
         seq_len = 8
         keep_count = 6
-        page_lists = {0: [1, 2, 0], 1: [0, 1, 2], 2: [2, 0, 1]}
+        page_lists = {0: [1, 2], 1: [0, 1], 2: [2, 0]}
         page_ids = {
             layer: torch.tensor(pages, dtype=torch.int64, device=device)
             for layer, pages in page_lists.items()
@@ -1902,7 +2362,7 @@ class TestFixedScoreMetadata:
             cache.get_buffers = lambda layer, **kwargs: pools[layer]
 
             def get_batch(request_ids, layer, num_blocks_per_seq=None):
-                assert num_blocks_per_seq == [3] * len(request_ids)
+                assert num_blocks_per_seq == [2] * len(request_ids)
                 cache.batch_calls.append((tuple(request_ids), layer))
                 return [list(page_lists[layer]) for _ in request_ids]
 
@@ -1947,6 +2407,7 @@ class TestFixedScoreMetadata:
                 freq,
                 offsets,
                 omega,
+                prompt_len=2,
             )
             if force_fallback:
                 workspace.stage = lambda *args: False
@@ -1954,7 +2415,7 @@ class TestFixedScoreMetadata:
             manager._fixed_score_workspaces = {("gptoss",): workspace}
             manager._fixed_score_prewarm_states = {("gptoss",): "ready"}
             manager._fixed_score_runtime_counts = {}
-            manager._pre_forward_kv_lengths = {7: seq_len}
+            manager._confirmed_kv_lengths = {7: seq_len}
             manager._evicted = {}
             original_evict_modes = manager._evict_modes
 
@@ -1978,7 +2439,7 @@ class TestFixedScoreMetadata:
         eager_targets = eager_manager._evict_requests([(eager_request, 7)], num_layers=3)
         torch.cuda.current_stream(device).synchronize()
 
-        assert fixed_targets == eager_targets == [(7, keep_count + 1)]
+        assert fixed_targets == eager_targets == [(7, keep_count)]
         assert torch.equal(fixed_manager.test_keep, eager_manager.test_keep)
         oracle_scores = _torch_tri_score_oracle(
             base_pools,
@@ -2001,7 +2462,7 @@ class TestFixedScoreMetadata:
         assert fixed_manager._fixed_score_runtime_counts[("gptoss",)]["hit"] == 1
         assert eager_manager._fixed_score_runtime_counts[("gptoss",)]["fallback"] == 1
         assert fixed_manager._evicted == eager_manager._evicted == {7: 2}
-        assert fixed_manager._pre_forward_kv_lengths == {7: keep_count}
+        assert fixed_manager._confirmed_kv_lengths == {7: keep_count}
         for layer in (1, 2):
             original_dense = _logical_kv(base_pools[layer], page_ids[layer], seq_len)
             expected_dense = original_dense.index_select(2, fixed_manager.test_keep)
@@ -2181,7 +2642,7 @@ class TestFixedUnionWorkspace:
                 manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
                 assert not manager._standalone_cuda_graph_enabled
 
-    def test_prewarm_shape_parser_is_exact_and_fail_closed(self):
+    def test_prewarm_shape_parser_is_explicit_and_fail_closed(self):
         assert TriAttention._parse_fixed_prewarm_shapes("1024:8192, 0:4097,1024:8192") == [
             (1024, 8192),
             (0, 4097),
@@ -2193,6 +2654,39 @@ class TestFixedUnionWorkspace:
             TriAttention._parse_fixed_prewarm_shapes("prompt:4225")
         with pytest.raises(ValueError, match="prompt_len >= 0"):
             TriAttention._parse_fixed_prewarm_shapes("-1:4225")
+
+    def test_prewarm_upper_buckets_split_and_coalesce_selection_backend_bands(self):
+        manager = _make_triattention()
+        manager.top_B = 2048
+
+        assert manager._upper_prewarm_shapes_by_backend(
+            [(1024, 3072), (1024, 4096), (1024, 4224), (0, 8192)]
+        ) == [
+            (0, 4095),
+            (0, 8192),
+            (1024, 4095),
+            (1024, 4224),
+        ]
+
+    @pytest.mark.parametrize(
+        "budget,beta,maximum_width,expected_widths",
+        [
+            (32, 4, 36, [36]),
+            (2048, 2048, 4100, [4095, 4100]),
+            (4096, 128, 4228, [4228]),
+            (4096, 4096, 8196, [8196]),
+        ],
+    )
+    def test_configured_budget_beta_k4_emits_backend_safe_upper_buckets(
+        self, budget, beta, maximum_width, expected_widths
+    ):
+        manager = _make_triattention()
+        manager.top_B = budget
+        manager.beta = beta
+
+        buckets = manager._upper_prewarm_shapes_by_backend([(1024, maximum_width)])
+
+        assert buckets == [(1024, width) for width in expected_widths]
 
     def test_startup_prewarm_dispatches_first_and_steady_buckets(self):
         import os
@@ -2207,7 +2701,7 @@ class TestFixedUnionWorkspace:
         with (
             mock.patch.dict(
                 os.environ,
-                {"TRIATTN_FIXED_PREWARM_SHAPES": "1024:4095,1024:4096"},
+                {"TRIATTN_FIXED_PREWARM_SHAPES": "1024:4096"},
             ),
             mock.patch.object(manager, "_validate_v2_compatibility"),
             mock.patch.object(manager, "_ensure_calibrated"),
@@ -2299,7 +2793,7 @@ class TestFixedUnionWorkspace:
             prompt_len=1024,
         )
 
-        assert native[0] == "triattention.fixed-prewarm.v2"
+        assert native[0] == "triattention.fixed-prewarm.v3"
         assert native[9] == "eager_union.indexer_topk"
         assert eager[9] == "eager_union.torch_topk"
         assert fixed[9] == "fixed_union.torch_topk"
@@ -2344,8 +2838,8 @@ class TestFixedUnionWorkspace:
         manager._fixed_union_active = {}
         manager._gen_steps = {}
         manager._evicted = {}
-        manager._pre_forward_kv_lengths = {}
-        manager._capacity_only_request_ids = set()
+        manager._confirmed_kv_lengths = {}
+        manager._initialized_request_ids = set()
         manager._local_to_global_layers_cache = [0, 1]
         manager._attention_layer_partition_cache = ([0, 1], [], None)
         return manager, pools
@@ -2365,8 +2859,8 @@ class TestFixedUnionWorkspace:
         request_state_before = (
             manager._gen_steps.copy(),
             manager._evicted.copy(),
-            manager._pre_forward_kv_lengths.copy(),
-            manager._capacity_only_request_ids.copy(),
+            manager._confirmed_kv_lengths.copy(),
+            manager._initialized_request_ids.copy(),
         )
 
         def fake_score(dummy_pools, page_ids_list, seq_lens, *args, **kwargs):
@@ -2457,8 +2951,8 @@ class TestFixedUnionWorkspace:
         assert request_state_before == (
             manager._gen_steps,
             manager._evicted,
-            manager._pre_forward_kv_lengths,
-            manager._capacity_only_request_ids,
+            manager._confirmed_kv_lengths,
+            manager._initialized_request_ids,
         )
         for pool, before in zip(pools, live_before):
             assert torch.equal(pool, before)
@@ -2598,8 +3092,8 @@ class TestFixedUnionWorkspace:
         request_state_before = (
             manager._gen_steps.copy(),
             manager._evicted.copy(),
-            manager._pre_forward_kv_lengths.copy(),
-            manager._capacity_only_request_ids.copy(),
+            manager._confirmed_kv_lengths.copy(),
+            manager._initialized_request_ids.copy(),
         )
         layer_pools, dense_layers, storage_groups = manager._fixed_union_live_geometry(2)
         with mock.patch.object(
@@ -2630,8 +3124,8 @@ class TestFixedUnionWorkspace:
         assert request_state_before == (
             manager._gen_steps,
             manager._evicted,
-            manager._pre_forward_kv_lengths,
-            manager._capacity_only_request_ids,
+            manager._confirmed_kv_lengths,
+            manager._initialized_request_ids,
         )
         for pool, before in zip(pools, live_before):
             assert torch.equal(pool, before)
@@ -2707,8 +3201,8 @@ class TestFixedUnionWorkspace:
         request_state_before = (
             manager._gen_steps.copy(),
             manager._evicted.copy(),
-            manager._pre_forward_kv_lengths.copy(),
-            manager._capacity_only_request_ids.copy(),
+            manager._confirmed_kv_lengths.copy(),
+            manager._initialized_request_ids.copy(),
         )
         layer_pools, dense_layers, storage_groups = manager._fixed_union_live_geometry(2)
 
@@ -2732,8 +3226,8 @@ class TestFixedUnionWorkspace:
         assert request_state_before == (
             manager._gen_steps,
             manager._evicted,
-            manager._pre_forward_kv_lengths,
-            manager._capacity_only_request_ids,
+            manager._confirmed_kv_lengths,
+            manager._initialized_request_ids,
         )
         for pool, before in zip(pools, live_before):
             assert torch.equal(pool, before)
@@ -3793,6 +4287,65 @@ class TestCrossRequestFixedUnionWorkspace:
                     == keep_addresses
                 )
 
+    def test_upper_bucket_masks_padded_scores_and_matches_per_request_reference(self):
+        rows = 4
+        width = 17
+        keep_count = 8
+        prompt_len = 3
+        valid_widths = [9, 13]
+        workspace = _BatchedFixedUnionWorkspace(
+            rows,
+            width,
+            keep_count,
+            prompt_len,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            selection_backend="torch_topk",
+            max_requests=2,
+        )
+        pointer_snapshot = workspace.pointer_snapshot()
+        token = torch.arange(width, dtype=torch.float32)
+        segments_by_request = []
+        for request_index, valid_width in enumerate(valid_widths):
+            scores = torch.stack(
+                [
+                    (row + 1.0) * token
+                    + (request_index + 1.0) * torch.remainder(token * token + row, 7)
+                    for row in range(rows)
+                ]
+            )
+            scores[:, valid_width:] = 1.0e9 + token[valid_width:]
+            segments_by_request.append([scores])
+
+        workspace.stage_valid_widths_from_seq_lens(
+            torch.tensor(
+                [prompt_len + valid_width for valid_width in valid_widths],
+                dtype=torch.int32,
+            ),
+            len(valid_widths),
+        )
+        selected = workspace.select_requests(
+            segments_by_request,
+            normalize_scores=True,
+        )
+
+        for request_index, valid_width in enumerate(valid_widths):
+            reference = _FixedUnionWorkspace(
+                rows,
+                valid_width,
+                keep_count,
+                prompt_len,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                allocate_segment_buffers=True,
+            ).select_segments(
+                [segments_by_request[request_index][0][:, :valid_width]],
+                normalize_scores=True,
+            )
+            assert torch.equal(selected[request_index].keep, reference)
+            assert int(selected[request_index].keep.max()) < prompt_len + valid_width
+        assert workspace.pointer_snapshot() == pointer_snapshot
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     @pytest.mark.parametrize(
         ("width", "selection_backend"),
@@ -3928,8 +4481,11 @@ class TestCrossRequestFixedUnionWorkspace:
         score_group = SimpleNamespace(launch=mock.Mock(return_value=(score_output, None)))
         score_workspace = SimpleNamespace(
             prewarm_key=key,
+            bucket_seq_len=8,
+            prompt_len=2,
             groups={0: score_group},
             round_starts_device=torch.tensor([8.0, 8.0]),
+            valid_seq_lens_device=torch.tensor([8, 8], dtype=torch.int32),
             mean_cos=torch.empty(0),
             mean_sin=torch.empty(0),
             prepare_phase=mock.Mock(),
@@ -3937,7 +4493,7 @@ class TestCrossRequestFixedUnionWorkspace:
         manager = _make_triattention()
         manager.kv_cache_manager = SimpleNamespace(get_buffers=lambda layer, **kwargs: pool)
         manager._evicted = {}
-        manager._pre_forward_kv_lengths = {7: 8, 8: 8}
+        manager._confirmed_kv_lengths = {7: 8, 8: 8}
         manager.top_B = 4
         manager.pin_prefill = True
         manager.count_prompt_tokens = False
@@ -3945,6 +4501,7 @@ class TestCrossRequestFixedUnionWorkspace:
         manager.normalize_scores = False
         manager.score_aggregation = "mean"
         manager._offsets = torch.ones(1)
+        manager._indexer_topk_supported = lambda width, k: False
         active_sentinel = object()
         manager._fixed_union_active = {99: active_sentinel}
         manager._fixed_union_compaction_enabled = True
@@ -3997,9 +4554,9 @@ class TestCrossRequestFixedUnionWorkspace:
                 num_layers=2,
             )
 
-        assert targets == [(7, 7), (8, 7)]
+        assert targets == [(7, 6), (8, 6)]
         assert manager._evicted == {7: 2, 8: 2}
-        assert manager._pre_forward_kv_lengths == {7: 6, 8: 6}
+        assert manager._confirmed_kv_lengths == {7: 6, 8: 6}
         assert manager._fixed_union_active == {99: active_sentinel}
         select_requests.assert_called_once()
         score_workspace.prepare_phase.assert_called_once_with(2)
@@ -4277,6 +4834,8 @@ class TestFactory:
         assert manager is expected
         triattention_cls.assert_called_once_with(
             kv_cache_manager,
+            draft_kv_cache_manager=None,
+            spec_config=None,
             top_B=2048,
             beta=128,
             model_path=None,

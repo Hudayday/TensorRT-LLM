@@ -694,6 +694,7 @@ class TestKVCacheV2SchedulerCrossParam:
             disable_overlap_scheduler=True,
             enable_early_first_token_response=False,
             kv_cache_config=SimpleNamespace(enable_kv_pool_rebalance=False),
+            kv_cache_compression_config=None,
         )
 
         with (

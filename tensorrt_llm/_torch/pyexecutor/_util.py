@@ -1929,6 +1929,8 @@ def _create_kv_cache_manager(
 def create_kv_cache_compression_manager(
     config: KvCacheCompressionConfig,
     kv_cache_manager: KVCacheManagerV2,
+    draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+    spec_config: Optional[SpeculativeConfig] = None,
 ) -> Optional[BaseKVCacheCompressionManager]:
     """Build the KV-cache compression manager for ``config.algorithm``, or return
     None if no algorithm matches.
@@ -1947,6 +1949,8 @@ def create_kv_cache_compression_manager(
                 config.model_dump()))
         return TriAttention(
             kv_cache_manager,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+            spec_config=spec_config,
             top_B=triattention_config.top_B,
             beta=triattention_config.beta,
             model_path=triattention_config.model_path,
@@ -2164,11 +2168,15 @@ def create_py_executor_instance(
     # Register the compression manager (if one is configured) with the other
     # managers, before building ResourceManager, so it is part of the manager
     # set from the start. Reads its own config, not the sparse-attention one.
-    kv_cache_compression_config = getattr(llm_args,
-                                          "kv_cache_compression_config", None)
+    kv_cache_compression_config = llm_args.kv_cache_compression_config
     if kv_cache_compression_config is not None:
         compression_manager = create_kv_cache_compression_manager(
-            kv_cache_compression_config, kv_cache_manager)
+            kv_cache_compression_config,
+            kv_cache_manager,
+            draft_kv_cache_manager=resources.get(
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER),
+            spec_config=spec_config,
+        )
         if compression_manager is not None:
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
                 compression_manager)
@@ -2180,17 +2188,16 @@ def create_py_executor_instance(
     if kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
-    # Compression manager runs after the cache manager: reconciles history once it's resized.
-    if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
-            in resource_manager.resource_managers):
-        resource_manager.resource_managers.move_to_end(
-            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER, last=True)
-
     cross_kv_cache_manager = resources.get(
         ResourceManagerType.CROSS_KV_CACHE_MANAGER)
     if cross_kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.CROSS_KV_CACHE_MANAGER, last=True)
+    # Compression is the final reconciler after every native KV manager.
+    if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
+            in resource_manager.resource_managers):
+        resource_manager.resource_managers.move_to_end(
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER, last=True)
 
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.

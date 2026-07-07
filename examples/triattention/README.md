@@ -11,7 +11,7 @@ For technical details see the paper [TriAttention](https://arxiv.org/abs/2604.04
 TriAttention runs entirely in the generation phase and reuses the standard dense attention kernel over the compacted cache:
 
 1. **Calibration (offline, one-time per model).** The importance score needs each attention head's mean and magnitude of the pre-RoPE query, gathered over a small calibration corpus. **TensorRT LLM does not compute calibration** — you produce it once with the official tool and pass the resulting `.pt` file. TensorRT LLM loads it and converts it to its runtime schema at the first request.
-2. **Periodic eviction (Stage during generation).** Every `beta` generation steps, once a sequence is over budget, TriAttention scores the whole cache, selects `top_B` tokens to keep (the prompt tokens are preserved on top of the budget), and physically compacts the KV cache down to the kept set.
+2. **Periodic eviction (Stage during generation).** Every `beta` confirmed generation tokens, once a sequence is over budget, TriAttention scores the whole cache, selects `top_B` tokens to keep (the prompt tokens are preserved on top of the budget), and physically compacts the KV cache down to the kept set. A speculative iteration may confirm multiple tokens; crossing multiple periods in one update is coalesced into one eviction.
 
 TriAttention is integrated into TensorRT LLM as a KV-cache compression manager on top of the `KVCacheManagerV2`. The scoring and compaction kernels are implemented in **Triton**.
 
@@ -66,7 +66,7 @@ from tensorrt_llm.llmapi import (KvCacheConfig,
 # 1. Configure the eviction manager + point it at the calibration file.
 compression_config = TriAttentionKvCacheCompressionConfig(
     top_B=2048,            # tokens kept at each eviction (prompt is kept on top)
-    beta=64,               # eviction period, in generation steps
+    beta=64,               # eviction period, in confirmed generation tokens
     eviction_mode="per_layer",
     calibration_path="qwen3-8b-calibration.pt",  # official tool's output
     model_path="<path_to_model>",                # used to derive the RoPE tables
@@ -117,7 +117,7 @@ trtllm-eval --model <path_to_model> --config config.yaml longbench_v2 --max_outp
 `TriAttentionKvCacheCompressionConfig` controls the compression ratio and the eviction algorithm:
 
 * **`top_B`** (int, default=1024): Tokens kept at each eviction (the upstream `budget`). Prompt tokens are always preserved on top of this. Smaller `top_B` → more compression.
-* **`beta`** (int, default=128): Eviction period, in generation steps (the upstream `divide_length`). Eviction fires once every `beta` steps for sequences over budget.
+* **`beta`** (int, default=128): Eviction period, in confirmed generation tokens (the upstream `divide_length`). Speculative acceptance advances the counter by `1 + accepted_draft_tokens`; at most one eviction is coalesced per final update.
 * **`eviction_mode`** (str, default=`per_layer`): Which token set each eviction keeps.
     * `per_layer`: score a layer, average over heads, keep one set per layer (the simplest variant).
     * `per_head`: each KV head keeps its own set, shared across layers (mean of per-layer maxima). The upstream AIME default.

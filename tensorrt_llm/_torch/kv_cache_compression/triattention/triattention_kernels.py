@@ -685,6 +685,9 @@ class _FixedScoreGroup:
         self.token_block = 64
         self.max_ntblk = (seq_len + self.token_block - 1) // self.token_block
         seg_ntblk = torch.full((num_segments,), self.max_ntblk, dtype=torch.int32, device=device)
+        self.seg_req = seg_req
+        self.seg_seq = seg_seq
+        self.seg_ntblk = seg_ntblk
         self.seg_offsets = (
             torch.arange(num_segments + 1, dtype=torch.int32, device=device) * seq_len
         )
@@ -710,6 +713,31 @@ class _FixedScoreGroup:
             mlr_coef_LHF.view(-1),
         )
         self.pointer_tail = (freq_scale_sq, omega, offsets)
+
+    def stage_lengths(self, valid_seq_lens: torch.Tensor, request_count: int) -> None:
+        """Stage per-request valid lengths into this fixed upper-bound bucket."""
+        if request_count <= 0 or request_count > self.max_requests:
+            raise ValueError("request count exceeds fixed score capacity")
+        if valid_seq_lens.ndim != 1 or valid_seq_lens.numel() < request_count:
+            raise ValueError("valid sequence lengths do not match the fixed score cohort")
+        num_segments = request_count * self.num_layers
+        torch.index_select(
+            valid_seq_lens,
+            0,
+            self.seg_req[:num_segments],
+            out=self.seg_seq[:num_segments],
+        )
+        torch.add(
+            self.seg_seq[:num_segments],
+            self.token_block - 1,
+            out=self.seg_ntblk[:num_segments],
+        )
+        torch.div(
+            self.seg_ntblk[:num_segments],
+            self.token_block,
+            rounding_mode="floor",
+            out=self.seg_ntblk[:num_segments],
+        )
 
     def launch(
         self,
@@ -981,12 +1009,8 @@ def fixed_perhead_segment_views(
         raise ValueError("fixed score segment geometry must be positive")
     expected_width = request_count * layer_count * seq_len
     if perhead_scores.ndim != 2 or int(perhead_scores.shape[1]) != expected_width:
-        raise ValueError(
-            "fixed score output width does not match request/layer/sequence geometry"
-        )
-    return perhead_scores.view(
-        int(perhead_scores.shape[0]), request_count, layer_count, seq_len
-    )
+        raise ValueError("fixed score output width does not match request/layer/sequence geometry")
+    return perhead_scores.view(int(perhead_scores.shape[0]), request_count, layer_count, seq_len)
 
 
 # --------------------------------------------------------------------------- #

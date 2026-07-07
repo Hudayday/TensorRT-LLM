@@ -387,6 +387,17 @@ class PyTorchModelEngine(ModelEngine):
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:
+            from ..kv_cache_compression import (
+                is_kv_cache_compression_attention_backend_enabled,
+                requires_kv_cache_compression_attention_backend)
+            if (requires_kv_cache_compression_attention_backend(
+                    llm_args.kv_cache_compression_config, self.spec_config)
+                    and not is_kv_cache_compression_attention_backend_enabled(
+                        model.model_config)):
+                raise ValueError(
+                    "prebuilt models used with speculative KV-cache compression "
+                    "must be constructed with the compression attention backend"
+                )
             self.model = model
         if drafting_loop_wrapper is not None:
             self.model = drafting_loop_wrapper(self.model)
@@ -550,6 +561,11 @@ class PyTorchModelEngine(ModelEngine):
         self.attn_backend = get_attention_backend(
             self.llm_args.attn_backend,
             sparse_attention_config=self.sparse_attention_config)
+        from ..kv_cache_compression import \
+            get_model_kv_cache_compression_attention_backend
+        self.attn_backend = get_model_kv_cache_compression_attention_backend(
+            self.model.model_config, self.attn_backend)
+        self._step_kv_compression_manager = None
 
         self.get_runtime_tokens_per_gen_step = spec_config.get_runtime_tokens_per_gen_step if spec_config is not None else lambda runtime_draft_len: 1
 
@@ -2821,9 +2837,9 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.kv_cache_manager = kv_cache_manager
         # Overlap fast path: reconcile the compacted cache before prepare() (same
         # hook as the full path; manager resolved at the _prepare_tp_inputs entry).
-        _kvc = getattr(self, "_step_kv_compression_manager", None)
-        if _kvc is not None:
-            _kvc.adjust_attention_metadata(attn_metadata)
+        if self._step_kv_compression_manager is not None:
+            self._step_kv_compression_manager.adjust_attention_metadata(
+                attn_metadata)
         attn_metadata.prepare()
 
         # Get LoRA parameters

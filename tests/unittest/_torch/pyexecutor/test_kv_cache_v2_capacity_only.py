@@ -16,18 +16,17 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
-
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 
 
-def _manager() -> KVCacheManagerV2:
+def _manager(*, is_draft: bool = False) -> KVCacheManagerV2:
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
-    manager.is_draft = True
+    manager.is_draft = is_draft
     manager.enable_block_reuse = False
     manager.kv_cache_map = {}
     manager._stream = MagicMock()
+    manager.generation_capacity_only = False
     return manager
 
 
@@ -35,9 +34,9 @@ def _request(request_id: int, *, rewind: int = 0, complete: bool = False) -> Mag
     request = MagicMock()
     request.py_request_id = request_id
     request.py_rewind_len = rewind
+    request.py_num_accepted_draft_tokens = 0
+    request.py_num_accepted_draft_tokens_indices = []
     request.max_beam_num_tokens = 201
-    request.py_kv_cache_generation_capacity_only = False
-    request.py_kv_cache_compaction = None
     request.state = (
         LlmRequestState.GENERATION_COMPLETE if complete else LlmRequestState.GENERATION_IN_PROGRESS
     )
@@ -52,22 +51,40 @@ def _cache(capacity: int = 256) -> MagicMock:
     return cache
 
 
-def test_capacity_only_is_request_scoped() -> None:
+def test_capacity_only_is_manager_scoped() -> None:
     manager = _manager()
-    regular = _request(1, rewind=3)
-    compacted = _request(2, rewind=5)
-    regular_cache = _cache()
-    compacted_cache = _cache()
-    manager.kv_cache_map = {1: regular_cache, 2: compacted_cache}
-    compacted.py_kv_cache_generation_capacity_only = True
+    first = _request(1, rewind=3)
+    second = _request(2, rewind=5)
+    first_cache = _cache()
+    second_cache = _cache()
+    manager.kv_cache_map = {1: first_cache, 2: second_cache}
+    manager.generation_capacity_only = True
 
-    manager.update_resources(SimpleNamespace(generation_requests=[regular, compacted]))
+    manager.update_resources(SimpleNamespace(generation_requests=[first, second]))
 
-    regular_cache.resize.assert_called_once_with(253, 200)
-    compacted_cache.resize.assert_called_once_with(251, None)
+    first_cache.resize.assert_called_once_with(253, None)
+    second_cache.resize.assert_called_once_with(251, None)
 
 
-def test_llm_request_initializes_compression_contract() -> None:
+def test_target_capacity_only_does_not_change_draft_manager() -> None:
+    request = _request(1, rewind=3)
+    target = _manager(is_draft=False)
+    target.generation_capacity_only = True
+    target_cache = _cache()
+    target.kv_cache_map[1] = target_cache
+    draft = _manager(is_draft=True)
+    draft_cache = _cache()
+    draft.kv_cache_map[1] = draft_cache
+
+    batch = SimpleNamespace(generation_requests=[request])
+    target.update_resources(batch)
+    draft.update_resources(batch)
+
+    target_cache.resize.assert_called_once_with(253, None)
+    draft_cache.resize.assert_called_once_with(253, 200)
+
+
+def test_llm_request_has_no_compression_marker() -> None:
     request = LlmRequest(
         request_id=1,
         max_new_tokens=1,
@@ -76,11 +93,11 @@ def test_llm_request_initializes_compression_contract() -> None:
         is_streaming=False,
     )
 
-    assert request.py_kv_cache_generation_capacity_only is False
-    assert request.py_kv_cache_compaction is None
+    assert "py_kv_cache_generation_capacity_only" not in request.__dict__
+    assert "py_kv_cache_compaction" not in request.__dict__
 
 
-def test_default_capacity_only_flag_preserves_history() -> None:
+def test_default_manager_preserves_native_history_update() -> None:
     manager = _manager()
     request = _request(1, rewind=3)
     cache = _cache()
@@ -96,40 +113,21 @@ def test_capacity_only_completion_preserves_history() -> None:
     request = _request(1, complete=True)
     cache = _cache()
     manager.kv_cache_map[1] = cache
-    request.py_kv_cache_generation_capacity_only = True
+    manager.generation_capacity_only = True
 
     manager.update_resources(SimpleNamespace(generation_requests=[request]))
 
     cache.resize.assert_called_once_with(None, None)
 
 
-def test_compaction_target_preserves_overlap_growth() -> None:
+def test_suspended_cache_keeps_native_v2_behavior() -> None:
     manager = _manager()
-    request = _request(1)
-    event = MagicMock()
-    request.py_kv_cache_compaction = (129, 256, event)
-    cache = _cache(capacity=257)
+    manager.generation_capacity_only = True
+    request = _request(1, rewind=3)
+    cache = _cache()
+    cache.is_active = False
     manager.kv_cache_map[1] = cache
-    request.py_kv_cache_generation_capacity_only = True
 
     manager.update_resources(SimpleNamespace(generation_requests=[request]))
 
-    manager._stream.wait_event.assert_called_once_with(event)
-    cache.resize.assert_called_once_with(130, None)
-    assert request.py_kv_cache_compaction is None
-
-
-def test_failed_compaction_resize_keeps_target() -> None:
-    manager = _manager()
-    request = _request(1)
-    target = (129, 256, MagicMock())
-    request.py_kv_cache_compaction = target
-    cache = _cache(capacity=256)
-    cache.resize.return_value = False
-    manager.kv_cache_map[1] = cache
-    request.py_kv_cache_generation_capacity_only = True
-
-    with pytest.raises(ValueError, match="Failed to resize KV cache"):
-        manager.update_resources(SimpleNamespace(generation_requests=[request]))
-
-    assert request.py_kv_cache_compaction is target
+    cache.resize.assert_not_called()

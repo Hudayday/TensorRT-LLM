@@ -647,6 +647,10 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_mask=layer_mask,
         )
         self.is_draft = is_draft
+        # Compression may opt the target manager into capacity-only generation
+        # updates. This is manager-owned so a separate draft KVCM keeps its
+        # native history/rewind lifecycle for the same request.
+        self.generation_capacity_only: bool = False
         self.enable_swa_scratch_reuse = (
             kv_cache_config.enable_swa_scratch_reuse and not self.is_draft
         )
@@ -3057,25 +3061,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
                 else kv_cache.capacity - req.py_rewind_len
             )
-            capacity_only = req.py_kv_cache_generation_capacity_only
-            history_length = None if capacity_only else req.max_beam_num_tokens - 1
-            compaction = req.py_kv_cache_compaction
-            consume_compaction = capacity_only and compaction is not None
-            if consume_compaction:
-                target_capacity, published_capacity, event = compaction
-                capacity_growth = kv_cache.capacity - published_capacity
-                if capacity_growth < 0:
-                    raise ValueError(
-                        f"Request {req.py_request_id} capacity {kv_cache.capacity} "
-                        f"fell below published capacity {published_capacity}"
-                    )
-                # K+1 retains every block addressable by this forward. Resizing
-                # may race the full-table offset copy, but only rewrites the
-                # unreachable tail; the stream event protects page reuse.
-                if event is not None:
-                    self._stream.wait_event(event)
-                if new_capacity is not None:
-                    new_capacity = target_capacity + capacity_growth - req.py_rewind_len
+            history_length = None if self.generation_capacity_only else req.max_beam_num_tokens - 1
             success = kv_cache.resize(new_capacity, history_length)
             if not success:
                 raise ValueError(
@@ -3083,8 +3069,6 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"to capacity {new_capacity} and history length "
                     f"{history_length} tokens at generation update"
                 )
-            if consume_compaction:
-                req.py_kv_cache_compaction = None
 
     def copy_batch_block_offsets(
         self,
