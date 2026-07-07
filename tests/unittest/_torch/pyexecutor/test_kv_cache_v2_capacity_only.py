@@ -14,12 +14,13 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import CacheTypeCpp, KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 
 
 def _manager(
@@ -168,3 +169,44 @@ def test_failed_capacity_only_resize_raises() -> None:
         manager.update_resources(SimpleNamespace(generation_requests=[request]))
 
     cache.resize.assert_called_once_with(256, None)
+
+
+def test_resource_manager_passes_attention_metadata_to_target_v2() -> None:
+    manager = _manager()
+    request = _request(1, rewind=3)
+    request.py_num_accepted_draft_tokens = 1
+    request.py_num_accepted_draft_tokens_indices = [0]
+    cache = _cache()
+    manager.kv_cache_map[1] = cache
+    scheduled_batch = SimpleNamespace(generation_requests=[request])
+    attn_metadata = object()
+    resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2._update_kv_cache_draft_token_location"
+    ) as update_draft_location:
+        resource_manager.update_resources(scheduled_batch, attn_metadata, 2.0)
+
+    update_draft_location.assert_called_once_with(manager, scheduled_batch, attn_metadata, 2.0)
+    cache.resize.assert_called_once_with(253, 200)
+
+
+def test_resource_manager_scopes_target_metadata_to_target_kvcm() -> None:
+    scheduled_batch = object()
+    attn_metadata = object()
+    target_manager = MagicMock()
+    draft_manager = MagicMock()
+    compression_manager = MagicMock()
+    resource_manager = ResourceManager(
+        {
+            ResourceManagerType.KV_CACHE_MANAGER: target_manager,
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft_manager,
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER: compression_manager,
+        }
+    )
+
+    resource_manager.update_resources(scheduled_batch, attn_metadata, 2.0)
+
+    target_manager.update_resources.assert_called_once_with(scheduled_batch, attn_metadata, 2.0)
+    draft_manager.update_resources.assert_called_once_with(scheduled_batch)
+    compression_manager.update_resources.assert_called_once_with(scheduled_batch)
