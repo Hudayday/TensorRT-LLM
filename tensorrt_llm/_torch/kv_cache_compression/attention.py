@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""TRT-LLM attention metadata support for independent target/draft KV caches."""
+"""TRT-LLM attention metadata support for paged draft KV length domains."""
 
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence, Tuple, Type
@@ -28,14 +28,33 @@ def requires_kv_cache_compression_attention_backend(
     compression_config: Any,
     spec_config: Any,
 ) -> bool:
-    """Whether a registered compression algorithm needs target/draft domains."""
+    """Whether compression needs the paged-draft KV length adapter."""
     if compression_config is None or compression_config.algorithm != "triattention":
         return False
+    return requires_paged_draft_kv_length_domain(spec_config)
+
+
+def requires_paged_draft_kv_length_domain(spec_config: Any) -> bool:
+    """Whether a separate draft KVCM feeds standard paged attention.
+
+    These modes execute their draft model through the regular attention stack,
+    so target-only compaction requires a dense draft length alongside the
+    compressed target length. DFlash instead reads its private context K/V and
+    does not consume this metadata domain.
+    """
     if spec_config is None:
         return False
     from ..speculative import should_use_separate_draft_kv_cache
 
-    return should_use_separate_draft_kv_cache(spec_config)
+    if not should_use_separate_draft_kv_cache(spec_config):
+        return False
+    mode = spec_config.spec_dec_mode
+    return (
+        mode.is_mtp_one_model()
+        or mode.is_eagle3_one_model()
+        or mode.is_draft_target_one_model()
+        or mode.is_pard()
+    )
 
 
 def is_kv_cache_compression_attention_backend_enabled(model_config: Any) -> bool:
@@ -246,5 +265,6 @@ __all__ = [
     "get_kv_cache_compression_attention_backend",
     "get_model_kv_cache_compression_attention_backend",
     "is_kv_cache_compression_attention_backend_enabled",
+    "requires_paged_draft_kv_length_domain",
     "requires_kv_cache_compression_attention_backend",
 ]

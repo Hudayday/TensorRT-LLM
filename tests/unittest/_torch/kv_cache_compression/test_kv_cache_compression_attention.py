@@ -14,6 +14,7 @@ from tensorrt_llm._torch.kv_cache_compression.attention import (
     get_kv_cache_compression_attention_backend,
     get_model_kv_cache_compression_attention_backend,
     requires_kv_cache_compression_attention_backend,
+    requires_paged_draft_kv_length_domain,
 )
 
 
@@ -67,17 +68,62 @@ def test_model_config_selects_same_backend_for_modules_and_metadata():
     )
 
 
-def test_only_registered_speculative_compression_requires_adapter():
-    speculative = mock.Mock()
+def test_only_paged_draft_attention_requires_adapter():
+    from tensorrt_llm.llmapi.llm_args import (
+        DFlashDecodingConfig,
+        DraftTargetDecodingConfig,
+        Eagle3DecodingConfig,
+        MTPDecodingConfig,
+        PARDDecodingConfig,
+        SADecodingConfig,
+    )
+
     triattention = mock.Mock(algorithm="triattention")
     unknown = mock.Mock(algorithm="unknown")
+    paged_draft_configs = [
+        Eagle3DecodingConfig(
+            max_draft_len=4,
+            speculative_model="/tmp/qwen3-eagle3-draft",
+        ),
+        MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True),
+        MTPDecodingConfig(max_draft_len=3),
+        DraftTargetDecodingConfig(
+            max_draft_len=3,
+            speculative_model="/tmp/draft-target-model",
+        ),
+        PARDDecodingConfig(max_draft_len=3),
+    ]
 
-    with mock.patch(
-        "tensorrt_llm._torch.speculative.should_use_separate_draft_kv_cache",
-        return_value=True,
-    ):
+    for speculative in paged_draft_configs:
+        assert requires_paged_draft_kv_length_domain(speculative)
         assert requires_kv_cache_compression_attention_backend(triattention, speculative)
         assert not requires_kv_cache_compression_attention_backend(unknown, speculative)
+
+    dflash = DFlashDecodingConfig(max_draft_len=3)
+    assert not requires_paged_draft_kv_length_domain(dflash)
+    assert not requires_kv_cache_compression_attention_backend(triattention, dflash)
+
+    eagle3_two_model = Eagle3DecodingConfig(
+        max_draft_len=4,
+        speculative_model="/tmp/qwen3-eagle3-draft",
+        eagle3_one_model=False,
+    )
+    draft_target_two_model = DraftTargetDecodingConfig(
+        max_draft_len=3,
+        speculative_model="/tmp/draft-target-model",
+    )
+    draft_target_two_model._draft_target_one_model = False
+    non_paged_draft_configs = [
+        SADecodingConfig(max_draft_len=3),
+        eagle3_two_model,
+        draft_target_two_model,
+    ]
+    for speculative in non_paged_draft_configs:
+        assert not requires_paged_draft_kv_length_domain(speculative)
+        assert not requires_kv_cache_compression_attention_backend(triattention, speculative)
+
+    paged_draft_configs[0]._allow_separate_draft_kv_cache = False
+    assert not requires_paged_draft_kv_length_domain(paged_draft_configs[0])
 
 
 def test_complete_target_and_draft_length_domains_are_independent():
