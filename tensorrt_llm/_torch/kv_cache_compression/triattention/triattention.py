@@ -1613,6 +1613,11 @@ class TriAttention(BaseKVCacheCompressionManager):
     def _validate_v2_compatibility(self) -> None:
         """Reject runtime modes outside the V2 physical-compaction contract."""
         manager = self.kv_cache_manager
+        if manager.kv_factor != 2:
+            raise ValueError(
+                "TriAttention requires a standard key/value KV cache; "
+                "MLA/SELFKONLY caches are not supported"
+            )
         if manager.mapping.enable_attention_dp:
             raise ValueError("TriAttention does not support attention DP")
         if manager.is_disagg:

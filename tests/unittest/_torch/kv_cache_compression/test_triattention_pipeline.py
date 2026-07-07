@@ -93,6 +93,7 @@ def _make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     fake_v2 = KVCacheManagerV2.__new__(KVCacheManagerV2)
     fake_v2.enable_block_reuse = enable_block_reuse
     fake_v2.is_draft = is_draft
+    fake_v2.kv_factor = 2
     fake_v2.mapping = SimpleNamespace(enable_attention_dp=False)
     fake_v2.is_disagg = False
     fake_v2.max_beam_width = 1
@@ -932,6 +933,13 @@ class TestStepEndHookRefactor:
 
         assert manager._confirmed_kv_lengths[7] == physical_confirmed
         cache.resize.assert_not_called()
+
+    def test_mla_selfkonly_cache_is_rejected(self):
+        manager = _make_triattention()
+        manager.kv_cache_manager.kv_factor = 1
+
+        with pytest.raises(ValueError, match="standard key/value KV cache"):
+            manager._validate_v2_compatibility()
 
     def test_one_model_mtp_target_only_contract_is_accepted(self):
         from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
