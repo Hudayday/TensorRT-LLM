@@ -845,7 +845,8 @@ class TestStandaloneGraphBuckets:
             prewarm_key=("dynamic-indexer",),
             max_requests=32,
             prepare_phase=mock.Mock(),
-            groups={0: group},
+            fused_group=group,
+            dense_layer_order=[0],
             round_starts_device=torch.zeros(8),
             mean_cos=torch.zeros(8, 1),
             mean_sin=torch.zeros(8, 1),
@@ -1327,7 +1328,7 @@ class TestStandaloneGraphCuda:
 
         def score_and_select():
             score.prepare_phase(request_count)
-            per_head, _ = score.groups[0].launch(
+            per_head, _ = score.fused_group.launch(
                 request_count,
                 score.round_starts_device,
                 score.mean_cos,

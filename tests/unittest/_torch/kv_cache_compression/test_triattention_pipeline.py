@@ -1434,15 +1434,21 @@ class TestStepEndHookRefactor:
         mgr._evict_modes = mock.Mock(return_value=torch.arange(6))
 
         def score_group(*args, **kwargs):
-            layer = kwargs["layer_indices"][0]
-            segment = SimpleNamespace(request_index=0, layer_index=layer)
-            return torch.empty(0), torch.empty(0), [segment]
+            segments = [
+                SimpleNamespace(request_index=0, layer_index=layer)
+                for layer in kwargs["layer_indices"]
+            ]
+            return torch.empty(0), torch.empty(0), segments
 
         with (
             mock.patch.object(
                 kernels, "triton_tri_score_perhead", side_effect=score_group
             ) as score,
-            mock.patch.object(kernels, "flat_perhead_to_list", return_value=[torch.zeros(1, 8)]),
+            mock.patch.object(
+                kernels,
+                "flat_perhead_to_list",
+                return_value=[torch.zeros(1, 8), torch.zeros(1, 8)],
+            ),
             mock.patch.object(kernels, "triton_tri_compact") as compact,
             mock.patch.object(
                 tri_module,
@@ -1453,12 +1459,14 @@ class TestStepEndHookRefactor:
             targets = mgr._evict_requests([(request, 7)], num_layers=2)
 
         assert targets == [(7, 6)]
-        assert score.call_count == 2
-        first_score, second_score = score.call_args_list
-        assert first_score.kwargs["layer_indices"] == [0]
-        assert first_score.args[1][0].tolist() == [10]
-        assert second_score.kwargs["layer_indices"] == [1]
-        assert second_score.args[1][0].tolist() == [20]
+        # ONE fused launch spans both dense layers; each layer still supplies
+        # its OWN page table via page_ids_per_layer.
+        assert score.call_count == 1
+        fused_call = score.call_args
+        assert fused_call.kwargs["layer_indices"] == [0, 1]
+        per_layer = fused_call.kwargs["page_ids_per_layer"]
+        assert per_layer[0][0].tolist() == [10]
+        assert per_layer[0][1].tolist() == [20]
         assert compact.call_count == 2
         first_compact, second_compact = compact.call_args_list
         assert first_compact.args[0] is pools[0]
@@ -1467,7 +1475,6 @@ class TestStepEndHookRefactor:
         assert second_compact.args[1][0].tolist() == [20]
         assert [call.args[0] for call in nvtx.call_args_list] == [
             "triattention.metadata",
-            "triattention.score",
             "triattention.score",
             "triattention.select",
             "triattention.compact",
@@ -2079,10 +2086,10 @@ class TestFixedScoreMetadata:
         assert workspace.offsets.is_contiguous()
         assert workspace.omega.dtype == torch.float32
         assert workspace.omega.is_contiguous()
-        for group in workspace.groups.values():
-            for calibration in (*group.pointer_middle[2:], *group.pointer_tail):
-                assert calibration.dtype == torch.float32
-                assert calibration.is_contiguous()
+        fused = workspace.fused_group
+        for calibration in (*fused.pointer_middle[2:], *fused.pointer_tail):
+            assert calibration.dtype == torch.float32
+            assert calibration.is_contiguous()
         tables = {
             10: [[2 * request, 2 * request + 1] for request in range(request_count)],
             12: [[2 * request + 1, 2 * request] for request in range(request_count)],
@@ -2192,7 +2199,8 @@ class TestFixedScoreMetadata:
                 page_count,
                 seq_len,
                 2,
-                page_ids,
+                page_ids.unsqueeze(0).contiguous(),
+                [0] * len(layers),
                 q_real,
                 q_imag,
                 mlr,
@@ -2235,6 +2243,154 @@ class TestFixedScoreMetadata:
                         torch.topk(expected.max(dim=0).values, 3).indices.sort().values
                     )
                     assert torch.equal(selected, expected_selected)
+
+    @pytest.mark.parametrize("request_count", [1, 7])
+    @pytest.mark.parametrize("aggregation", ["mean", "max"])
+    @CUDA_REQUIRED
+    def test_fused_score_spans_distinct_storages_and_block_tables(
+        self, request_count, aggregation
+    ):
+        """ONE launch over layers in DISTINCT storages with DISTINCT block tables.
+
+        This is the production V2 shape: get_buffers wraps every layer as its
+        own TensorWrapper storage and every layer allocates its own pages, so
+        the fused path must not assume a shared storage anchor or a shared
+        per-request block table.
+        """
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+            _FixedScoreGroup,
+            flat_perhead_to_list,
+            triton_tri_score_perhead,
+        )
+
+        device = torch.device("cuda")
+        torch.manual_seed(20260707 + request_count)
+        max_requests = 8
+        page_count = 2
+        seq_len = 7
+        num_layers = 3
+        # Three SEPARATE allocations (distinct storages, like V2 TensorWrapper).
+        pools = [
+            torch.randn(max_requests * page_count, 2, 1, 4, 4, device=device)
+            for _ in range(num_layers)
+        ]
+        assert len({pool.untyped_storage().data_ptr() for pool in pools}) == num_layers
+        # A DIFFERENT block table per layer (per-layer page allocation).
+        generator = torch.Generator(device="cpu").manual_seed(7 + request_count)
+        page_ids_3d = torch.stack(
+            [
+                torch.randperm(max_requests * page_count, generator=generator)[
+                    : max_requests * page_count
+                ]
+                .view(max_requests, page_count)
+                .to(device=device, dtype=torch.int64)
+                for _ in range(num_layers)
+            ]
+        ).contiguous()
+        q_real = torch.randn(num_layers, 2, 2, device=device)
+        q_imag = torch.randn(num_layers, 2, 2, device=device)
+        mlr = torch.randn(num_layers, 2, 2, device=device)
+        freq = torch.tensor([0.7, 1.3], device=device)
+        omega = torch.tensor([0.013, 0.071], device=device)
+        offsets = torch.tensor([1.0, 2.0, 4.0], device=device)
+        round_device = torch.arange(max_requests, dtype=torch.float32, device=device) + 9.0
+        round_starts = round_device[:request_count].tolist()
+        seq_lens = [seq_len] * request_count
+        phase = (round_device[:, None, None] + offsets[None, :, None]) * omega[None, None]
+
+        layer_order = list(range(num_layers))
+        group = _FixedScoreGroup(
+            pools,
+            layer_order,
+            max_requests,
+            page_count,
+            seq_len,
+            2,
+            page_ids_3d,
+            layer_order,  # slot i holds layer i's tables
+            q_real,
+            q_imag,
+            mlr,
+            freq,
+            omega,
+            offsets,
+        )
+        fixed, _ = group.launch(
+            request_count,
+            round_device,
+            torch.cos(phase).mean(dim=1),
+            torch.sin(phase).mean(dim=1),
+            aggregation,
+        )
+
+        page_ids_per_layer = [
+            [page_ids_3d[layer, request] for layer in layer_order]
+            for request in range(request_count)
+        ]
+        eager, eager_offsets, _ = triton_tri_score_perhead(
+            pools,
+            [per_layer[0] for per_layer in page_ids_per_layer],
+            seq_lens,
+            round_starts,
+            q_real,
+            q_imag,
+            mlr,
+            freq,
+            omega,
+            offsets,
+            2,
+            score_aggregation=aggregation,
+            layer_indices=layer_order,
+            page_ids_per_layer=page_ids_per_layer,
+        )
+        # Fixed and eager fused launches must agree bit-for-bit.
+        assert torch.equal(fixed, eager)
+
+        # The fused launch must agree bit-for-bit with per-layer launches.
+        segments = flat_perhead_to_list(eager, eager_offsets)
+        for layer_slot, layer in enumerate(layer_order):
+            single, single_offsets, _ = triton_tri_score_perhead(
+                pools,
+                [page_ids_3d[layer, request] for request in range(request_count)],
+                seq_lens,
+                round_starts,
+                q_real,
+                q_imag,
+                mlr,
+                freq,
+                omega,
+                offsets,
+                2,
+                score_aggregation=aggregation,
+                layer_indices=[layer],
+            )
+            single_segments = flat_perhead_to_list(single, single_offsets)
+            for request in range(request_count):
+                assert torch.equal(
+                    segments[request * num_layers + layer_slot], single_segments[request]
+                )
+
+        # And with the independent Torch oracle (per-layer block tables).
+        oracle = _torch_tri_score_oracle(
+            pools,
+            {layer: page_ids_3d[layer, :request_count] for layer in layer_order},
+            seq_lens,
+            round_starts,
+            q_real,
+            q_imag,
+            mlr,
+            freq,
+            omega,
+            offsets,
+            layer_order,
+            aggregation,
+        )
+        for request in range(request_count):
+            for layer_slot, layer in enumerate(layer_order):
+                segment_index = request * num_layers + layer_slot
+                segment = fixed[:, segment_index * seq_len : (segment_index + 1) * seq_len]
+                expected = oracle[request * num_layers + layer]
+                torch.testing.assert_close(segment, expected, rtol=5e-3, atol=5e-3)
 
     @CUDA_REQUIRED
     def test_fixed_score_metadata_alternates_r7_r1_without_stale_rows(self):
@@ -2341,7 +2497,7 @@ class TestFixedScoreMetadata:
 
         selection_manager = build_selection_manager(True)
         eager_selection_manager = build_selection_manager(False)
-        group = workspace.groups[0]
+        group = workspace.fused_group
         stable_workspace_pointers = tensor_pointers(workspace)
         stable_group_pointers = tensor_pointers(group)
         stable_selection_pointers = [tensor_pointers(item) for item in selection_bank]
@@ -4651,7 +4807,8 @@ class TestCrossRequestFixedUnionWorkspace:
             prewarm_key=key,
             bucket_seq_len=8,
             prompt_len=2,
-            groups={0: score_group},
+            fused_group=score_group,
+            dense_layer_order=[0, 1],
             round_starts_device=torch.tensor([8.0, 8.0]),
             valid_seq_lens_device=torch.tensor([8, 8], dtype=torch.int32),
             mean_cos=torch.empty(0),

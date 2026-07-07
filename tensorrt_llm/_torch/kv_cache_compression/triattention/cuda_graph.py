@@ -329,18 +329,18 @@ class FixedBatchedCompactionWorkspace:
             ("offsets", _tensor_fingerprint(self.score_workspace.offsets)),
             ("omega", _tensor_fingerprint(self.score_workspace.omega)),
         ]
-        for representative, group in self.score_workspace.groups.items():
-            group_tensors = (
-                *group.pointer_prefix,
-                *group.pointer_middle,
-                *group.pointer_tail,
-                group.output,
-                group.seg_offsets,
-            )
-            score_tensors.extend(
-                (f"group.{representative}.{index}", _tensor_fingerprint(tensor))
-                for index, tensor in enumerate(group_tensors)
-            )
+        fused_group = self.score_workspace.fused_group
+        group_tensors = (
+            *fused_group.pointer_prefix,
+            *fused_group.pointer_middle,
+            *fused_group.pointer_tail,
+            fused_group.output,
+            fused_group.seg_offsets,
+        )
+        score_tensors.extend(
+            (f"group.fused.{index}", _tensor_fingerprint(tensor))
+            for index, tensor in enumerate(group_tensors)
+        )
         context_token = int(torch.cuda.current_blas_handle())
         return (
             "triattention.standalone-eviction-graph.v2",

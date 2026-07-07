@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Vendored Triton kernels for the TriAttention KV-eviction pipeline.
 
-The production eviction path is fully fused over (request x layer): one fused score launch over
-(request x layer), torch.topk SELECT, and one per-layer compaction.
+The production eviction path is fully fused over (request x layer) x KV head: ONE score
+launch spanning ALL dense layers (layers may live in distinct storages with distinct
+block tables; the kernel takes per-layer absolute base addresses), torch.topk SELECT,
+and one per-layer compaction.
 The kernels here back that path:
 
   * Fused trig-score over (request x layer) segments, writing un-reduced
@@ -13,8 +15,7 @@ The kernels here back that path:
     (``triton_tri_compact`` / ``_tri_compact_kernel``), reusing a
     per-(dtype,device) scratch buffer (``_get_compact_scratch`` /
     ``_COMPACT_SCRATCH``).
-  * Flat->list bridge (``flat_perhead_to_list``) and
-    the single-storage-base helper (``_flat_from_true_storage_base`` / ``SegMeta``).
+  * Flat->list bridge (``flat_perhead_to_list``) and ``SegMeta``.
 
 House rules honored throughout:
   * fp32 math (loads up-cast to fp32, fp32 accumulators, fp32 score output).
@@ -392,32 +393,6 @@ def triton_tri_compact_perhead(pool, page_ids_list, keep_2d_list, seq_len_list):
         )
 
 
-def _flat_from_true_storage_base(anchor: torch.Tensor) -> Tuple[torch.Tensor, int]:
-    """Return (flat, storage_base_ptr) where ``flat`` is a 1-D element-typed
-    tensor whose ``data_ptr()`` is the TRUE underlying storage base, spanning the
-    whole storage WITHOUT copying. Gives the kernel a single typed base pointer;
-    per-layer element offsets index into it.
-
-    Anchors on the TRUE storage base (NOT on the min layer data_ptr), so it is
-    correct even when the scored layers are a subset of a larger allocation whose
-    lowest scored layer has storage_offset > 0. Built via
-    ``set_(storage, storage_offset=0, ...)`` so ``flat.data_ptr()`` IS the true
-    base regardless of which layer we anchored on.
-    """
-    st = anchor.untyped_storage()
-    elt_size = anchor.element_size()
-    nelem = st.nbytes() // elt_size
-    flat = torch.empty(0, dtype=anchor.dtype, device=anchor.device)
-    flat.set_(st, storage_offset=0, size=(nelem,), stride=(1,))
-    storage_base = int(flat.data_ptr())
-    # Cross-check the offset arithmetic: anchor's data_ptr must equal
-    # storage_base + storage_offset*elt_size.
-    assert int(anchor.data_ptr()) == storage_base + anchor.storage_offset() * elt_size, (
-        "unexpected storage layout: anchor data_ptr != base + offset*elt_size"
-    )
-    return flat, storage_base
-
-
 class SegMeta(NamedTuple):
     seg_index: int  # position in the request-major (req_slot*L + layer_slot) order
     request_index: int  # slot into page_ids_list / seq_lens / round_starts
@@ -428,16 +403,20 @@ class SegMeta(NamedTuple):
 
 @triton.jit
 def _tri_score_perhead_kernel(
-    pool_storage_ptr,  # ONE typed base pointer; data_ptr() == TRUE storage base.
-    #   element-typed view aliasing all scored layers'
-    #   shared storage (no copy).
-    layer_base_ptrs,  # [num_layers] int64: ELEMENT offset of each layer's
-    #   HND view base relative to the TRUE storage base.
-    page_ids_ptr,  # [sum_pages] int64: all requests' page ids concat.
-    page_ids_offsets,  # [num_requests+1] int64: cum #pages per request.
+    pool_anchor_ptr,  # typed pool pointer; used ONLY to infer the element type
+    #   for the int->pointer cast below (its data is never read through it).
+    layer_base_addrs,  # [num_layers] int64: ABSOLUTE device address of each
+    #   scored layer's HND base. Layers do NOT need to share one storage:
+    #   each segment casts its own layer's address back to a typed pointer, so
+    #   all address arithmetic stays inside that layer's own allocation.
+    page_ids_ptr,  # [sum_page_tables] int64: page tables concatenated in
+    #   SEGMENT order (V2 allocates pages per layer, so block tables are
+    #   per-(request, layer), not per-request).
+    seg_page_off,  # [nseg] int64: offset of this segment's page table into
+    #   page_ids_ptr.
     # per-SEGMENT metadata (seg = req_slot*L_scored + layer_slot), idx by pid(0):
-    seg_req_id,  # [nseg] int32: request slot (into page_ids_offsets etc.)
-    seg_layer_id,  # [nseg] int32: ABSOLUTE layer id (indexes layer_base_ptrs + calib)
+    seg_req_id,  # [nseg] int32: request slot (round_start / mean phase lookup)
+    seg_layer_id,  # [nseg] int32: ABSOLUTE layer id (indexes layer_base_addrs + calib)
     seg_seq_len,  # [nseg] int32
     req_round_start,  # [num_requests] fp32
     seg_out_offset,  # [nseg] int64: write base (column) into each [H, sum_seq] row
@@ -463,7 +442,7 @@ def _tri_score_perhead_kernel(
     tokens_per_block,
     kv_factor,
     num_offsets,  # O ('max' path only)
-    # per-layer HND element strides (uniform across scored segments):
+    # per-layer HND element strides (uniform across scored layers):
     s_page,
     s_kv_factor,
     s_kv_head,
@@ -475,6 +454,12 @@ def _tri_score_perhead_kernel(
 ):
     seg = tl.program_id(0)
     t_blk = tl.program_id(1)
+    # KV heads are grid-parallel (axis 2): iterations of the former kv_head
+    # loop shared NO data (each KV head reads its own K and writes its own
+    # output rows), so hoisting it onto the grid multiplies parallelism with
+    # zero extra HBM traffic. The q-in-group loop below stays inside the
+    # program because it REUSES this head's K from registers (GQA dedup).
+    kv_head = tl.program_id(2)
 
     # tiles beyond this segment's own block count do nothing (ragged grid).
     n_tblk = tl.load(seg_n_tblk + seg)
@@ -486,8 +471,15 @@ def _tri_score_perhead_kernel(
     req_id = tl.load(seg_req_id + seg)
     rstart = tl.load(req_round_start + req_id)
     out_base = tl.load(seg_out_offset + seg)
-    layer_elt = tl.load(layer_base_ptrs + layer_id).to(tl.int64)
-    page_off = tl.load(page_ids_offsets + req_id)
+    # This segment's layer base: an absolute address cast back to a pool-typed
+    # pointer. TRT-LLM V2 exposes every layer as its own TensorWrapper storage,
+    # so "element offset relative to one shared storage" does not exist; the
+    # per-layer absolute address is the same device-pointer-array pattern the
+    # C++ backends use (KVBlockArray / grouped-GEMM pointer arrays).
+    layer_ptr = tl.load(layer_base_addrs + layer_id).to(
+        tl.pointer_type(pool_anchor_ptr.dtype.element_ty)
+    )
+    page_off = tl.load(seg_page_off + seg)
 
     f = tl.arange(0, F_BLOCK)
     f_mask = f < num_freqs
@@ -498,14 +490,14 @@ def _tri_score_perhead_kernel(
     t_mask = t < seq_len
     blk_in_seq = t // tokens_per_block
     slot = (t % tokens_per_block).to(tl.int64)
-    # page_off + blk_in_seq stays within this request's page slice for in-range
+    # page_off + blk_in_seq stays within this segment's page table for in-range
     # tokens (t_mask). For masked tail tokens the load is masked (other=0) so the
-    # possibly-out-of-this-request index is never dereferenced.
+    # possibly-out-of-this-segment index is never dereferenced.
     phys_page = tl.load(page_ids_ptr + page_off + blk_in_seq, mask=t_mask, other=0).to(tl.int64)
 
-    # element offset into pool_storage for (layer, page, KEY=0, *, slot).
+    # element offset into THIS layer's pool for (page, KEY=0, *, slot).
     # KEY half is kv_factor index 0 -> its stride term is 0 (matches reference).
-    tok_base = layer_elt + phys_page * s_page + slot * s_slot  # [T_BLOCK] int64
+    tok_base = phys_page * s_page + slot * s_slot  # [T_BLOCK] int64
 
     # per-request 'mean'-path phase + shared freq scale.
     mcos = tl.load(mean_cos_ptr + req_id * num_freqs + f, mask=f_mask, other=0.0)
@@ -513,71 +505,62 @@ def _tri_score_perhead_kernel(
     fss = tl.load(freq_scale_sq_ptr + f, mask=f_mask, other=0.0)
 
     # ---- PER-HEAD (position + mlr), GQA-deduped, NO head reduction ----
-    # Per-segment trig-score (fp32 math, int64 paged offsets): instead of
-    # accumulating into a single head-mean we WRITE each head's own
-    # (score + mlr) to its row in the [H, sum_seq] output. Iterating kv_head outer /
-    # q-in-group inner gives h = kv_head*group_size + qg, i.e. query-head order
-    # 0..num_q_heads-1, so row h holds query head h's score. K (and |K|) is
-    # loaded ONCE per KV head, shared by the group_size = H // nkv q-heads.
+    # This program scores ONE KV head's token tile for the group_size q-heads
+    # that share it. K (and |K|) is loaded ONCE and reused across the group;
+    # h = kv_head*group_size + qg keeps query-head order 0..num_q_heads-1, so
+    # every head's math is bit-for-bit identical to the looped variant.
     group_size = num_q_heads // num_kv_heads
     load_mask = t_mask[:, None] & f_mask[None, :]
     off_re = f64[None, :] * s_dim
     off_im = (num_freqs + f64[None, :]) * s_dim
 
-    kv_head = 0
-    while kv_head < num_kv_heads:
-        base = tok_base + kv_head.to(tl.int64) * s_kv_head  # [T_BLOCK]
-        # paged K loaded ONCE for this KV head (shared by group_size q-heads).
-        k_re = tl.load(pool_storage_ptr + base[:, None] + off_re, mask=load_mask, other=0.0).to(
-            tl.float32
-        )
-        k_im = tl.load(pool_storage_ptr + base[:, None] + off_im, mask=load_mask, other=0.0).to(
-            tl.float32
-        )
-        kmag = tl.sqrt(k_re * k_re + k_im * k_im)  # once per KV head
+    base = tok_base + kv_head.to(tl.int64) * s_kv_head  # [T_BLOCK]
+    # paged K loaded ONCE for this KV head (shared by group_size q-heads).
+    k_re = tl.load(layer_ptr + base[:, None] + off_re, mask=load_mask, other=0.0).to(tl.float32)
+    k_im = tl.load(layer_ptr + base[:, None] + off_im, mask=load_mask, other=0.0).to(tl.float32)
+    kmag = tl.sqrt(k_re * k_re + k_im * k_im)  # once per KV head
 
-        qg = 0
-        while qg < group_size:
-            h = kv_head * group_size + qg
-            calib_off = (layer_id.to(tl.int64) * num_q_heads + h) * num_freqs
-            qre = tl.load(q_real_ptr + calib_off + f, mask=f_mask, other=0.0)
-            qim = tl.load(q_imag_ptr + calib_off + f, mask=f_mask, other=0.0)
-            mlrc = tl.load(mlr_coef_ptr + calib_off + f, mask=f_mask, other=0.0)
+    qg = 0
+    while qg < group_size:
+        h = kv_head * group_size + qg
+        calib_off = (layer_id.to(tl.int64) * num_q_heads + h) * num_freqs
+        qre = tl.load(q_real_ptr + calib_off + f, mask=f_mask, other=0.0)
+        qim = tl.load(q_imag_ptr + calib_off + f, mask=f_mask, other=0.0)
+        mlrc = tl.load(mlr_coef_ptr + calib_off + f, mask=f_mask, other=0.0)
 
-            # complex product Q . conj(K) -- the trig importance score.
-            prod_real = qre[None, :] * k_re + qim[None, :] * k_im  # [T_BLOCK, F]
-            prod_imag = qim[None, :] * k_re - qre[None, :] * k_im
+        # complex product Q . conj(K) -- the trig importance score.
+        prod_real = qre[None, :] * k_re + qim[None, :] * k_im  # [T_BLOCK, F]
+        prod_imag = qim[None, :] * k_re - qre[None, :] * k_im
 
-            if USE_MAX:
-                # max over O offsets does NOT commute through the freq-sum;
-                # explicit O loop reducing max over the per-offset F-sum.
-                score = tl.full((T_BLOCK,), -float("inf"), tl.float32)
-                o = 0
-                while o < num_offsets:
-                    off = tl.load(offsets_ptr + o)
-                    om = tl.load(omega_ptr + f, mask=f_mask, other=0.0)
-                    phase = (rstart + off) * om
-                    cphase = tl.cos(phase)
-                    sphase = tl.sin(phase)
-                    per_f = fss[None, :] * (
-                        prod_real * cphase[None, :] - prod_imag * sphase[None, :]
-                    )
-                    offset_score = tl.sum(tl.where(f_mask[None, :], per_f, 0.0), axis=1)
-                    score = tl.maximum(score, offset_score)
-                    o += 1
-            else:
-                # 'mean': offset loop collapsed into mean_cos/mean_sin.
-                per_f = fss[None, :] * (prod_real * mcos[None, :] - prod_imag * msin[None, :])
-                score = tl.sum(tl.where(f_mask[None, :], per_f, 0.0), axis=1)
+        if USE_MAX:
+            # max over O offsets does NOT commute through the freq-sum;
+            # explicit O loop reducing max over the per-offset F-sum.
+            score = tl.full((T_BLOCK,), -float("inf"), tl.float32)
+            o = 0
+            while o < num_offsets:
+                off = tl.load(offsets_ptr + o)
+                om = tl.load(omega_ptr + f, mask=f_mask, other=0.0)
+                phase = (rstart + off) * om
+                cphase = tl.cos(phase)
+                sphase = tl.sin(phase)
+                per_f = fss[None, :] * (
+                    prod_real * cphase[None, :] - prod_imag * sphase[None, :]
+                )
+                offset_score = tl.sum(tl.where(f_mask[None, :], per_f, 0.0), axis=1)
+                score = tl.maximum(score, offset_score)
+                o += 1
+        else:
+            # 'mean': offset loop collapsed into mean_cos/mean_sin.
+            per_f = fss[None, :] * (prod_real * mcos[None, :] - prod_imag * msin[None, :])
+            score = tl.sum(tl.where(f_mask[None, :], per_f, 0.0), axis=1)
 
-            # position-INDEPENDENT MLR term (reuses the per-KV-head |K|).
-            mlr_f = kmag * mlrc[None, :] * fss[None, :]
-            mlr = tl.sum(tl.where(f_mask[None, :], mlr_f, 0.0), axis=1)
+        # position-INDEPENDENT MLR term (reuses the per-KV-head |K|).
+        mlr_f = kmag * mlrc[None, :] * fss[None, :]
+        mlr = tl.sum(tl.where(f_mask[None, :], mlr_f, 0.0), axis=1)
 
-            # write this head's score at row h, column (out_base + t). No mean.
-            tl.store(out_ptr + h.to(tl.int64) * sum_seq + out_base + t, score + mlr, mask=t_mask)
-            qg += 1
-        kv_head += 1
+        # write this head's score at row h, column (out_base + t). No mean.
+        tl.store(out_ptr + h.to(tl.int64) * sum_seq + out_base + t, score + mlr, mask=t_mask)
+        qg += 1
 
 
 def _launch_tri_score_perhead(
@@ -602,7 +585,13 @@ def _launch_tri_score_perhead(
 
 
 class _FixedScoreGroup:
-    """Persistent score metadata/output for one storage group and sequence bucket."""
+    """Persistent score metadata/output for one sequence bucket.
+
+    Since the per-layer absolute-address ABI, ONE group can span dense layers
+    living in DISTINCT storages with DISTINCT block tables: ``page_ids`` holds
+    one page table per (page-table slot, request) and ``page_table_slots`` maps
+    each scored layer to its slot.
+    """
 
     def __init__(
         self,
@@ -612,7 +601,8 @@ class _FixedScoreGroup:
         page_count: int,
         seq_len: int,
         num_q_heads: int,
-        page_ids: torch.Tensor,
+        page_ids: torch.Tensor,  # [num_slots, max_requests, page_count] int64
+        page_table_slots: List[int],  # per scored layer: slot into page_ids
         q_real_LHF: torch.Tensor,
         q_imag_LHF: torch.Tensor,
         mlr_coef_LHF: torch.Tensor,
@@ -622,6 +612,8 @@ class _FixedScoreGroup:
     ) -> None:
         if not layer_indices or min(max_requests, page_count, seq_len) <= 0:
             raise ValueError("fixed score group requires non-empty positive geometry")
+        if len(page_table_slots) != len(layer_indices):
+            raise ValueError("page_table_slots must align with layer_indices")
         self.max_requests = max_requests
         self.seq_len = seq_len
         self.num_q_heads = num_q_heads
@@ -639,6 +631,7 @@ class _FixedScoreGroup:
         _, kv_factor, num_kv_heads, tokens_per_block, head_dim = p0.shape
         if num_q_heads % num_kv_heads:
             raise ValueError("query heads must be divisible by KV heads")
+        self.num_kv_heads = int(num_kv_heads)
         self.num_freqs = head_dim // 2
         strides = tuple(int(value) for value in p0.stride())
         self.geometry_args = (
@@ -651,29 +644,28 @@ class _FixedScoreGroup:
             int(offsets.numel()),
             *strides,
         )
-        anchor = layer_pools[layer_indices[0]]
-        pool_storage, storage_base = _flat_from_true_storage_base(anchor)
-        element_size = anchor.element_size()
-        layer_base_ptrs = torch.zeros(len(layer_pools), dtype=torch.int64, device=device)
+        # Per-layer ABSOLUTE base addresses. Layers may live in distinct
+        # storages (V2 TensorWrapper-per-layer); only geometry must be uniform.
+        element_size = p0.element_size()
+        layer_base_addrs = torch.zeros(len(layer_pools), dtype=torch.int64, device=device)
         for layer in layer_indices:
             pool = layer_pools[layer]
             if (
-                pool.untyped_storage().data_ptr() != anchor.untyped_storage().data_ptr()
-                or tuple(pool.shape[1:]) != tuple(p0.shape[1:])
+                tuple(pool.shape[1:]) != tuple(p0.shape[1:])
                 or tuple(pool.stride()) != strides
                 or pool.dtype != p0.dtype
             ):
-                raise ValueError("fixed score layers must share one uniform storage")
-            offset_bytes = int(pool.data_ptr()) - storage_base
-            if offset_bytes < 0 or offset_bytes % element_size:
-                raise ValueError("fixed score layer offset is invalid")
-            layer_base_ptrs[layer] = offset_bytes // element_size
+                raise ValueError("fixed score layers must share one uniform geometry")
+            address = int(pool.data_ptr())
+            if address % element_size:
+                raise ValueError("fixed score layer base is not element-aligned")
+            layer_base_addrs[layer] = address
+        # The anchor pool is passed as a typed kernel argument ONLY so the
+        # kernel can recover the element type for the int->pointer cast.
+        self.anchor_pool = p0
 
         num_segments = max_requests * self.num_layers
         segment = torch.arange(num_segments, device=device)
-        page_ids_offsets = (
-            torch.arange(max_requests + 1, dtype=torch.int64, device=device) * page_count
-        )
         seg_req = torch.arange(max_requests, dtype=torch.int32, device=device).repeat_interleave(
             self.num_layers
         )
@@ -682,6 +674,20 @@ class _FixedScoreGroup:
         )
         seg_seq = torch.full((num_segments,), seq_len, dtype=torch.int32, device=device)
         seg_out_off = segment.to(torch.int64) * seq_len
+        # Per-segment page-table offsets into page_ids.view(-1): segment
+        # (r, layer_slot) reads table [page_table_slots[layer_slot], r].
+        if page_ids.ndim != 3 or tuple(page_ids.shape[1:]) != (max_requests, page_count):
+            raise ValueError("page ids do not match fixed score geometry")
+        if not page_ids.is_contiguous():
+            raise ValueError("fixed score page ids must be contiguous")
+        slots_t = torch.tensor(page_table_slots, dtype=torch.int64, device=device)
+        if int(slots_t.max()) >= int(page_ids.shape[0]):
+            raise ValueError("page table slot exceeds staged page-id planes")
+        req_idx = torch.arange(max_requests, dtype=torch.int64, device=device).repeat_interleave(
+            self.num_layers
+        )
+        slot_idx = slots_t.repeat(max_requests)
+        seg_page_off = (slot_idx * max_requests + req_idx) * page_count
         self.token_block = 64
         self.max_ntblk = (seq_len + self.token_block - 1) // self.token_block
         seg_ntblk = torch.full((num_segments,), self.max_ntblk, dtype=torch.int32, device=device)
@@ -694,13 +700,11 @@ class _FixedScoreGroup:
         self.output = torch.empty(
             num_q_heads * num_segments * seq_len, dtype=torch.float32, device=device
         )
-        if page_ids.shape != (max_requests, page_count) or not page_ids.is_contiguous():
-            raise ValueError("page ids do not match fixed score geometry")
         self.pointer_prefix = (
-            pool_storage,
-            layer_base_ptrs,
+            self.anchor_pool,
+            layer_base_addrs,
             page_ids.view(-1),
-            page_ids_offsets,
+            seg_page_off,
             seg_req,
             seg_layer,
             seg_seq,
@@ -747,14 +751,14 @@ class _FixedScoreGroup:
         mean_sin: torch.Tensor,
         score_aggregation: str,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Launch the unchanged score kernel using the persistent metadata."""
+        """Launch the fused score kernel using the persistent metadata."""
         if request_count <= 0 or request_count > self.max_requests:
             raise ValueError("request count exceeds fixed score capacity")
         num_segments = request_count * self.num_layers
         sum_seq = num_segments * self.seq_len
         output = self.output[: self.num_q_heads * sum_seq]
         _launch_tri_score_perhead(
-            (num_segments, self.max_ntblk),
+            (num_segments, self.max_ntblk, self.num_kv_heads),
             (
                 *self.pointer_prefix,
                 round_starts_device,
@@ -774,7 +778,8 @@ class _FixedScoreGroup:
 
 def triton_tri_score_perhead(
     layer_pools,  # list[L_all] of HND views get_buffers(l,'HND').
-    page_ids_list,  # list[K] of 1-D int tensors: each request's page ids.
+    page_ids_list,  # list[K] of 1-D int tensors: per-request page ids (used for
+    #   ALL scored layers when ``page_ids_per_layer`` is None).
     seq_lens,  # list[K] int: per-request committed seq_len (>top_B).
     round_starts,  # list[K] int/float: per-request round_start.
     q_real_LHF,  # [L_all,H,F] fp32 (stack of per-layer E_q.real).
@@ -786,36 +791,39 @@ def triton_tri_score_perhead(
     num_q_heads,  # H.
     score_aggregation="mean",
     layer_indices=None,  # optional list of ABSOLUTE layer ids to score (default all).
+    page_ids_per_layer=None,  # optional [request][layer_slot] page-id tensors for
+    #   layers with DISTINCT block tables (V2 allocates pages per layer). When
+    #   given, ``page_ids_list`` is ignored.
 ) -> Tuple[torch.Tensor, torch.Tensor, List[SegMeta]]:
-    """Per-query-head fused trig-score: returns un-reduced per-query-head
-    scores (one row per query head) over (request x layer) segments.
+    """Per-query-head fused trig-score over (request x layer) segments.
+
+    Scored layers may live in DISTINCT storages (V2 TensorWrapper-per-layer):
+    the kernel receives each layer's ABSOLUTE base address and casts it back to
+    a typed pointer, so no shared-storage anchor is required. Geometry
+    (shape[1:], strides, dtype) must still be uniform across scored layers.
 
     Returns (perhead_scores[H, sum_seq], seg_offsets[nseg+1] int32, seg_meta).
-
-    seg_meta is a list of SegMeta (seg_index, request_index, layer_index,
-    seq_len, round_start) in segment order (REQUEST-MAJOR, then layer). The slice
-    perhead_scores[:, seg_offsets[s]:seg_offsets[s+1]] equals
-    triton_tri_score(pool=layer_pools[layer_index],
-    page_ids=page_ids_list[request_index], ... same calib/round_start ...) (i.e.
-    [H, seq_len], NO head-mean reduction).
-
-    To split into the per-segment list of [H, seq_i] views, use
-    ``flat_perhead_to_list(perhead_scores, seg_offsets)``.
+    seg_meta is REQUEST-MAJOR, then layer. To split into per-segment [H, seq_i]
+    views use ``flat_perhead_to_list(perhead_scores, seg_offsets)``.
     """
     assert score_aggregation in ("mean", "max")
     L_all = len(layer_pools)
     layer_ids = list(range(L_all)) if layer_indices is None else list(layer_indices)
     device = layer_pools[layer_ids[0]].device
-    K = len(page_ids_list)
+    K = len(page_ids_list) if page_ids_per_layer is None else len(page_ids_per_layer)
     assert len(seq_lens) == K and len(round_starts) == K
+    if page_ids_per_layer is not None:
+        assert all(len(per_layer) == len(layer_ids) for per_layer in page_ids_per_layer), (
+            "page_ids_per_layer must provide one page table per scored layer"
+        )
 
     # ---- HND geometry (uniform across scored layers; assert it) ----
     p0 = layer_pools[layer_ids[0]]
     _num_pages0, kv_factor, num_kv_heads, tokens_per_block, head_dim = p0.shape
     num_freqs = head_dim // 2
-    # GQA-deduped score kernel loads K once per KV head and inner-loops the
-    # group_size = H // nkv q-heads sharing it; needs exact divisibility so the
-    # h order (and thus the per-head math) is preserved bit-for-bit.
+    # GQA-deduped score kernel: KV heads run on grid axis 2 and the group_size
+    # = H // nkv q-heads sharing one K run in-program; exact divisibility keeps
+    # the h order (and thus the per-head math) bit-for-bit.
     assert num_q_heads % num_kv_heads == 0, (
         f"score kernel requires num_q_heads ({num_q_heads}) % num_kv_heads ({num_kv_heads}) == 0"
     )
@@ -835,32 +843,44 @@ def triton_tri_score_perhead(
         assert pl.stride() == p0.stride(), "non-uniform HND strides across layers"
         assert pl.dtype == p0.dtype, "non-uniform pool dtype across layers"
 
-    # ---- single typed base ptr (TRUE storage base) + per-layer element offsets ----
+    # ---- per-layer ABSOLUTE base addresses (no shared-storage anchor) ----
     elt_size = p0.element_size()
-    anchor = layer_pools[layer_ids[0]]
-    pool_storage, storage_base = _flat_from_true_storage_base(anchor)
-
-    layer_base_ptrs = torch.zeros(L_all, dtype=torch.int64, device=device)
+    layer_base_addrs = torch.zeros(L_all, dtype=torch.int64, device=device)
     for lid in layer_ids:
-        pl = layer_pools[lid]
-        # All scored layers must alias the SAME underlying storage.
-        assert pl.untyped_storage().data_ptr() == anchor.untyped_storage().data_ptr(), (
-            "scored layer views do not share one storage; group segments by pool "
-            "and call triton_tri_score_perhead per group."
-        )
-        off_bytes = int(pl.data_ptr()) - storage_base
-        assert off_bytes >= 0 and off_bytes % elt_size == 0, (
-            "layer base not within/aligned to chosen storage"
-        )
-        layer_base_ptrs[lid] = off_bytes // elt_size
+        address = int(layer_pools[lid].data_ptr())
+        assert address % elt_size == 0, "layer base not element-aligned"
+        layer_base_addrs[lid] = address
 
-    # ---- page ids: concat per request, request-indexed offsets ----
-    page_ids_offsets = torch.zeros(K + 1, dtype=torch.int64, device=device)
+    # ---- page tables, concatenated in SEGMENT order ----
+    # V2 allocates pages per layer, so a request's block table differs by
+    # layer. With ``page_ids_per_layer`` each (request, layer) segment gets its
+    # own table; otherwise all layers of a request share one table and their
+    # segments simply point at the same slice (no duplication).
+    L = len(layer_ids)
+    nseg = K * L
     pid_parts = []
-    for r in range(K):
-        pid = torch.as_tensor(page_ids_list[r], device=device, dtype=torch.int64).reshape(-1)
-        pid_parts.append(pid)
-        page_ids_offsets[r + 1] = page_ids_offsets[r] + pid.numel()
+    seg_page_off = torch.empty(nseg, dtype=torch.int64, device=device)
+    page_cursor = 0
+    if page_ids_per_layer is None:
+        req_table_off = []
+        for r in range(K):
+            pid = torch.as_tensor(page_ids_list[r], device=device, dtype=torch.int64).reshape(-1)
+            pid_parts.append(pid)
+            req_table_off.append(page_cursor)
+            page_cursor += pid.numel()
+        for r in range(K):
+            seg_page_off[r * L : (r + 1) * L] = req_table_off[r]
+    else:
+        s = 0
+        for r in range(K):
+            for layer_slot in range(L):
+                pid = torch.as_tensor(
+                    page_ids_per_layer[r][layer_slot], device=device, dtype=torch.int64
+                ).reshape(-1)
+                pid_parts.append(pid)
+                seg_page_off[s] = page_cursor
+                page_cursor += pid.numel()
+                s += 1
     page_ids_flat = (
         torch.cat(pid_parts).contiguous()
         if pid_parts
@@ -868,8 +888,6 @@ def triton_tri_score_perhead(
     )
 
     # ---- segments: request-major then layer ----
-    L = len(layer_ids)
-    nseg = K * L
     seg_req = torch.empty(nseg, dtype=torch.int32, device=device)
     seg_layer = torch.empty(nseg, dtype=torch.int32, device=device)
     seg_seq = torch.empty(nseg, dtype=torch.int32, device=device)
@@ -881,9 +899,7 @@ def triton_tri_score_perhead(
     # T_BLOCK is the TOKEN tiling. Each token's score is a single per-tile tl.sum
     # over F (F_BLOCK covers all freqs) with no cross-tile/cross-token fp32 fold, so
     # the stored value is INVARIANT to T_BLOCK -> tuning it is byte-identical (only
-    # launch/index overhead changes). num_warps/num_stages are scheduling-only
-    # (numerics-neutral). All three are env-tunable at call time for the bench/sweep;
-    # the winning constants get baked in once validated byte-identical.
+    # launch/index overhead changes).
     T_BLOCK = 64  # verified token-tile width
 
     request_round_starts = torch.as_tensor(round_starts, dtype=torch.float32, device=device)
@@ -899,7 +915,7 @@ def triton_tri_score_perhead(
         sl = int(seq_lens[r])
         rs = float(round_starts[r])
         # offset-collapsed cos/sin: same for all layers of this request, built
-        # EXACTLY as triton_tri_score does (mean over offsets of cos/sin(phase)).
+        # EXACTLY as the reference does (mean over offsets of cos/sin(phase)).
         qp = (rs + offsets_d).view(-1, 1)  # [O,1]
         phase = qp * omega_d.view(1, -1)  # [O,F]
         mc = torch.cos(phase).mean(dim=0)  # [F]
@@ -931,19 +947,16 @@ def triton_tri_score_perhead(
     mlr_f = mlr_coef_LHF.to(device=device, dtype=torch.float32).contiguous().view(-1)
     fss_d = freq_scale_sq.to(device=device, dtype=torch.float32).contiguous()
 
-    # grid axis 0 = nseg (on the 2^31-1 axis); axis 1 = max token-blocks per
-    # segment (small: cdiv(seq_len, T_BLOCK), <=1024 even at 64k tokens). The
-    # unbounded token count NEVER lands on a 65535-limited grid axis.
-    #
-    # Production launch: the kv_head-loop scoring kernel with Triton's autochosen
-    # schedule.
+    # grid: axis 0 = nseg (on the 2^31-1 axis); axis 1 = max token-blocks per
+    # segment (small: cdiv(seq_len, T_BLOCK), <=1024 even at 64k tokens); axis
+    # 2 = KV heads (data-independent across heads -> free grid parallelism).
     _launch_tri_score_perhead(
-        (nseg, max_ntblk),
+        (nseg, max_ntblk, num_kv_heads),
         (
-            pool_storage,
-            layer_base_ptrs,
+            p0,
+            layer_base_addrs,
             page_ids_flat,
-            page_ids_offsets,
+            seg_page_off,
             seg_req,
             seg_layer,
             seg_seq,

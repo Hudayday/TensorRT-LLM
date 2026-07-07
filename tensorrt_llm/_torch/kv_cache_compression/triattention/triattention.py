@@ -1223,24 +1223,30 @@ class _FixedScoreMetadataWorkspace:
         self.mean_sin = torch.empty_like(self.mean_cos)
         self.offsets = offsets
         self.omega = omega
-        self.groups = {
-            layers[0]: _FixedScoreGroup(
-                layer_pools,
-                layers,
-                max_requests,
-                self.page_count,
-                seq_len,
-                num_q_heads,
-                self.page_ids_device[self.representative_slots[layers[0]]],
-                q_real,
-                q_imag,
-                mlr_coef,
-                freq_scale_sq,
-                omega,
-                offsets,
-            )
-            for layers in dense_groups
-        }
+        # ONE fused group across ALL dense layers: segments carry their own
+        # layer base address and page-table slot, so distinct per-layer
+        # storages/block tables no longer force one launch per storage group.
+        self.dense_layer_order = [layer for layers in dense_groups for layer in layers]
+        _rep_of = {layer: layers[0] for layers in dense_groups for layer in layers}
+        _page_table_slots = [
+            self.representative_slots[_rep_of[layer]] for layer in self.dense_layer_order
+        ]
+        self.fused_group = _FixedScoreGroup(
+            layer_pools,
+            self.dense_layer_order,
+            max_requests,
+            self.page_count,
+            seq_len,
+            num_q_heads,
+            self.page_ids_device,
+            _page_table_slots,
+            q_real,
+            q_imag,
+            mlr_coef,
+            freq_scale_sq,
+            omega,
+            offsets,
+        )
         self.copy_done = torch.cuda.Event()
         self.copy_pending = False
         self.stream = None
@@ -1351,8 +1357,7 @@ class _FixedScoreMetadataWorkspace:
             self.page_ids_device.copy_(self.page_ids_host, non_blocking=True)
             self.round_starts_device.copy_(self.round_starts_host, non_blocking=True)
             self.valid_seq_lens_device.copy_(self.valid_seq_lens_host, non_blocking=True)
-            for group in self.groups.values():
-                group.stage_lengths(self.valid_seq_lens_device, request_count)
+            self.fused_group.stage_lengths(self.valid_seq_lens_device, request_count)
         finally:
             # The event guards pinned-source reuse. Requiring the same stream also
             # orders the next device-buffer overwrite after every score consumer.
@@ -3742,24 +3747,24 @@ class TriAttention(BaseKVCacheCompressionManager):
         def graph_body() -> None:
             score_workspace.prepare_phase(request_count)
             req_layer_scores = [dict() for _ in prepared]
-            for layers in dense_groups:
-                representative = layers[0]
-                per_head, _ = score_workspace.groups[representative].launch(
-                    request_count,
-                    score_workspace.round_starts_device,
-                    score_workspace.mean_cos,
-                    score_workspace.mean_sin,
-                    self.score_aggregation,
-                )
-                views = fixed_perhead_segment_views(
-                    per_head,
-                    request_count,
-                    len(layers),
-                    seq_len,
-                )
-                for request_index in range(request_count):
-                    for layer_slot, layer in enumerate(layers):
-                        req_layer_scores[request_index][layer] = views[:, request_index, layer_slot]
+            # ONE fused launch over (request x dense layer) segments.
+            per_head, _ = score_workspace.fused_group.launch(
+                request_count,
+                score_workspace.round_starts_device,
+                score_workspace.mean_cos,
+                score_workspace.mean_sin,
+                self.score_aggregation,
+            )
+            layer_order = score_workspace.dense_layer_order
+            views = fixed_perhead_segment_views(
+                per_head,
+                request_count,
+                len(layer_order),
+                seq_len,
+            )
+            for request_index in range(request_count):
+                for layer_slot, layer in enumerate(layer_order):
+                    req_layer_scores[request_index][layer] = views[:, request_index, layer_slot]
             segments_by_request = [
                 [
                     req_layer_scores[request_index][layer][:, prompt_len:seq_len]
@@ -3955,50 +3960,59 @@ class TriAttention(BaseKVCacheCompressionManager):
             return graph_capacity_targets
         if fixed_score_active:
             fixed_score_workspace.prepare_phase(len(prepared))
-        # Score only dense layers, grouped by their backing storage.
+        # Score ALL dense layers in ONE launch. Segments carry per-layer base
+        # addresses and per-(request, layer) page tables, so distinct per-layer
+        # storages/block tables no longer force one launch per storage group.
         req_layer_scores = [dict() for _ in prepared]  # [req] -> {layer_idx: [H,seq]}
-        for lids in storage_groups.values():
-            representative = lids[0]
-            group_page_ids = [item["page_ids"][representative] for item in prepared]
-            with nvtx_range("triattention.score", color="blue"):
-                if fixed_score_active:
-                    ph, _ = fixed_score_workspace.groups[representative].launch(
-                        len(prepared),
-                        fixed_score_workspace.round_starts_device,
-                        fixed_score_workspace.mean_cos,
-                        fixed_score_workspace.mean_sin,
-                        self.score_aggregation,
-                    )
-                    fixed_views = fixed_perhead_segment_views(
-                        ph,
-                        len(prepared),
-                        len(lids),
-                        fixed_score_workspace.bucket_seq_len,
-                    )
-                    for request in range(len(prepared)):
-                        for layer_slot, layer in enumerate(lids):
-                            req_layer_scores[request][layer] = fixed_views[:, request, layer_slot]
-                    continue
-                else:
-                    ph, so, sm = triton_tri_score_perhead(
-                        layer_pools,
-                        group_page_ids,
-                        seq_lens,
-                        round_starts,
-                        q_real,
-                        q_imag,
-                        mlr_coef,
-                        self._freq_scale_sq,
-                        self.calibration["omega"],
-                        self._offsets,
-                        self._H,
-                        score_aggregation=self.score_aggregation,
-                        layer_indices=lids,
-                    )
-                    segments = ((meta.request_index, meta.layer_index) for meta in sm)
-            seg_list = flat_perhead_to_list(ph, so)
-            for scores, (request, layer) in zip(seg_list, segments):
-                req_layer_scores[request][layer] = scores
+        with nvtx_range("triattention.score", color="blue"):
+            if fixed_score_active:
+                ph, _ = fixed_score_workspace.fused_group.launch(
+                    len(prepared),
+                    fixed_score_workspace.round_starts_device,
+                    fixed_score_workspace.mean_cos,
+                    fixed_score_workspace.mean_sin,
+                    self.score_aggregation,
+                )
+                layer_order = fixed_score_workspace.dense_layer_order
+                fixed_views = fixed_perhead_segment_views(
+                    ph,
+                    len(prepared),
+                    len(layer_order),
+                    fixed_score_workspace.bucket_seq_len,
+                )
+                for request in range(len(prepared)):
+                    for layer_slot, layer in enumerate(layer_order):
+                        req_layer_scores[request][layer] = fixed_views[:, request, layer_slot]
+            else:
+                # Each layer keeps its own block table (V2 allocates pages per
+                # layer); the staged page_ids dict is keyed by the layer's
+                # storage-group representative.
+                page_ids_per_layer = [
+                    [
+                        item["page_ids"][layer_group_representative[layer]]
+                        for layer in dense_layers
+                    ]
+                    for item in prepared
+                ]
+                ph, so, sm = triton_tri_score_perhead(
+                    layer_pools,
+                    [per_layer[0] for per_layer in page_ids_per_layer],
+                    seq_lens,
+                    round_starts,
+                    q_real,
+                    q_imag,
+                    mlr_coef,
+                    self._freq_scale_sq,
+                    self.calibration["omega"],
+                    self._offsets,
+                    self._H,
+                    score_aggregation=self.score_aggregation,
+                    layer_indices=dense_layers,
+                    page_ids_per_layer=page_ids_per_layer,
+                )
+                seg_list = flat_perhead_to_list(ph, so)
+                for scores, meta in zip(seg_list, sm):
+                    req_layer_scores[meta.request_index][meta.layer_index] = scores
         cross_request_workspaces = None
         if cross_request_selection is not None:
             with nvtx_range("triattention.select", color="yellow"):
