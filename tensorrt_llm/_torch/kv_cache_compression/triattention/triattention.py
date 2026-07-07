@@ -15,20 +15,21 @@
 
 """TriAttention KV-cache compression: periodic physical KV eviction.
 
-Every ``beta`` generation steps TriAttention scores each cached token with a
+Every ``beta`` generated target tokens TriAttention scores each cached token with a
 trigonometric importance score (computed from offline-calibrated statistics of
 the model's pre-RoPE query vectors) and physically deletes the tokens below the
-top-B keep set. There is no context-phase work and no per-step attention mask:
-the eviction runs in one pre-forward ``on_generation_step_begin`` hook.
+top-B keep set. There is no context-phase work and no per-step attention mask.
+The pre-forward hook records the exact target allocation for the in-flight
+batch; physical compaction runs from the final resource-update hook, after the
+target cache manager has applied speculative relocation and rewind.
 
 TriAttention is a :class:`BaseKVCacheCompressionManager` and nothing more -- it
 has no attention backend of its own; decode runs the model's standard dense
-kernel over the compacted cache. TriAttention derives each request's effective
-pre-forward physical length from V2 capacity and any unconsumed compaction;
-it writes that value through ``adjust_attention_metadata`` just before
-``attn_metadata.prepare()``. Physical reclaim uses V2's existing resize path:
-TriAttention publishes a request-scoped capacity-only target and trailing pages
-return to the pool after compaction finishes.
+kernel over the compacted cache. TriAttention writes the physical target length
+through ``adjust_attention_metadata`` just before ``attn_metadata.prepare()``.
+The compression manager owns the complete compaction transaction and final
+target resize; V2 only preserves capacity-only generation history for target
+caches.
 
 KV layout: the decode kernel stores keys in HND layout
 ``[num_pages, kv_factor, num_kv_heads, tokens_per_block, head_dim]``. The Python
@@ -53,6 +54,7 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import BaseKVCacheCompressionManager
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.logger import logger
@@ -62,6 +64,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 
 # Required keys for the calibration ``.pt`` consumed by TriAttention.
@@ -120,11 +123,6 @@ def _build_swa_rebase_copy(
         keep_count - window_size, keep_count, device=device, dtype=torch.long
     )
     return source, destination
-
-
-def _request_draft_length(request: "LlmRequest") -> int:
-    """Return the active speculative-draft length exposed by a request."""
-    return len(request.py_draft_tokens)
 
 
 class _FixedUnionWorkspace:
@@ -1115,9 +1113,9 @@ class _FixedScoreMetadataWorkspace:
             self._signature(layer_pools, dense_groups, page_representatives),
         )
         tokens_per_block = int(layer_pools[page_representatives[0]].shape[3])
-        self.page_count = (seq_len + tokens_per_block) // tokens_per_block
+        self.page_count = (seq_len + tokens_per_block - 1) // tokens_per_block
         if any(
-            (seq_len + int(layer_pools[layer].shape[3])) // int(layer_pools[layer].shape[3])
+            (seq_len + int(layer_pools[layer].shape[3]) - 1) // int(layer_pools[layer].shape[3])
             != self.page_count
             for layer in page_representatives
         ):
@@ -1170,6 +1168,7 @@ class _FixedScoreMetadataWorkspace:
         self.copy_pending = False
         self.stream = None
         self.prewarm_key: Optional[tuple] = None
+        self.staged_page_rows: List[List[List[int]]] = []
 
     def _signature(
         self,
@@ -1252,6 +1251,7 @@ class _FixedScoreMetadataWorkspace:
                 return False
             rows_by_group.append(rows)
 
+        self.staged_page_rows = rows_by_group
         self.page_ids_host[:, :request_count].copy_(
             torch.as_tensor(rows_by_group, dtype=torch.int64)
         )
@@ -1294,12 +1294,11 @@ class _FixedScoreMetadataWorkspace:
 class TriAttention(BaseKVCacheCompressionManager):
     """Periodic physical KV eviction driven by trigonometric importance scoring.
 
-    Overrides ``on_generation_step_begin``: every ``beta`` generation steps it
-    reads the cached keys through the ``KVCacheManagerV2``, scores each token
-    with offline-calibrated stats, and physically evicts the tokens below the
-    keep set. Full-attention layers are scored; kernel-masked SWA layers preserve
-    their latest window in the same compacted prefix. Every layer ends with the
-    same request-wide cached length.
+    Records the in-flight allocation in ``on_generation_step_begin`` and runs
+    periodic eviction in ``on_generation_step_end`` after native target-cache
+    relocation/rewind. Full-attention layers are scored; kernel-masked SWA
+    layers preserve their latest window in the same compacted prefix. Every
+    target layer ends with the same request-wide cached length.
     """
 
     # The TRT-LLM IndexerTopK op's single-block kernel sizes dynamic shared memory
@@ -1328,8 +1327,16 @@ class TriAttention(BaseKVCacheCompressionManager):
         pin_prefill: bool = True,
         count_prompt_tokens: bool = False,
         skip_swa: bool = True,
+        draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None,
+        spec_config: Optional["DecodingBaseConfig"] = None,
     ):
         super().__init__(kv_cache_manager)
+        if top_B <= 0:
+            raise ValueError("TriAttention top_B must be positive")
+        if beta <= 0:
+            raise ValueError("TriAttention beta must be positive")
+        self.draft_kv_cache_manager = draft_kv_cache_manager
+        self.spec_config = spec_config
         self.top_B = top_B
         self.beta = beta
         # Which token set each eviction round keeps (all reproduce the upstream
@@ -1401,14 +1408,25 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._offset_max_length = offset_max_length
         self._offsets: Optional[torch.Tensor] = None
 
-        # Per-request generation-step counter; eviction fires when it hits
-        # ``beta``. Cleared on request finish.
+        # Per-request generated-token counter; eviction checks fire whenever a
+        # scheduler iteration crosses a ``beta`` token boundary. Cleared on
+        # request finish.
         self._gen_steps: Dict[int, int] = {}
         # Cumulative physically-evicted token count per request, consumed by the
         # public introspection API.
         self._evicted: Dict[int, int] = {}
+        # A beta boundary can be crossed while overlap scheduling has the cache
+        # suspended. Preserve that due state until the request resumes with an
+        # active cache; generated-token accounting must not depend on residency.
+        self._pending_eviction_request_ids: set[int] = set()
         # Authoritative written-KV length for the forward being prepared.
         self._pre_forward_kv_lengths: Dict[int, int] = {}
+        # Under overlap scheduling this is the newer, already-enqueued batch.
+        # Its exact target growth (one base token plus scheduler-recorded draft
+        # slots) is not acceptance-finalized yet, so final-update compaction must
+        # append that entire allocation unchanged after the retained prefix.
+        self._prepared_batch: Optional["ScheduledRequests"] = None
+        self._prepared_target_growth: Dict[int, int] = {}
         # Context requests initialize through the framework hook; generation-only
         # disaggregated requests initialize lazily in the pre-forward hook.
         self._capacity_only_request_ids: set[int] = set()
@@ -1469,10 +1487,22 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._standalone_graph_cache = None
         self._standalone_graph_arena_generation = 0
         self._standalone_graph_runtime_counts = {}
+        # Physical compaction is irreversible. Any subsequent resize failure
+        # poisons the manager so no request can observe partially committed state.
+        self._fatal_error: Optional[BaseException] = None
+        self._fatal_request_ids: Tuple[int, ...] = ()
         self._local_to_global_layers_cache: Optional[List[int]] = None
         self._attention_layer_partition_cache: Optional[
             Tuple[List[int], List[int], Optional[int]]
         ] = None
+
+    def _raise_if_fatal(self) -> None:
+        if self._fatal_error is not None:
+            request_ids = ", ".join(str(request_id) for request_id in self._fatal_request_ids)
+            raise RuntimeError(
+                "TriAttention is unusable after an irreversible compaction/resize "
+                f"failure for request(s): {request_ids}"
+            ) from self._fatal_error
 
     def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
         """Mark capacity-only decode and resolve calibration once.
@@ -1480,13 +1510,13 @@ class TriAttention(BaseKVCacheCompressionManager):
         Loads the user-supplied OFFICIAL calibration .pt and converts it to our
         runtime schema (see _resolve_calibration). TRT-LLM does not calibrate.
         """
+        self._raise_if_fatal()
         request_id = request.py_request_id
         if request_id not in self._capacity_only_request_ids:
             self._validate_v2_compatibility()
             num_layers = self._num_layers_from_manager()
             self._attention_layer_partition(num_layers)
             request.py_kv_cache_generation_capacity_only = True
-            request.py_kv_cache_compaction = None
             self._capacity_only_request_ids.add(request_id)
         self._ensure_calibrated()
 
@@ -1512,19 +1542,83 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._calibrated = True
 
     def _validate_v2_compatibility(self) -> None:
-        """Reject runtime modes that do not follow single-token full-attention V2."""
+        """Validate the target-only V2 contract used by physical compaction."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+            CacheTypeCpp,
+            KVCacheManagerV2,
+        )
+
         manager = self.kv_cache_manager
+        if type(manager) is not KVCacheManagerV2:
+            raise ValueError(
+                "TriAttention currently supports only the base dense KVCacheManagerV2; "
+                "sparse and hybrid cache-manager subclasses have additional state that "
+                "physical K/V compaction does not update"
+            )
+        if manager.kv_cache_type != CacheTypeCpp.SELF:
+            raise ValueError(
+                "TriAttention currently supports only dense SELF K/V caches; "
+                "MLA SELFKONLY and cross-attention caches are not supported"
+            )
         if manager.mapping.enable_attention_dp:
             raise ValueError("TriAttention does not support attention DP")
         if manager.is_disagg:
             raise ValueError("TriAttention does not support disaggregated serving")
-        if (
-            manager.max_beam_width != 1
-            or manager.num_extra_kv_tokens
-            or manager.max_total_draft_tokens
-            or manager._kv_reserve_draft_tokens
-        ):
-            raise ValueError("TriAttention requires single-token, beam-width-one decoding")
+        if manager.max_beam_width != 1:
+            raise ValueError("TriAttention requires beam-width-one decoding")
+
+        spec_config = self.spec_config
+        if spec_config is None:
+            if (
+                manager.num_extra_kv_tokens
+                or manager.max_total_draft_tokens
+                or manager._kv_reserve_draft_tokens
+            ):
+                raise ValueError(
+                    "TriAttention received speculative KV capacity without an "
+                    "explicit speculative-decoding config"
+                )
+        else:
+            from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+
+            mode = spec_config.spec_dec_mode
+            supported_modes = (
+                SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
+                SpeculativeDecodingMode.DFLASH,
+            )
+            if mode not in supported_modes:
+                raise ValueError(
+                    "TriAttention speculative decoding initially supports only "
+                    "fixed-linear EAGLE3 one-model and DFlash"
+                )
+            if self.draft_kv_cache_manager is None:
+                raise ValueError(
+                    "TriAttention speculative decoding requires a separate draft KV cache manager"
+                )
+            if manager.is_draft:
+                raise ValueError("TriAttention target KV cache manager cannot be a draft manager")
+            if self.draft_kv_cache_manager is manager:
+                raise ValueError("TriAttention target and draft KV cache managers must be distinct")
+            if self.eviction_mode != "union":
+                raise ValueError(
+                    "TriAttention speculative protected-tail compaction currently "
+                    "requires eviction_mode='union'"
+                )
+            if not self.draft_kv_cache_manager.is_draft:
+                raise ValueError("TriAttention received a non-draft manager as its draft KV cache")
+            if not spec_config.is_linear_tree or spec_config.draft_len_schedule is not None:
+                raise ValueError(
+                    "TriAttention speculative decoding requires a fixed linear draft length"
+                )
+            if mode == SpeculativeDecodingMode.EAGLE3_ONE_MODEL and spec_config.use_dynamic_tree:
+                raise ValueError("TriAttention does not yet support dynamic-tree EAGLE3")
+            if manager.max_total_draft_tokens != spec_config.max_total_draft_tokens:
+                raise ValueError("Target KV manager and speculative config draft sizes differ")
+            if (
+                self.draft_kv_cache_manager.max_total_draft_tokens
+                != spec_config.max_total_draft_tokens
+            ):
+                raise ValueError("Draft KV manager and speculative config draft sizes differ")
         if any(window is not None for window in manager.max_attention_window_vec) or any(
             not isinstance(layer, AttentionLayerConfig) or layer.sliding_window_size is not None
             for layer in manager.kv_cache_manager_py_config.layers
@@ -1535,126 +1629,214 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
 
     # The framework drives startup prewarm and all request-lifecycle hooks.
-    # TriAttention overrides prewarm plus three lifecycle hooks: on_request_init
-    # (resolve calibration once), on_generation_step_begin (periodic eviction),
-    # and on_request_finish (per-request cleanup). It scores from offline
-    # calibration, not from live queries or attention scores, so it needs no
-    # per-layer attention hook: the whole eviction runs once per period in
-    # on_generation_step_begin, which loops the layers and reads each layer's keys
-    # straight from the KV pool.
+    # The begin hook records the newer in-flight batch. The end hook runs after
+    # native target relocation/rewind and owns compaction plus the final resize.
 
     def on_generation_step_begin(
         self, scheduled_batch: "ScheduledRequests", attn_metadata=None, **kwargs
     ) -> None:
-        """Periodic physical eviction, PRE-forward (framework hook, fired from the
-        base prepare_resources before _forward_step). Every beta steps over budget:
-        score the full cache, select top-B, physically compact, reconcile the
-        forward's attention metadata, and publish a K+1 target that V2 consumes
-        at its post-forward update boundary.
+        """Record each request's exact scheduler-owned target-cache growth."""
+        self._raise_if_fatal()
+        target_growth: Dict[int, int] = {}
+        allocated_draft_lens = self.kv_cache_manager._allocated_draft_lens
+        for request in scheduled_batch.generation_requests:
+            if request.is_dummy:
+                continue
+            if request.py_request_id not in self._capacity_only_request_ids:
+                self.on_request_init(request)
+            request_id = request.py_request_id
+            allocated_draft_len = allocated_draft_lens.get(request_id)
+            if allocated_draft_len is None:
+                raise RuntimeError(
+                    f"Request {request_id} has no scheduler-recorded target KV allocation"
+                )
+            if allocated_draft_len < 0:
+                raise RuntimeError(
+                    f"Request {request_id} has negative draft allocation {allocated_draft_len}"
+                )
+            if allocated_draft_len > self.kv_cache_manager.max_total_draft_tokens:
+                raise RuntimeError(
+                    f"Request {request_id} draft allocation {allocated_draft_len} exceeds "
+                    f"the target manager maximum {self.kv_cache_manager.max_total_draft_tokens}"
+                )
+            target_growth[request_id] = 1 + allocated_draft_len
+        self._prepared_batch = scheduled_batch
+        self._prepared_target_growth = target_growth
 
-        Uses the pre-forward hook (NOT post-forward on_generation_step_end) because
-        the latter races the overlap scheduler: the next iteration's forward is
-        enqueued before the post-forward hook mutates the KV, so it reads a racy /
-        stale-length cache (det bs=32 overlap-ON: 32/32 divergent; a GPU sync did
-        NOT fix it -- the forward metadata was already computed). Mirrors RocketKV.
-        """
+    def on_generation_step_end(
+        self,
+        scheduled_batch: "ScheduledRequests",
+        attn_metadata=None,
+        **kwargs,
+    ) -> None:
+        """Compact after native target relocation/rewind and reclaim tail pages."""
+        self._raise_if_fatal()
         self._periodic_evict(scheduled_batch)
 
     def _periodic_evict(
         self,
         scheduled_batch: "ScheduledRequests",
     ) -> None:
-        """Bump a per-request step counter; every ``beta`` steps score the cache
-        and physically evict to the pinned prompt plus top-B decode tokens."""
+        """Periodically compact the stable target prefix plus protected suffix."""
+        self._raise_if_fatal()
         gen_requests = scheduled_batch.generation_requests
         if not gen_requests:
             return
         active_requests = []
         for request in gen_requests:
-            if request.is_dummy:
+            if request.is_dummy or request.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             if request.py_request_id not in self._capacity_only_request_ids:
                 self.on_request_init(request)
             active_requests.append(request)
         if not active_requests or not self._calibrated:
             return
+        active_request_ids = [request.py_request_id for request in active_requests]
+        if len(set(active_request_ids)) != len(active_request_ids):
+            raise RuntimeError(
+                "TriAttention received duplicate request IDs in one generation update"
+            )
         mgr = self.kv_cache_manager
         num_layers = self._num_layers_from_manager()
 
-        # (1) bump per-request step counters; collect who evicts THIS step.
+        # Under overlap this hook receives B(n-1), while _prepared_batch is B(n).
+        # max_beam_num_tokens has already incorporated B(n-1)'s acceptance. V2's
+        # written/finalized KV contract excludes the request's next-token slot, so
+        # subtract both that slot and cumulative physical eviction to recover the
+        # exact stable target prefix. Any remaining capacity is opaque
+        # current-forward/reserve state and must be appended unchanged.
+        overlap_update = self._prepared_batch is not scheduled_batch
+        staged_gen_steps = {}
+        staged_pending_evictions = set(self._pending_eviction_request_ids)
         evict_now = []
         for request in active_requests:
             rid = request.py_request_id
-            draft_len = _request_draft_length(request)
-            if draft_len:
-                raise ValueError(
-                    "TriAttention physical eviction does not support speculative "
-                    f"decoding; request {rid} has {draft_len} draft tokens"
-                )
+            previous_generated_tokens = self._gen_steps.get(rid, 0)
+            generated_tokens = (
+                previous_generated_tokens + 1 + int(request.py_num_accepted_draft_tokens)
+            )
+            stable_length = int(request.max_beam_num_tokens) - 1 - self._evicted.get(rid, 0)
+            minimum_evictable_length = self._minimum_evictable_length(request, stable_length)
+            crossed_eviction_boundary = (
+                generated_tokens // self.beta > previous_generated_tokens // self.beta
+            )
+            staged_gen_steps[rid] = generated_tokens
+            if crossed_eviction_boundary and stable_length > minimum_evictable_length:
+                staged_pending_evictions.add(rid)
             kv_cache = mgr.kv_cache_map.get(rid)
             if kv_cache is None or not kv_cache.is_active:
-                raise RuntimeError(f"Request {rid} has no active V2 KV cache")
+                continue
             raw_capacity = int(kv_cache.capacity)
-            compaction = request.py_kv_cache_compaction
-            if compaction is not None:
-                target_capacity, published_capacity, _ = compaction
-                capacity_growth = raw_capacity - published_capacity
-                if capacity_growth < 0:
-                    raise RuntimeError(
-                        f"Request {rid} capacity {raw_capacity} fell below "
-                        f"published capacity {published_capacity}"
-                    )
-                effective_capacity = target_capacity + capacity_growth
-            else:
-                effective_capacity = raw_capacity
-            # The scheduler has reserved one unwritten slot for this forward.
-            seq_len = effective_capacity - 1
-            if seq_len < kv_cache.history_length:
+            protected_tail = raw_capacity - stable_length
+            expected_tail = int(mgr.num_extra_kv_tokens)
+            if overlap_update:
+                expected_tail += self._prepared_target_growth.get(rid, 0)
+            if stable_length < kv_cache.history_length:
                 raise RuntimeError(
-                    f"Request {rid} KV length {seq_len} is below finalized "
+                    f"Request {rid} stable KV length {stable_length} is below finalized "
                     f"history {kv_cache.history_length}"
                 )
-            self._pre_forward_kv_lengths[rid] = seq_len
-            step = self._gen_steps.get(rid, 0) + 1
-            self._gen_steps[rid] = step
-            if step % self.beta == 0:
-                if compaction is not None:
-                    self._gen_steps[rid] = step - 1
-                    continue
-                if seq_len > self._minimum_evictable_length(request, seq_len):
-                    evict_now.append((request, rid))
+            if protected_tail != expected_tail:
+                raise RuntimeError(
+                    f"Request {rid} protected target suffix {protected_tail} does not "
+                    f"match the exact V2 allocation ledger {expected_tail} "
+                    f"(capacity={raw_capacity}, stable_length={stable_length})"
+                )
+            if rid in staged_pending_evictions:
+                if stable_length > minimum_evictable_length:
+                    evict_now.append((request, rid, stable_length, protected_tail))
+                else:
+                    staged_pending_evictions.discard(rid)
 
-        # (2) Compact all affected dense and kernel-masked SWA layers, then publish
-        # one target per request. V2 consumes it at its existing post-enqueue
-        # update boundary, where host block-table mutation is overlap-safe.
-        if evict_now:
-            self._materialize_fixed_shape_selection_banks()
-            self._materialize_cross_request_selection_banks()
-            capacity_targets = self._evict_requests(evict_now, num_layers)
-        else:
-            capacity_targets = []
-        if capacity_targets:
-            with nvtx_range("triattention.publish", color="red"):
-                compaction_event = torch.cuda.Event()
-                compaction_event.record()
-                requests_by_id = {request.py_request_id: request for request in active_requests}
-                for rid, target_capacity in capacity_targets:
-                    kv_cache = mgr.kv_cache_map.get(rid)
-                    if kv_cache is None or not kv_cache.is_active:
-                        raise RuntimeError(f"Request {rid} has no active V2 KV cache")
-                    if target_capacity > kv_cache.capacity:
+        # Compact on the current stream. _forward_step has already made this
+        # stream wait for the execution stream, so the protected suffix is fully
+        # written before it is copied.
+        if not evict_now:
+            self._gen_steps.update(staged_gen_steps)
+            self._pending_eviction_request_ids = staged_pending_evictions
+            return
+        transaction_request_ids = tuple(request_id for _, request_id, _, _ in evict_now)
+        transaction_request_id_set = set(transaction_request_ids)
+        if len(transaction_request_id_set) != len(transaction_request_ids):
+            raise RuntimeError(
+                "TriAttention received duplicate request IDs in one eviction transaction"
+            )
+        expected_capacity_targets = {
+            request_id: self._minimum_evictable_length(request, stable_length) + protected_tail
+            for request, request_id, stable_length, protected_tail in evict_now
+        }
+        self._materialize_fixed_shape_selection_banks()
+        self._materialize_cross_request_selection_banks()
+        self._gen_steps.update(staged_gen_steps)
+        self._pending_eviction_request_ids = staged_pending_evictions
+        try:
+            # From this call onward, a kernel may have irreversibly overwritten
+            # KV data even if the call later raises. Keep compaction, ledger
+            # publication, and physical resize in one fail-closed transaction.
+            eviction_buckets: Dict[Tuple[int, int], list] = {}
+            for eviction in evict_now:
+                request, _, stable_length, _ = eviction
+                prompt_length = min(int(request.py_prompt_len), stable_length)
+                eviction_buckets.setdefault((stable_length, prompt_length), []).append(eviction)
+            capacity_targets_by_request = {}
+            for bucket in eviction_buckets.values():
+                for request_id, target_capacity in self._evict_requests(bucket, num_layers):
+                    if request_id not in transaction_request_id_set:
+                        raise RuntimeError(f"Compaction returned an unknown request {request_id}")
+                    if request_id in capacity_targets_by_request:
                         raise RuntimeError(
-                            f"Request {rid} compacted capacity {target_capacity} exceeds "
-                            f"current capacity {kv_cache.capacity}"
+                            f"Compaction returned duplicate target for request {request_id}"
                         )
-                    request = requests_by_id[rid]
-                    if request.py_kv_cache_compaction is not None:
-                        raise RuntimeError(f"Request {rid} already has an unconsumed KV compaction")
-                    request.py_kv_cache_compaction = (
-                        target_capacity,
-                        int(kv_cache.capacity),
-                        compaction_event,
-                    )
+                    if type(target_capacity) is not int:
+                        raise RuntimeError(
+                            f"Compaction returned a non-integer capacity target for request "
+                            f"{request_id}: {type(target_capacity).__name__}"
+                        )
+                    expected_target = expected_capacity_targets[request_id]
+                    if target_capacity != expected_target:
+                        raise RuntimeError(
+                            f"Compaction returned capacity {target_capacity} for request "
+                            f"{request_id}, expected {expected_target}"
+                        )
+                    capacity_targets_by_request[request_id] = target_capacity
+            if set(capacity_targets_by_request) != transaction_request_id_set:
+                missing = sorted(transaction_request_id_set - set(capacity_targets_by_request))
+                raise RuntimeError(
+                    f"Compaction did not publish capacity targets for requests {missing}"
+                )
+            capacity_targets = [
+                (request_id, capacity_targets_by_request[request_id])
+                for request_id in transaction_request_ids
+            ]
+            if capacity_targets:
+                with nvtx_range("triattention.resize", color="red"):
+                    # V2 records page-release events on its execution stream.
+                    # Order that stream after compaction before mutating the
+                    # host page table, so released pages cannot be reused early.
+                    mgr._stream.wait_stream(torch.cuda.current_stream())
+                    for rid, target_capacity in capacity_targets:
+                        kv_cache = mgr.kv_cache_map.get(rid)
+                        if kv_cache is None or not kv_cache.is_active:
+                            raise RuntimeError(
+                                f"Request {rid} target KV cache disappeared after compaction"
+                            )
+                        if target_capacity > kv_cache.capacity:
+                            raise RuntimeError(
+                                f"Request {rid} compacted capacity {target_capacity} exceeds "
+                                f"current capacity {kv_cache.capacity}"
+                            )
+                        if not kv_cache.resize(target_capacity, None):
+                            raise RuntimeError(
+                                f"Failed to resize compacted target KV cache for request {rid} "
+                                f"to {target_capacity} tokens"
+                            )
+                self._pending_eviction_request_ids.difference_update(transaction_request_ids)
+        except Exception as exc:
+            self._fatal_error = exc
+            self._fatal_request_ids = transaction_request_ids
+            raise RuntimeError(
+                "TriAttention entered a terminal failed state after physical compaction"
+            ) from exc
 
     def _minimum_evictable_length(self, request: "LlmRequest", seq_len: int) -> int:
         """Return the largest cache length for which selection is an identity.
@@ -2354,14 +2536,14 @@ class TriAttention(BaseKVCacheCompressionManager):
 
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
         """Drop this request's per-request length and eviction state."""
-        compaction = request.py_kv_cache_compaction
-        if compaction is not None and compaction[2] is not None:
-            self.kv_cache_manager._stream.wait_event(compaction[2])
         request.py_kv_cache_generation_capacity_only = False
-        request.py_kv_cache_compaction = None
         self._gen_steps.pop(request.py_request_id, None)
         self._evicted.pop(request.py_request_id, None)
+        self._pending_eviction_request_ids.discard(request.py_request_id)
         self._pre_forward_kv_lengths.pop(request.py_request_id, None)
+        self._prepared_target_growth.pop(request.py_request_id, None)
+        if not self._prepared_target_growth:
+            self._prepared_batch = None
         self._capacity_only_request_ids.discard(request.py_request_id)
         self._clear_fixed_union_workspaces(request.py_request_id)
 
@@ -2383,25 +2565,45 @@ class TriAttention(BaseKVCacheCompressionManager):
         """Reconcile the attention metadata for this iteration's eviction.
 
         The framework calls this immediately before ``attn_metadata.prepare()``.
-        V2 capacity after scheduling gives the written KV length for this
-        forward. Use that physical value instead of reconstructing it from
-        logical request length.
+        Model-engine cached lengths remain logical. Subtract cumulative physical
+        eviction for target layers while preserving the original logical values
+        for the separate dense draft cache.
         Prompt length is clamped when necessary so the prompt/generation split
         cannot extend beyond the compacted prefix.
         """
+        self._raise_if_fatal()
         kvp = attn_metadata.kv_cache_params
         if kvp is None or kvp.num_cached_tokens_per_seq is None:
             return
         num_contexts = attn_metadata.num_contexts
         num_requests = num_contexts + attn_metadata.num_generations
         req_ids = attn_metadata.request_ids
+        logical_cached_lens = list(kvp.num_cached_tokens_per_seq)
+        if self.draft_kv_cache_manager is not None:
+            from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+
+            if not isinstance(attn_metadata, TrtllmAttentionMetadata):
+                raise TypeError(
+                    "TriAttention separate draft KV lengths require TRT-LLM attention metadata"
+                )
+            # CUDA Graph capture happens before the first eviction. Always use a
+            # distinct draft-length allocation so captured draft attention nodes
+            # never bind the target length pointer, even while both values match.
+            attn_metadata.use_distinct_draft_kv_lengths = True
+            attn_metadata.set_draft_cached_token_lens(logical_cached_lens)
         prompt_lens = attn_metadata.prompt_lens
         pl = list(prompt_lens) if prompt_lens is not None else None
         pl_changed = False
         for i in range(num_contexts, num_requests):
-            nc = self._pre_forward_kv_lengths.get(req_ids[i])
-            if nc is None:
+            evicted = self._evicted.get(req_ids[i], 0)
+            if evicted == 0:
                 continue
+            nc = int(logical_cached_lens[i]) - evicted
+            if nc < 0:
+                raise RuntimeError(
+                    f"Request {req_ids[i]} logical cached length {logical_cached_lens[i]} "
+                    f"is below cumulative eviction {evicted}"
+                )
             kvp.num_cached_tokens_per_seq[i] = nc
             if pl is not None and int(pl[i]) > nc:
                 pl[i] = nc
@@ -2621,7 +2823,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             page_ids = self._resolve_page_ids(
                 request,
                 layer_idx,
-                (seq_len + tokens_per_block) // tokens_per_block,
+                (seq_len + tokens_per_block - 1) // tokens_per_block,
             )
             if not page_ids:
                 raise RuntimeError(
@@ -3090,7 +3292,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         page_ids = self._resolve_page_ids(
             request,
             layer_idx,
-            (seq_len + tokens_per_block) // tokens_per_block,
+            (seq_len + tokens_per_block - 1) // tokens_per_block,
         )
         if not page_ids:
             raise RuntimeError(
@@ -3216,6 +3418,40 @@ class TriAttention(BaseKVCacheCompressionManager):
                     ]
                     for layer in required_layers
                 }
+                if item["protected_tail"]:
+                    request = item["request"]
+                    for layer in required_layers:
+                        tokens_per_block = int(layer_pools[layer].shape[3])
+                        required_pages = (
+                            item["compaction_length"] + tokens_per_block - 1
+                        ) // tokens_per_block
+                        if item["page_ids"][layer].shape[0] >= required_pages:
+                            continue
+                        page_ids = self._resolve_page_ids(
+                            request,
+                            layer,
+                            required_pages,
+                        )
+                        if not page_ids:
+                            raise RuntimeError(
+                                f"Missing protected-suffix KV page ids for attention "
+                                f"layer {global_layers[layer]} of request "
+                                f"{item['request_id']}"
+                            )
+                        staged_page_ids = workspace.staged_page_rows[
+                            workspace.representative_slots[layer]
+                        ][request_index]
+                        if page_ids[: workspace.page_count] != staged_page_ids:
+                            raise RuntimeError(
+                                f"Protected-suffix KV page table changed after fixed staging "
+                                f"for attention layer {global_layers[layer]} of request "
+                                f"{item['request_id']}"
+                            )
+                        item["page_ids"][layer] = torch.as_tensor(
+                            page_ids,
+                            device=layer_pools[layer].device,
+                            dtype=torch.int64,
+                        )
             self._record_fixed_score_runtime(workspace.prewarm_key, "hit")
             return True
 
@@ -3230,7 +3466,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 page_ids = self._resolve_page_ids(
                     request,
                     layer,
-                    (item["seq_len"] + tokens_per_block) // tokens_per_block,
+                    (item["compaction_length"] + tokens_per_block - 1) // tokens_per_block,
                 )
                 if not page_ids:
                     raise RuntimeError(
@@ -3281,7 +3517,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             or selection_workspace.prompt_len != prompt_len
             or selection_workspace.width != width
             or selection_workspace.keep_count != self.top_B
-            or any(item.get("expected_keep_count") != prompt_len + self.top_B for item in prepared)
+            or any(item["expected_keep_count"] != prompt_len + self.top_B for item in prepared)
         ):
             return None
         if min(score_workspace.max_requests, selection_workspace.max_requests) < request_count:
@@ -3491,17 +3727,61 @@ class TriAttention(BaseKVCacheCompressionManager):
             return None
         self._record_standalone_graph_runtime("success", request_count)
 
+        if any(item["protected_tail"] for item in prepared):
+            self._copy_protected_suffixes(
+                prepared,
+                layer_pools,
+                dense_layers,
+                swa_layers,
+                layer_group_representative,
+            )
+
         capacity_targets = []
         for item in prepared:
             keep_count = item["expected_keep_count"]
+            protected_tail = item["protected_tail"]
             evicted = item["seq_len"] - keep_count
             if evicted <= 0:
                 raise RuntimeError("standalone eviction graph captured an identity compaction")
             request_id = item["request_id"]
             self._evicted[request_id] = self._evicted.get(request_id, 0) + evicted
-            self._pre_forward_kv_lengths[request_id] = keep_count
-            capacity_targets.append((request_id, keep_count + 1))
+            self._pre_forward_kv_lengths[request_id] = keep_count + protected_tail
+            capacity_targets.append((request_id, keep_count + protected_tail))
         return capacity_targets
+
+    @staticmethod
+    def _copy_protected_suffixes(
+        prepared: List[dict],
+        layer_pools: List[torch.Tensor],
+        dense_layers: List[int],
+        swa_layers: List[int],
+        layer_group_representative: Dict[int, int],
+    ) -> None:
+        """Append graph-external live suffixes after stable-prefix compaction."""
+        tail_items = [item for item in prepared if item["protected_tail"]]
+        if not tail_items:
+            return
+
+        from .triattention_kernels import triton_tri_compact
+
+        with nvtx_range("triattention.protected_tail", color="orange"):
+            for layer in dense_layers:
+                representative = layer_group_representative[layer]
+                triton_tri_compact(
+                    layer_pools[layer],
+                    [item["page_ids"][representative] for item in tail_items],
+                    [item["tail_source"] for item in tail_items],
+                    [item["compaction_length"] for item in tail_items],
+                    dest_list=[item["tail_destination"] for item in tail_items],
+                )
+            for layer in swa_layers:
+                triton_tri_compact(
+                    layer_pools[layer],
+                    [item["page_ids"][layer] for item in tail_items],
+                    [item["tail_source"] for item in tail_items],
+                    [item["compaction_length"] for item in tail_items],
+                    dest_list=[item["tail_destination"] for item in tail_items],
+                )
 
     def _standalone_cuda_graph_stats(self) -> dict:
         """Return host-side counters used to seal graph-hit profiling windows."""
@@ -3517,13 +3797,33 @@ class TriAttention(BaseKVCacheCompressionManager):
             "runtime": dict(self._standalone_graph_runtime_counts),
         }
 
-    def _evict_requests(self, evict_reqs, num_layers: int) -> List[Tuple[int, int]]:
+    def _evict_requests(
+        self,
+        evict_reqs: List[Tuple["LlmRequest", int, int, int]],
+        num_layers: int,
+    ) -> List[Tuple[int, int]]:
         """Score and compact requests, returning ``(request_id, capacity)`` targets.
 
         Only full-attention layers participate in scoring. For kernel-masked SWA
         layers, the latest model window is rebased to the tail of the common
         compacted prefix before the request-wide capacity is reduced.
         """
+        for eviction in evict_reqs:
+            if type(eviction) is not tuple or len(eviction) != 4:
+                raise ValueError(
+                    "TriAttention eviction requires an exact tuple containing "
+                    "request, request ID, stable length, and protected tail"
+                )
+            _, request_id, stable_length, protected_tail = eviction
+            if any(type(value) is not int for value in (request_id, stable_length, protected_tail)):
+                raise TypeError(
+                    "TriAttention eviction request ID, stable length, and "
+                    "protected tail must be exact integers"
+                )
+            if stable_length < 0 or protected_tail < 0:
+                raise ValueError(
+                    "TriAttention eviction stable length and protected tail must be non-negative"
+                )
         from .triattention_kernels import (
             fixed_perhead_segment_views,
             flat_perhead_to_list,
@@ -3555,28 +3855,29 @@ class TriAttention(BaseKVCacheCompressionManager):
             layer: layers[0] for layers in storage_groups.values() for layer in layers
         }
 
-        # Resolve request length and page metadata before mutating any layer.
+        # Resolve the stable prefix and opaque suffix before mutating any layer.
         prepared = []
         with nvtx_range("triattention.metadata", color="cyan"):
-            for request, rid in evict_reqs:
-                draft_len = _request_draft_length(request)
-                if draft_len:
-                    raise ValueError(
-                        "TriAttention physical eviction does not support speculative "
-                        f"decoding; request {rid} has {draft_len} draft tokens"
-                    )
-                seq_len = self._pre_forward_kv_lengths.get(rid)
-                if seq_len is None:
-                    raise RuntimeError(
-                        f"Missing authoritative pre-forward KV length for request {rid}"
-                    )
+            for eviction in evict_reqs:
+                request, rid, seq_len, protected_tail = eviction
                 # Restore the uncompressed logical position from the authoritative
-                # physical prefix. This is max_beam-1 without overlap and max_beam
-                # for the previous-tensor overlap path, without branching on executor mode.
+                # physical prefix.
                 round_start = seq_len + self._evicted.get(rid, 0)
                 if seq_len <= self._minimum_evictable_length(request, seq_len):
                     continue
                 expected_keep_count = self._minimum_evictable_length(request, seq_len)
+                tail_source = torch.arange(
+                    seq_len,
+                    seq_len + protected_tail,
+                    dtype=torch.long,
+                    device=device,
+                )
+                tail_destination = torch.arange(
+                    expected_keep_count,
+                    expected_keep_count + protected_tail,
+                    dtype=torch.long,
+                    device=device,
+                )
                 swa_source = None
                 swa_destination = None
                 if swa_layers:
@@ -3584,6 +3885,9 @@ class TriAttention(BaseKVCacheCompressionManager):
                     swa_source, swa_destination = _build_swa_rebase_copy(
                         seq_len, expected_keep_count, swa_window, device=device
                     )
+                    if protected_tail:
+                        swa_source = torch.cat([swa_source, tail_source])
+                        swa_destination = torch.cat([swa_destination, tail_destination])
                 prepared.append(
                     {
                         "request": request,
@@ -3591,6 +3895,10 @@ class TriAttention(BaseKVCacheCompressionManager):
                         "seq_len": int(seq_len),
                         "round_start": float(round_start),
                         "expected_keep_count": expected_keep_count,
+                        "protected_tail": protected_tail,
+                        "tail_source": tail_source,
+                        "tail_destination": tail_destination,
+                        "compaction_length": seq_len + protected_tail,
                         "swa_source": swa_source,
                         "swa_destination": swa_destination,
                     }
@@ -3764,7 +4072,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 continue
             if is_union and isinstance(keep_count, torch.Tensor):
                 keep = keep_count
-                keep_count = int(keep.numel())
+                selected_keep_count = int(keep.numel())
                 workspace = (
                     cross_request_workspaces[r]
                     if cross_request_workspaces is not None
@@ -3772,6 +4080,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 )
                 can_use_fixed_compaction = (
                     len(prepared) == 1
+                    and item["protected_tail"] == 0
                     and self._fixed_union_compaction_enabled
                     and workspace is not None
                     and not workspace.selection_only
@@ -3788,12 +4097,20 @@ class TriAttention(BaseKVCacheCompressionManager):
                 if can_use_fixed_compaction:
                     fixed_union_compaction = (workspace, item, seq_len)
                 else:
+                    if item["protected_tail"]:
+                        keep = torch.cat([keep, item["tail_source"]])
                     for lid in dense_layers:
                         grp = union_by_layer.setdefault(lid, ([], [], []))
                         representative = layer_group_representative[lid]
                         grp[0].append(item["page_ids"][representative])
                         grp[1].append(keep)
-                        grp[2].append(seq_len)
+                        grp[2].append(item["compaction_length"])
+                keep_count = selected_keep_count
+            elif item["protected_tail"]:
+                raise ValueError(
+                    "TriAttention speculative protected-tail compaction currently "
+                    "requires eviction_mode='union'"
+                )
             if keep_count != item["expected_keep_count"]:
                 raise RuntimeError(
                     f"TriAttention selected {keep_count} tokens for request {rid}, "
@@ -3805,9 +4122,9 @@ class TriAttention(BaseKVCacheCompressionManager):
                     grp = swa_by_layer.setdefault(lid, ([], [], [], []))
                     grp[0].append(item["page_ids"][lid])
                     grp[1].append(item["swa_source"])
-                    grp[2].append(seq_len)
+                    grp[2].append(item["compaction_length"])
                     grp[3].append(item["swa_destination"])
-                pending_updates.append((rid, evicted, keep_count))
+                pending_updates.append((rid, evicted, keep_count, item["protected_tail"]))
 
         if union_by_layer or swa_by_layer:
             from .triattention_kernels import triton_tri_compact
@@ -3843,11 +4160,10 @@ class TriAttention(BaseKVCacheCompressionManager):
                 )
 
         capacity_targets = []
-        for rid, evicted, keep_count in pending_updates:
+        for rid, evicted, keep_count, protected_tail in pending_updates:
             self._evicted[rid] = self._evicted.get(rid, 0) + evicted
-            self._pre_forward_kv_lengths[rid] = keep_count
-            # The current forward appends one token immediately after the kept prefix.
-            capacity_targets.append((rid, keep_count + 1))
+            self._pre_forward_kv_lengths[rid] = keep_count + protected_tail
+            capacity_targets.append((rid, keep_count + protected_tail))
         return capacity_targets
 
     # ------------------------------------------------------------------ #

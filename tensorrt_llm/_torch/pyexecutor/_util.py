@@ -1856,6 +1856,8 @@ def _create_kv_cache_manager(
 def create_kv_cache_compression_manager(
     config: KvCacheCompressionConfig,
     kv_cache_manager: KVCacheManagerV2,
+    draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+    spec_config: Optional[SpeculativeConfig] = None,
 ) -> Optional[BaseKVCacheCompressionManager]:
     """Build the KV-cache compression manager for ``config.algorithm``, or return
     None if no algorithm matches.
@@ -1875,6 +1877,8 @@ def create_kv_cache_compression_manager(
         return TriAttention(
             kv_cache_manager,
             top_B=triattention_config.top_B,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+            spec_config=spec_config,
             beta=triattention_config.beta,
             model_path=triattention_config.model_path,
             calibration_path=triattention_config.calibration_path,
@@ -2095,7 +2099,12 @@ def create_py_executor_instance(
                                           "kv_cache_compression_config", None)
     if kv_cache_compression_config is not None:
         compression_manager = create_kv_cache_compression_manager(
-            kv_cache_compression_config, kv_cache_manager)
+            kv_cache_compression_config,
+            kv_cache_manager,
+            draft_kv_cache_manager=resources.get(
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER),
+            spec_config=llm_args.speculative_config,
+        )
         if compression_manager is not None:
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
                 compression_manager)
@@ -2107,7 +2116,8 @@ def create_py_executor_instance(
     if kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
-    # Compression manager runs after the cache manager: reconciles history once it's resized.
+    # Compression runs after native relocation/rewind, then owns compaction and
+    # the final target-cache capacity resize.
     if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
             in resource_manager.resource_managers):
         resource_manager.resource_managers.move_to_end(

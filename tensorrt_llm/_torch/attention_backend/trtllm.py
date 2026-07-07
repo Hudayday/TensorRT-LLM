@@ -18,7 +18,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -69,6 +69,18 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
         mask[:, blk * 32:blk * 32 + n, blk] = vals
         remaining -= 32
     return mask
+
+
+@dataclass(frozen=True)
+class _TargetKVLengthState:
+    """Target length-domain views temporarily replaced by the draft domain."""
+
+    kv_cache_params: KVCacheParams
+    kv_lens: torch.Tensor
+    kv_lens_cuda: torch.Tensor
+    kv_lens_runtime: torch.Tensor
+    kv_lens_cuda_runtime: torch.Tensor
+    host_total_kv_lens: torch.Tensor
 
 
 @dataclass(kw_only=True)
@@ -145,6 +157,62 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
     draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
+    use_distinct_draft_kv_lengths: bool = field(default=False,
+                                                init=False,
+                                                repr=False)
+
+    # Target and draft managers may retain different physical prefix lengths.
+    # Keep every kernel-visible length view in the same domain as its page table.
+    kv_lens: Optional[torch.Tensor] = field(default=None,
+                                            init=False,
+                                            repr=False)
+    kv_lens_cuda: Optional[torch.Tensor] = field(default=None,
+                                                 init=False,
+                                                 repr=False)
+    kv_lens_runtime: Optional[torch.Tensor] = field(default=None,
+                                                    init=False,
+                                                    repr=False)
+    kv_lens_cuda_runtime: Optional[torch.Tensor] = field(default=None,
+                                                         init=False,
+                                                         repr=False)
+    host_total_kv_lens: Optional[torch.Tensor] = field(default=None,
+                                                       init=False,
+                                                       repr=False)
+    draft_kv_cache_params: Optional[KVCacheParams] = field(default=None,
+                                                           init=False,
+                                                           repr=False)
+    draft_kv_lens: Optional[torch.Tensor] = field(default=None,
+                                                  init=False,
+                                                  repr=False)
+    draft_kv_lens_cuda: Optional[torch.Tensor] = field(default=None,
+                                                       init=False,
+                                                       repr=False)
+    draft_kv_lens_runtime: Optional[torch.Tensor] = field(default=None,
+                                                          init=False,
+                                                          repr=False)
+    draft_kv_lens_cuda_runtime: Optional[torch.Tensor] = field(default=None,
+                                                               init=False,
+                                                               repr=False)
+    draft_host_total_kv_lens: Optional[torch.Tensor] = field(default=None,
+                                                             init=False,
+                                                             repr=False)
+    _draft_cached_token_lens: Optional[List[int]] = field(default=None,
+                                                          init=False,
+                                                          repr=False)
+    _target_cached_token_lens_baseline: Optional[List[int]] = field(
+        default=None, init=False, repr=False)
+    _draft_cached_token_lens_baseline: Optional[List[int]] = field(default=None,
+                                                                   init=False,
+                                                                   repr=False)
+    _draft_kv_lens_cuda_baseline: Optional[torch.Tensor] = field(default=None,
+                                                                 init=False,
+                                                                 repr=False)
+    _target_kv_lens_cuda_baseline: Optional[torch.Tensor] = field(default=None,
+                                                                  init=False,
+                                                                  repr=False)
+    _draft_kv_lens_cuda_delta: Optional[torch.Tensor] = field(default=None,
+                                                              init=False,
+                                                              repr=False)
 
     # Pre-computed FlashMLA tile-scheduler metadata and num_splits.
     # Computed once per forward pass in TrtllmAttention.forward() and reused across layers.
@@ -329,6 +397,37 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int32,
                     capture_graph=capture_graph,
                 )
+                self.draft_kv_lens_cuda = self.get_empty_like(
+                    buffers,
+                    self.kv_lens_cuda,
+                    cache_name="draft_kv_lens_cuda",
+                    capture_graph=capture_graph,
+                )
+                self._draft_kv_lens_cuda_baseline = self.get_empty_like(
+                    buffers,
+                    self.kv_lens_cuda,
+                    cache_name="draft_kv_lens_cuda_baseline",
+                    capture_graph=capture_graph,
+                )
+                self._target_kv_lens_cuda_baseline = self.get_empty_like(
+                    buffers,
+                    self.kv_lens_cuda,
+                    cache_name="target_kv_lens_cuda_baseline",
+                    capture_graph=capture_graph,
+                )
+                self._draft_kv_lens_cuda_delta = self.get_empty_like(
+                    buffers,
+                    self.kv_lens_cuda,
+                    cache_name="draft_kv_lens_cuda_delta",
+                    capture_graph=capture_graph,
+                )
+                self.draft_kv_lens = torch.empty_like(
+                    self.kv_lens,
+                    device='cpu',
+                    pin_memory=prefer_pinned(),
+                )
+                self.draft_host_total_kv_lens = torch.empty_like(
+                    self.host_total_kv_lens)
 
             if self.enable_flash_mla:
                 self.block_ids_per_seq = self.get_empty(
@@ -442,6 +541,196 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
 
+    def set_draft_cached_token_lens(self,
+                                    cached_token_lens: Sequence[int]) -> None:
+        """Preserve the uncompressed cached lengths for a separate draft KVCM.
+
+        A target-only KV compressor must call this before replacing
+        ``kv_cache_params.num_cached_tokens_per_seq`` with target physical
+        lengths. The value is consumed by the next :meth:`prepare` call.
+        """
+        if self.draft_kv_cache_manager is None:
+            raise RuntimeError(
+                "Distinct draft KV lengths require a separate draft KV cache manager"
+            )
+        if len(cached_token_lens) != self.num_seqs:
+            raise ValueError(
+                "Draft cached-token lengths must contain one value per "
+                f"sequence: got {len(cached_token_lens)}, expected {self.num_seqs}"
+            )
+        normalized = [int(length) for length in cached_token_lens]
+        if any(length < 0 for length in normalized):
+            raise ValueError("Draft cached-token lengths must be non-negative")
+        self.use_distinct_draft_kv_lengths = True
+        self._draft_cached_token_lens = normalized
+
+    def _prepare_draft_kv_length_domain(self) -> None:
+        """Build stable target/draft length baselines for this forward."""
+        if not self.use_distinct_draft_kv_lengths:
+            self._draft_cached_token_lens = None
+            return
+        if self.draft_kv_cache_manager is None:
+            raise RuntimeError(
+                "Distinct draft KV lengths require a separate draft KV cache manager"
+            )
+        if self._draft_cached_token_lens is None:
+            raise RuntimeError(
+                "Distinct draft KV lengths require set_draft_cached_token_lens() "
+                "before every attention metadata prepare")
+
+        assert self.kv_cache_params is not None
+        target_cached_token_lens = self.kv_cache_params.num_cached_tokens_per_seq
+        assert target_cached_token_lens is not None
+        draft_cached_token_lens = self._draft_cached_token_lens
+        self._draft_cached_token_lens = None
+        if len(draft_cached_token_lens) != self.num_seqs:
+            raise ValueError(
+                "Draft cached-token lengths must contain one value per "
+                f"sequence: got {len(draft_cached_token_lens)}, expected {self.num_seqs}"
+            )
+        if (self.is_spec_dec_tree
+                and draft_cached_token_lens != target_cached_token_lens):
+            raise NotImplementedError(
+                "Separate target/draft KV length domains currently support "
+                "linear one-model speculative decoding only")
+
+        draft_cached_lens = torch.tensor(
+            draft_cached_token_lens,
+            dtype=torch.int,
+            device='cpu',
+        )
+        if self.enable_helix:
+            active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
+            draft_kv_lens = draft_cached_lens.clone()
+            draft_kv_lens[active_rank] += self.seq_lens_kv[active_rank]
+        else:
+            draft_kv_lens = draft_cached_lens + self.seq_lens_kv
+
+        assert self.draft_kv_lens is not None
+        assert self.draft_kv_lens_cuda is not None
+        assert self._draft_kv_lens_cuda_baseline is not None
+        assert self._target_kv_lens_cuda_baseline is not None
+        assert self.draft_host_total_kv_lens is not None
+        self.draft_kv_lens[:self.num_seqs].copy_(
+            draft_kv_lens + self.kv_cache_params.num_extra_kv_tokens)
+        pinned_draft_kv_lens = maybe_pin_memory(draft_kv_lens[:self.num_seqs])
+        self._draft_kv_lens_cuda_baseline[:self.num_seqs].copy_(
+            pinned_draft_kv_lens, non_blocking=True)
+        self.draft_kv_lens_cuda[:self.num_seqs].copy_(pinned_draft_kv_lens,
+                                                      non_blocking=True)
+        self._target_kv_lens_cuda_baseline[:self.num_seqs].copy_(
+            self.kv_lens_cuda[:self.num_seqs])
+        self.draft_host_total_kv_lens[
+            0] = draft_kv_lens[:self.num_contexts].sum().item()
+        self.draft_host_total_kv_lens[1] = draft_kv_lens[self.num_contexts:self.
+                                                         num_seqs].sum().item()
+        self.draft_kv_lens_runtime = draft_kv_lens[:self.num_seqs]
+        self.draft_kv_lens_cuda_runtime = self.draft_kv_lens_cuda[:self.
+                                                                  num_seqs]
+        self._target_cached_token_lens_baseline = list(target_cached_token_lens)
+        self._draft_cached_token_lens_baseline = list(draft_cached_token_lens)
+        self.draft_kv_cache_params = KVCacheParams(
+            use_cache=self.kv_cache_params.use_cache,
+            num_cached_tokens_per_seq=list(draft_cached_token_lens),
+            block_ids_per_seq=self.kv_cache_params.block_ids_per_seq,
+            host_max_attention_window_sizes=self.kv_cache_params.
+            host_max_attention_window_sizes,
+            host_sink_token_length=self.kv_cache_params.host_sink_token_length,
+            num_extra_kv_tokens=self.kv_cache_params.num_extra_kv_tokens,
+        )
+
+        max_draft_kv_len = int(self.draft_kv_lens[:self.num_seqs].max().item())
+        if max_draft_kv_len > self.draft_kv_cache_manager.max_seq_len:
+            raise ValueError(
+                f"The maximum draft KV length ({max_draft_kv_len}) exceeds "
+                "the draft KV cache manager's maximum supported length "
+                f"({self.draft_kv_cache_manager.max_seq_len}).")
+
+    def activate_draft_kv_length_domain(self) -> _TargetKVLengthState:
+        """Switch all kernel-visible length views to the draft KVCM domain."""
+        if self.draft_kv_cache_manager is None:
+            raise RuntimeError(
+                "No separate draft KV cache manager is configured")
+        if self.draft_kv_cache_params is None:
+            raise RuntimeError(
+                "Draft KV lengths were not prepared before entering draft attention"
+            )
+        assert self.kv_cache_params is not None
+        assert self.kv_lens is not None
+        assert self.kv_lens_cuda is not None
+        assert self.kv_lens_runtime is not None
+        assert self.kv_lens_cuda_runtime is not None
+        assert self.host_total_kv_lens is not None
+        assert self.draft_kv_lens is not None
+        assert self.draft_kv_lens_cuda is not None
+        assert self.draft_kv_lens_runtime is not None
+        assert self.draft_host_total_kv_lens is not None
+        assert self._draft_kv_lens_cuda_baseline is not None
+        assert self._target_kv_lens_cuda_baseline is not None
+        assert self._draft_kv_lens_cuda_delta is not None
+        assert self._target_cached_token_lens_baseline is not None
+        assert self._draft_cached_token_lens_baseline is not None
+
+        state = _TargetKVLengthState(
+            kv_cache_params=self.kv_cache_params,
+            kv_lens=self.kv_lens,
+            kv_lens_cuda=self.kv_lens_cuda,
+            kv_lens_runtime=self.kv_lens_runtime,
+            kv_lens_cuda_runtime=self.kv_lens_cuda_runtime,
+            host_total_kv_lens=self.host_total_kv_lens,
+        )
+        num_seqs = self.num_seqs
+        torch.sub(
+            self.kv_lens_cuda[:num_seqs],
+            self._target_kv_lens_cuda_baseline[:num_seqs],
+            out=self._draft_kv_lens_cuda_delta[:num_seqs],
+        )
+        torch.add(
+            self._draft_kv_lens_cuda_baseline[:num_seqs],
+            self._draft_kv_lens_cuda_delta[:num_seqs],
+            out=self.draft_kv_lens_cuda[:num_seqs],
+        )
+
+        target_cached_token_lens = self.kv_cache_params.num_cached_tokens_per_seq
+        draft_cached_token_lens = self.draft_kv_cache_params.num_cached_tokens_per_seq
+        assert target_cached_token_lens is not None
+        assert draft_cached_token_lens is not None
+        for index in range(num_seqs):
+            target_delta = (target_cached_token_lens[index] -
+                            self._target_cached_token_lens_baseline[index])
+            draft_cached_token_lens[index] = (
+                self._draft_cached_token_lens_baseline[index] + target_delta)
+
+        try:
+            self.kv_cache_params = self.draft_kv_cache_params
+            self.kv_lens = self.draft_kv_lens
+            self.kv_lens_cuda = self.draft_kv_lens_cuda
+            self.kv_lens_runtime = self.draft_kv_lens_runtime
+            self.kv_lens_cuda_runtime = self.draft_kv_lens_cuda[:num_seqs]
+            self.host_total_kv_lens = self.draft_host_total_kv_lens
+            self.on_update_kv_lens()
+        except Exception:
+            self.kv_cache_params = state.kv_cache_params
+            self.kv_lens = state.kv_lens
+            self.kv_lens_cuda = state.kv_lens_cuda
+            self.kv_lens_runtime = state.kv_lens_runtime
+            self.kv_lens_cuda_runtime = state.kv_lens_cuda_runtime
+            self.host_total_kv_lens = state.host_total_kv_lens
+            self.on_update_kv_lens()
+            raise
+        return state
+
+    def restore_target_kv_length_domain(self,
+                                        state: _TargetKVLengthState) -> None:
+        """Restore target views after a separate-draft attention region."""
+        self.kv_cache_params = state.kv_cache_params
+        self.kv_lens = state.kv_lens
+        self.kv_lens_cuda = state.kv_lens_cuda
+        self.kv_lens_runtime = state.kv_lens_runtime
+        self.kv_lens_cuda_runtime = state.kv_lens_cuda_runtime
+        self.host_total_kv_lens = state.host_total_kv_lens
+        self.on_update_kv_lens()
+
     def update_for_spec_dec(self) -> None:
         # MTP updates kv_lens_cuda in-place between sub-steps, which changes
         # cache_seq_lens seen by the C++ attention op.  Invalidate the metadata
@@ -538,6 +827,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                              num_seqs].sum().item()
         self.host_request_types[:self.num_contexts].fill_(0)
         self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
+
+        self._prepare_draft_kv_length_domain()
 
         # prepare for kv cache reuse/chunked context in MLA
         if self.enable_context_mla_with_cached_kv:
