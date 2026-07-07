@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._torch.kv_cache_compression.attention import requires_paged_draft_kv_length_domain
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import BaseKVCacheCompressionManager
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
@@ -1421,6 +1422,10 @@ class TriAttention(BaseKVCacheCompressionManager):
         super().__init__(kv_cache_manager, draft_kv_cache_manager)
         self.kv_cache_manager.generation_capacity_only = True
         self.spec_config = spec_config
+        self._publish_draft_kv_length_delta = (
+            self.has_independent_draft_kv_cache
+            and requires_paged_draft_kv_length_domain(spec_config)
+        )
         self.top_B = top_B
         self.beta = beta
         # Which token set each eviction round keeps (all reproduce the upstream
@@ -1622,10 +1627,10 @@ class TriAttention(BaseKVCacheCompressionManager):
                     "TriAttention does not yet support dynamic speculative draft lengths"
                 )
             mode = self.spec_config.spec_dec_mode
-            if not (mode.is_dflash() or mode.is_mtp_vanilla() or mode.is_eagle3_one_model()):
+            if not (mode.is_dflash() or requires_paged_draft_kv_length_domain(self.spec_config)):
                 raise ValueError(
                     "TriAttention target-only speculative compatibility currently "
-                    "supports DFlash, vanilla MTP, and linear Eagle3 one-model"
+                    "requires DFlash private context K/V or standard paged draft attention"
                 )
             if (
                 self.spec_config.acceptance_window is not None
@@ -2625,7 +2630,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 pl_changed = True
         if pl_changed:
             attn_metadata.prompt_lens = pl
-        if self.has_independent_draft_kv_cache:
+        if self._publish_draft_kv_length_delta:
             self.publish_draft_kv_length_delta(
                 attn_metadata,
                 [

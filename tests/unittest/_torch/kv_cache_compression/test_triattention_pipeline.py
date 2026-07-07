@@ -483,17 +483,13 @@ class TestAttentionMetadataReconcile:
         assert meta.kv_cache_params.num_cached_tokens_per_seq == [40, 63]
         assert meta.draft_kv_length_delta == [0, 37]
 
-    @pytest.mark.parametrize("mode", ["dflash", "eagle3_one_model"])
-    def test_separate_draft_modes_publish_dense_draft_length_delta(self, mode):
-        from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig, Eagle3DecodingConfig
+    def test_eagle3_paged_draft_attention_publishes_dense_length_delta(self):
+        from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig
 
-        if mode == "dflash":
-            spec_config = DFlashDecodingConfig(max_draft_len=4)
-        else:
-            spec_config = Eagle3DecodingConfig(
-                max_draft_len=4,
-                speculative_model="/tmp/qwen3-eagle3-draft",
-            )
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=4,
+            speculative_model="/tmp/qwen3-eagle3-draft",
+        )
         mgr = _make_triattention(
             spec_config=spec_config,
             draft_kv_cache_manager=_make_fake_v2(is_draft=True),
@@ -505,6 +501,21 @@ class TestAttentionMetadataReconcile:
 
         assert meta.kv_cache_params.num_cached_tokens_per_seq == [40, 63]
         assert meta.draft_kv_length_delta == [0, 37]
+
+    def test_dflash_private_context_does_not_publish_paged_draft_length_delta(self):
+        from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
+
+        mgr = _make_triattention(
+            spec_config=DFlashDecodingConfig(max_draft_len=4),
+            draft_kv_cache_manager=_make_fake_v2(is_draft=True),
+        )
+        mgr._evicted = {2: 37}
+        meta = _FakeMetadata([40, 100], [40, 50], [1, 2], num_contexts=1)
+
+        mgr.adjust_attention_metadata(meta)
+
+        assert meta.kv_cache_params.num_cached_tokens_per_seq == [40, 63]
+        assert not hasattr(meta, "draft_kv_length_delta")
 
     def test_eviction_cannot_exceed_native_cached_length(self):
         mgr = _make_triattention()
@@ -937,7 +948,7 @@ class TestStepEndHookRefactor:
         manager._validate_v2_compatibility()
         assert manager.kv_cache_manager.generation_capacity_only is True
 
-    def test_mtp_eagle_remains_fail_closed(self):
+    def test_mtp_eagle_paged_draft_length_contract_is_accepted(self):
         from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
         spec_config = MTPDecodingConfig(max_draft_len=1)
@@ -949,8 +960,28 @@ class TestStepEndHookRefactor:
             draft_kv_cache_manager=_make_fake_v2(is_draft=True),
         )
 
-        with pytest.raises(ValueError, match="supports DFlash, vanilla MTP"):
-            manager._validate_v2_compatibility()
+        manager._validate_v2_compatibility()
+
+    @pytest.mark.parametrize("mode", ["draft_target", "pard"])
+    def test_other_paged_draft_length_contracts_are_not_rejected(self, mode):
+        from tensorrt_llm.llmapi.llm_args import DraftTargetDecodingConfig, PARDDecodingConfig
+
+        if mode == "draft_target":
+            spec_config = DraftTargetDecodingConfig(
+                max_draft_len=3,
+                speculative_model="/tmp/draft-target-model",
+            )
+        else:
+            spec_config = PARDDecodingConfig(max_draft_len=3)
+        manager = TriAttention(
+            _make_fake_v2(),
+            top_B=8,
+            skip_swa=False,
+            spec_config=spec_config,
+            draft_kv_cache_manager=_make_fake_v2(is_draft=True),
+        )
+
+        manager._validate_v2_compatibility()
 
     def test_linear_eagle3_one_model_target_only_contract_is_accepted(self):
         from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig
@@ -972,7 +1003,10 @@ class TestStepEndHookRefactor:
     @pytest.mark.parametrize(
         "config_overrides,error",
         [
-            ({"eagle3_one_model": False}, "supports DFlash, vanilla MTP"),
+            (
+                {"eagle3_one_model": False},
+                "requires DFlash private context K/V or standard paged draft attention",
+            ),
             (
                 {"use_dynamic_tree": True, "dynamic_tree_max_topK": 2},
                 "requires linear drafting",

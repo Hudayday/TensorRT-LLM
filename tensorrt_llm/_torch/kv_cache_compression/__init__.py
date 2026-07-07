@@ -16,6 +16,7 @@ from .attention import (
     get_model_kv_cache_compression_attention_backend,
     is_kv_cache_compression_attention_backend_enabled,
     requires_kv_cache_compression_attention_backend,
+    requires_paged_draft_kv_length_domain,
 )
 
 __all__ = [
@@ -25,5 +26,6 @@ __all__ = [
     "get_kv_cache_compression_attention_backend",
     "get_model_kv_cache_compression_attention_backend",
     "is_kv_cache_compression_attention_backend_enabled",
+    "requires_paged_draft_kv_length_domain",
     "requires_kv_cache_compression_attention_backend",
 ]
