@@ -4130,12 +4130,23 @@ class TriAttention(BaseKVCacheCompressionManager):
                 pending_updates.append((rid, evicted, keep_count))
 
         if union_by_layer or swa_by_layer:
-            from .triattention_kernels import triton_tri_compact
+            from .triattention_kernels import (
+                cpp_sparse_compact,
+                cpp_sparse_compact_supported,
+                triton_tri_compact,
+            )
 
         if union_by_layer:
+            # Backend "cpp" reuses the upstream single-pass attention compact
+            # kernel (1x memory traffic, wins at high batch); anything it
+            # cannot take (kv_factor != 2, missing op) falls back to Triton.
+            use_cpp = getattr(self, "_compact_backend", "torch") == "cpp"
             for lid, (pl, kl, sl) in union_by_layer.items():
                 with nvtx_range("triattention.compact", color="purple"):
-                    triton_tri_compact(layer_pools[lid], pl, kl, sl)
+                    if use_cpp and cpp_sparse_compact_supported(layer_pools[lid]):
+                        cpp_sparse_compact(layer_pools[lid], pl, kl, sl)
+                    else:
+                        triton_tri_compact(layer_pools[lid], pl, kl, sl)
         if fixed_union_compaction is not None:
             workspace, item, seq_len = fixed_union_compaction
             for lids in storage_groups.values():

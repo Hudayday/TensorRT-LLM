@@ -393,6 +393,55 @@ def triton_tri_compact_perhead(pool, page_ids_list, keep_2d_list, seq_len_list):
         )
 
 
+def cpp_sparse_compact_supported(pool: torch.Tensor) -> bool:
+    """The upstream C++ single-pass compact kernel needs an interleaved-K/V
+    HND pool (kv_factor == 2, contiguous) and the thop op compiled in."""
+    return (
+        pool.ndim == 5
+        and pool.shape[1] == 2
+        and pool.is_contiguous()
+        and pool.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and hasattr(torch.ops.trtllm, "sparse_kv_cache_compact")
+    )
+
+
+def cpp_sparse_compact(pool, page_ids_list, keep_list, seq_len_list):
+    """Union compaction via the upstream single-pass C++ kernel
+    (updateSparseKvCacheAfterFmha through the sparse_kv_cache_compact
+    thop op). One launch covers all requests of ONE layer pool; K and V move
+    in the same pass (no global scratch: grid (1, nkv, batch) with an ordered
+    in-block sweep, so it wins at high batch and loses at batch 1 -- see the
+    compact bench). Falls back are the caller's responsibility via
+    ``cpp_sparse_compact_supported``.
+    """
+    device = pool.device
+    _, kv_factor, num_kv_heads, tokens_per_block, _ = pool.shape
+    if kv_factor != 2:
+        raise ValueError("cpp_sparse_compact requires an interleaved K/V pool (kv_factor == 2)")
+    tables, keeps = [], []
+    for page_ids, keep, seq_len in zip(page_ids_list, keep_list, seq_len_list):
+        keep32 = keep.to(device=device, dtype=torch.int32)
+        if keep32.numel() >= seq_len:
+            continue  # nothing to drop for this request
+        tables.append(page_ids.to(device=device, dtype=torch.int32).reshape(-1))
+        keeps.append(keep32)
+    if not keeps:
+        return
+    batch = len(keeps)
+    max_pages = max(int(t.numel()) for t in tables)
+    page_table = torch.zeros(batch, max_pages, dtype=torch.int32, device=device)
+    for i, t in enumerate(tables):
+        page_table[i, : t.numel()] = t
+    offsets_host = [0]
+    for k in keeps:
+        offsets_host.append(offsets_host[-1] + int(k.numel()))
+    offsets = torch.tensor(offsets_host, dtype=torch.int32, device=device)
+    flat = torch.cat(keeps)
+    # union: every KV head keeps the same token set -> replicate rows.
+    indices = flat.unsqueeze(0).expand(num_kv_heads, -1).contiguous()
+    torch.ops.trtllm.sparse_kv_cache_compact(pool, page_table, indices, offsets)
+
+
 class SegMeta(NamedTuple):
     seg_index: int  # position in the request-major (req_slot*L + layer_slot) order
     request_index: int  # slot into page_ids_list / seq_lens / round_starts
