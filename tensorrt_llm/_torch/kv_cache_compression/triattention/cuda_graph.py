@@ -177,6 +177,8 @@ class FixedBatchedCompactionWorkspace:
                 and layer_pools[layer].shape[1] == 2
                 and int(layer_pools[layer].shape[2]) == cpp_num_kv_heads
                 and layer_pools[layer].is_contiguous()
+                and layer_pools[layer].dtype
+                in (torch.bfloat16, torch.float16, torch.float32)
                 for layer in self.dense_layers
             )
         )

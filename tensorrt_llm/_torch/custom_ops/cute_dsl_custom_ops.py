@@ -5885,7 +5885,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             input_values: Input logits tensor [batch_size * next_n, vocab_size]
             seq_lens: Sequence lengths for each batch [batch_size]
             output_indices: Pre-allocated output buffer [batch_size * next_n, top_k]
-            top_k: Number of top elements to select (max 2048)
+            top_k: Number of top elements to select (max 4096)
             next_n: Number of candidates per sequence (for speculative decoding)
             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
             dynamic: Use dynamic multi-CTA scheduling (for 2-pass multi-CTA)
