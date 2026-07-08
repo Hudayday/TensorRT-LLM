@@ -20,8 +20,6 @@ selection, and physical compaction. Scheduler decisions, page-table uploads,
 request bookkeeping, and KV-cache resize remain on the host path.
 """
 
-import os
-
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
@@ -52,26 +50,21 @@ def _unique_tensor_nbytes(tensors: Iterable[torch.Tensor]) -> int:
     return sum(storages.values())
 
 
-@dataclass(frozen=True)
-class _FixedCompactLaunch:
-    pool: torch.Tensor
-    page_ids: torch.Tensor
-    source: torch.Tensor
-    destination: torch.Tensor
-    page_base: torch.Tensor
-    scratch: torch.Tensor
-
-    def run(self) -> None:
-        from .triattention_kernels import triton_tri_compact_fixed
-
-        triton_tri_compact_fixed(
-            self.pool,
-            self.page_ids,
-            self.source,
-            self.destination,
-            self.page_base,
-            self.scratch,
-        )
+def _run_cpp_compact(
+    pool: torch.Tensor,
+    page_table: torch.Tensor,
+    source: torch.Tensor,
+    offsets: torch.Tensor,
+    destination: Optional[torch.Tensor],
+) -> None:
+    """Issue the sole physical-compaction op used by a graph workspace."""
+    torch.ops.trtllm.sparse_kv_cache_compact(
+        pool,
+        page_table,
+        source,
+        offsets,
+        destination,
+    )
 
 
 class FixedBatchedCompactionWorkspace:
@@ -130,96 +123,71 @@ class FixedBatchedCompactionWorkspace:
         self.score_workspace = score_workspace
         self.layer_pools = tuple(layer_pools)
 
-        total_decode = self.request_count * self.decode_keep_count
-        self.dense_source = torch.empty(total_decode, dtype=torch.int64, device=self.device)
-        decode_destination = torch.arange(
-            self.prompt_len,
-            self.keep_count,
-            dtype=torch.int64,
-            device=self.device,
-        )
-        self.dense_destination = decode_destination.repeat(self.request_count)
-        request_page_base = (
-            torch.arange(self.request_count, dtype=torch.int64, device=self.device)
-            * score_workspace.page_count
-        )
-        self.dense_page_base = request_page_base.repeat_interleave(self.decode_keep_count)
-
-        scratch_by_geometry = {}
-        self.dense_launches = []
-        for layer in self.dense_layers:
-            representative = layer_group_representative[layer]
-            page_ids = self._page_ids_for(score_workspace, representative)
-            scratch = self._scratch_for(layer_pools[layer], total_decode, scratch_by_geometry)
-            self.dense_launches.append(
-                _FixedCompactLaunch(
-                    layer_pools[layer],
-                    page_ids,
-                    self.dense_source,
-                    self.dense_destination,
-                    self.dense_page_base,
-                    scratch,
-                )
-            )
-
-        # Optional cpp backend: ONE sparse_kv_cache_compact op launch per dense
-        # layer replaces the two-phase Triton pair. Uses the FULL keep list
-        # (prompt tokens have src == dst and the upstream kernel skips them),
-        # so no destination remap is needed. All buffers are fixed-shape and
-        # owned here; the launch path only issues copies + op calls (capture-safe).
+        # C++ only: one sparse_kv_cache_compact op per layer. Fixed-shape int32
+        # buffers make page-table staging, index staging, and the op graph-safe.
         first_dense_pool = layer_pools[self.dense_layers[0]]
         cpp_num_kv_heads = int(first_dense_pool.shape[2]) if first_dense_pool.ndim == 5 else -1
-        self.cpp_backend = (
-            os.environ.get("TRIATTN_COMPACT_BACKEND") == "cpp"
-            and hasattr(torch.ops.trtllm, "sparse_kv_cache_compact")
-            and all(
-                layer_pools[layer].ndim == 5
-                and layer_pools[layer].shape[1] == 2
-                and int(layer_pools[layer].shape[2]) == cpp_num_kv_heads
-                and layer_pools[layer].is_contiguous()
-                and layer_pools[layer].dtype
-                in (torch.bfloat16, torch.float16, torch.float32)
-                for layer in self.dense_layers
-            )
+        supported_pools = all(
+            layer_pools[layer].ndim == 5
+            and layer_pools[layer].shape[1] == 2
+            and layer_pools[layer].device == self.device
+            and int(layer_pools[layer].shape[2]) == cpp_num_kv_heads
+            and layer_pools[layer].is_contiguous()
+            and layer_pools[layer].dtype in (torch.bfloat16, torch.float16, torch.float32)
+            for layer in (*self.dense_layers, *self.swa_layers)
         )
-        if self.cpp_backend:
-            self.cpp_num_kv_heads = cpp_num_kv_heads
-            self.cpp_indices = torch.empty(
-                cpp_num_kv_heads,
-                self.request_count * self.keep_count,
-                dtype=torch.int32,
-                device=self.device,
+        if not supported_pools:
+            raise ValueError(
+                "fixed graph compaction requires contiguous interleaved BF16/FP16/FP32 pools "
+                "with one common KV-head count"
             )
-            self.cpp_offsets = (
-                torch.arange(self.request_count + 1, dtype=torch.int32, device=self.device)
-                * self.keep_count
-            )
-            self.cpp_page_tables = {}
-            self.cpp_dense_ops = []
-            for layer in self.dense_layers:
-                representative = layer_group_representative[layer]
-                if representative not in self.cpp_page_tables:
-                    # 2-D [request_count, page_count] (the op's page-table shape;
-                    # the Triton fixed path flattens this same plane to 1-D).
-                    source_pages = score_workspace.page_ids_device[
-                        score_workspace.representative_slots[representative],
-                        : self.request_count,
-                    ]
-                    self.cpp_page_tables[representative] = (
-                        source_pages,
-                        torch.empty(
-                            source_pages.shape, dtype=torch.int32, device=self.device
-                        ).contiguous(),
-                    )
-                self.cpp_dense_ops.append(
-                    (layer_pools[layer], self.cpp_page_tables[representative][1])
-                )
+        self.cpp_num_kv_heads = cpp_num_kv_heads
+        self.cpp_indices = torch.empty(
+            cpp_num_kv_heads,
+            self.request_count * self.keep_count,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.cpp_offsets = (
+            torch.arange(self.request_count + 1, dtype=torch.int32, device=self.device)
+            * self.keep_count
+        )
+        self.cpp_page_tables = {}
+        self.cpp_dense_ops = []
 
-        self.swa_launches = []
+        def page_table_for(representative: int) -> torch.Tensor:
+            if representative not in self.cpp_page_tables:
+                source_pages = score_workspace.page_ids_device[
+                    score_workspace.representative_slots[representative],
+                    : self.request_count,
+                ]
+                if source_pages.device != self.device or source_pages.dtype not in (
+                    torch.int32,
+                    torch.int64,
+                ):
+                    raise ValueError(
+                        "fixed graph page tables must be integer tensors on the pool device"
+                    )
+                self.cpp_page_tables[representative] = (
+                    source_pages,
+                    torch.empty(
+                        source_pages.shape,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ).contiguous(),
+                )
+            return self.cpp_page_tables[representative][1]
+
+        for layer in self.dense_layers:
+            representative = layer_group_representative[layer]
+            self.cpp_dense_ops.append((layer_pools[layer], page_table_for(representative)))
+
         self.swa_source = None
+        self.swa_indices = None
         self.swa_destination = None
-        self.swa_page_base = None
+        self.swa_offsets = None
         self.swa_source_offsets = None
+        self.cpp_swa_ops = []
         if self.swa_layers:
             if swa_window is None or swa_window <= 0 or self.keep_count < swa_window:
                 raise ValueError("fixed graph SWA compaction requires a valid retained window")
@@ -227,112 +195,56 @@ class FixedBatchedCompactionWorkspace:
             self.swa_source_offsets = torch.arange(
                 -int(swa_window),
                 0,
-                dtype=torch.int64,
+                dtype=torch.int32,
                 device=self.device,
             )
             destination = torch.arange(
                 self.keep_count - int(swa_window),
                 self.keep_count,
-                dtype=torch.int64,
+                dtype=torch.int32,
                 device=self.device,
             )
-            self.swa_source = torch.empty(total_swa, dtype=torch.int64, device=self.device)
+            self.swa_source = torch.empty(total_swa, dtype=torch.int32, device=self.device)
+            self.swa_indices = torch.empty(
+                cpp_num_kv_heads,
+                total_swa,
+                dtype=torch.int32,
+                device=self.device,
+            )
             self.swa_destination = destination.repeat(self.request_count)
-            self.swa_page_base = request_page_base.repeat_interleave(int(swa_window))
+            self.swa_offsets = torch.arange(
+                self.request_count + 1, dtype=torch.int32, device=self.device
+            ) * int(swa_window)
             for layer in self.swa_layers:
-                page_ids = self._page_ids_for(score_workspace, layer)
-                scratch = self._scratch_for(layer_pools[layer], total_swa, scratch_by_geometry)
-                self.swa_launches.append(
-                    _FixedCompactLaunch(
-                        layer_pools[layer],
-                        page_ids,
-                        self.swa_source,
-                        self.swa_destination,
-                        self.swa_page_base,
-                        scratch,
-                    )
-                )
+                self.cpp_swa_ops.append((layer_pools[layer], page_table_for(layer)))
 
         owned_tensors = [
-            self.dense_source,
-            self.dense_destination,
-            self.dense_page_base,
+            self.cpp_indices,
+            self.cpp_offsets,
         ]
         if self.swa_source_offsets is not None:
-            owned_tensors.append(self.swa_source_offsets)
-        strong_refs = [*owned_tensors, *layer_pools]
-        if self.cpp_backend:
-            cpp_page_sources = [source for source, _ in self.cpp_page_tables.values()]
-            cpp_page_staging = [staging for _, staging in self.cpp_page_tables.values()]
-            owned_tensors.extend(
-                (self.cpp_indices, self.cpp_offsets, *cpp_page_staging)
-            )
-            strong_refs.extend(
-                (
-                    self.cpp_indices,
-                    self.cpp_offsets,
-                    *cpp_page_sources,
-                    *cpp_page_staging,
-                )
-            )
-        for launch in (*self.dense_launches, *self.swa_launches):
-            strong_refs.extend(
-                (
-                    launch.page_ids,
-                    launch.source,
-                    launch.destination,
-                    launch.page_base,
-                    launch.scratch,
-                )
-            )
             owned_tensors.extend(
                 (
-                    launch.source,
-                    launch.destination,
-                    launch.page_base,
-                    launch.scratch,
+                    self.swa_source_offsets,
+                    self.swa_source,
+                    self.swa_indices,
+                    self.swa_destination,
+                    self.swa_offsets,
                 )
             )
+        cpp_page_sources = [source for source, _ in self.cpp_page_tables.values()]
+        cpp_page_staging = [staging for _, staging in self.cpp_page_tables.values()]
+        owned_tensors.extend(cpp_page_staging)
+        strong_refs = [*owned_tensors, *layer_pools, *cpp_page_sources]
         self._tensor_refs = tuple(dict.fromkeys(strong_refs))
         self._owned_tensor_refs = tuple(dict.fromkeys(owned_tensors))
         self.nbytes = _unique_tensor_nbytes(self._owned_tensor_refs)
 
-    def _page_ids_for(self, score_workspace, representative: int) -> torch.Tensor:
-        slot = score_workspace.representative_slots[representative]
-        page_ids = score_workspace.page_ids_device[slot, : self.request_count]
-        if not page_ids.is_contiguous():
-            raise ValueError("fixed graph page-id view must be contiguous")
-        return page_ids.view(-1)
-
-    @staticmethod
-    def _scratch_for(
-        pool: torch.Tensor,
-        total_tokens: int,
-        scratch_by_geometry: dict,
-    ) -> torch.Tensor:
-        _, kv_factor, num_kv_heads, _, head_dim = pool.shape
-        key = (
-            str(pool.device),
-            pool.dtype,
-            int(kv_factor),
-            int(num_kv_heads),
-            int(total_tokens),
-            int(head_dim),
-        )
-        scratch = scratch_by_geometry.get(key)
-        if scratch is None:
-            scratch = torch.empty(
-                kv_factor * num_kv_heads * total_tokens * head_dim,
-                dtype=pool.dtype,
-                device=pool.device,
-            )
-            scratch_by_geometry[key] = scratch
-        return scratch
-
     def launch(self) -> None:
-        """Copy dynamic keep indices, then run fixed dense and SWA launches."""
+        """Stage dynamic metadata and run C++ dense/SWA compact launches."""
         if self.swa_source is not None:
             assert self.swa_source_offsets is not None
+            assert self.swa_indices is not None
             torch.add(
                 self.score_workspace.valid_seq_lens_device[: self.request_count].view(
                     self.request_count, 1
@@ -340,30 +252,30 @@ class FixedBatchedCompactionWorkspace:
                 self.swa_source_offsets.view(1, -1),
                 out=self.swa_source.view(self.request_count, -1),
             )
-        if self.cpp_backend:
-            # FULL keep list (prompt + selected decode), replicated per KV head
-            # with an int64 -> int32 cast in one captured copy.
-            keep_full = self.selection_workspace.keep[: self.request_count]
-            self.cpp_indices.copy_(
-                keep_full.reshape(1, -1).expand(self.cpp_num_kv_heads, -1)
+            self.swa_indices.copy_(self.swa_source.reshape(1, -1).expand(self.cpp_num_kv_heads, -1))
+        keep_full = self.selection_workspace.keep[: self.request_count]
+        self.cpp_indices.copy_(keep_full.reshape(1, -1).expand(self.cpp_num_kv_heads, -1))
+        for source_pages, staged_i32 in self.cpp_page_tables.values():
+            staged_i32.copy_(source_pages)
+        for pool, page_table in self.cpp_dense_ops:
+            _run_cpp_compact(
+                pool,
+                page_table,
+                self.cpp_indices,
+                self.cpp_offsets,
+                None,
             )
-            for source_pages, staged_i32 in self.cpp_page_tables.values():
-                staged_i32.copy_(source_pages)
-            for pool, page_table in self.cpp_dense_ops:
-                torch.ops.trtllm.sparse_kv_cache_compact(
-                    pool, page_table, self.cpp_indices, self.cpp_offsets
+        if self.swa_indices is not None:
+            assert self.swa_offsets is not None
+            assert self.swa_destination is not None
+            for pool, page_table in self.cpp_swa_ops:
+                _run_cpp_compact(
+                    pool,
+                    page_table,
+                    self.swa_indices,
+                    self.swa_offsets,
+                    self.swa_destination,
                 )
-        else:
-            selected_decode = self.selection_workspace.keep[
-                : self.request_count, self.prompt_len :
-            ]
-            self.dense_source.view(self.request_count, self.decode_keep_count).copy_(
-                selected_decode
-            )
-            for launch in self.dense_launches:
-                launch.run()
-        for launch in self.swa_launches:
-            launch.run()
 
     def matches_runtime(
         self,

@@ -1372,7 +1372,7 @@ class TestStepEndHookRefactor:
                 return_value=(torch.empty(0), torch.empty(0), [segment]),
             ) as score,
             mock.patch.object(kernels, "flat_perhead_to_list", return_value=[torch.zeros(1, 8)]),
-            mock.patch.object(kernels, "triton_tri_compact") as compact,
+            mock.patch.object(kernels, "cpp_sparse_compact") as compact,
         ):
             targets = mgr._evict_requests([(request, 7)], num_layers=2)
 
@@ -1449,7 +1449,7 @@ class TestStepEndHookRefactor:
                 "flat_perhead_to_list",
                 return_value=[torch.zeros(1, 8), torch.zeros(1, 8)],
             ),
-            mock.patch.object(kernels, "triton_tri_compact") as compact,
+            mock.patch.object(kernels, "cpp_sparse_compact") as compact,
             mock.patch.object(
                 tri_module,
                 "nvtx_range",
@@ -1789,9 +1789,7 @@ class TestFixedScoreMetadata:
 
         manager_stream = mock.Mock()
         manager = SimpleNamespace(
-            host_kv_cache_block_offsets=SimpleNamespace(
-                shape=(1, 8, 2, 4), dtype=torch.int32
-            ),
+            host_kv_cache_block_offsets=SimpleNamespace(shape=(1, 8, 2, 4), dtype=torch.int32),
             kv_factor=2,
             layer_offsets={10: 0},
             layer_to_pool_mapping_dict={0: 0},
@@ -2310,9 +2308,7 @@ class TestFixedScoreMetadata:
     @pytest.mark.parametrize("request_count", [1, 7])
     @pytest.mark.parametrize("aggregation", ["mean", "max"])
     @CUDA_REQUIRED
-    def test_fused_score_spans_distinct_storages_and_block_tables(
-        self, request_count, aggregation
-    ):
+    def test_fused_score_spans_distinct_storages_and_block_tables(self, request_count, aggregation):
         """ONE launch over layers in DISTINCT storages with DISTINCT block tables.
 
         This is the production V2 shape: get_buffers wraps every layer as its
@@ -3011,7 +3007,6 @@ class TestFixedUnionWorkspace:
 
         env = {
             "TRIATTN_FIXED_BUFFER_UNION": "1",
-            "TRIATTN_COMPACT_KEPT_ONLY": "1",
             "TRIATTN_FIXED_PREWARM": "1",
             "TRIATTN_FIXED_SCORE_METADATA": "1",
             "TRIATTN_FIXED_SHAPE_SELECTION": "1",
@@ -3215,7 +3210,6 @@ class TestFixedUnionWorkspace:
         manager.normalize_scores = True
         manager.eviction_mode = "union"
         manager.skip_swa = False
-        manager._compact_backend = "torch"
         manager._fixed_union_compaction_enabled = True
         manager._fixed_union_prewarm_enabled = True
         manager._fixed_union_prewarm_states = {}
@@ -3378,7 +3372,7 @@ class TestFixedUnionWorkspace:
 
         with (
             mock.patch.object(kernels, "triton_tri_score_perhead", side_effect=fake_score),
-            mock.patch.object(kernels, "triton_tri_compact") as compact,
+            mock.patch.object(kernels, "cpp_sparse_compact") as compact,
             mock.patch.object(manager, "_indexer_topk_idx", side_effect=fake_indexer),
             mock.patch.object(
                 tri_module,
@@ -3434,7 +3428,7 @@ class TestFixedUnionWorkspace:
         real_topk = torch.topk
         with (
             mock.patch.object(kernels, "triton_tri_score_perhead", side_effect=fake_score),
-            mock.patch.object(kernels, "triton_tri_compact") as compact,
+            mock.patch.object(kernels, "cpp_sparse_compact") as compact,
             mock.patch.object(
                 tri_module,
                 "nvtx_range",
@@ -3537,7 +3531,7 @@ class TestFixedUnionWorkspace:
 
         with (
             mock.patch.object(kernels, "triton_tri_score_perhead", side_effect=fake_score),
-            mock.patch.object(kernels, "triton_tri_compact") as compact,
+            mock.patch.object(kernels, "cpp_sparse_compact") as compact,
             mock.patch.object(
                 tri_module,
                 "nvtx_range",
@@ -4930,7 +4924,7 @@ class TestCrossRequestFixedUnionWorkspace:
                 "select_requests",
                 wraps=selection.select_requests,
             ) as select_requests,
-            mock.patch.object(kernels, "triton_tri_compact") as compact,
+            mock.patch.object(kernels, "cpp_sparse_compact") as compact,
             mock.patch.object(
                 tri_module,
                 "nvtx_range",

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Vendored Triton kernels for the TriAttention KV-eviction pipeline.
+"""GPU kernels for the TriAttention KV-eviction pipeline.
 
 The production eviction path is fully fused over (request x layer) x KV head: ONE score
 launch spanning ALL dense layers (layers may live in distinct storages with distinct
@@ -11,10 +11,9 @@ The kernels here back that path:
   * Fused trig-score over (request x layer) segments, writing un-reduced
     per-query-head rows
     (``triton_tri_score_perhead`` / ``_tri_score_perhead_kernel``
-  * In-place compaction over many requests sharing one layer pool
-    (``triton_tri_compact`` / ``_tri_compact_kernel``), reusing a
-    per-(dtype,device) scratch buffer (``_get_compact_scratch`` /
-    ``_COMPACT_SCRATCH``).
+  * C++ in-place compaction over many requests sharing one layer pool
+    (``cpp_sparse_compact``), including per-head sources and explicit
+    destinations for SWA/protected speculative tails.
   * Flat->list bridge (``flat_perhead_to_list``) and ``SegMeta``.
 
 House rules honored throughout:
@@ -26,420 +25,118 @@ House rules honored throughout:
 
 from __future__ import annotations
 
-import os
 from typing import List, NamedTuple, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-# Move only retained tokens to the compacted prefix. Once the compacted length is
-# published, the tail is unreachable, so reordering dropped tokens only adds traffic.
-# The opt-out exists for controlled in-process A/B comparisons.
-_COMPACT_KEPT_ONLY = os.environ.get("TRIATTN_COMPACT_KEPT_ONLY", "1") == "1"
-
-# --------------------------------------------------------------------------- #
-# Block (4): gather / compact kept tokens                                     #
-#   gather retained tokens into the compacted (page, slot) prefix             #
-#   axis, for BOTH K and V, writing back the touched pages.  Two-pass          #
-#   (gather -> scratch -> scatter) to match the reference .clone() semantics   #
-#   and avoid the in-place read/write aliasing hazard.                         #
-# --------------------------------------------------------------------------- #
-# R3 perf: reuse a per-(dtype,device) compaction scratch buffer instead of
-# allocating [kv_factor,nkv,seq_len,hd] on every call (L per eviction). Grows to
-# the max size seen; sliced [:need] (contiguous) so scratch.reshape(-1) never clones.
-_COMPACT_SCRATCH = {}
-
-
-def _get_compact_scratch(need: int, dtype, device) -> torch.Tensor:
-    key = (dtype, str(device))
-    buf = _COMPACT_SCRATCH.get(key)
-    if buf is None or buf.numel() < need:
-        buf = torch.empty(need, dtype=dtype, device=device)
-        _COMPACT_SCRATCH[key] = buf
-    return buf
-
-
-def _build_compaction_indices(
-    keep: torch.Tensor, seq_len: int, *, kept_only: bool
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build source and destination token indices for one compaction segment."""
-    keep = keep.to(dtype=torch.int64)
-    if kept_only:
-        dest = torch.arange(keep.numel(), device=keep.device, dtype=torch.int64)
-        return keep, dest
-
-    all_ids = torch.arange(seq_len, device=keep.device, dtype=torch.int64)
-    is_dropped = torch.ones(seq_len, device=keep.device, dtype=torch.bool)
-    is_dropped[keep] = False
-    return torch.cat([keep, all_ids[is_dropped]]), all_ids
-
-
-@triton.jit
-def _tri_compact_kernel(
-    pool_ptr,  # one layer's HND pool (strided view; in place)
-    new_order_ptr,  # [total] int64: per-dest-token SOURCE local idx (within its request)
-    dest_local_ptr,  # [total] int64: per-dest-token LOCAL dest idx (within its request)
-    page_base_ptr,  # [total] int64: this token's request's base offset into cat_page_ids
-    page_ids_ptr,  # [sum_pages] int64: concatenated per-request physical page ids
-    scratch_ptr,  # [kv_factor, num_kv_heads, total, head_dim] scratch
-    total,
-    num_kv_heads,
-    tokens_per_block,
-    head_dim,
-    s_page,
-    s_kv_factor,
-    s_kv_head,
-    s_slot,
-    s_dim,
-    PHASE: tl.constexpr,
-    D_BLOCK: tl.constexpr,
-    BLOCK_TOKENS: tl.constexpr,
-    PER_HEAD: tl.constexpr,
-):
-    # grid = (cdiv(total, BLOCK_TOKENS), kv_factor, num_kv_heads). Each program
-    # moves BLOCK_TOKENS dest tokens' head_dim vectors for one (kv_factor half,
-    # kv head). BLOCK_TOKENS=1 reproduces the original one-token-per-program grid
-    # byte-for-byte; >1 tiles to amortize index/launch overhead + raise occupancy.
-    # Tail tokens (g >= total) are clamped to index 0 and masked out (no-op).
-    g_base = tl.program_id(0) * BLOCK_TOKENS
-    kv_half = tl.program_id(1)
-    kv_head = tl.program_id(2)
-
-    d = tl.arange(0, D_BLOCK)
-    d_mask = d < head_dim
-    d64 = d.to(tl.int64)
-
-    for tt in tl.static_range(BLOCK_TOKENS):
-        g = g_base + tt
-        g_ok = g < total
-        gs = tl.where(g_ok, g, 0)
-        m = d_mask & g_ok
-        pbase = tl.load(page_base_ptr + gs)
-        scratch_base = (
-            (kv_half.to(tl.int64) * num_kv_heads + kv_head.to(tl.int64)) * total + gs.to(tl.int64)
-        ) * head_dim
-        if PHASE == 0:
-            # gather: SOURCE local token of this token's request. union (shared
-            # reorder) reads new_order[g]; per_head reads new_order[kv_head, g]
-            # (a different [kept...,dropped...] permutation per KV head), laid out
-            # row-major [num_kv_heads, total].
-            if PER_HEAD:
-                src = tl.load(new_order_ptr + kv_head.to(tl.int64) * total + gs)
-            else:
-                src = tl.load(new_order_ptr + gs)
-            src_blk = src // tokens_per_block
-            src_slot = (src % tokens_per_block).to(tl.int64)
-            src_page = tl.load(page_ids_ptr + pbase + src_blk).to(tl.int64)
-            src_base = (
-                src_page * s_page
-                + kv_half.to(tl.int64) * s_kv_factor
-                + kv_head.to(tl.int64) * s_kv_head
-                + src_slot * s_slot
-            )
-            val = tl.load(pool_ptr + src_base + d64 * s_dim, mask=m, other=0.0)
-            tl.store(scratch_ptr + scratch_base + d64, val, mask=m)
-        else:
-            # scatter: write to the LOCAL dest slot of this token's request.
-            dst = tl.load(dest_local_ptr + gs)
-            dst_blk = dst // tokens_per_block
-            dst_slot = (dst % tokens_per_block).to(tl.int64)
-            dst_page = tl.load(page_ids_ptr + pbase + dst_blk).to(tl.int64)
-            dst_base = (
-                dst_page * s_page
-                + kv_half.to(tl.int64) * s_kv_factor
-                + kv_head.to(tl.int64) * s_kv_head
-                + dst_slot * s_slot
-            )
-            val = tl.load(scratch_ptr + scratch_base + d64, mask=m, other=0.0)
-            tl.store(pool_ptr + dst_base + d64 * s_dim, val, mask=m)
-
-
-def triton_tri_compact(pool, page_ids_list, keep_list, seq_len_list, *, dest_list=None):
-    """In-place compaction over many requests sharing ONE layer ``pool``.
-    By default each request's kept tokens are gathered to the front. An explicit
-    ``dest_list`` copies only the supplied source/destination ranges.
-
-    pool:          one layer's HND view [num_pages, kv_factor, nkv, tpb, hd].
-    page_ids_list: list of 1-D int page-id tensors, one per request.
-    keep_list:     source local-index tensors, one per request.
-    seq_len_list:  list of committed token counts, one per request.
-    dest_list:     optional explicit destination tensors. When omitted, each
-                   source is a complete keep set compacted to [0, keep_count).
-    """
-    device = pool.device
-    _, kv_factor, num_kv_heads, tokens_per_block, head_dim = pool.shape
-    if not (len(page_ids_list) == len(keep_list) == len(seq_len_list)):
-        raise ValueError("page_ids_list, keep_list, and seq_len_list must have equal lengths")
-    if dest_list is not None and len(dest_list) != len(keep_list):
-        raise ValueError("dest_list and keep_list must have equal lengths")
-
-    flat_new_order = []
-    flat_dest_local = []
-    flat_page_base = []
-    cat_page_ids = []
-    page_cursor = 0
-    for request_index, (page_ids, keep, seq_len) in enumerate(
-        zip(page_ids_list, keep_list, seq_len_list)
-    ):
-        keep = keep.to(device=device, dtype=torch.long)
-        keep_count = int(keep.numel())
-        if dest_list is None:
-            if keep_count >= seq_len:
-                continue  # nothing to drop for this request
-            new_order, dest = _build_compaction_indices(keep, seq_len, kept_only=_COMPACT_KEPT_ONLY)
-        else:
-            new_order = keep.to(torch.int64)
-            dest = dest_list[request_index].to(device=device, dtype=torch.int64)
-            if new_order.numel() != dest.numel():
-                raise ValueError("Each explicit source and destination must have equal lengths")
-            if new_order.numel() == 0:
-                continue
-        flat_new_order.append(new_order)
-        flat_dest_local.append(dest)
-        pids = page_ids.to(device=device, dtype=torch.int64)
-        flat_page_base.append(
-            torch.full((new_order.numel(),), page_cursor, device=device, dtype=torch.int64)
-        )
-        cat_page_ids.append(pids)
-        page_cursor += int(pids.numel())
-
-    if not flat_new_order:
-        return
-    new_order_t = torch.cat(flat_new_order)
-    dest_local_t = torch.cat(flat_dest_local)
-    page_base_t = torch.cat(flat_page_base)
-    page_ids_t = torch.cat(cat_page_ids)
-    total = int(new_order_t.numel())
-
-    _need = kv_factor * num_kv_heads * total * head_dim
-    scratch = _get_compact_scratch(_need, pool.dtype, device)[:_need].view(
-        kv_factor, num_kv_heads, total, head_dim
-    )
-    D_BLOCK = triton.next_power_of_2(head_dim)
-    # BLOCK_TOKENS tiles dest tokens per program to amortize the per-token index
-    # overhead (the compact is overhead-bound: scattered 128-elem moves, ~40x its
-    # memory-traffic floor). Baked default = 16: bench-measured ~14% faster than the
-    # one-token-per-program grid (BT=1), and BYTE-IDENTICAL across BT in
-    # {8,16,32,64} (test_compact_tune.py / test_compact_equiv.py).
-    BLOCK_TOKENS = 16  # verified-best compaction tile (BT sweep: 16 > 32 > 64 tok/s)
-    grid = (triton.cdiv(total, BLOCK_TOKENS), kv_factor, num_kv_heads)
-    for phase in (0, 1):
-        _tri_compact_kernel[grid](
-            pool,
-            new_order_t,
-            dest_local_t,
-            page_base_t,
-            page_ids_t,
-            scratch.reshape(-1),
-            total,
-            num_kv_heads,
-            tokens_per_block,
-            head_dim,
-            pool.stride(0),
-            pool.stride(1),
-            pool.stride(2),
-            pool.stride(3),
-            pool.stride(4),
-            PHASE=phase,
-            D_BLOCK=D_BLOCK,
-            BLOCK_TOKENS=BLOCK_TOKENS,
-            PER_HEAD=False,
-        )
-
-
-def triton_tri_compact_fixed(
-    pool: torch.Tensor,
-    page_ids: torch.Tensor,
-    keep: torch.Tensor,
-    destination: torch.Tensor,
-    page_base: torch.Tensor,
-    scratch: torch.Tensor,
-) -> None:
-    """Compact one request with caller-owned fixed-shape buffers.
-
-    The regular wrapper remains the general batched/ragged path. This entry
-    point only removes its per-call cat/arange/full allocation chain after the
-    manager has validated a stable one-request bucket.
-    """
-    if pool.ndim != 5:
-        raise ValueError("pool must use the five-dimensional HND layout")
-    _, kv_factor, num_kv_heads, tokens_per_block, head_dim = pool.shape
-    total = int(keep.numel())
-    tensors = (page_ids, keep, destination, page_base, scratch)
-    if any(tensor.device != pool.device for tensor in tensors):
-        raise ValueError("fixed compaction buffers must be on the pool device")
-    if (
-        page_ids.ndim != 1
-        or keep.ndim != 1
-        or destination.shape != keep.shape
-        or page_base.shape != keep.shape
-    ):
-        raise ValueError("fixed compaction index buffers have incompatible shapes")
-    if any(tensor.dtype != torch.int64 for tensor in tensors[:-1]):
-        raise ValueError("fixed compaction indices must use int64")
-    need = kv_factor * num_kv_heads * total * head_dim
-    if scratch.dtype != pool.dtype or scratch.numel() < need:
-        raise ValueError("fixed compaction scratch does not match the pool layout")
-
-    block_tokens = 16
-    dim_block = triton.next_power_of_2(head_dim)
-    grid = (triton.cdiv(total, block_tokens), kv_factor, num_kv_heads)
-    for phase in (0, 1):
-        _tri_compact_kernel[grid](
-            pool,
-            keep,
-            destination,
-            page_base,
-            page_ids,
-            scratch,
-            total,
-            num_kv_heads,
-            tokens_per_block,
-            head_dim,
-            pool.stride(0),
-            pool.stride(1),
-            pool.stride(2),
-            pool.stride(3),
-            pool.stride(4),
-            PHASE=phase,
-            D_BLOCK=dim_block,
-            BLOCK_TOKENS=block_tokens,
-            PER_HEAD=False,
-        )
-
-
-def triton_tri_compact_perhead(pool, page_ids_list, keep_2d_list, seq_len_list):
-    """In-place PER-HEAD compaction over many requests sharing ONE layer ``pool``.
-
-    Same as ``triton_tri_compact`` but each KV head keeps a DIFFERENT token set:
-    ``keep_2d_list`` holds one ``[num_kv_heads, keep_count]`` tensor per request
-    (sorted-ascending kept local indices per head). For each request+head the
-    token axis is reordered ``[kept(head order)..., dropped(ascending)...]`` so
-    every slot in ``[0, seq_len)`` still holds a real key/value. This collapses
-    the old per-(layer,head) PyTorch gather/scatter loop into ONE batched launch
-    per layer (matching the union path's launch count). Byte-identical to the
-    PyTorch per-head reorder (validated by test_compact_perhead_equiv.py).
-    """
-    device = pool.device
-    _, kv_factor, num_kv_heads, tokens_per_block, head_dim = pool.shape
-
-    flat_new_order = []  # per request: [num_kv_heads, seq_len]
-    flat_dest_local = []  # per request: [seq_len]
-    flat_page_base = []
-    cat_page_ids = []
-    page_cursor = 0
-    for page_ids, keep_2d, seq_len in zip(page_ids_list, keep_2d_list, seq_len_list):
-        keep_2d = keep_2d.to(device=device, dtype=torch.long)  # [nkv, keep_count]
-        keep_count = int(keep_2d.shape[1])
-        if keep_count >= seq_len:
-            continue  # nothing to drop for this request
-        all_ids = torch.arange(seq_len, device=device, dtype=torch.long)
-        # dropped slots per head, ascending: mask out the kept slots, then gather
-        # the survivors. keep_count is uniform across heads, so the boolean mask
-        # selects exactly (seq_len - keep_count) per head -> reshape to [nkv, .].
-        is_dropped = torch.ones((num_kv_heads, seq_len), device=device, dtype=torch.bool)
-        is_dropped[torch.arange(num_kv_heads, device=device).unsqueeze(1), keep_2d] = False
-        dropped = (
-            all_ids.unsqueeze(0)
-            .expand(num_kv_heads, seq_len)[is_dropped]
-            .view(num_kv_heads, seq_len - keep_count)
-        )
-        new_order = torch.cat([keep_2d, dropped], dim=1).to(torch.int64)  # [nkv, seq_len]
-        flat_new_order.append(new_order)
-        flat_dest_local.append(all_ids.to(torch.int64))  # 0..seq_len-1 (shared by all heads)
-        pids = page_ids.to(device=device, dtype=torch.int64)
-        flat_page_base.append(torch.full((seq_len,), page_cursor, device=device, dtype=torch.int64))
-        cat_page_ids.append(pids)
-        page_cursor += int(pids.numel())
-
-    if not flat_new_order:
-        return
-    # [num_kv_heads, total] row-major -> kernel reads new_order[kv_head*total + g].
-    new_order_t = torch.cat(flat_new_order, dim=1).contiguous()
-    dest_local_t = torch.cat(flat_dest_local)
-    page_base_t = torch.cat(flat_page_base)
-    page_ids_t = torch.cat(cat_page_ids)
-    total = int(dest_local_t.numel())
-
-    _need = kv_factor * num_kv_heads * total * head_dim
-    scratch = _get_compact_scratch(_need, pool.dtype, device)[:_need].view(
-        kv_factor, num_kv_heads, total, head_dim
-    )
-    D_BLOCK = triton.next_power_of_2(head_dim)
-    BLOCK_TOKENS = 16  # same verified-best tile as the union path
-    grid = (triton.cdiv(total, BLOCK_TOKENS), kv_factor, num_kv_heads)
-    for phase in (0, 1):
-        _tri_compact_kernel[grid](
-            pool,
-            new_order_t.reshape(-1),
-            dest_local_t,
-            page_base_t,
-            page_ids_t,
-            scratch.reshape(-1),
-            total,
-            num_kv_heads,
-            tokens_per_block,
-            head_dim,
-            pool.stride(0),
-            pool.stride(1),
-            pool.stride(2),
-            pool.stride(3),
-            pool.stride(4),
-            PHASE=phase,
-            D_BLOCK=D_BLOCK,
-            BLOCK_TOKENS=BLOCK_TOKENS,
-            PER_HEAD=True,
-        )
-
 
 def cpp_sparse_compact_supported(pool: torch.Tensor) -> bool:
-    """The upstream C++ single-pass compact kernel needs an interleaved-K/V
-    HND pool (kv_factor == 2, contiguous) and the thop op compiled in."""
+    """Return whether ``pool`` satisfies the C++ compact op layout contract."""
     return (
         pool.ndim == 5
         and pool.shape[1] == 2
         and pool.is_contiguous()
         and pool.dtype in (torch.bfloat16, torch.float16, torch.float32)
-        and hasattr(torch.ops.trtllm, "sparse_kv_cache_compact")
     )
 
 
-def cpp_sparse_compact(pool, page_ids_list, keep_list, seq_len_list):
-    """Union compaction via the upstream single-pass C++ kernel
-    (updateSparseKvCacheAfterFmha through the sparse_kv_cache_compact
-    thop op). One launch covers all requests of ONE layer pool; K and V move
-    in the same pass (no global scratch: grid (1, nkv, batch) with an ordered
-    in-block sweep, so it wins at high batch and loses at batch 1 -- see the
-    compact bench). Falls back are the caller's responsibility via
-    ``cpp_sparse_compact_supported``.
+def cpp_sparse_compact(
+    pool: torch.Tensor,
+    page_ids_list: List[torch.Tensor],
+    source_list: List[torch.Tensor],
+    seq_len_list: List[int],
+    *,
+    dest_list: List[torch.Tensor] | None = None,
+) -> None:
+    """Compact one layer with the C++ V2 op and no Triton fallback.
+
+    A one-dimensional source is shared by every KV head. A two-dimensional
+    source is ``[num_kv_heads, move_count]`` and supports per-head selection.
+    Destinations are local token ordinals, either shared (1-D) or per-head
+    (2-D). Omitting destinations compacts each request to its prefix. Each
+    request/head must provide strictly increasing sources and destinations with
+    ``destination[i] <= source[i]``; all TriAttention producers satisfy this
+    monotonic-left in-place contract.
     """
+    if not cpp_sparse_compact_supported(pool):
+        raise ValueError(
+            "cpp_sparse_compact requires a contiguous [pages, 2, heads, tokens, dim] "
+            "BF16/FP16/FP32 pool"
+        )
+    if not (len(page_ids_list) == len(source_list) == len(seq_len_list)):
+        raise ValueError("page_ids_list, source_list, and seq_len_list must have equal lengths")
+    if dest_list is not None and len(dest_list) != len(source_list):
+        raise ValueError("dest_list and source_list must have equal lengths")
+
     device = pool.device
-    _, kv_factor, num_kv_heads, tokens_per_block, _ = pool.shape
-    if kv_factor != 2:
-        raise ValueError("cpp_sparse_compact requires an interleaved K/V pool (kv_factor == 2)")
-    tables, keeps = [], []
-    for page_ids, keep, seq_len in zip(page_ids_list, keep_list, seq_len_list):
-        keep32 = keep.to(device=device, dtype=torch.int32)
-        if keep32.numel() >= seq_len:
-            continue  # nothing to drop for this request
+    num_kv_heads = int(pool.shape[2])
+    tables = []
+    sources = []
+    destinations = []
+    per_head_source = None
+    per_head_destination = None
+    for request_index, (page_ids, source, seq_len) in enumerate(
+        zip(page_ids_list, source_list, seq_len_list)
+    ):
+        source = source.to(device=device, dtype=torch.int32)
+        if source.ndim not in (1, 2):
+            raise ValueError("Each source must be [moves] or [num_kv_heads, moves]")
+        current_per_head = source.ndim == 2
+        if current_per_head and int(source.shape[0]) != num_kv_heads:
+            raise ValueError("Per-head source row count must match the pool")
+        move_count = int(source.shape[-1])
+        if dest_list is None and move_count >= int(seq_len):
+            continue
+        if move_count == 0:
+            continue
+        if per_head_source is None:
+            per_head_source = current_per_head
+        elif per_head_source != current_per_head:
+            raise ValueError("A compact launch cannot mix union and per-head source layouts")
+        if not current_per_head:
+            source = source.reshape(1, -1).expand(num_kv_heads, -1)
+        sources.append(source)
         tables.append(page_ids.to(device=device, dtype=torch.int32).reshape(-1))
-        keeps.append(keep32)
-    if not keeps:
+
+        if dest_list is not None:
+            destination = dest_list[request_index].to(device=device, dtype=torch.int32)
+            if destination.ndim not in (1, 2):
+                raise ValueError("Each destination must be [moves] or [num_kv_heads, moves]")
+            current_destination_per_head = destination.ndim == 2
+            expected_shape = source.shape if current_destination_per_head else (move_count,)
+            if tuple(destination.shape) != tuple(expected_shape):
+                raise ValueError("Each source and destination must have matching move counts")
+            if per_head_destination is None:
+                per_head_destination = current_destination_per_head
+            elif per_head_destination != current_destination_per_head:
+                raise ValueError("A compact launch cannot mix destination layouts")
+            destinations.append(destination)
+
+    if not sources:
         return
-    batch = len(keeps)
+    batch = len(sources)
     max_pages = max(int(t.numel()) for t in tables)
     page_table = torch.zeros(batch, max_pages, dtype=torch.int32, device=device)
-    for i, t in enumerate(tables):
-        page_table[i, : t.numel()] = t
+    for request_index, table in enumerate(tables):
+        page_table[request_index, : table.numel()] = table
     offsets_host = [0]
-    for k in keeps:
-        offsets_host.append(offsets_host[-1] + int(k.numel()))
+    for source in sources:
+        offsets_host.append(offsets_host[-1] + int(source.shape[1]))
     offsets = torch.tensor(offsets_host, dtype=torch.int32, device=device)
-    flat = torch.cat(keeps)
-    # union: every KV head keeps the same token set -> replicate rows.
-    indices = flat.unsqueeze(0).expand(num_kv_heads, -1).contiguous()
-    torch.ops.trtllm.sparse_kv_cache_compact(pool, page_table, indices, offsets)
+    indices = torch.cat(sources, dim=1).contiguous()
+    destination_indices = None
+    if destinations:
+        cat_dim = 1 if per_head_destination else 0
+        destination_indices = torch.cat(destinations, dim=cat_dim).contiguous()
+    torch.ops.trtllm.sparse_kv_cache_compact(
+        pool,
+        page_table,
+        indices,
+        offsets,
+        destination_indices,
+    )
 
 
 class SegMeta(NamedTuple):
@@ -592,9 +289,7 @@ def _tri_score_perhead_kernel(
                 phase = (rstart + off) * om
                 cphase = tl.cos(phase)
                 sphase = tl.sin(phase)
-                per_f = fss[None, :] * (
-                    prod_real * cphase[None, :] - prod_imag * sphase[None, :]
-                )
+                per_f = fss[None, :] * (prod_real * cphase[None, :] - prod_imag * sphase[None, :])
                 offset_score = tl.sum(tl.where(f_mask[None, :], per_f, 0.0), axis=1)
                 score = tl.maximum(score, offset_score)
                 o += 1

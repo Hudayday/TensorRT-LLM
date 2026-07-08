@@ -1,5 +1,6 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+ *All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,16 +29,18 @@ namespace kernels
 {
 
 //! In-place sparse KV compaction for one KVCacheManagerV2 per-layer HND pool
-//! (general: any eviction method that produces per-head kept-token lists)
 //! ([num_pages, 2, num_kv_heads, tokens_per_block, head_dim], K/V interleaved
-//! per page). Reuses the attention sparse-compaction kernel
-//! (updateSparseKvCacheAfterFmha) with a V2-pool KVCacheBuffer adapter:
-//! kept tokens (per KV head lists in ``sparse_kv_indices`` laid out
-//! [num_kv_heads, total]) are gathered to each request's sequence prefix.
+//! per page). Source tokens are laid out per head as [num_kv_heads, total].
+//! They are gathered either to each request's prefix or to explicit local-token
+//! destinations shared by all heads ([total]) or varying by head
+//! ([num_kv_heads, total]). For every head and request, source and destination
+//! indices must be strictly increasing and destination[i] <= source[i]. This
+//! monotonic-left contract makes the in-place operation safe without scratch.
 template <typename T>
-void invokeSparseKvCacheCompactV2(T* pool, int32_t const* page_table, int32_t max_pages_per_seq,
-    int32_t const* sparse_kv_indices, int32_t const* sparse_kv_offsets, int32_t batch_size, int32_t num_kv_heads,
-    int32_t tokens_per_block, int32_t head_dim, cudaStream_t stream);
+void invokeSparseKvCacheCompactV2(T* pool, int32_t const* pageTable, int32_t maxPagesPerSeq,
+    int32_t const* sparseKvIndices, int32_t const* sparseKvOffsets, int32_t const* destinationIndices,
+    bool destinationPerHead, int32_t batchSize, int32_t numKvHeads, int32_t tokensPerBlock, int32_t headDim,
+    cudaStream_t stream);
 
 } // namespace kernels
 

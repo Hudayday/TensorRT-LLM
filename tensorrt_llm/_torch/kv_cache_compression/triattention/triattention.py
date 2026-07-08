@@ -35,7 +35,7 @@ KV layout: the decode kernel stores keys in HND layout
 ``[num_pages, kv_factor, num_kv_heads, tokens_per_block, head_dim]``. The Python
 gather / score / compact code MUST read ``get_buffers`` with ``kv_layout="HND"``;
 reading the default NHD silently swaps the token and head axes and scrambles the
-cache. See ``_evict_layer_perhead``.
+cache.
 
 Position handling: kept keys retain their original RoPE rotation (no re-RoPE on
 compaction). The model engine keeps the decode query at its true absolute
@@ -144,9 +144,7 @@ def _topk_indices_into(
     raising ``filtered_topk_max_k`` to 4096 supports our budget range.
     """
     if backend == "cute_dsl_topk":
-        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
-            scores, seq_lens, indices_i32, keep_count, 1
-        )
+        torch.ops.trtllm.cute_dsl_indexer_topk_decode(scores, seq_lens, indices_i32, keep_count, 1)
     else:
         torch.ops.trtllm.indexer_topk_decode(scores, seq_lens, indices_i32, 1, keep_count)
 
@@ -572,6 +570,9 @@ class _FixedUnionWorkspace:
             and page_ids.ndim == 1
             and page_ids.device == self.device
             and page_ids.dtype == torch.int64
+            and pool.shape[1] == 2
+            and pool.is_contiguous()
+            and pool.dtype in (torch.bfloat16, torch.float16, torch.float32)
             and self.total_keep < seq_len
         )
 
@@ -597,19 +598,28 @@ class _FixedUnionWorkspace:
         """Materialize fixed compaction buffers without launching a kernel."""
         if not self.can_compact(pool, page_ids, seq_len):
             raise ValueError("pool no longer matches the fixed union compaction bucket")
-        _, kv_factor, num_kv_heads, _, head_dim = pool.shape
+        _, _, num_kv_heads, _, _ = pool.shape
         key = self._compaction_key(pool, page_ids)
         buffers = self._compaction_buffers.get(key)
         if buffers is None:
-            fixed_page_ids = torch.empty_like(page_ids)
-            destination = torch.arange(self.total_keep, dtype=torch.int64, device=self.device)
-            page_base = torch.zeros(self.total_keep, dtype=torch.int64, device=self.device)
-            scratch = torch.empty(
-                kv_factor * num_kv_heads * self.total_keep * head_dim,
-                dtype=pool.dtype,
+            page_table = torch.empty(
+                1,
+                page_ids.numel(),
+                dtype=torch.int32,
                 device=self.device,
             )
-            buffers = (fixed_page_ids, destination, page_base, scratch)
+            indices = torch.empty(
+                num_kv_heads,
+                self.total_keep,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            offsets = torch.tensor(
+                [0, self.total_keep],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            buffers = (page_table, indices, offsets)
             self._compaction_buffers[key] = buffers
         return buffers
 
@@ -621,21 +631,18 @@ class _FixedUnionWorkspace:
         *,
         copy_page_ids: bool = True,
     ) -> None:
-        """Compact one HND layer using persistent indices and scratch storage."""
+        """Compact one HND layer using persistent C++ op inputs."""
         buffers = self.prepare_compaction(pool, page_ids, seq_len)
-        fixed_page_ids, destination, page_base, scratch = buffers
+        page_table, indices, offsets = buffers
         if copy_page_ids:
-            fixed_page_ids.copy_(page_ids)
-
-        from .triattention_kernels import triton_tri_compact_fixed
-
-        triton_tri_compact_fixed(
+            page_table[0].copy_(page_ids)
+        indices.copy_(self.keep.reshape(1, -1).expand(indices.shape[0], -1))
+        torch.ops.trtllm.sparse_kv_cache_compact(
             pool,
-            fixed_page_ids,
-            self.keep,
-            destination,
-            page_base,
-            scratch,
+            page_table,
+            indices,
+            offsets,
+            None,
         )
 
 
@@ -1384,9 +1391,7 @@ class _FixedScoreMetadataWorkspace:
                         or any(page < 0 for page in pages)
                     ):
                         return False
-                    padded_rows.append(
-                        pages + [pages[-1]] * (self.page_count - live_page_count)
-                    )
+                    padded_rows.append(pages + [pages[-1]] * (self.page_count - live_page_count))
                 rows_by_group.append(padded_rows)
             self.page_ids_host[:, :request_count].copy_(
                 torch.as_tensor(rows_by_group, dtype=torch.int64)
@@ -1464,9 +1469,7 @@ class _FixedScoreMetadataWorkspace:
             return False
         if not self._bulk_stage_logged:
             self._bulk_stage_logged = True
-            logger.info(
-                "TriAttention bulk page-table staging engaged (copy_batch_block_offsets)"
-            )
+            logger.info("TriAttention bulk page-table staging engaged (copy_batch_block_offsets)")
         return True
 
     def _assert_bulk_matches_legacy(
@@ -1486,20 +1489,12 @@ class _FixedScoreMetadataWorkspace:
             )
             if len(rows) != request_count:
                 raise RuntimeError("legacy page-table staging returned the wrong request count")
-            for request_index, (row, live_page_count) in enumerate(
-                zip(rows, num_blocks_per_seq)
-            ):
+            for request_index, (row, live_page_count) in enumerate(zip(rows, num_blocks_per_seq)):
                 pages = [int(page) for page in row]
-                if (
-                    len(pages) != live_page_count
-                    or not pages
-                    or any(page < 0 for page in pages)
-                ):
+                if len(pages) != live_page_count or not pages or any(page < 0 for page in pages):
                     raise RuntimeError("legacy page table contains BAD in its live prefix")
                 expected = torch.as_tensor(pages, dtype=torch.int64, device=self.device)
-                got = self.page_ids_device[
-                    slot, request_index, :live_page_count
-                ]
+                got = self.page_ids_device[slot, request_index, :live_page_count]
                 if not torch.equal(got, expected):
                     raise RuntimeError(
                         f"bulk page-table staging mismatch at representative {global_layer}"
@@ -1563,11 +1558,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             and hasattr(torch.ops.trtllm, "cute_dsl_indexer_topk_decode")
         ):
             return "cute_dsl_topk"
-        return (
-            "indexer_topk"
-            if self._indexer_topk_supported(width, keep_count)
-            else "torch_topk"
-        )
+        return "indexer_topk" if self._indexer_topk_supported(width, keep_count) else "torch_topk"
 
     _INDEXER_TOPK_SUBBLOCK = 2048
 
@@ -1638,17 +1629,8 @@ class TriAttention(BaseKVCacheCompressionManager):
                 "count_prompt_tokens=False so finalized prompt KV is preserved"
             )
         self.skip_swa = bool(skip_swa)
-        # per_head / per_layer_perhead compaction backend:
-        #   "torch" (default) -- the vectorized PyTorch reorder (_build_new_order +
-        #     _evict_layer_perhead). MEASURED FASTEST at BS=32 (per_head -13% vs
-        #     dense; per_layer -23%), beating both the old per-head loop (-35%) and
-        #     the fused Triton kernel below (-23%): once the per-head loop is
-        #     vectorized, the Triton per-layer scratch + 2-phase overhead dominates.
-        #   "triton"           -- one fused batched Triton launch per layer
-        #     (triton_tri_compact_perhead); may win at high-BS serving (the
-        #     launch-amortization regime) -- re-benchmark there. Both backends
-        #     produce a byte-identical compacted cache.
-        self._compact_backend = os.environ.get("TRIATTN_COMPACT_BACKEND", "torch")
+        # All physical moves use the capture-safe C++ V2 compact op. Scoring
+        # remains Triton; there is deliberately no runtime compact fallback.
         # Recency-window knob, kept for API compatibility. The upstream
         # calibration-based selection does not apply a recency window on the AIME
         # protocol and none of the implemented modes read this value, so it is
@@ -1704,9 +1686,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         # Experimental production path promoted by the sealed real-shape P0.
         # It remains opt-in until same-shape serving A/B closes the e2e gate.
         self._fixed_union_enabled = os.environ.get("TRIATTN_FIXED_BUFFER_UNION", "0") == "1"
-        self._fixed_union_compaction_enabled = (
-            self._fixed_union_enabled and os.environ.get("TRIATTN_COMPACT_KEPT_ONLY", "1") == "1"
-        )
+        self._fixed_union_compaction_enabled = self._fixed_union_enabled
         # Keep cold-path prewarm independently selectable so its correctness and
         # performance evidence cannot be confused with the fixed-buffer change.
         self._fixed_union_prewarm_enabled = (
@@ -2096,10 +2076,12 @@ class TriAttention(BaseKVCacheCompressionManager):
         )
         if use_fixed_workspace:
             compaction_backend = (
-                "triton_tri_compact_fixed" if self._fixed_union_compaction_enabled else "disabled"
+                "cpp_sparse_kv_cache_compact"
+                if self._fixed_union_compaction_enabled
+                else "disabled"
             )
         else:
-            compaction_backend = "triton_tri_compact"
+            compaction_backend = "cpp_sparse_kv_cache_compact"
         pool_geometry = []
         for lids in storage_groups:
             pool = layer_pools[lids[0]]
@@ -2128,7 +2110,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             "triton_tri_score_perhead",
             selection_backend,
             compaction_backend,
-            self._compact_backend,
             future_seq_len,
             prompt_len,
             self.top_B,
@@ -2432,10 +2413,10 @@ class TriAttention(BaseKVCacheCompressionManager):
                             for _, dummy_pool, page_ids in group_inputs:
                                 workspace.compact(dummy_pool, page_ids, seq_len)
                         else:
-                            from .triattention_kernels import triton_tri_compact
+                            from .triattention_kernels import cpp_sparse_compact
 
                             for _, dummy_pool, page_ids in group_inputs:
-                                triton_tri_compact(
+                                cpp_sparse_compact(
                                     dummy_pool,
                                     [page_ids],
                                     [keep],
@@ -3026,12 +3007,7 @@ class TriAttention(BaseKVCacheCompressionManager):
     def _compact_perhead_layers(
         self, request: "LlmRequest", layer_indices: List[int], keep_2d: "torch.Tensor", seq_len: int
     ) -> None:
-        """Physically compact ``layer_indices`` keeping a per-KV-head token set
-        (``keep_2d`` = ``[num_kv_heads, keep_count]``). Two interchangeable backends
-        (``self._compact_backend``) producing a byte-identical compacted cache:
-        ``triton`` runs one fused ``triton_tri_compact_perhead`` launch per layer;
-        ``torch`` runs the vectorized PyTorch reorder. SWA layers are excluded by
-        the caller (``layer_indices`` is already dense-only)."""
+        """Compact dense layers with per-head source sets through the C++ op."""
         if int(keep_2d.shape[1]) >= seq_len:
             return  # nothing to drop
         mgr = self.kv_cache_manager
@@ -3055,16 +3031,16 @@ class TriAttention(BaseKVCacheCompressionManager):
                     f"of request {request.py_request_id}"
                 )
             prepared_layers.append((layer_idx, pool, page_ids))
-        if self._compact_backend == "torch":
-            new_order = self._build_new_order(keep_2d, seq_len)
-            for layer_idx, _, _ in prepared_layers:
-                self._evict_layer_perhead(request, layer_idx, new_order, seq_len)
-            return
-        from .triattention_kernels import triton_tri_compact_perhead
+        from .triattention_kernels import cpp_sparse_compact
 
         for _, pool, page_ids in prepared_layers:
             page_ids_t = torch.as_tensor(page_ids, device=pool.device, dtype=torch.long)
-            triton_tri_compact_perhead(pool, [page_ids_t], [keep_2d.to(pool.device)], [seq_len])
+            cpp_sparse_compact(
+                pool,
+                [page_ids_t],
+                [keep_2d.to(pool.device)],
+                [seq_len],
+            )
 
     def _evict_per_layer_perhead(
         self,
@@ -3102,7 +3078,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         """union: union of every head's top-k, re-ranked by the per-token max
         (upstream ``_select_union_based``). One 1-D keep set shared by every
         layer; returns the sorted kept slot indices in ``[0, seq_len)`` so the
-        caller compacts all layers in one pass (``triton_tri_compact``)."""
+        caller compacts all layers with the C++ V2 op."""
         request_id = request.py_request_id
         workspace = None
         if use_fixed_workspace:
@@ -3243,10 +3219,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             segments_by_request.append(segments)
             valid_widths.append(valid_width)
 
-        actual_backends = {
-            self._selection_backend_for(width, self.top_B)
-            for width in valid_widths
-        }
+        actual_backends = {self._selection_backend_for(width, self.top_B) for width in valid_widths}
         if actual_backends != {workspace.selection_backend}:
             raise ValueError("cross-request requests crossed a selection-backend band")
         workspace.stage_valid_widths_from_seq_lens(
@@ -3370,25 +3343,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             union_idx = torch.cat([union_idx, extra])
         return torch.sort(union_idx).values
 
-    def _build_new_order(self, keep_2d: "torch.Tensor", seq_len: int) -> "torch.Tensor":
-        """Per-KV-head full token permutation ``[num_kv_heads, seq_len]``: each row =
-        kept slots (in their given order) then the dropped slots (ascending), so no
-        slot in ``[0, seq_len)`` is left holding stale data. Vectorized over heads
-        (one scatter + one nonzero + one cat) -- replaces the old per-head Python
-        loop, which issued ~num_kv_heads x more tiny ones/index_put/cat launches (the
-        dominant per_head eviction cost in the nsys kernel-launch profile). The
-        result is identical to the loop: kept-then-dropped, dropped ascending."""
-        keep_2d = keep_2d.to(dtype=torch.long)
-        nkv, keep_count = keep_2d.shape
-        if keep_count >= seq_len:
-            return keep_2d[:, :seq_len].contiguous()
-        kept_mask = torch.zeros(nkv, seq_len, device=keep_2d.device, dtype=torch.bool)
-        kept_mask.scatter_(1, keep_2d, True)
-        # nonzero is row-major sorted -> per-head dropped cols ascending; every row
-        # drops exactly seq_len-keep_count (keep_2d rows are unique), so reshape groups.
-        dropped = (~kept_mask).nonzero(as_tuple=True)[1].reshape(nkv, seq_len - keep_count)
-        return torch.cat([keep_2d, dropped], dim=1)
-
     def _local_to_global_layers(self, num_layers: int) -> List[int]:
         """Return V2's global layer id for every local TriAttention layer slot."""
         cached = self._local_to_global_layers_cache
@@ -3510,60 +3464,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         """Return full-attention layers used for TriAttention scoring."""
         return self._attention_layer_partition(num_layers)[0]
 
-    def _evict_layer_perhead(
-        self, request: "LlmRequest", layer_idx: int, new_order: "torch.Tensor", seq_len: int
-    ) -> None:
-        """Physically compact ONE layer's cache, keeping a DIFFERENT token set per
-        KV head. ``new_order`` is the ``[num_kv_heads, seq_len]`` per-head token
-        permutation from ``_build_new_order`` (kept-then-dropped); each KV head's
-        token axis is reordered independently (a gather on the ``num_kv_heads`` axis)
-        so every slot in ``[0, seq_len)`` still holds a real key/value. Same HND
-        layout + no-re-RoPE reasoning as the union compaction. ``new_order`` is built
-        ONCE by the caller (it is identical across layers in per_head mode) rather
-        than rebuilt per layer."""
-        mgr = self.kv_cache_manager
-        get_buffers = mgr.get_buffers
-        num_layers = self._num_layers_from_manager()
-        global_layer = self._global_layer_id(layer_idx, num_layers)
-        pool = get_buffers(global_layer, kv_layout="HND")
-        if pool is None:
-            raise RuntimeError(f"Missing KV pool for attention layer {global_layer}")
-        tokens_per_block = int(pool.shape[3])
-        page_ids = self._resolve_page_ids(
-            request,
-            layer_idx,
-            (seq_len + tokens_per_block - 1) // tokens_per_block,
-        )
-        if not page_ids:
-            raise RuntimeError(
-                f"Missing KV page ids for local attention layer {layer_idx} "
-                f"of request {request.py_request_id}"
-            )
-        page_ids_t = torch.as_tensor(page_ids, device=pool.device, dtype=torch.long)
-        request_pages = pool[page_ids_t]
-        num_pages, kv_factor, num_kv_heads, _, head_dim = request_pages.shape
-        new_order = new_order.to(request_pages.device)
-        # [kv_factor, num_kv_heads, num_pages * tokens_per_block, head_dim]
-        kv_by_token = (
-            request_pages.permute(1, 2, 0, 3, 4)
-            .contiguous()
-            .reshape(kv_factor, num_kv_heads, num_pages * tokens_per_block, head_dim)
-        )
-        # Gather the token axis (dim 2) with a DIFFERENT order per KV head.
-        region = kv_by_token[:, :, :seq_len]
-        idx = new_order.view(1, num_kv_heads, seq_len, 1).expand(
-            kv_factor, num_kv_heads, seq_len, head_dim
-        )
-        reordered = torch.gather(region, 2, idx).clone()
-        kv_by_token[:, :, :seq_len] = reordered
-        num_touched_pages = (seq_len + tokens_per_block - 1) // tokens_per_block
-        repaged = (
-            kv_by_token.reshape(kv_factor, num_kv_heads, num_pages, tokens_per_block, head_dim)
-            .permute(2, 0, 1, 3, 4)
-            .contiguous()
-        )
-        pool[page_ids_t[:num_touched_pages]] = repaged[:num_touched_pages]
-
     def _record_fixed_score_runtime(self, key: Optional[tuple], outcome: str) -> None:
         if key is None:
             return
@@ -3590,8 +3490,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         prompt_len = next(iter(prompt_lens))
         max_seq_len = max(seq_lens)
         actual_backends = {
-            self._selection_backend_for(seq_len - prompt_len, self.top_B)
-            for seq_len in seq_lens
+            self._selection_backend_for(seq_len - prompt_len, self.top_B) for seq_len in seq_lens
         }
         if len(actual_backends) != 1:
             return None
@@ -3648,7 +3547,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         workspace: Optional[_FixedScoreMetadataWorkspace],
     ) -> bool:
         fixed = False
-        get_batch = self.kv_cache_manager.get_batch_cache_indices
         if workspace is not None:
             try:
                 fixed = workspace.stage(
@@ -3729,8 +3627,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         bucket_seq_len = score_workspace.bucket_seq_len
         width = bucket_seq_len - prompt_len
         actual_backends = {
-            self._selection_backend_for(seq_len - prompt_len, self.top_B)
-            for seq_len in seq_lens
+            self._selection_backend_for(seq_len - prompt_len, self.top_B) for seq_len in seq_lens
         }
         if len(actual_backends) != 1:
             return None
@@ -4138,10 +4035,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 # layer); the staged page_ids dict is keyed by the layer's
                 # storage-group representative.
                 page_ids_per_layer = [
-                    [
-                        item["page_ids"][layer_group_representative[layer]]
-                        for layer in dense_layers
-                    ]
+                    [item["page_ids"][layer_group_representative[layer]] for layer in dense_layers]
                     for item in prepared
                 ]
                 ph, so, sm = triton_tri_score_perhead(
@@ -4280,23 +4174,12 @@ class TriAttention(BaseKVCacheCompressionManager):
                 pending_updates.append((rid, evicted, keep_count))
 
         if union_by_layer or swa_by_layer:
-            from .triattention_kernels import (
-                cpp_sparse_compact,
-                cpp_sparse_compact_supported,
-                triton_tri_compact,
-            )
+            from .triattention_kernels import cpp_sparse_compact
 
         if union_by_layer:
-            # Backend "cpp" reuses the upstream single-pass attention compact
-            # kernel (1x memory traffic, wins at high batch); anything it
-            # cannot take (kv_factor != 2, missing op) falls back to Triton.
-            use_cpp = self._compact_backend == "cpp"
             for lid, (pl, kl, sl) in union_by_layer.items():
                 with nvtx_range("triattention.compact", color="purple"):
-                    if use_cpp and cpp_sparse_compact_supported(layer_pools[lid]):
-                        cpp_sparse_compact(layer_pools[lid], pl, kl, sl)
-                    else:
-                        triton_tri_compact(layer_pools[lid], pl, kl, sl)
+                    cpp_sparse_compact(layer_pools[lid], pl, kl, sl)
         if fixed_union_compaction is not None:
             workspace, item, seq_len = fixed_union_compaction
             for lids in storage_groups.values():
@@ -4315,7 +4198,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                     copied_buffer_keys.add(buffer_key)
         for lid, (pl, sources, seq_lens, destinations) in swa_by_layer.items():
             with nvtx_range("triattention.compact", color="purple"):
-                triton_tri_compact(
+                cpp_sparse_compact(
                     layer_pools[lid],
                     pl,
                     sources,
@@ -4355,7 +4238,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         if min(source_start, destination_start) < 0:
             raise ValueError("protected-tail offsets must be non-negative")
 
-        from .triattention_kernels import triton_tri_compact
+        from .triattention_kernels import cpp_sparse_compact
 
         num_layers = self._num_layers_from_manager()
         source = None
@@ -4387,7 +4270,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                     dtype=torch.long,
                     device=pool.device,
                 )
-            triton_tri_compact(
+            cpp_sparse_compact(
                 pool,
                 [torch.as_tensor(page_ids, dtype=torch.long, device=pool.device)],
                 [source],

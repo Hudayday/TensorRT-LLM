@@ -23,7 +23,6 @@ import torch
 from tensorrt_llm._torch.kv_cache_compression.triattention.cuda_graph import (
     FixedBatchedCompactionWorkspace,
     StandaloneEvictionGraphCache,
-    _FixedCompactLaunch,
     _tensor_fingerprint,
 )
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
@@ -32,8 +31,8 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
     _FixedScoreMetadataWorkspace,
 )
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+    cpp_sparse_compact,
     fixed_perhead_segment_views,
-    triton_tri_compact,
 )
 
 CUDA_REQUIRED = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -1107,18 +1106,124 @@ class TestFixedBatchedCompactionWorkspace:
             arena_generation=1,
         )
 
-        with mock.patch.object(_FixedCompactLaunch, "run") as run:
+        with mock.patch(
+            "tensorrt_llm._torch.kv_cache_compression.triattention.cuda_graph._run_cpp_compact"
+        ) as run:
             workspace.launch()
 
         assert run.call_count == 2
-        assert workspace.dense_source.tolist() == [2, 4, 5, 7]
-        assert workspace.dense_destination.tolist() == [2, 3, 4, 5]
-        assert 0 not in workspace.dense_destination.tolist()
-        assert 1 not in workspace.dense_destination.tolist()
-        assert workspace.dense_launches[0].page_ids.tolist() == [3, 1]
-        assert workspace.swa_launches[0].page_ids.tolist() == [2, 0]
+        assert workspace.cpp_indices.tolist() == [[0, 1, 2, 4, 5, 7]]
+        assert workspace.cpp_page_tables[0][1].tolist() == [[3, 1]]
+        assert workspace.cpp_page_tables[1][1].tolist() == [[2, 0]]
         assert workspace.swa_source.tolist() == [6, 7]
+        assert workspace.swa_indices.tolist() == [[6, 7]]
         assert workspace.swa_destination.tolist() == [4, 5]
+
+    @staticmethod
+    def _logical_tokens(pool, page_table):
+        return (
+            pool[page_table]
+            .permute(0, 2, 3, 1, 4, 5)
+            .reshape(page_table.shape[0], 2, pool.shape[2], -1, pool.shape[4])
+        )
+
+    @pytest.mark.parametrize("head_dim", [80, 96, 128, 192])
+    @CUDA_REQUIRED
+    def test_cpp_only_compact_multilayer_perhead_destination_and_reuse(self, head_dim):
+        """Exercise every TriAttention move shape against a clone oracle."""
+        device = torch.device("cuda")
+        request_count = 2
+        num_heads = 3
+        tokens_per_block = 4
+        page_tables = (
+            torch.tensor([[2, 0, 1], [5, 3, 4]], dtype=torch.int64, device=device),
+            torch.tensor([[1, 2, 0], [4, 5, 3]], dtype=torch.int64, device=device),
+        )
+        pools = []
+        for layer in range(2):
+            values = torch.arange(
+                6 * 2 * num_heads * tokens_per_block * head_dim,
+                dtype=torch.float32,
+                device=device,
+            )
+            pools.append(
+                values.view(6, 2, num_heads, tokens_per_block, head_dim) + layer * 1_000_000
+            )
+
+        # Each layer, request, and head has a distinct sorted keep set. The
+        # wrapper must preserve this 2-D source layout rather than replicating
+        # a union row.
+        layer_sources = (
+            [
+                torch.tensor(
+                    [[0, 2, 4, 6, 8], [0, 1, 5, 7, 8], [1, 3, 4, 7, 8]],
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                torch.tensor(
+                    [[0, 2, 4, 6, 7], [0, 1, 3, 5, 7], [1, 2, 4, 6, 7]],
+                    dtype=torch.int64,
+                    device=device,
+                ),
+            ],
+            [
+                torch.tensor(
+                    [[0, 1, 3, 5, 8], [1, 2, 4, 6, 8], [0, 3, 5, 7, 8]],
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                torch.tensor(
+                    [[0, 1, 4, 6, 7], [1, 2, 3, 6, 7], [0, 2, 5, 6, 7]],
+                    dtype=torch.int64,
+                    device=device,
+                ),
+            ],
+        )
+        seq_lens = [9, 8]
+        for layer, (pool, page_table, sources) in enumerate(zip(pools, page_tables, layer_sources)):
+            before = self._logical_tokens(pool, page_table).clone()
+            cpp_sparse_compact(
+                pool,
+                [page_table[request] for request in range(request_count)],
+                sources,
+                seq_lens,
+            )
+            after = self._logical_tokens(pool, page_table)
+            for request, source in enumerate(sources):
+                for head in range(num_heads):
+                    assert torch.equal(
+                        after[request, :, head, : source.shape[1]],
+                        before[request, :, head].index_select(1, source[head]),
+                    ), f"layer={layer}, request={request}, head={head}"
+
+        # Refill reused physical pages and move a protected/SWA-like suffix to
+        # nonzero destinations. Reversing each page table ensures the second
+        # round does not accidentally rely on first-round physical ordering.
+        destination = torch.tensor([3, 4], dtype=torch.int64, device=device)
+        reused_tables = tuple(table.flip(1).contiguous() for table in page_tables)
+        suffix_sources = [
+            torch.tensor([6, 7], dtype=torch.int64, device=device),
+            torch.tensor([5, 6], dtype=torch.int64, device=device),
+        ]
+        for layer, (pool, page_table) in enumerate(zip(pools, reused_tables)):
+            pool.copy_(
+                torch.arange(pool.numel(), dtype=pool.dtype, device=device).view_as(pool)
+                + (layer + 2) * 1_000_000
+            )
+            before = self._logical_tokens(pool, page_table).clone()
+            cpp_sparse_compact(
+                pool,
+                [page_table[request] for request in range(request_count)],
+                suffix_sources,
+                [8, 7],
+                dest_list=[destination, destination],
+            )
+            after = self._logical_tokens(pool, page_table)
+            for request, source in enumerate(suffix_sources):
+                assert torch.equal(
+                    after[request].index_select(2, destination),
+                    before[request].index_select(2, source),
+                ), f"reuse layer={layer}, request={request}"
 
     def test_tensor_fingerprint_changes_for_view_offset_and_stride(self):
         base = torch.arange(16)
@@ -1358,7 +1463,7 @@ class TestStandaloneGraphCuda:
 
         def stage4_body():
             score_and_select()
-            triton_tri_compact(
+            cpp_sparse_compact(
                 pool,
                 [score.page_ids_device[0, request] for request in range(request_count)],
                 [selection.keep[request] for request in range(request_count)],
@@ -1610,7 +1715,7 @@ class TestStandaloneGraphCuda:
         eager_pools = [pool.clone() for pool in base_pools]
         graph_pools = [pool.clone() for pool in base_pools]
         graphed = build(graph_pools)
-        triton_tri_compact(
+        cpp_sparse_compact(
             eager_pools[0],
             [dense_tables[request] for request in range(request_count)],
             [keep[request] for request in range(request_count)],
@@ -1626,7 +1731,7 @@ class TestStandaloneGraphCuda:
             for valid_seq_len in valid_seq_lens
         ]
         swa_destination = torch.tensor([4, 5], dtype=torch.int64, device=device)
-        triton_tri_compact(
+        cpp_sparse_compact(
             eager_pools[1],
             [swa_tables[request] for request in range(request_count)],
             swa_sources,
