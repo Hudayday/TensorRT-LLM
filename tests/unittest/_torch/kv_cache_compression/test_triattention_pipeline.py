@@ -100,6 +100,7 @@ def _make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     fake_v2.num_extra_kv_tokens = 0
     fake_v2.max_total_draft_tokens = 0
     fake_v2._kv_reserve_draft_tokens = 0
+    fake_v2.max_seq_len = 65536
     fake_v2.max_attention_window_vec = []
     fake_v2.kv_cache_manager_py_config = SimpleNamespace(layers=[])
     fake_v2.impl = object()
@@ -109,6 +110,19 @@ def _make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     fake_v2.layer_offsets = {}
     fake_v2.layer_to_pool_mapping_dict = {}
     return fake_v2
+
+
+def _make_fake_cpp_hybrid(*, is_draft=False, max_seq_len=512):
+    """Build the common owner surface of Qwen3-Next's native hybrid KVCM."""
+    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import CppMambaHybridCacheManager
+
+    manager = CppMambaHybridCacheManager.__new__(CppMambaHybridCacheManager)
+    manager.enable_block_reuse = False
+    manager.is_draft = is_draft
+    manager.impl = object()
+    manager.host_kv_cache_block_offsets = torch.empty(1, dtype=torch.int64)
+    manager.max_seq_len = max_seq_len
+    return manager
 
 
 def _make_triattention(**overrides):
@@ -217,6 +231,57 @@ class TestKvCacheCompressionConfig:
         cfg = TriAttentionKvCacheCompressionConfig(top_B=256, beta=64, calibration_path="/tmp/x.pt")
         assert cfg.top_B == 256
         assert cfg.beta == 64
+
+    def test_llm_args_round_trip_preserves_concrete_config_fields(self):
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+        from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
+
+        args = TorchLlmArgs(
+            model="dummy",
+            kv_cache_compression_config=TriAttentionKvCacheCompressionConfig(
+                top_B=16384,
+                beta=16384,
+                skip_swa=False,
+            ),
+        )
+
+        serialized = args.model_dump()
+        assert serialized["kv_cache_compression_config"]["top_B"] == 16384
+        assert serialized["kv_cache_compression_config"]["beta"] == 16384
+        explicit = args.model_dump(exclude_unset=True)
+        assert explicit["kv_cache_compression_config"]["top_B"] == 16384
+        assert explicit["kv_cache_compression_config"]["beta"] == 16384
+        restored = TorchLlmArgs.model_validate(serialized)
+        apply_model_defaults_to_llm_args(
+            restored,
+            {"kv_cache_config": {"enable_block_reuse": False}},
+        )
+        assert isinstance(
+            restored.kv_cache_compression_config,
+            TriAttentionKvCacheCompressionConfig,
+        )
+        assert restored.kv_cache_compression_config.top_B == 16384
+        assert restored.kv_cache_compression_config.beta == 16384
+
+    def test_llm_args_dispatches_concrete_and_unknown_algorithms(self):
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        tri_args = TorchLlmArgs(
+            model="dummy",
+            kv_cache_compression_config={"algorithm": "triattention"},
+        )
+        assert isinstance(
+            tri_args.kv_cache_compression_config,
+            TriAttentionKvCacheCompressionConfig,
+        )
+        assert tri_args.kv_cache_compression_config.top_B == 2048
+        assert tri_args.kv_cache_compression_config.beta == 128
+
+        unknown_args = TorchLlmArgs(
+            model="dummy",
+            kv_cache_compression_config={"algorithm": "future_method"},
+        )
+        assert type(unknown_args.kv_cache_compression_config) is KvCacheCompressionConfig
 
     def test_eviction_mode_validated(self):
         with pytest.raises(ValidationError):
@@ -534,6 +599,66 @@ class TestStepEndHookRefactor:
         assert "prepare_resources" in TriAttention.__dict__
         assert "update_resources" not in TriAttention.__dict__
         assert "on_generation_step_end" in TriAttention.__dict__
+
+    def test_qwen_next_mtp_hybrid_no_eviction_is_an_explicit_noop(self):
+        from unittest import mock
+
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+        target = _make_fake_cpp_hybrid()
+        target.enable_block_reuse = True
+        draft = _make_fake_cpp_hybrid(is_draft=True)
+        manager = TriAttention(
+            target,
+            top_B=target.max_seq_len,
+            spec_config=MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True),
+            draft_kv_cache_manager=draft,
+        )
+        request = _make_request(7, is_first_context_chunk=True)
+        batch = SimpleNamespace(
+            context_requests=[request],
+            context_requests_last_chunk=[],
+            generation_requests=[request],
+        )
+
+        with mock.patch.object(manager, "_resolve_calibration") as calibration:
+            with mock.patch.object(manager, "_attention_layer_partition") as partition:
+                with mock.patch.object(manager, "_periodic_evict") as evict:
+                    manager.prepare_resources(batch)
+                    manager.update_resources(batch)
+
+        assert manager._inert_no_eviction
+        assert manager._initialized_request_ids == {7}
+        assert manager._evicted == {}
+        assert "generation_capacity_only" not in target.__dict__
+        assert "generation_capacity_only" not in draft.__dict__
+        calibration.assert_not_called()
+        partition.assert_not_called()
+        evict.assert_not_called()
+
+        manager.adjust_attention_metadata(object())
+        metadata = _FakeMetadata([64], [32], [7])
+        manager.adjust_attention_metadata(metadata)
+        assert metadata.kv_cache_params.num_cached_tokens_per_seq == [64]
+        assert not hasattr(metadata, "draft_kv_length_delta")
+
+        manager.free_resources(request)
+        assert manager._initialized_request_ids == set()
+
+    def test_qwen_next_mtp_hybrid_evicting_config_fails_closed(self):
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+        target = _make_fake_cpp_hybrid()
+        draft = _make_fake_cpp_hybrid(is_draft=True)
+
+        with pytest.raises(ValueError, match="physical eviction requires KVCacheManagerV2"):
+            TriAttention(
+                target,
+                top_B=target.max_seq_len - 1,
+                skip_swa=False,
+                spec_config=MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True),
+                draft_kv_cache_manager=draft,
+            )
 
     def test_hook_runs_periodic_evict(self):
         import unittest.mock as mock
@@ -4916,6 +5041,25 @@ class TestFactory:
         assert mgr.top_B == 32
         assert mgr.beta == 16
         assert mgr.kv_cache_manager is fake_v2
+
+    def test_factory_accepts_cpp_hybrid_mtp_only_when_eviction_is_impossible(self):
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+        target = _make_fake_cpp_hybrid(max_seq_len=512)
+        draft = _make_fake_cpp_hybrid(is_draft=True, max_seq_len=512)
+        cfg = TriAttentionKvCacheCompressionConfig(top_B=512, beta=128)
+
+        manager = create_kv_cache_compression_manager(
+            cfg,
+            kv_cache_manager=target,
+            draft_kv_cache_manager=draft,
+            spec_config=MTPDecodingConfig(max_draft_len=3, mtp_eagle_one_model=True),
+        )
+
+        assert isinstance(manager, TriAttention)
+        assert manager._inert_no_eviction
+        assert manager.kv_cache_manager is target
+        assert manager.draft_kv_cache_manager is draft
 
     def test_factory_propagates_eviction_mode(self):
         cfg = TriAttentionKvCacheCompressionConfig(

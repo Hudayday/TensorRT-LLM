@@ -3313,6 +3313,12 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "requires False.")
 
 
+KvCacheCompressionConfigType: TypeAlias = Union[
+    TriAttentionKvCacheCompressionConfig,
+    KvCacheCompressionConfig,
+]
+
+
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
 class AgentTreeConfig(StrictBaseModel, PybindMirror):
     """Configuration for agent tree scheduling.
@@ -4014,7 +4020,7 @@ class BaseLlmArgs(StrictBaseModel):
 
     # KV cache compression config (separate from sparse attention: changes which
     # KV is stored, not the attention computation)
-    kv_cache_compression_config: Optional[KvCacheCompressionConfig] = Field(
+    kv_cache_compression_config: Optional[KvCacheCompressionConfigType] = Field(
         default=None,
         description="KV-cache compression config; None disables compression.",
         status="prototype")

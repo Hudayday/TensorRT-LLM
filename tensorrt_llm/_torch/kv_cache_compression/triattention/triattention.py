@@ -55,14 +55,18 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._torch.kv_cache_compression.attention import requires_paged_draft_kv_length_domain
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, get_draft_token_length
-from tensorrt_llm._torch.pyexecutor.resource_manager import BaseKVCacheCompressionManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    BaseKVCacheCompressionManager,
+    KVCacheCompressionCacheOwner,
+    KVCacheManager,
+)
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
     from tensorrt_llm.llmapi.llm_args import SpeculativeConfig
@@ -1403,9 +1407,9 @@ class TriAttention(BaseKVCacheCompressionManager):
 
     def __init__(
         self,
-        kv_cache_manager: "KVCacheManagerV2",
+        kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
         top_B: int,
-        draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None,
+        draft_kv_cache_manager: Optional[KVCacheCompressionCacheOwner] = None,
         beta: int = 128,
         model_path: Optional[str] = None,
         calibration_path: Optional[str] = None,
@@ -1419,11 +1423,29 @@ class TriAttention(BaseKVCacheCompressionManager):
         skip_swa: bool = True,
         spec_config: Optional["SpeculativeConfig"] = None,
     ):
-        super().__init__(kv_cache_manager, draft_kv_cache_manager)
-        self.kv_cache_manager.generation_capacity_only = True
+        self._inert_no_eviction = int(top_B) >= int(kv_cache_manager.max_seq_len)
+        super().__init__(
+            kv_cache_manager,
+            draft_kv_cache_manager,
+            mutates_kv_cache=not self._inert_no_eviction,
+        )
+        if self._inert_no_eviction:
+            logger.info(
+                "TriAttention is running in inert no-eviction mode because "
+                f"top_B={top_B} is at least max_seq_len={kv_cache_manager.max_seq_len}"
+            )
+        elif not isinstance(kv_cache_manager, KVCacheManagerV2):
+            raise ValueError(
+                "TriAttention physical eviction requires KVCacheManagerV2; "
+                "legacy and hybrid KV cache managers are supported only when "
+                "top_B >= max_seq_len, where eviction is impossible"
+            )
+        else:
+            kv_cache_manager.generation_capacity_only = True
         self.spec_config = spec_config
         self._publish_draft_kv_length_delta = (
-            self.has_independent_draft_kv_cache
+            not self._inert_no_eviction
+            and self.has_independent_draft_kv_cache
             and requires_paged_draft_kv_length_domain(spec_config)
         )
         self.top_B = top_B
@@ -1477,7 +1499,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         # (on_request_init). TRT-LLM does NOT compute calibration; model_path is
         # used for RoPE tables and local layer_types/sliding_window metadata.
         self.model_path = model_path
-        if self.skip_swa and self.model_path is None:
+        if not self._inert_no_eviction and self.skip_swa and self.model_path is None:
             raise ValueError(
                 "TriAttention skip_swa=True requires model_path so kernel-masked "
                 "sliding-attention layers can be classified safely"
@@ -1582,6 +1604,9 @@ class TriAttention(BaseKVCacheCompressionManager):
         runtime schema (see _resolve_calibration). TRT-LLM does not calibrate.
         """
         request_id = request.py_request_id
+        if self._inert_no_eviction:
+            self._initialized_request_ids.add(request_id)
+            return
         if request_id not in self._initialized_request_ids:
             self._validate_v2_compatibility()
             num_layers = self._num_layers_from_manager()
@@ -1613,6 +1638,8 @@ class TriAttention(BaseKVCacheCompressionManager):
     def _validate_v2_compatibility(self) -> None:
         """Reject runtime modes outside the V2 physical-compaction contract."""
         manager = self.kv_cache_manager
+        if not isinstance(manager, KVCacheManagerV2):
+            raise ValueError("TriAttention physical eviction requires KVCacheManagerV2")
         if manager.kv_factor != 2:
             raise ValueError(
                 "TriAttention requires a standard key/value KV cache; "
@@ -1684,11 +1711,14 @@ class TriAttention(BaseKVCacheCompressionManager):
         compaction after that reader, and resize happens only after compaction is
         complete so released pages cannot be reused early.
         """
-        self._periodic_evict(scheduled_batch)
+        if not self._inert_no_eviction:
+            self._periodic_evict(scheduled_batch)
 
     def prepare_resources(self, scheduled_batch: "ScheduledRequests") -> None:
         """Snapshot fixed-linear target growth; mutation remains in final update."""
         super().prepare_resources(scheduled_batch)
+        if self._inert_no_eviction:
+            return
         generation_growth = {}
         for request in scheduled_batch.generation_requests:
             request_id = request.py_request_id
@@ -2051,7 +2081,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         observed prompt length and maximum decode width rather than infer one
         from beta.
         """
-        if not self._fixed_union_prewarm_enabled:
+        if self._inert_no_eviction or not self._fixed_union_prewarm_enabled:
             return
         raw_shapes = os.environ.get("TRIATTN_FIXED_PREWARM_SHAPES", "")
         try:
@@ -2609,6 +2639,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         generation step has one allocated query slot that is not cached yet,
         while later overlap steps include the previous speculative span.
         """
+        if self._inert_no_eviction:
+            return
         kvp = attn_metadata.kv_cache_params
         if kvp is None or kvp.num_cached_tokens_per_seq is None:
             return

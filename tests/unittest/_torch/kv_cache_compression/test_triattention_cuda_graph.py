@@ -122,12 +122,14 @@ def _make_triattention():
 
     kv_cache_manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
     kv_cache_manager.enable_block_reuse = False
+    kv_cache_manager.is_draft = False
     kv_cache_manager.mapping = SimpleNamespace(enable_attention_dp=False)
     kv_cache_manager.is_disagg = False
     kv_cache_manager.max_beam_width = 1
     kv_cache_manager.num_extra_kv_tokens = 0
     kv_cache_manager.max_total_draft_tokens = 0
     kv_cache_manager._kv_reserve_draft_tokens = 0
+    kv_cache_manager.max_seq_len = 65536
     kv_cache_manager.max_attention_window_vec = []
     kv_cache_manager.kv_cache_manager_py_config = SimpleNamespace(layers=[])
     kv_cache_manager.pp_layers = []
