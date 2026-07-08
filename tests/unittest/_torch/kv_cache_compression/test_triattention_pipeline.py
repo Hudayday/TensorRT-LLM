@@ -29,12 +29,13 @@ cover the config + construction + reconcile layer:
   - ``create_kv_cache_compression_manager`` factory dispatch.
   - Capacity-only V2 registration and immediate compacted-capacity resize.
 
-These tests do not run real eviction or attention; that needs model weights and
-is covered by the NIAH end-to-end run.
+These tests cover fixed-buffer selection, page-table preparation, graph
+bookkeeping, and request lifecycle behavior. Model-level correctness is covered
+by separate end-to-end tests.
 """
 
 import ast
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -893,11 +894,8 @@ class TestStepEndHookRefactor:
             timeline.append("stage5_dispatch")
             return [(7, 1024 + 4096)]
 
-        def materialize_stage3():
-            timeline.append("materialize_stage3")
-
-        def materialize_stage4():
-            timeline.append("materialize_stage4")
+        def ensure_graph_buckets(*_args):
+            timeline.append("ensure_graph_buckets")
 
         @contextlib.contextmanager
         def track_range(name, **kwargs):
@@ -908,29 +906,22 @@ class TestStepEndHookRefactor:
         with (
             mock.patch.object(
                 mgr,
-                "_materialize_fixed_shape_selection_banks",
-                side_effect=materialize_stage3,
-            ) as materialize_stage3_banks,
-            mock.patch.object(
-                mgr,
-                "_materialize_cross_request_selection_banks",
-                side_effect=materialize_stage4,
-            ) as materialize_stage4_banks,
+                "_ensure_configured_graph_buckets",
+                side_effect=ensure_graph_buckets,
+            ) as ensure_buckets,
             mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict,
             mock.patch.object(torch.cuda, "Event", return_value=event),
             mock.patch.object(tri_module, "nvtx_range", side_effect=track_range),
         ):
             mgr._periodic_evict(batch)
 
-        materialize_stage3_banks.assert_called_once_with()
-        materialize_stage4_banks.assert_called_once_with()
+        ensure_buckets.assert_called_once_with([(request, 7)], 2)
         evict.assert_called_once_with([(request, 7)], 2)
         event.record.assert_called_once_with()
         event.synchronize.assert_called_once_with()
         cache.resize.assert_called_once_with(1024 + 4096, None)
         assert timeline == [
-            "materialize_stage3",
-            "materialize_stage4",
+            "ensure_graph_buckets",
             "stage5_dispatch",
             "enter:triattention.resize",
             "event",
@@ -981,8 +972,7 @@ class TestStepEndHookRefactor:
             ]
 
         with (
-            mock.patch.object(mgr, "_materialize_fixed_shape_selection_banks"),
-            mock.patch.object(mgr, "_materialize_cross_request_selection_banks"),
+            mock.patch.object(mgr, "_ensure_configured_graph_buckets"),
             mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict,
             mock.patch.object(torch.cuda, "Event", return_value=event),
         ):
@@ -993,7 +983,7 @@ class TestStepEndHookRefactor:
         cache_b.resize.assert_called_once_with(1024 + 4096, None)
         cache_c.resize.assert_called_once_with(1024 + 4096, None)
 
-    def test_cross_request_selection_splits_actual_backend_boundary(self):
+    def test_cross_request_selection_coalesces_legacy_backend_boundary(self):
         from types import SimpleNamespace
         from unittest import mock
 
@@ -1022,17 +1012,13 @@ class TestStepEndHookRefactor:
             return [(rid, prompt_len + mgr.top_B) for _, rid in group]
 
         with (
-            mock.patch.object(mgr, "_materialize_fixed_shape_selection_banks"),
-            mock.patch.object(mgr, "_materialize_cross_request_selection_banks"),
+            mock.patch.object(mgr, "_ensure_configured_graph_buckets"),
             mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict,
             mock.patch.object(torch.cuda, "Event", return_value=event),
         ):
             mgr._periodic_evict(batch)
 
-        assert evict.call_args_list == [
-            mock.call([(request_a, 7)], 2),
-            mock.call([(request_b, 8)], 2),
-        ]
+        evict.assert_called_once_with([(request_a, 7), (request_b, 8)], 2)
 
     def test_resize_failure_is_reported(self):
         from unittest import mock
@@ -1043,8 +1029,7 @@ class TestStepEndHookRefactor:
         event = mock.Mock()
 
         with (
-            mock.patch.object(mgr, "_materialize_fixed_shape_selection_banks"),
-            mock.patch.object(mgr, "_materialize_cross_request_selection_banks"),
+            mock.patch.object(mgr, "_ensure_configured_graph_buckets"),
             mock.patch.object(mgr, "_evict_requests", return_value=[(7, 1024 + 4096)]),
             mock.patch.object(torch.cuda, "Event", return_value=event),
         ):
@@ -1076,8 +1061,7 @@ class TestStepEndHookRefactor:
         event = mock.Mock()
 
         with (
-            mock.patch.object(mgr, "_materialize_fixed_shape_selection_banks"),
-            mock.patch.object(mgr, "_materialize_cross_request_selection_banks"),
+            mock.patch.object(mgr, "_ensure_configured_graph_buckets"),
             mock.patch.object(mgr, "_evict_requests", return_value=[(7, retained)]) as evict,
             mock.patch.object(mgr, "_rebase_protected_tail") as rebase,
             mock.patch.object(torch.cuda, "Event", return_value=event),
@@ -1428,19 +1412,14 @@ class TestStepEndHookRefactor:
         assert mgr._confirmed_kv_lengths == {}
         assert mgr._prepared_generation_growth == {}
 
-    def test_evict_requests_returns_exact_post_forward_capacity(self):
-        from types import SimpleNamespace
-        from unittest import mock
-
-        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels as kernels
-
-        # The reserved-but-unwritten slot may contain nonzero data from a reused
-        # page. Length accounting must use request metadata, not pool contents.
+    def test_evict_requests_builds_exact_graph_metadata(self):
+        # Length accounting must use request state, not unused pool contents.
         pools = [torch.ones(2, 2, 1, 8, 2), torch.ones(2, 2, 1, 8, 2)]
         manager = SimpleNamespace(
             get_buffers=lambda layer, **kwargs: pools[layer],
-            get_batch_cache_indices=lambda *args, **kwargs: [],
             pp_layers=[0, 1],
+            layer_offsets={0: 0, 1: 1},
+            layer_to_pool_mapping_dict={0: 0, 1: 1},
         )
         request = _make_request(7, py_prompt_len=2, max_beam_num_tokens=999)
         mgr = _make_triattention()
@@ -1460,59 +1439,50 @@ class TestStepEndHookRefactor:
         mgr.calibration = {"omega": torch.ones(1)}
         mgr.score_aggregation = "mean"
         mgr._attention_layer_partition = mock.Mock(return_value=([1], [0], 2))
-        mgr._resolve_page_ids = mock.Mock(
-            side_effect=lambda request, layer, page_count=None: ([10] if layer == 1 else [20])
+        mgr._local_score_calibration = mock.Mock(
+            return_value=(torch.ones(1), torch.ones(1), torch.ones(1))
         )
-        mgr._evict_modes = mock.Mock(return_value=torch.arange(6))
-        segment = SimpleNamespace(request_index=0, layer_index=1)
+        score_workspace = object()
+        selection_workspace = object()
+        mgr._fixed_score_workspace_for = mock.Mock(return_value=score_workspace)
+        mgr._attach_page_ids = mock.Mock(return_value=True)
+        mgr._cross_request_selection_for = mock.Mock(return_value=selection_workspace)
+        captured = {}
 
-        with (
-            mock.patch.object(
-                kernels,
-                "triton_tri_score_perhead",
-                return_value=(torch.empty(0), torch.empty(0), [segment]),
-            ) as score,
-            mock.patch.object(kernels, "flat_perhead_to_list", return_value=[torch.zeros(1, 8)]),
-            mock.patch.object(kernels, "cpp_sparse_compact") as compact,
-        ):
-            targets = mgr._evict_requests([(request, 7)], num_layers=2)
+        def run_graph(**kwargs):
+            captured.update(kwargs)
+            return [(7, 6)]
+
+        mgr._try_standalone_cuda_graph = mock.Mock(side_effect=run_graph)
+
+        targets = mgr._evict_requests([(request, 7)], num_layers=2)
 
         assert targets == [(7, 6)]
-        assert mgr._evicted == {7: 7}
-        assert mgr._confirmed_kv_lengths == {7: 6}
-        assert score.call_args.kwargs["layer_indices"] == [1]
-        assert score.call_args.args[1][0].tolist() == [10]
-        assert score.call_args.args[2] == [8]
-        assert score.call_args.args[3] == [13.0]
-        assert mgr._resolve_page_ids.call_args_list == [
-            mock.call(request, 1, 1),
-            mock.call(request, 0, 1),
-        ]
-        assert compact.call_count == 2
-        dense_call, swa_call = compact.call_args_list
-        assert dense_call.args[0] is pools[1]
-        assert dense_call.args[1][0].tolist() == [10]
-        assert swa_call.args[0] is pools[0]
-        assert swa_call.args[1][0].tolist() == [20]
-        assert swa_call.args[2][0].tolist() == [6, 7]
-        assert swa_call.kwargs["dest_list"][0].tolist() == [4, 5]
-        assert swa_call.args[2][0].numel() == 2
+        assert captured["score_workspace"] is score_workspace
+        assert captured["selection_workspace"] is selection_workspace
+        assert captured["dense_layers"] == [1]
+        assert captured["swa_layers"] == [0]
+        assert captured["dense_groups"] == [[1]]
+        item = captured["prepared"][0]
+        assert item["request"] is request
+        assert item["request_id"] == 7
+        assert item["seq_len"] == 8
+        assert item["round_start"] == 13.0
+        assert item["expected_keep_count"] == 6
+        assert item["swa_source"].tolist() == [6, 7]
+        assert item["swa_destination"].tolist() == [4, 5]
+        mgr._attach_page_ids.assert_called_once()
+        mgr._try_standalone_cuda_graph.assert_called_once()
 
-    def test_dense_storage_groups_use_their_own_page_ids(self):
-        import contextlib
-        from types import SimpleNamespace
-        from unittest import mock
-
-        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention as tri_module
-        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels as kernels
-
+    def test_distinct_v2_pools_are_passed_separately_to_the_graph(self):
         pools = [torch.zeros(2, 2, 1, 8, 2), torch.zeros(2, 2, 1, 8, 2)]
         request = _make_request(7, py_prompt_len=2, max_beam_num_tokens=9)
         mgr = _make_triattention()
         mgr.kv_cache_manager = SimpleNamespace(
             get_buffers=lambda layer, **kwargs: pools[layer],
-            get_batch_cache_indices=lambda *args, **kwargs: [],
             pp_layers=[0, 1],
+            layer_offsets={0: 0, 1: 1},
+            layer_to_pool_mapping_dict={0: 10, 1: 20},
         )
         mgr._evicted = {}
         mgr._confirmed_kv_lengths = {7: 8}
@@ -1529,58 +1499,30 @@ class TestStepEndHookRefactor:
         mgr.calibration = {"omega": torch.ones(1)}
         mgr.score_aggregation = "mean"
         mgr._attention_layer_partition = mock.Mock(return_value=([0, 1], [], None))
-        mgr._resolve_page_ids = mock.Mock(
-            side_effect=lambda request, layer, page_count=None: ([10] if layer == 0 else [20])
+        mgr._local_score_calibration = mock.Mock(
+            return_value=(torch.ones(1), torch.ones(1), torch.ones(1))
         )
-        mgr._evict_modes = mock.Mock(return_value=torch.arange(6))
+        score_workspace = object()
+        selection_workspace = object()
+        mgr._fixed_score_workspace_for = mock.Mock(return_value=score_workspace)
+        mgr._attach_page_ids = mock.Mock(return_value=True)
+        mgr._cross_request_selection_for = mock.Mock(return_value=selection_workspace)
+        captured = {}
 
-        def score_group(*args, **kwargs):
-            segments = [
-                SimpleNamespace(request_index=0, layer_index=layer)
-                for layer in kwargs["layer_indices"]
-            ]
-            return torch.empty(0), torch.empty(0), segments
+        def run_graph(**kwargs):
+            captured.update(kwargs)
+            return [(7, 6)]
 
-        with (
-            mock.patch.object(
-                kernels, "triton_tri_score_perhead", side_effect=score_group
-            ) as score,
-            mock.patch.object(
-                kernels,
-                "flat_perhead_to_list",
-                return_value=[torch.zeros(1, 8), torch.zeros(1, 8)],
-            ),
-            mock.patch.object(kernels, "cpp_sparse_compact") as compact,
-            mock.patch.object(
-                tri_module,
-                "nvtx_range",
-                side_effect=lambda *args, **kwargs: contextlib.nullcontext(),
-            ) as nvtx,
-        ):
-            targets = mgr._evict_requests([(request, 7)], num_layers=2)
+        mgr._try_standalone_cuda_graph = mock.Mock(side_effect=run_graph)
+
+        targets = mgr._evict_requests([(request, 7)], num_layers=2)
 
         assert targets == [(7, 6)]
-        # ONE fused launch spans both dense layers; each layer still supplies
-        # its OWN page table via page_ids_per_layer.
-        assert score.call_count == 1
-        fused_call = score.call_args
-        assert fused_call.kwargs["layer_indices"] == [0, 1]
-        per_layer = fused_call.kwargs["page_ids_per_layer"]
-        assert per_layer[0][0].tolist() == [10]
-        assert per_layer[0][1].tolist() == [20]
-        assert compact.call_count == 2
-        first_compact, second_compact = compact.call_args_list
-        assert first_compact.args[0] is pools[0]
-        assert first_compact.args[1][0].tolist() == [10]
-        assert second_compact.args[0] is pools[1]
-        assert second_compact.args[1][0].tolist() == [20]
-        assert [call.args[0] for call in nvtx.call_args_list] == [
-            "triattention.metadata",
-            "triattention.score",
-            "triattention.select",
-            "triattention.compact",
-            "triattention.compact",
-        ]
+        assert captured["dense_groups"] == [[0], [1]]
+        assert captured["layer_group_representative"] == {0: 0, 1: 1}
+        attach_call = mgr._attach_page_ids.call_args
+        assert attach_call.args[1] == [0, 1]
+        assert attach_call.args[4] == [0, 1]
 
 
 class TestTopKRouting:
@@ -1597,20 +1539,6 @@ class TestTopKRouting:
         cute_topk.assert_called_once()
         assert actual.dtype == torch.long
         assert torch.equal(torch.sort(actual, dim=1).values, expected)
-
-    @pytest.mark.parametrize("keep_count", [4096, 8192])
-    def test_eager_union_uses_cute_without_fallback(self, keep_count):
-        width = keep_count + 64
-        scores = _distinct_topk_scores(width)
-        combined = scores.max(dim=0).values
-        expected = _union_oracle(scores, keep_count)
-        manager = _make_triattention(top_B=keep_count)
-
-        with _mock_cute_topk_without_fallbacks() as cute_topk:
-            actual = manager._select_union(scores, combined, keep_count)
-
-        assert cute_topk.call_count >= 2
-        assert torch.equal(actual, expected)
 
     @pytest.mark.parametrize("keep_count", [4096, 8192])
     @pytest.mark.parametrize("eviction_mode", ["per_head", "per_layer_perhead"])
@@ -1801,6 +1729,33 @@ def _torch_union_keep(head_scores, prompt_len, budget):
 
 
 class TestFixedScoreMetadata:
+    def test_live_geometry_groups_by_v2_pool_not_tensor_storage(self):
+        base = torch.empty(4, 2, 1, 8, 2)
+        shared_storage = [base[:2], base[2:]]
+        manager = _make_triattention()
+        manager._dense_layers = mock.Mock(return_value=[0, 1])
+        manager._local_to_global_layers = mock.Mock(return_value=[10, 11])
+        manager.kv_cache_manager = SimpleNamespace(
+            get_buffers=lambda layer, **kwargs: shared_storage[layer - 10],
+            layer_offsets={10: 100, 11: 101},
+            layer_to_pool_mapping_dict={100: 3, 101: 4},
+        )
+
+        _, _, groups = manager._fixed_union_live_geometry(2)
+
+        assert groups == [[0], [1]]
+
+        separate_storage = [torch.empty_like(base[:2]), torch.empty_like(base[:2])]
+        manager.kv_cache_manager = SimpleNamespace(
+            get_buffers=lambda layer, **kwargs: separate_storage[layer - 10],
+            layer_offsets={10: 100, 11: 101},
+            layer_to_pool_mapping_dict={100: 3, 101: 3},
+        )
+
+        _, _, groups = manager._fixed_union_live_geometry(2)
+
+        assert groups == [[0, 1]]
+
     def test_page_table_pool_keys_and_slots_deduplicate_only_identical_v2_pools(self):
         from types import SimpleNamespace
 
@@ -1981,31 +1936,34 @@ class TestFixedScoreMetadata:
         workspace.bulk_copy_done.record.assert_called_once_with(manager_stream)
         current_stream.wait_event.assert_called_once_with(workspace.bulk_copy_done)
 
-    def test_stage2_gate_requires_stage1_prewarm(self):
+    @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
+    def test_config_enables_one_graph_pipeline_without_environment_gates(self, eviction_mode):
         import os
         from unittest import mock
 
         with mock.patch.dict(
             os.environ,
             {
-                "TRIATTN_FIXED_BUFFER_UNION": "1",
+                "TRIATTN_FIXED_BUFFER_UNION": "0",
                 "TRIATTN_FIXED_PREWARM": "0",
-                "TRIATTN_FIXED_SCORE_METADATA": "1",
+                "TRIATTN_FIXED_SCORE_METADATA": "0",
+                "TRIATTN_FIXED_SHAPE_SELECTION": "0",
+                "TRIATTN_CROSS_REQUEST_SELECTION": "0",
+                "TRIATTN_STANDALONE_CUDA_GRAPH": "0",
             },
         ):
-            manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
-            assert not manager._fixed_score_metadata_enabled
-
-        with mock.patch.dict(
-            os.environ,
-            {
-                "TRIATTN_FIXED_BUFFER_UNION": "1",
-                "TRIATTN_FIXED_PREWARM": "1",
-                "TRIATTN_FIXED_SCORE_METADATA": "1",
-            },
-        ):
-            manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
+            manager = TriAttention(
+                _make_fake_v2(),
+                top_B=4096,
+                eviction_mode=eviction_mode,
+                skip_swa=False,
+            )
+            assert manager._fixed_union_enabled == (eviction_mode == "union")
+            assert manager._fixed_union_prewarm_enabled
             assert manager._fixed_score_metadata_enabled
+            assert not manager._fixed_shape_selection_enabled
+            assert manager._cross_request_selection_enabled
+            assert manager._standalone_cuda_graph_enabled
 
     @pytest.mark.parametrize("request_count", [1, 7, 8])
     def test_ready_workspace_selects_smallest_covering_upper_bucket(self, request_count):
@@ -2013,7 +1971,9 @@ class TestFixedScoreMetadata:
         from unittest import mock
 
         manager = _make_triattention()
+        manager.top_B = 4
         manager._fixed_score_metadata_enabled = True
+        manager._cross_request_selection_enabled = False
         workspace = SimpleNamespace(
             max_requests=8,
             prompt_len=2,
@@ -2047,7 +2007,7 @@ class TestFixedScoreMetadata:
             manager._fixed_score_workspace_for(pools, [0, 1], [[0], [1]], [], 2, prepared) is None
         )
 
-    def test_busy_pinned_staging_falls_back_without_querying_page_tables(self):
+    def test_busy_pinned_staging_waits_then_reuses_the_same_graph_buffers(self):
         from types import SimpleNamespace
         from unittest import mock
 
@@ -2061,13 +2021,26 @@ class TestFixedScoreMetadata:
         stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=4)
         workspace.stream = stream
         workspace.copy_pending = True
-        workspace.copy_done = SimpleNamespace(query=mock.Mock(return_value=False))
-        get_batch = mock.Mock(side_effect=AssertionError("busy workspace queried V2"))
+        workspace.copy_done = mock.Mock()
+        workspace.copy_done.query.return_value = False
+        workspace.global_representatives = (10,)
+        workspace.page_count = 2
+        workspace.bucket_seq_len = 8
+        workspace.tokens_per_block = 4
+        workspace.page_ids_host = torch.empty((1, 8, 2), dtype=torch.int64)
+        workspace.round_starts_host = torch.empty(8, dtype=torch.float32)
+        workspace.valid_seq_lens_host = torch.empty(8, dtype=torch.int32)
+        workspace.page_ids_device = mock.Mock()
+        workspace.round_starts_device = mock.Mock()
+        workspace.valid_seq_lens_device = mock.Mock()
+        workspace.fused_group = mock.Mock()
+        get_batch = mock.Mock(return_value=[[4, 5]])
 
         with mock.patch.object(torch.cuda, "current_stream", return_value=stream):
-            assert not workspace.stage(get_batch, [1], [8.0])
+            assert workspace.stage(get_batch, [1], [8.0])
         workspace.copy_done.query.assert_called_once_with()
-        get_batch.assert_not_called()
+        workspace.copy_done.synchronize.assert_called_once_with()
+        get_batch.assert_called_once_with([1], 10, num_blocks_per_seq=[2])
 
     def test_cross_stream_staging_is_rejected_before_page_table_query(self):
         from types import SimpleNamespace
@@ -2083,7 +2056,7 @@ class TestFixedScoreMetadata:
         workspace.max_requests = 8
         workspace.stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=4)
         workspace.copy_pending = False
-        workspace.copy_done = SimpleNamespace(query=mock.Mock())
+        workspace.copy_done = SimpleNamespace(query=mock.Mock(), synchronize=mock.Mock())
         get_batch = mock.Mock(side_effect=AssertionError("cross-stream workspace queried V2"))
 
         other_stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=5)
@@ -2091,6 +2064,7 @@ class TestFixedScoreMetadata:
             with pytest.raises(_FixedScoreStreamMismatch, match="first CUDA stream"):
                 workspace.stage(get_batch, [1], [8.0])
         workspace.copy_done.query.assert_not_called()
+        workspace.copy_done.synchronize.assert_not_called()
         get_batch.assert_not_called()
 
     def test_attach_page_ids_does_not_swallow_cross_stream_rejection(self):
@@ -2714,7 +2688,6 @@ class TestFixedScoreMetadata:
             return manager
 
         selection_manager = build_selection_manager(True)
-        eager_selection_manager = build_selection_manager(False)
         group = workspace.fused_group
         stable_workspace_pointers = tensor_pointers(workspace)
         stable_group_pointers = tensor_pointers(group)
@@ -2826,16 +2799,9 @@ class TestFixedScoreMetadata:
                     precomputed,
                     fixed_union_workspace=active_selection[request],
                 ).clone()
-                eager_keep = eager_selection_manager._evict_modes(
-                    request_state,
-                    len(pools),
-                    seq_len,
-                    precomputed,
-                ).clone()
                 oracle_keep = _torch_union_keep(
                     torch.cat(fixed_rows, dim=0), prompt_len=1, budget=3
                 )
-                assert torch.equal(fixed_keep, eager_keep)
                 assert torch.equal(fixed_keep, oracle_keep)
 
             for item in selection_bank[request_count:]:
@@ -2863,162 +2829,67 @@ class TestFixedScoreMetadata:
         }
 
     @CUDA_REQUIRED
-    def test_gptoss_dense_swa_rebase_and_capacity_match_staging_fallback(self):
-        from types import SimpleNamespace
-
+    def test_gptoss_page_tables_stage_each_dense_and_swa_pool(self):
         from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
             _FixedScoreMetadataWorkspace,
         )
 
         device = torch.device("cuda")
-        torch.manual_seed(731)
         seq_len = 8
-        keep_count = 6
         page_lists = {0: [1, 2], 1: [0, 1], 2: [2, 0]}
-        page_ids = {
-            layer: torch.tensor(pages, dtype=torch.int64, device=device)
-            for layer, pages in page_lists.items()
-        }
-        base_pools = [
-            torch.arange(3 * 2 * 1 * 4 * 4, dtype=torch.float32, device=device).view(3, 2, 1, 4, 4),
-            torch.arange(3 * 2 * 1 * 4 * 4, dtype=torch.float32, device=device).view(3, 2, 1, 4, 4)
-            + 500.0,
-            torch.arange(3 * 2 * 1 * 4 * 4, dtype=torch.float32, device=device).view(3, 2, 1, 4, 4)
-            + 1000.0,
-        ]
+        pools = [torch.empty(3, 2, 1, 4, 4, dtype=torch.float32, device=device) for _ in range(3)]
         q_real = torch.ones(3, 2, 2, device=device)
         q_imag = torch.full_like(q_real, 0.25)
         mlr = torch.full_like(q_real, 0.1)
         freq = torch.tensor([0.8, 1.2], device=device)
         omega = torch.tensor([0.017, 0.043], device=device)
         offsets = torch.tensor([1.0, 2.0, 4.0], device=device)
-
-        def build(force_fallback):
-            pools = [pool.clone() for pool in base_pools]
-            cache = _make_fake_v2()
-            cache.max_batch_size = 8
-            cache.pp_layers = [0, 1, 2]
-            cache.num_layers = 3
-            cache.layer_offsets = {0: 0, 1: 1, 2: 2}
-            cache.batch_calls = []
-            cache.get_buffers = lambda layer, **kwargs: pools[layer]
-
-            def get_batch(request_ids, layer, num_blocks_per_seq=None):
-                assert num_blocks_per_seq == [2] * len(request_ids)
-                cache.batch_calls.append((tuple(request_ids), layer))
-                return [list(page_lists[layer]) for _ in request_ids]
-
-            cache.get_batch_cache_indices = get_batch
-            manager = TriAttention(
-                cache,
-                top_B=4,
-                beta=4,
-                score_aggregation="mean",
-                eviction_mode="union",
-                skip_swa=False,
-            )
-            manager._calibrated = True
-            manager._L = 3
-            manager._H = manager._F = 2
-            manager._triattn_q_real = q_real
-            manager._triattn_q_imag = q_imag
-            manager._triattn_mlr_coef = mlr
-            manager._freq_scale_sq = freq
-            manager.calibration = {"omega": omega}
-            manager._offsets = offsets
-            manager._attention_layer_partition = lambda num_layers: ([1, 2], [0], 2)
-            manager._local_to_global_layers_cache = [0, 1, 2]
-            manager._fixed_union_enabled = False
-            manager._fixed_union_prewarm_enabled = False
-            manager._fixed_union_compaction_enabled = False
-            manager._fixed_score_metadata_enabled = True
-            manager._fixed_union_prewarm_key = lambda *args: ("gptoss",)
-            workspace = _FixedScoreMetadataWorkspace(
-                pools,
-                [[1], [2]],
-                [1, 2, 0],
-                [0, 1, 2],
-                8,
-                seq_len,
-                2,
-                2,
-                q_real,
-                q_imag,
-                mlr,
-                freq,
-                offsets,
-                omega,
-                prompt_len=2,
-            )
-            if force_fallback:
-                workspace.stage = lambda *args: False
-            workspace.prewarm_key = ("gptoss",)
-            manager._fixed_score_workspaces = {("gptoss",): workspace}
-            manager._fixed_score_prewarm_states = {("gptoss",): "ready"}
-            manager._fixed_score_runtime_counts = {}
-            manager._confirmed_kv_lengths = {7: seq_len}
-            manager._evicted = {}
-            original_evict_modes = manager._evict_modes
-
-            def capture_keep(*args, **kwargs):
-                keep = original_evict_modes(*args, **kwargs)
-                manager.test_keep = keep.clone()
-                return keep
-
-            manager._evict_modes = capture_keep
-            request = SimpleNamespace(
-                py_request_id=7,
-                py_prompt_len=2,
-                py_draft_tokens=[],
-                max_beam_num_tokens=seq_len + 1,
-            )
-            return manager, request, pools, cache
-
-        fixed_manager, fixed_request, fixed_pools, fixed_cache = build(False)
-        eager_manager, eager_request, eager_pools, _ = build(True)
-        fixed_targets = fixed_manager._evict_requests([(fixed_request, 7)], num_layers=3)
-        eager_targets = eager_manager._evict_requests([(eager_request, 7)], num_layers=3)
-        torch.cuda.current_stream(device).synchronize()
-
-        assert fixed_targets == eager_targets == [(7, keep_count)]
-        assert torch.equal(fixed_manager.test_keep, eager_manager.test_keep)
-        oracle_scores = _torch_tri_score_oracle(
-            base_pools,
-            {layer: ids.unsqueeze(0) for layer, ids in page_ids.items()},
-            [seq_len],
-            [float(seq_len)],
+        workspace = _FixedScoreMetadataWorkspace(
+            pools,
+            [[1], [2]],
+            [1, 2, 0],
+            [0, 1, 2],
+            2,
+            seq_len,
+            2,
+            2,
             q_real,
             q_imag,
             mlr,
             freq,
-            omega,
             offsets,
-            [1, 2],
-            "mean",
+            omega,
+            page_table_keys=[("pool", 1), ("pool", 2), ("pool", 0)],
+            prompt_len=2,
         )
-        assert torch.equal(
-            fixed_manager.test_keep,
-            _torch_union_keep(torch.cat(oracle_scores), prompt_len=2, budget=4),
+        batch_calls = []
+
+        def get_batch(request_ids, layer, num_blocks_per_seq=None):
+            batch_calls.append((tuple(request_ids), layer, tuple(num_blocks_per_seq)))
+            return [list(page_lists[layer]) for _ in request_ids]
+
+        cache = SimpleNamespace(get_batch_cache_indices=get_batch)
+
+        assert workspace.stage(cache, [7, 8], [8.0, 9.0], [8, 7])
+        torch.cuda.current_stream(device).synchronize()
+
+        expected = torch.tensor(
+            [
+                [page_lists[1], page_lists[1]],
+                [page_lists[2], page_lists[2]],
+                [page_lists[0], page_lists[0]],
+            ],
+            dtype=torch.int64,
+            device=device,
         )
-        assert fixed_manager._fixed_score_runtime_counts[("gptoss",)]["hit"] == 1
-        assert eager_manager._fixed_score_runtime_counts[("gptoss",)]["fallback"] == 1
-        assert fixed_manager._evicted == eager_manager._evicted == {7: 2}
-        assert fixed_manager._confirmed_kv_lengths == {7: keep_count}
-        for layer in (1, 2):
-            original_dense = _logical_kv(base_pools[layer], page_ids[layer], seq_len)
-            expected_dense = original_dense.index_select(2, fixed_manager.test_keep)
-            fixed_dense = _logical_kv(fixed_pools[layer], page_ids[layer], keep_count)
-            eager_dense = _logical_kv(eager_pools[layer], page_ids[layer], keep_count)
-            assert torch.equal(fixed_dense, expected_dense)
-            assert torch.equal(fixed_dense, eager_dense)
-        original_swa = _logical_kv(base_pools[0], page_ids[0], seq_len)
-        swa_keep = _build_swa_rebase_keep(seq_len, keep_count, 2, device=device)
-        expected_swa = original_swa.index_select(2, swa_keep)
-        fixed_swa = _logical_kv(fixed_pools[0], page_ids[0], keep_count)
-        eager_swa = _logical_kv(eager_pools[0], page_ids[0], keep_count)
-        assert torch.equal(fixed_swa, expected_swa)
-        assert torch.equal(fixed_swa, eager_swa)
-        assert fixed_cache.batch_calls[:3] == [((7,), 1), ((7,), 2), ((7,), 0)]
+        assert torch.equal(workspace.page_ids_device[:, :2], expected)
+        assert workspace.round_starts_device[:2].tolist() == [8.0, 9.0]
+        assert workspace.valid_seq_lens_device[:2].tolist() == [8, 7]
+        assert batch_calls == [
+            ((7, 8), 1, (2, 2)),
+            ((7, 8), 2, (2, 2)),
+            ((7, 8), 0, (2, 2)),
+        ]
 
 
 class TestFixedScoreSegmentViews:
@@ -3105,83 +2976,6 @@ class TestFixedUnionWorkspace:
 
         assert workspace._matches_input(scores)
 
-    def test_prewarm_has_distinct_nested_environment_gate(self):
-        import os
-        from unittest import mock
-
-        with mock.patch.dict(
-            os.environ,
-            {
-                "TRIATTN_FIXED_BUFFER_UNION": "0",
-                "TRIATTN_FIXED_PREWARM": "1",
-            },
-        ):
-            manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
-            assert not manager._fixed_union_prewarm_enabled
-
-        with mock.patch.dict(
-            os.environ,
-            {
-                "TRIATTN_FIXED_BUFFER_UNION": "1",
-                "TRIATTN_FIXED_PREWARM": "0",
-            },
-        ):
-            manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
-            assert manager._fixed_union_enabled
-            assert not manager._fixed_union_prewarm_enabled
-
-        with mock.patch.dict(
-            os.environ,
-            {
-                "TRIATTN_FIXED_BUFFER_UNION": "1",
-                "TRIATTN_FIXED_PREWARM": "1",
-            },
-        ):
-            manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
-            assert manager._fixed_union_prewarm_enabled
-
-    def test_fixed_shape_selection_requires_every_cumulative_gate(self):
-        import os
-        from unittest import mock
-
-        env = {
-            "TRIATTN_FIXED_BUFFER_UNION": "1",
-            "TRIATTN_FIXED_PREWARM": "1",
-            "TRIATTN_FIXED_SCORE_METADATA": "1",
-            "TRIATTN_FIXED_SHAPE_SELECTION": "0",
-        }
-        with mock.patch.dict(os.environ, env):
-            manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
-            assert not manager._fixed_shape_selection_enabled
-
-        env["TRIATTN_FIXED_SHAPE_SELECTION"] = "1"
-        with mock.patch.dict(os.environ, env):
-            manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
-            assert manager._fixed_shape_selection_enabled
-
-    def test_standalone_cuda_graph_requires_every_cumulative_gate(self):
-        import os
-        from unittest import mock
-
-        env = {
-            "TRIATTN_FIXED_BUFFER_UNION": "1",
-            "TRIATTN_FIXED_PREWARM": "1",
-            "TRIATTN_FIXED_SCORE_METADATA": "1",
-            "TRIATTN_FIXED_SHAPE_SELECTION": "1",
-            "TRIATTN_CROSS_REQUEST_SELECTION": "1",
-            "TRIATTN_STANDALONE_CUDA_GRAPH": "1",
-        }
-        with mock.patch.dict(os.environ, env):
-            manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
-            assert manager._standalone_cuda_graph_enabled
-
-        for gate in env:
-            disabled = dict(env)
-            disabled[gate] = "0"
-            with mock.patch.dict(os.environ, disabled):
-                manager = TriAttention(_make_fake_v2(), top_B=4096, skip_swa=False)
-                assert not manager._standalone_cuda_graph_enabled
-
     def test_prewarm_shape_parser_is_explicit_and_fail_closed(self):
         assert TriAttention._parse_fixed_prewarm_shapes("1024:8192, 0:4097,1024:8192") == [
             (1024, 8192),
@@ -3202,9 +2996,7 @@ class TestFixedUnionWorkspace:
         assert manager._upper_prewarm_shapes_by_backend(
             [(1024, 3072), (1024, 4096), (1024, 4224), (0, 8192)]
         ) == [
-            (0, 4095),
             (0, 8192),
-            (1024, 4095),
             (1024, 4224),
         ]
 
@@ -3212,7 +3004,7 @@ class TestFixedUnionWorkspace:
         "budget,beta,maximum_width,expected_widths",
         [
             (32, 4, 36, [36]),
-            (2048, 2048, 4100, [4095, 4100]),
+            (2048, 2048, 4100, [4100]),
             (4096, 128, 4228, [4228]),
             (4096, 4096, 8196, [8196]),
         ],
@@ -3253,10 +3045,172 @@ class TestFixedUnionWorkspace:
         ):
             manager.prewarm()
 
-        assert [call.args[-2:] for call in prewarm_bucket.call_args_list] == [
-            (1024, 4095),
-            (1024, 4096),
+        assert [call.args[-2:] for call in prewarm_bucket.call_args_list] == [(1024, 4096)]
+
+    def test_runtime_graph_buckets_use_smallest_configured_upper_shape(self):
+        import os
+        from unittest import mock
+
+        manager = _make_triattention(top_B=4096, beta=128)
+        manager._confirmed_kv_lengths = {
+            7: 1024 + 4223,
+            8: 1024 + 4300,
+            9: 512 + 4100,
+        }
+        layer_pools = [object()]
+        dense_layers = [0]
+        storage_groups = [[0]]
+        manager._fixed_union_live_geometry = mock.Mock(
+            return_value=(layer_pools, dense_layers, storage_groups)
+        )
+        manager._fixed_union_prewarm_key = mock.Mock(
+            side_effect=lambda *args: (args[-1], args[-2] - args[-1])
+        )
+
+        def mark_ready(*args):
+            key = (args[-2], args[-1])
+            manager._fixed_union_prewarm_states[key] = "ready"
+            manager._fixed_score_prewarm_states[key] = "ready"
+            manager._cross_request_selection_prewarm_states[key] = "ready"
+
+        manager._prewarm_fixed_union_bucket = mock.Mock(side_effect=mark_ready)
+        manager._materialize_cross_request_selection_banks = mock.Mock()
+        evict_now = [
+            (SimpleNamespace(py_prompt_len=1024), 7),
+            (SimpleNamespace(py_prompt_len=1024), 8),
+            (SimpleNamespace(py_prompt_len=512), 9),
         ]
+
+        with mock.patch.dict(
+            os.environ,
+            {"TRIATTN_FIXED_PREWARM_SHAPES": "512:4224,1024:4352"},
+        ):
+            manager._ensure_configured_graph_buckets(evict_now, num_layers=1)
+
+        assert [call.args[-2:] for call in manager._prewarm_fixed_union_bucket.call_args_list] == [
+            (512, 4224),
+            (1024, 4352),
+        ]
+        manager._materialize_cross_request_selection_banks.assert_called_once_with()
+
+    def test_runtime_graph_reuses_one_upper_shape_for_ragged_lengths_and_batches(self):
+        import os
+        from unittest import mock
+
+        manager = _make_triattention(top_B=128, beta=4)
+        layer_pools = [object()]
+        dense_layers = [0]
+        storage_groups = [[0]]
+        upper_key = (64, 136)
+        manager._fixed_union_live_geometry = mock.Mock(
+            return_value=(layer_pools, dense_layers, storage_groups)
+        )
+        manager._fixed_union_prewarm_key = mock.Mock(
+            side_effect=lambda *args: (args[-1], args[-2] - args[-1])
+        )
+
+        score_workspace = SimpleNamespace(
+            prewarm_key=upper_key,
+            prompt_len=64,
+            bucket_seq_len=200,
+            max_requests=2,
+            matches=mock.Mock(return_value=True),
+        )
+        selection_workspace = SimpleNamespace(
+            eviction_mode="union",
+            selection_backend="cute_dsl_topk",
+            max_requests=2,
+            prompt_len=64,
+            width=136,
+            keep_count=128,
+            dense_layers=(0,),
+            num_query_heads=1,
+            num_kv_heads=1,
+        )
+        selection_plan = SimpleNamespace(
+            eviction_mode="union",
+            dense_layers=(0,),
+            selection_backend="cute_dsl_topk",
+        )
+
+        def mark_ready(*args):
+            assert args[-2:] == (64, 136)
+            manager._fixed_union_prewarm_states[upper_key] = "ready"
+            manager._fixed_score_prewarm_states[upper_key] = "ready"
+            manager._fixed_score_workspaces[upper_key] = score_workspace
+            manager._cross_request_selection_prewarm_states[upper_key] = "ready"
+            manager._cross_request_selection_workspaces[upper_key] = selection_workspace
+            manager._cross_request_selection_plans[upper_key] = selection_plan
+
+        manager._prewarm_fixed_union_bucket = mock.Mock(side_effect=mark_ready)
+        manager._materialize_cross_request_selection_banks = mock.Mock()
+        graph_keys = set()
+        request_id = 0
+
+        with mock.patch.dict(
+            os.environ,
+            {"TRIATTN_FIXED_PREWARM_SHAPES": "64:136"},
+        ):
+            for decode_width in (132, 133, 134, 136):
+                for request_count in (1, 2):
+                    evict_now = []
+                    prepared = []
+                    for _ in range(request_count):
+                        request = SimpleNamespace(py_prompt_len=64)
+                        manager._confirmed_kv_lengths[request_id] = 64 + decode_width
+                        evict_now.append((request, request_id))
+                        prepared.append(
+                            {
+                                "seq_len": 64 + decode_width,
+                                "request": request,
+                                "expected_keep_count": 192,
+                            }
+                        )
+                        request_id += 1
+
+                    manager._ensure_configured_graph_buckets(evict_now, num_layers=1)
+                    selected_score_workspace = manager._fixed_score_workspace_for(
+                        layer_pools,
+                        dense_layers,
+                        storage_groups,
+                        [],
+                        1,
+                        prepared,
+                    )
+                    assert selected_score_workspace is score_workspace
+                    graph_keys.add(
+                        manager._standalone_graph_bucket_for(
+                            prepared,
+                            selected_score_workspace,
+                            selection_workspace,
+                        )
+                    )
+
+        manager._prewarm_fixed_union_bucket.assert_called_once()
+        assert manager._prewarm_fixed_union_bucket.call_args.args[-2:] == (64, 136)
+        assert len(graph_keys) == 2
+        assert {(key[3], key[4]) for key in graph_keys} == {(1, 200), (2, 200)}
+
+    def test_runtime_graph_bucket_fails_when_configured_upper_shape_is_too_small(self):
+        import os
+        from unittest import mock
+
+        manager = _make_triattention(top_B=128, beta=4)
+        manager._confirmed_kv_lengths = {7: 64 + 137}
+        manager._fixed_union_live_geometry = mock.Mock(return_value=([object()], [0], [[0]]))
+        manager._prewarm_fixed_union_bucket = mock.Mock()
+        evict_now = [(SimpleNamespace(py_prompt_len=64), 7)]
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"TRIATTN_FIXED_PREWARM_SHAPES": "64:136"},
+            ),
+            pytest.raises(RuntimeError, match="no configured upper bucket covering"),
+        ):
+            manager._ensure_configured_graph_buckets(evict_now, num_layers=1)
+
+        manager._prewarm_fixed_union_bucket.assert_not_called()
 
     def test_dummy_pool_preserves_geometry_without_aliasing_live_storage(self):
         live = torch.arange(3 * 2 * 2 * 4 * 3, dtype=torch.float32).reshape(3, 2, 2, 4, 3)
@@ -3299,7 +3253,7 @@ class TestFixedUnionWorkspace:
 
         assert first == second
 
-    def test_prewarm_key_records_cute_backend_for_eager_and_fixed_shapes(self):
+    def test_prewarm_key_records_one_fixed_cute_backend_for_all_shapes(self):
         manager, pools = self._make_mocked_prewarm_manager()
         manager.top_B = 2048
 
@@ -3329,11 +3283,11 @@ class TestFixedUnionWorkspace:
             prompt_len=1024,
         )
 
-        assert native[0] == "triattention.fixed-prewarm.v3"
-        assert native[9] == "eager_union.cute_dsl_topk"
-        assert eager[9] == "eager_union.cute_dsl_topk"
+        assert native[0] == "triattention.fixed-prewarm.v5"
+        assert native[9] == "fixed_union.cute_dsl_topk"
+        assert eager[9] == "fixed_union.cute_dsl_topk"
         assert fixed[9] == "fixed_union.cute_dsl_topk"
-        assert native[12:17] == (1024 + 4095, 1024, 2048, 4, 4095)
+        assert native[11:17] == (1024 + 4095, 1024, 2048, 4, 4095, "union")
         assert native != eager
 
     @staticmethod
@@ -3348,7 +3302,11 @@ class TestFixedUnionWorkspace:
             storage.as_strided(shape, stride, storage_offset=32),
         ]
         manager = _make_triattention()
-        manager.kv_cache_manager = SimpleNamespace(get_buffers=lambda layer, **kwargs: pools[layer])
+        manager.kv_cache_manager = SimpleNamespace(
+            get_buffers=lambda layer, **kwargs: pools[layer],
+            layer_offsets={0: 0, 1: 1},
+            layer_to_pool_mapping_dict={0: 0, 1: 0},
+        )
         manager.top_B = 4
         manager._H = 2
         manager._F = 1
@@ -3511,7 +3469,7 @@ class TestFixedUnionWorkspace:
 
         with (
             mock.patch.object(kernels, "triton_tri_score_perhead", side_effect=fake_score),
-            mock.patch.object(kernels, "cpp_sparse_compact") as compact,
+            mock.patch.object(_FixedUnionWorkspace, "compact", autospec=True) as compact,
             mock.patch.object(
                 tri_module,
                 "nvtx_range",
@@ -3534,11 +3492,11 @@ class TestFixedUnionWorkspace:
         ]
         assert all(call.args[3] == 2048 for call in cute_topk.call_args_list)
         compact.assert_called_once()
-        assert compact.call_args.args[3] == [1024 + 4095]
-        keep = compact.call_args.args[2][0]
-        assert keep.shape == (1024 + 2048,)
+        assert compact.call_args.args[3] == 1024 + 4095
+        workspace = next(iter(manager._fixed_union_prewarmed_workspaces.values()))
+        assert workspace.keep.shape == (1024 + 2048,)
         assert list(manager._fixed_union_prewarm_states.values()) == ["ready"]
-        assert not manager._fixed_union_prewarmed_workspaces
+        assert len(manager._fixed_union_prewarmed_workspaces) == 1
         assert live_ptrs == [pool.untyped_storage().data_ptr() for pool in pools]
         for pool, before in zip(pools, live_before):
             assert torch.equal(pool, before)
@@ -3563,7 +3521,7 @@ class TestFixedUnionWorkspace:
 
         with (
             mock.patch.object(kernels, "triton_tri_score_perhead", side_effect=fake_score),
-            mock.patch.object(kernels, "cpp_sparse_compact") as compact,
+            mock.patch.object(_FixedUnionWorkspace, "compact", autospec=True) as compact,
             mock.patch.object(
                 tri_module,
                 "nvtx_range",
@@ -3586,18 +3544,18 @@ class TestFixedUnionWorkspace:
         ]
         assert all(call.args[3] == 2048 for call in cute_topk.call_args_list)
         compact.assert_called_once()
-        assert compact.call_args.args[3] == [1024 + 4096]
-        keep = compact.call_args.args[2][0]
-        assert keep.shape == (1024 + 2048,)
+        assert compact.call_args.args[3] == 1024 + 4096
+        workspace = next(iter(manager._fixed_union_prewarmed_workspaces.values()))
+        assert workspace.keep.shape == (1024 + 2048,)
         assert list(manager._fixed_union_prewarm_states.values()) == ["ready"]
         key = next(iter(manager._fixed_union_prewarm_states))
-        assert key[9] == "eager_union.cute_dsl_topk"
-        assert not manager._fixed_union_prewarmed_workspaces
+        assert key[9] == "fixed_union.cute_dsl_topk"
+        assert len(manager._fixed_union_prewarmed_workspaces) == 1
         assert live_ptrs == [pool.untyped_storage().data_ptr() for pool in pools]
         for pool, before in zip(pools, live_before):
             assert torch.equal(pool, before)
 
-    def test_prewarm_failure_marks_bucket_and_runtime_falls_back(self):
+    def test_prewarm_failure_marks_bucket_and_runtime_uses_new_fixed_workspace(self):
         from unittest import mock
 
         import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels as kernels
@@ -3628,14 +3586,14 @@ class TestFixedUnionWorkspace:
 
         assert list(manager._fixed_union_prewarm_states.values()) == ["failed"]
         assert not manager._fixed_union_prewarmed_workspaces
-        fallback = manager._get_fixed_union_workspace(
+        runtime = manager._get_fixed_union_workspace(
             99,
             torch.zeros((4, 5), dtype=torch.float32),
             4,
             2,
         )
-        assert fallback is not None
-        assert not fallback.prewarmed
+        assert runtime is not None
+        assert not runtime.prewarmed
         assert request_state_before == (
             manager._gen_steps,
             manager._evicted,
@@ -3645,7 +3603,7 @@ class TestFixedUnionWorkspace:
         for pool, before in zip(pools, live_before):
             assert torch.equal(pool, before)
 
-    def test_width_fallback_prewarm_keeps_runtime_on_eager_route(self):
+    def test_small_budget_prewarm_uses_the_same_fixed_route(self):
         import contextlib
         from unittest import mock
 
@@ -3663,13 +3621,13 @@ class TestFixedUnionWorkspace:
 
         with (
             mock.patch.object(kernels, "triton_tri_score_perhead", side_effect=fake_score),
-            mock.patch.object(kernels, "cpp_sparse_compact") as compact,
+            mock.patch.object(_FixedUnionWorkspace, "compact", autospec=True) as compact,
             mock.patch.object(
                 tri_module,
                 "nvtx_range",
                 side_effect=lambda *args, **kwargs: contextlib.nullcontext(),
             ) as nvtx,
-            mock.patch.object(torch, "topk", wraps=torch.topk) as topk,
+            _mock_cute_topk_without_fallbacks() as cute_topk,
         ):
             manager._prewarm_fixed_union_bucket(
                 layer_pools,
@@ -3686,12 +3644,13 @@ class TestFixedUnionWorkspace:
             "triattention.prewarm.select",
             "triattention.prewarm.compact",
         ]
-        assert topk.call_count == 2
+        assert cute_topk.call_count == 2
         compact.assert_called_once()
-        assert compact.call_args.args[2][0].tolist() == [0, 1, 4, 5]
-        assert compact.call_args.args[3] == [6]
+        assert compact.call_args.args[3] == 6
+        workspace = next(iter(manager._fixed_union_prewarmed_workspaces.values()))
+        assert workspace.keep.tolist() == [0, 1, 4, 5]
         assert list(manager._fixed_union_prewarm_states.values()) == ["ready"]
-        assert not manager._fixed_union_prewarmed_workspaces
+        assert len(manager._fixed_union_prewarmed_workspaces) == 1
         assert (
             manager._get_fixed_union_workspace(
                 99,
@@ -3699,7 +3658,7 @@ class TestFixedUnionWorkspace:
                 2,
                 2,
             )
-            is None
+            is not None
         )
         for pool, before in zip(pools, live_before):
             assert torch.equal(pool, before)
@@ -3745,7 +3704,7 @@ class TestFixedUnionWorkspace:
         for pool, before in zip(pools, live_before):
             assert torch.equal(pool, before)
 
-    def test_missing_or_mismatched_prewarm_bucket_preserves_fixed_fallback(self):
+    def test_missing_or_mismatched_prewarm_bucket_creates_runtime_fixed_workspace(self):
         manager, _ = self._make_mocked_prewarm_manager()
 
         missing = manager._get_fixed_union_workspace(
@@ -3788,8 +3747,9 @@ class TestFixedUnionWorkspace:
             if isinstance(value, torch.Tensor)
         }
 
-        first = workspace.select(scores).clone()
-        second = workspace.select(scores).clone()
+        with _mock_cute_topk_without_fallbacks():
+            first = workspace.select(scores).clone()
+            second = workspace.select(scores).clone()
         reference = self._reference(scores, keep_count)
 
         assert torch.equal(first, second)
@@ -3861,6 +3821,9 @@ class TestFixedUnionWorkspace:
         }
 
         with (
+            _mock_cute_topk_without_fallbacks()
+            if torch.device(device).type == "cpu"
+            else nullcontext(),
             mock.patch.object(
                 torch,
                 "nonzero",
@@ -3915,8 +3878,16 @@ class TestFixedUnionWorkspace:
 
         assert selected == workspaces[:2]
         assert len({item.keep.data_ptr() for item in workspaces}) == 3
-        for name in _FixedUnionWorkspace._SELECTION_SCRATCH_NAMES:
-            assert len({getattr(item, name).data_ptr() for item in workspaces}) == 1
+        for tensor_index in range(len(base._selection_scratch_tensors())):
+            assert (
+                len(
+                    {
+                        item._selection_scratch_tensors()[tensor_index].data_ptr()
+                        for item in workspaces
+                    }
+                )
+                == 1
+            )
         keep_bytes = base.keep.numel() * base.keep.element_size()
         shared_bank_bytes = base.selection_buffer_nbytes() + keep_bytes * (len(workspaces) - 1)
         legacy_bank_bytes = base.selection_buffer_nbytes() * len(workspaces)
@@ -3992,6 +3963,7 @@ class TestFixedUnionWorkspace:
                 scores_by_layer,
                 [0, 1],
                 2,
+                2,
                 19,
             )
         workspace_init.assert_not_called()
@@ -4005,6 +3977,7 @@ class TestFixedUnionWorkspace:
         assert not hasattr(base, "input_scores")
 
         with (
+            _mock_cute_topk_without_fallbacks() if device.type == "cpu" else nullcontext(),
             mock.patch.object(
                 manager,
                 "_build_fixed_shape_selection_workspaces",
@@ -4060,6 +4033,7 @@ class TestFixedUnionWorkspace:
             score_workspace,
             scores_by_layer,
             [0, 1],
+            2,
             2,
             19,
         )
@@ -4118,6 +4092,7 @@ class TestFixedUnionWorkspace:
                 SimpleNamespace(max_requests=3),
                 scores_by_layer,
                 [0, 1],
+                2,
                 2,
                 19,
             )
@@ -4288,7 +4263,6 @@ class TestFixedUnionWorkspace:
             return manager
 
         fixed_manager = build_manager(True)
-        eager_manager = build_manager(False)
         score_workspace = SimpleNamespace(prewarm_key=key)
         tensor_pointers = [
             {
@@ -4342,24 +4316,27 @@ class TestFixedUnionWorkspace:
                     py_prompt_len=prompt_len,
                 )
 
-                fixed_keep = fixed_manager._evict_modes(
-                    request,
-                    2,
-                    seq_len,
-                    precomputed,
-                    fixed_union_workspace=fixed_workspaces[slot],
+                with (
+                    _mock_cute_topk_without_fallbacks()
+                    if device.type == "cpu"
+                    else nullcontext()
+                ):
+                    fixed_keep = fixed_manager._evict_modes(
+                        request,
+                        2,
+                        seq_len,
+                        precomputed,
+                        fixed_union_workspace=fixed_workspaces[slot],
+                    )
+                expected_keep = _torch_union_keep(
+                    torch.cat(precomputed, dim=0),
+                    prompt_len=prompt_len,
+                    budget=keep_count,
                 )
-                eager_keep = eager_manager._evict_modes(
-                    request,
-                    2,
-                    seq_len,
-                    precomputed,
-                ).clone()
+                pending_keeps.append((fixed_keep, expected_keep))
 
-                pending_keeps.append((fixed_keep, eager_keep))
-
-            for fixed_keep, eager_keep in pending_keeps:
-                assert torch.equal(fixed_keep, eager_keep)
+            for fixed_keep, expected_keep in pending_keeps:
+                assert torch.equal(fixed_keep, expected_keep)
             assert torch.isfinite(base.input_scores).all()
 
             for workspace in bank[request_count:]:
@@ -4423,10 +4400,15 @@ class TestFixedUnionWorkspace:
             allocate_segment_buffers=True,
         )
 
-        fixed = workspace.select_segments(
-            segments,
-            normalize_scores=False,
-        ).clone()
+        with (
+            _mock_cute_topk_without_fallbacks()
+            if device.type == "cpu"
+            else nullcontext()
+        ):
+            fixed = workspace.select_segments(
+                segments,
+                normalize_scores=False,
+            ).clone()
         reference = self._reference(scores, keep_count)
         combined = scores.max(dim=0).values
         row_top = torch.topk(scores, keep_count, dim=1, sorted=False).indices
@@ -4454,8 +4436,9 @@ class TestFixedUnionWorkspace:
             device=scores.device,
         )
 
-        first = workspace.select(scores).clone()
-        second = workspace.select(scores).clone()
+        with _mock_cute_topk_without_fallbacks():
+            first = workspace.select(scores).clone()
+            second = workspace.select(scores).clone()
         reference = self._reference(scores, keep_count)
         combined = scores.max(dim=0).values
 
@@ -4465,7 +4448,7 @@ class TestFixedUnionWorkspace:
             combined.index_select(0, reference).sort().values,
         )
 
-    def test_manager_uses_fixed_workspace_only_when_requested(self):
+    def test_manager_always_uses_one_fixed_workspace_for_union(self):
         from types import SimpleNamespace
 
         mgr = _make_triattention()
@@ -4476,10 +4459,6 @@ class TestFixedUnionWorkspace:
         large = torch.arange(2 * 4096, dtype=torch.float32).reshape(2, 4096)
         keep_count = 3072
         with _mock_cute_topk_without_fallbacks():
-            fallback = mgr._evict_union(request, 1, 4100, 4, keep_count, large)
-
-        assert not mgr._fixed_union_workspaces
-        with _mock_cute_topk_without_fallbacks():
             fixed = mgr._evict_union(
                 request,
                 1,
@@ -4487,12 +4466,12 @@ class TestFixedUnionWorkspace:
                 4,
                 keep_count,
                 large,
-                use_fixed_workspace=True,
             )
         workspace = mgr._get_fixed_union_workspace(7, large, keep_count, 4)
 
         assert workspace is not None
-        assert torch.equal(fixed, fallback)
+        assert fixed is workspace.keep
+        assert mgr._fixed_union_active[7] is workspace
         assert mgr._get_fixed_union_workspace(7, large, keep_count, 4) is workspace
         assert mgr._get_fixed_union_workspace(7, large[:, :128], keep_count, 4) is None
 
@@ -4592,7 +4571,9 @@ class TestCrossRequestFixedUnionWorkspace:
             mock.patch.object(torch, "arange", side_effect=allocation_error),
             mock.patch.object(torch, "full", side_effect=allocation_error),
         ):
-            manager._prewarm_cross_request_selection_bucket(key, stage3_plan)
+            manager._prewarm_cross_request_selection_bucket(
+                key, stage3_plan, (0,), stage3_plan.rows, 1
+            )
 
         workspace_init.assert_not_called()
         plan = manager._cross_request_selection_plans[key]
@@ -4624,13 +4605,18 @@ class TestCrossRequestFixedUnionWorkspace:
         stage3_plan = self._stage3_plan(17, "cute_dsl_topk", max_requests=3)
         manager = self._manager()
         manager._fixed_shape_selection_prewarm_states = {key: "ready"}
-        manager._prewarm_cross_request_selection_bucket(key, stage3_plan)
+        manager._prewarm_cross_request_selection_bucket(
+            key, stage3_plan, (0,), stage3_plan.rows, 1
+        )
 
-        with mock.patch.object(
-            manager,
-            "_build_cross_request_selection_workspace",
-            wraps=manager._build_cross_request_selection_workspace,
-        ) as build_workspace:
+        with (
+            _mock_cute_topk_without_fallbacks(),
+            mock.patch.object(
+                manager,
+                "_build_cross_request_selection_workspace",
+                wraps=manager._build_cross_request_selection_workspace,
+            ) as build_workspace,
+        ):
             manager._materialize_cross_request_selection_banks()
             manager._materialize_cross_request_selection_banks()
 
@@ -4684,7 +4670,9 @@ class TestCrossRequestFixedUnionWorkspace:
         manager._fixed_shape_selection_prewarm_states = {key: "ready"}
         manager._fixed_shape_selection_workspaces = {key: stage3_bank}
         manager._fixed_shape_selection_runtime_counts = {}
-        manager._prewarm_cross_request_selection_bucket(key, stage3_plan)
+        manager._prewarm_cross_request_selection_bucket(
+            key, stage3_plan, (0,), stage3_plan.rows, 1
+        )
         manager._build_cross_request_selection_workspace = mock.Mock(
             side_effect=torch.cuda.OutOfMemoryError("sealed Stage4 bank")
         )
@@ -4703,7 +4691,9 @@ class TestCrossRequestFixedUnionWorkspace:
 
         manager._cross_request_selection_materialization_state = "pending"
         manager._materialize_cross_request_selection_banks()
-        manager._prewarm_cross_request_selection_bucket(key, stage3_plan)
+        manager._prewarm_cross_request_selection_bucket(
+            key, stage3_plan, (0,), stage3_plan.rows, 1
+        )
 
         assert manager._build_cross_request_selection_workspace.call_count == 1
         assert manager._cross_request_selection_prewarm_states[key] == "failed"
@@ -4730,10 +4720,13 @@ class TestCrossRequestFixedUnionWorkspace:
         keep_addresses = tuple(item.keep.data_ptr() for item in workspace.request_workspaces)
         assert len(set(keep_addresses)) == max_requests
 
-        with mock.patch.object(
-            torch,
-            "nonzero",
-            side_effect=AssertionError("cross-request selection must not call nonzero"),
+        with (
+            _mock_cute_topk_without_fallbacks(),
+            mock.patch.object(
+                torch,
+                "nonzero",
+                side_effect=AssertionError("cross-request selection must not call nonzero"),
+            ),
         ):
             for iteration, request_count in enumerate((1, 7, 8, 1, 7, 8)):
                 workspace.input_scores.fill_(float("nan"))
@@ -4810,24 +4803,26 @@ class TestCrossRequestFixedUnionWorkspace:
             ),
             len(valid_widths),
         )
-        selected = workspace.select_requests(
-            segments_by_request,
-            normalize_scores=True,
-        )
-
-        for request_index, valid_width in enumerate(valid_widths):
-            reference = _FixedUnionWorkspace(
-                rows,
-                valid_width,
-                keep_count,
-                prompt_len,
-                dtype=torch.float32,
-                device=torch.device("cpu"),
-                allocate_segment_buffers=True,
-            ).select_segments(
-                [segments_by_request[request_index][0][:, :valid_width]],
+        with _mock_cute_topk_without_fallbacks():
+            selected = workspace.select_requests(
+                segments_by_request,
                 normalize_scores=True,
             )
+
+        for request_index, valid_width in enumerate(valid_widths):
+            with _mock_cute_topk_without_fallbacks():
+                reference = _FixedUnionWorkspace(
+                    rows,
+                    valid_width,
+                    keep_count,
+                    prompt_len,
+                    dtype=torch.float32,
+                    device=torch.device("cpu"),
+                    allocate_segment_buffers=True,
+                ).select_segments(
+                    [segments_by_request[request_index][0][:, :valid_width]],
+                    normalize_scores=True,
+                )
             assert torch.equal(selected[request_index].keep, reference)
             assert int(selected[request_index].keep.max()) < prompt_len + valid_width
         assert workspace.pointer_snapshot() == pointer_snapshot
@@ -4930,38 +4925,40 @@ class TestCrossRequestFixedUnionWorkspace:
             is None
         )
         assert manager._cross_request_selection_for(SimpleNamespace(prewarm_key=key), 4) is None
-        manager._fixed_shape_selection_prewarm_states[key] = "failed"
+        manager._cross_request_selection_prewarm_states[key] = "failed"
         assert manager._cross_request_selection_for(SimpleNamespace(prewarm_key=key), 1) is None
 
         assert manager._cross_request_selection_runtime_counts[key] == {
             "hit": 1,
-            "fallback": 2,
+            "rejected": 2,
         }
         assert manager._cross_request_selection_runtime_counts[("other-bucket",)] == {
             "hit": 0,
-            "fallback": 1,
+            "rejected": 1,
         }
 
-    def test_selection_runs_once_before_existing_batched_compaction(self):
+    def test_selection_runs_once_inside_the_request_batched_graph(self):
         import contextlib
-        from types import SimpleNamespace
-        from unittest import mock
 
         import tensorrt_llm._torch.kv_cache_compression.triattention.triattention as tri_module
-        import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels as kernels
-
-        pool = torch.zeros(8, 2, 1, 4, 2)
         requests = [_make_request(request_id, py_prompt_len=2) for request_id in (7, 8)]
         key = ("cross-request",)
-        selection = _BatchedFixedUnionWorkspace(
-            2,
-            6,
-            4,
-            2,
-            dtype=torch.float32,
-            device=torch.device("cpu"),
-            selection_backend="cute_dsl_topk",
+        selection = SimpleNamespace(
+            eviction_mode="union",
+            dense_layers=(0, 1),
+            num_query_heads=1,
+            num_kv_heads=1,
+            prompt_len=2,
+            width=6,
+            keep_count=4,
             max_requests=2,
+            selection_backend="cute_dsl_topk",
+            stage_valid_widths_from_seq_lens=mock.Mock(),
+            select_requests=mock.Mock(),
+        )
+        stream = SimpleNamespace(
+            device=torch.device("cpu"),
+            cuda_stream=9,
         )
         score_output = torch.arange(2 * 2 * 8, dtype=torch.float32).view(1, -1)
         score_group = SimpleNamespace(launch=mock.Mock(return_value=(score_output, None)))
@@ -4969,6 +4966,8 @@ class TestCrossRequestFixedUnionWorkspace:
             prewarm_key=key,
             bucket_seq_len=8,
             prompt_len=2,
+            device=torch.device("cpu"),
+            stream=stream,
             fused_group=score_group,
             dense_layer_order=[0, 1],
             round_starts_device=torch.tensor([8.0, 8.0]),
@@ -4978,112 +4977,83 @@ class TestCrossRequestFixedUnionWorkspace:
             prepare_phase=mock.Mock(),
         )
         manager = _make_triattention()
-        manager.kv_cache_manager = SimpleNamespace(get_buffers=lambda layer, **kwargs: pool)
         manager._evicted = {}
         manager._confirmed_kv_lengths = {7: 8, 8: 8}
         manager.top_B = 4
-        manager.pin_prefill = True
-        manager.count_prompt_tokens = False
         manager.eviction_mode = "union"
         manager.normalize_scores = False
         manager.score_aggregation = "mean"
-        manager._offsets = torch.ones(1)
-        active_sentinel = object()
-        manager._fixed_union_active = {99: active_sentinel}
-        manager._fixed_union_compaction_enabled = True
-        manager._fixed_union_prewarm_enabled = False
-        manager._cross_request_selection_enabled = True
-        manager._cross_request_selection_workspaces = {key: selection}
-        manager._cross_request_selection_prewarm_states = {key: "ready"}
-        manager._cross_request_selection_runtime_counts = {}
-        manager._fixed_shape_selection_prewarm_states = {key: "ready"}
-        manager._local_to_global_layers = lambda num_layers: [0, 1]
-        manager._attention_layer_partition = mock.Mock(return_value=([0, 1], [], None))
-        manager._local_score_calibration = mock.Mock(
-            return_value=(torch.empty(0), torch.empty(0), torch.empty(0))
-        )
-        manager._fixed_score_workspace_for = mock.Mock(return_value=score_workspace)
-        manager._fixed_shape_selection_for = mock.Mock(
-            side_effect=AssertionError("Stage4 hit must not dispatch Stage3")
-        )
         manager._evict_modes = mock.Mock(
-            side_effect=AssertionError("Stage4 must not select per request")
+            side_effect=AssertionError("the graph must not select each request separately")
         )
+        manager._standalone_graph_bucket_for = mock.Mock(return_value=key)
+        graph_workspace = SimpleNamespace(
+            pointer_fingerprint=mock.Mock(return_value=("stable",)),
+            launch=mock.Mock(),
+        )
+        manager._standalone_graph_workspace_for = mock.Mock(return_value=graph_workspace)
 
-        def attach_page_ids(prepared, *_args):
-            for request_index, item in enumerate(prepared):
-                item["page_ids"] = {
-                    0: torch.tensor(
-                        [request_index * 2, request_index * 2 + 1],
-                        dtype=torch.int64,
-                    )
-                }
-            return True
+        def execute_graph(**kwargs):
+            kwargs["capture_body"]()
+            return "capture"
 
-        manager._attach_page_ids = mock.Mock(side_effect=attach_page_ids)
+        cache = SimpleNamespace(
+            is_disabled=mock.Mock(return_value=False),
+            classify=mock.Mock(return_value="capture"),
+            execute=mock.Mock(side_effect=execute_graph),
+        )
+        manager._standalone_graph_cache_for = mock.Mock(return_value=cache)
+        prepared = [
+            {
+                "request": request,
+                "request_id": request.py_request_id,
+                "seq_len": 8,
+                "expected_keep_count": 6,
+            }
+            for request in requests
+        ]
+        fixed_views = torch.arange(1 * 2 * 2 * 8, dtype=torch.float32).view(1, 2, 2, 8)
 
         with (
-            mock.patch.object(
-                selection,
-                "select_requests",
-                wraps=selection.select_requests,
-            ) as select_requests,
-            mock.patch.object(kernels, "cpp_sparse_compact") as compact,
             mock.patch.object(
                 tri_module,
                 "nvtx_range",
                 side_effect=lambda *args, **kwargs: contextlib.nullcontext(),
-            ) as nvtx,
+            ),
+            mock.patch.object(torch.cuda, "current_stream", return_value=stream),
         ):
-            targets = manager._evict_requests(
-                list(zip(requests, (7, 8))),
-                num_layers=2,
+            targets = manager._try_standalone_cuda_graph(
+                prepared=prepared,
+                layer_pools=[torch.empty(0), torch.empty(0)],
+                dense_layers=[0, 1],
+                dense_groups=[[0], [1]],
+                swa_layers=[],
+                swa_window=None,
+                layer_group_representative={0: 0, 1: 1},
+                global_layers=[0, 1],
+                score_workspace=score_workspace,
+                selection_workspace=selection,
+                fixed_perhead_segment_views=lambda *_args: fixed_views,
             )
 
         assert targets == [(7, 6), (8, 6)]
         assert manager._evicted == {7: 2, 8: 2}
         assert manager._confirmed_kv_lengths == {7: 6, 8: 6}
-        assert manager._fixed_union_active == {99: active_sentinel}
-        select_requests.assert_called_once()
-        score_workspace.prepare_phase.assert_called_once_with(2)
-        manager._fixed_shape_selection_for.assert_not_called()
-        manager._evict_modes.assert_not_called()
-        assert compact.call_count == 2
-        for call in compact.call_args_list:
-            assert call.args[0] is pool
-            assert len(call.args[1]) == 2
-            assert all(
-                observed is workspace.keep
-                for observed, workspace in zip(call.args[2], selection.request_workspaces)
-            )
-            assert call.args[3] == [8, 8]
-        assert [call.args[0] for call in nvtx.call_args_list].count("triattention.select") == 1
-        assert manager._cross_request_selection_runtime_counts[key] == {
-            "hit": 1,
-            "fallback": 0,
-        }
-
-
-class TestKeptOnlyCompaction:
-    def test_retained_prefix_matches_legacy_full_reorder(self):
-        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-            _build_compaction_indices,
+        selection.stage_valid_widths_from_seq_lens.assert_called_once_with(
+            score_workspace.valid_seq_lens_device,
+            2,
         )
-
-        seq_len = 17
-        keep = torch.tensor([0, 2, 5, 9, 16], dtype=torch.long)
-        source = torch.arange(2 * 3 * seq_len * 4).reshape(2, 3, seq_len, 4)
-
-        kept_src, kept_dst = _build_compaction_indices(keep, seq_len, kept_only=True)
-        legacy_src, legacy_dst = _build_compaction_indices(keep, seq_len, kept_only=False)
-        kept_result = torch.full_like(source, -1)
-        legacy_result = torch.full_like(source, -1)
-        kept_result[:, :, kept_dst] = source[:, :, kept_src]
-        legacy_result[:, :, legacy_dst] = source[:, :, legacy_src]
-
-        assert torch.equal(kept_result[:, :, : keep.numel()], legacy_result[:, :, : keep.numel()])
-        assert kept_src.numel() == keep.numel()
-        assert legacy_src.numel() == seq_len
+        selection.select_requests.assert_called_once()
+        score_workspace.prepare_phase.assert_called_once_with(2)
+        manager._evict_modes.assert_not_called()
+        graph_workspace.launch.assert_called_once_with()
+        cache.execute.assert_called_once()
+        assert manager._standalone_graph_runtime_counts == {
+            "attempt": 1,
+            "attempt_requests": 2,
+            "success": 1,
+            "success_requests": 2,
+        }
 
 
 class TestKernelMaskedSwa:

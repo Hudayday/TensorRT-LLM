@@ -68,7 +68,7 @@ def _run_cpp_compact(
 
 
 class FixedBatchedCompactionWorkspace:
-    """Caller-owned upper-bucket buffers for graph-captured compaction.
+    """Fixed-shape buffers for graph-captured compaction.
 
     Dense layers move only selected decode slots. The finalized prompt is never
     a destination and therefore remains byte-untouched. Kernel-masked SWA
@@ -79,6 +79,7 @@ class FixedBatchedCompactionWorkspace:
     def __init__(
         self,
         *,
+        eviction_mode: str,
         layer_pools: List[torch.Tensor],
         dense_layers: List[int],
         swa_layers: List[int],
@@ -93,8 +94,10 @@ class FixedBatchedCompactionWorkspace:
         swa_window: Optional[int],
         arena_generation: int,
     ) -> None:
+        if eviction_mode not in ("union", "per_head", "per_layer_perhead"):
+            raise ValueError(f"unsupported graph compaction mode: {eviction_mode}")
         if request_count <= 0 or decode_keep_count <= 0:
-            raise ValueError("fixed graph compaction requires a non-empty cohort and keep set")
+            raise ValueError("fixed graph compaction requires requests and retained tokens")
         if not dense_layers:
             raise ValueError("fixed graph compaction requires at least one dense layer")
         if request_count > selection_workspace.max_requests:
@@ -106,6 +109,12 @@ class FixedBatchedCompactionWorkspace:
         ):
             raise ValueError("fixed graph compaction geometry does not match selection")
 
+        if selection_workspace.eviction_mode != eviction_mode or tuple(
+            selection_workspace.dense_layers
+        ) != tuple(dense_layers):
+            raise ValueError("fixed graph selection mode or dense-layer order does not match")
+
+        self.eviction_mode = eviction_mode
         self.device = layer_pools[dense_layers[0]].device
         self.request_count = int(request_count)
         self.seq_len = int(seq_len)
@@ -142,6 +151,8 @@ class FixedBatchedCompactionWorkspace:
                 "with one common KV-head count"
             )
         self.cpp_num_kv_heads = cpp_num_kv_heads
+        if selection_workspace.num_kv_heads != cpp_num_kv_heads:
+            raise ValueError("fixed graph selection KV-head count does not match the pool")
         self.cpp_indices = torch.empty(
             cpp_num_kv_heads,
             self.request_count * self.keep_count,
@@ -253,11 +264,13 @@ class FixedBatchedCompactionWorkspace:
                 out=self.swa_source.view(self.request_count, -1),
             )
             self.swa_indices.copy_(self.swa_source.reshape(1, -1).expand(self.cpp_num_kv_heads, -1))
-        keep_full = self.selection_workspace.keep[: self.request_count]
-        self.cpp_indices.copy_(keep_full.reshape(1, -1).expand(self.cpp_num_kv_heads, -1))
         for source_pages, staged_i32 in self.cpp_page_tables.values():
             staged_i32.copy_(source_pages)
-        for pool, page_table in self.cpp_dense_ops:
+        if self.eviction_mode != "per_layer_perhead":
+            self._stage_dense_indices(0)
+        for layer_slot, (pool, page_table) in enumerate(self.cpp_dense_ops):
+            if self.eviction_mode == "per_layer_perhead":
+                self._stage_dense_indices(layer_slot)
             _run_cpp_compact(
                 pool,
                 page_table,
@@ -277,6 +290,28 @@ class FixedBatchedCompactionWorkspace:
                     self.swa_destination,
                 )
 
+    def _stage_dense_indices(self, layer_slot: int) -> None:
+        """Pack retained token indices into the C++ operation input layout."""
+        target = self.cpp_indices.view(
+            self.cpp_num_kv_heads,
+            self.request_count,
+            self.keep_count,
+        )
+        keep = self.selection_workspace.keep[: self.request_count]
+        if self.eviction_mode == "union":
+            target.copy_(keep.view(1, self.request_count, self.keep_count).expand_as(target))
+            return
+        if self.eviction_mode == "per_head":
+            target.copy_(keep.permute(1, 0, 2))
+            return
+        per_layer = keep.view(
+            self.request_count,
+            len(self.dense_layers),
+            self.cpp_num_kv_heads,
+            self.keep_count,
+        )
+        target.copy_(per_layer[:, layer_slot].permute(1, 0, 2))
+
     def matches_runtime(
         self,
         *,
@@ -291,6 +326,7 @@ class FixedBatchedCompactionWorkspace:
         if (
             score_workspace is not self.score_workspace
             or selection_workspace is not self.selection_workspace
+            or selection_workspace.eviction_mode != self.eviction_mode
             or len(layer_pools) != len(self.layer_pools)
             or tuple(dense_layers) != self.dense_layers
             or tuple(swa_layers) != self.swa_layers
@@ -342,7 +378,8 @@ class FixedBatchedCompactionWorkspace:
         )
         context_token = int(torch.cuda.current_blas_handle())
         return (
-            "triattention.standalone-eviction-graph.v2",
+            "triattention.standalone-eviction-graph.v3",
+            self.eviction_mode,
             self.request_count,
             self.seq_len,
             self.prompt_len,
@@ -406,7 +443,7 @@ class StandaloneEvictionGraphCache:
             # Historical observers treat replay as every successful
             # CUDAGraph.replay(), including the first launch after capture.
             "replay": 0,
-            "fallback": 0,
+            "rejected": 0,
             "invalidated": 0,
             "failure": 0,
             "capture_failure": 0,
@@ -429,7 +466,7 @@ class StandaloneEvictionGraphCache:
                 "launch": 0,
                 "cache_hit": 0,
                 "covered_requests": 0,
-                "fallback": 0,
+                "rejected": 0,
                 "invalidated": 0,
                 "failure": 0,
                 "capture_failure": 0,
@@ -448,13 +485,13 @@ class StandaloneEvictionGraphCache:
         bucket["attempted_requests"] += request_count
         return bucket
 
-    def _record_fallback(self, bucket: dict) -> None:
-        self.counts["fallback"] += 1
-        bucket["fallback"] += 1
+    def _record_rejection(self, bucket: dict) -> None:
+        self.counts["rejected"] += 1
+        bucket["rejected"] += 1
 
-    def record_fallback(self, *, key: tuple, request_count: int) -> None:
-        """Record a fail-safe fallback rejected before workspace mutation."""
-        self._record_fallback(self._record_attempt(key, request_count))
+    def record_rejection(self, *, key: tuple, request_count: int) -> None:
+        """Record work rejected before graph-visible state is changed."""
+        self._record_rejection(self._record_attempt(key, request_count))
 
     @staticmethod
     def _event_complete(event: Optional[object]) -> bool:
@@ -491,7 +528,7 @@ class StandaloneEvictionGraphCache:
 
     def classify(self, key: tuple, fingerprint: tuple) -> str:
         if key in self.disabled:
-            return "fallback"
+            return "rejected"
         entry = self.entries.get(key)
         return "replay" if entry is not None and entry.fingerprint == fingerprint else "capture"
 
@@ -586,17 +623,17 @@ class StandaloneEvictionGraphCache:
         workspace: FixedBatchedCompactionWorkspace,
         capture_body: Callable[[], None],
     ) -> str:
-        """Replay/capture one exact graph or return ``fallback`` before mutation.
+        """Replay or capture one exact graph, or reject it before mutation.
 
-        A capture failure is safe to fall back because stream capture records
-        operations without executing them. Once replay is attempted, errors are
-        propagated and the caller must not issue eager compaction for that step.
+        A capture failure is rejected because stream capture records operations
+        without executing them. Replay errors are raised because some graph work
+        may already have been submitted.
         """
         bucket = self._record_attempt(key, request_count)
         self._collect_retired()
         if key in self.disabled:
-            self._record_fallback(bucket)
-            return "fallback"
+            self._record_rejection(bucket)
+            return "rejected"
 
         entry = self.entries.get(key)
         if entry is not None and entry.fingerprint != fingerprint:
@@ -608,8 +645,8 @@ class StandaloneEvictionGraphCache:
 
         if entry is None:
             if not self._make_room(workspace.nbytes):
-                self._record_fallback(bucket)
-                return "fallback"
+                self._record_rejection(bucket)
+                return "rejected"
             try:
                 graph, capture_stream, graph_bytes = self._capture_graph(workspace, capture_body)
             except RuntimeError as exc:
@@ -618,18 +655,18 @@ class StandaloneEvictionGraphCache:
                 self.counts["capture_failure"] += 1
                 bucket["failure"] += 1
                 bucket["capture_failure"] += 1
-                self._record_fallback(bucket)
+                self._record_rejection(bucket)
                 self.last_error = {
                     "phase": "capture",
                     "type": type(exc).__name__,
                     "message": str(exc),
                 }
-                return "fallback"
+                return "rejected"
             entry_bytes = workspace.nbytes + graph_bytes
             if not self._make_room(entry_bytes):
                 graph.reset()
-                self._record_fallback(bucket)
-                return "fallback"
+                self._record_rejection(bucket)
+                return "rejected"
             entry = _GraphEntry(
                 graph=graph,
                 capture_stream=capture_stream,
