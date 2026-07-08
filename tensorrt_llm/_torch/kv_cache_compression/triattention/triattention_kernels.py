@@ -4,7 +4,7 @@
 
 The production eviction path is fully fused over (request x layer) x KV head: ONE score
 launch spanning ALL dense layers (layers may live in distinct storages with distinct
-block tables; the kernel takes per-layer absolute base addresses), torch.topk SELECT,
+block tables; the kernel takes per-layer absolute base addresses), CuTE-DSL TopK SELECT,
 and one per-layer compaction.
 The kernels here back that path:
 

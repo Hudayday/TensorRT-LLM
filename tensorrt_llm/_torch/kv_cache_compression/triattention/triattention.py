@@ -131,65 +131,25 @@ def _build_swa_rebase_copy(
 
 
 def _topk_indices_into(
-    backend: str,
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
     indices_i32: torch.Tensor,
     keep_count: int,
 ) -> None:
-    """Write per-row top-k indices into ``indices_i32`` via the backend op.
-
-    ``cute_dsl_topk`` reuses the exact indexer_topk dataflow (int32 output
-    buffer written in place) with the Blackwell CuTE-DSL kernel, which after
-    raising ``filtered_topk_max_k`` to 4096 supports our budget range.
-    """
-    if backend == "cute_dsl_topk":
-        torch.ops.trtllm.cute_dsl_indexer_topk_decode(scores, seq_lens, indices_i32, keep_count, 1)
-    else:
-        torch.ops.trtllm.indexer_topk_decode(scores, seq_lens, indices_i32, 1, keep_count)
+    """Write per-row top-k indices with the CuTE-DSL selector."""
+    torch.ops.trtllm.cute_dsl_indexer_topk_decode(scores, seq_lens, indices_i32, keep_count, 1)
 
 
 class _FixedUnionWorkspace:
     """Persistent buffers for one request's fixed-shape union eviction.
 
     This workspace is intentionally internal and shape-specific. It removes the
-    dynamic ``nonzero`` and temporary allocation chain only for the large-k
-    ``torch.topk`` route. The caller retains eager fallbacks for every other
-    shape and owns this object for the request lifetime. Finite ties are
+    dynamic ``nonzero`` and temporary allocation chain from the capturable
+    CuTE-DSL route. The caller owns this object for the request lifetime. Finite ties are
     repeatable for a fixed Torch runtime and preserve the selected-value
     multiset; cross-backend token identity remains the existing unspecified
     tie contract. Non-finite scores remain unsupported.
     """
-
-    _SELECTION_SCRATCH_NAMES = (
-        "input_scores",
-        "row_mean",
-        "row_std",
-        "combined",
-        "combined_argmax",
-        "row_top_values",
-        "row_top_indices",
-        "union_mask",
-        "candidates",
-        "negative_inf",
-        "final_values",
-        "final_indices",
-        "sorted_indices",
-        "sort_order",
-    )
-    _INDEXER_SCRATCH_NAMES = (
-        "row_seq_lens",
-        "row_top_indices_i32",
-        "token_indices",
-        "width_sentinel",
-        "union_physical_indices",
-        "union_indices_sorted",
-        "union_sort_order",
-        "candidate_gather_indices",
-        "union_count",
-        "final_indices_i32",
-        "final_relative_indices",
-    )
 
     @staticmethod
     def _canonical_device(device: torch.device) -> torch.device:
@@ -215,11 +175,11 @@ class _FixedUnionWorkspace:
         dtype: torch.dtype,
         device: torch.device,
         allocate_segment_buffers: bool = False,
-        selection_backend: str = "torch_topk",
+        selection_backend: str = "cute_dsl_topk",
     ) -> None:
         if rows <= 0 or width <= keep_count or keep_count <= 0:
             raise ValueError("fixed union workspace requires rows > 0 and width > keep_count > 0")
-        if selection_backend not in ("torch_topk", "indexer_topk", "cute_dsl_topk"):
+        if selection_backend != "cute_dsl_topk":
             raise ValueError(f"unsupported fixed union selection backend: {selection_backend}")
         self.rows = rows
         self.width = width
@@ -234,31 +194,25 @@ class _FixedUnionWorkspace:
 
         self.combined = torch.empty(width, dtype=dtype, device=device)
         self.combined_argmax = torch.empty(width, dtype=torch.long, device=device)
-        self.row_top_values = torch.empty((rows, keep_count), dtype=dtype, device=device)
         self.row_top_indices = torch.empty((rows, keep_count), dtype=torch.long, device=device)
         self.union_mask = torch.empty(width, dtype=torch.bool, device=device)
         self.candidates = torch.empty(width, dtype=dtype, device=device)
-        self.negative_inf = torch.full((), float("-inf"), dtype=dtype, device=device)
-        self.final_values = torch.empty(keep_count, dtype=dtype, device=device)
         self.final_indices = torch.empty(keep_count, dtype=torch.long, device=device)
         self.sorted_indices = torch.empty_like(self.final_indices)
         self.sort_order = torch.empty_like(self.final_indices)
         self.keep = torch.empty(self.total_keep, dtype=torch.long, device=device)
         self.keep[:prompt_len].copy_(torch.arange(prompt_len, dtype=torch.long, device=device))
-        if selection_backend in ("indexer_topk", "cute_dsl_topk"):
-            self.row_seq_lens = torch.full((rows,), width, dtype=torch.int32, device=device)
-            self.row_top_indices_i32 = torch.empty(
-                (rows, keep_count), dtype=torch.int32, device=device
-            )
-            self.token_indices = torch.arange(width, dtype=torch.long, device=device)
-            self.width_sentinel = torch.full((), width, dtype=torch.long, device=device)
-            self.union_physical_indices = torch.empty(width, dtype=torch.long, device=device)
-            self.union_indices_sorted = torch.empty_like(self.union_physical_indices)
-            self.union_sort_order = torch.empty_like(self.union_physical_indices)
-            self.candidate_gather_indices = torch.empty_like(self.union_physical_indices)
-            self.union_count = torch.empty(1, dtype=torch.int32, device=device)
-            self.final_indices_i32 = torch.empty(keep_count, dtype=torch.int32, device=device)
-            self.final_relative_indices = torch.empty_like(self.final_indices)
+        self.row_seq_lens = torch.full((rows,), width, dtype=torch.int32, device=device)
+        self.row_top_indices_i32 = torch.empty((rows, keep_count), dtype=torch.int32, device=device)
+        self.token_indices = torch.arange(width, dtype=torch.long, device=device)
+        self.width_sentinel = torch.full((), width, dtype=torch.long, device=device)
+        self.union_physical_indices = torch.empty(width, dtype=torch.long, device=device)
+        self.union_indices_sorted = torch.empty_like(self.union_physical_indices)
+        self.union_sort_order = torch.empty_like(self.union_physical_indices)
+        self.candidate_gather_indices = torch.empty_like(self.union_physical_indices)
+        self.union_count = torch.empty(1, dtype=torch.int32, device=device)
+        self.final_indices_i32 = torch.empty(keep_count, dtype=torch.int32, device=device)
+        self.final_relative_indices = torch.empty_like(self.final_indices)
         self._compaction_buffers = {}
         self.prewarm_attempted = False
         self.prewarmed = False
@@ -338,37 +292,30 @@ class _FixedUnionWorkspace:
         return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
 
     def _selection_scratch_tensors(self) -> Tuple[torch.Tensor, ...]:
-        tensors = (
+        return (
             self.input_scores,
             self.row_mean,
             self.row_std,
             self.combined,
             self.combined_argmax,
-            self.row_top_values,
             self.row_top_indices,
             self.union_mask,
             self.candidates,
-            self.negative_inf,
-            self.final_values,
             self.final_indices,
             self.sorted_indices,
             self.sort_order,
+            self.row_seq_lens,
+            self.row_top_indices_i32,
+            self.token_indices,
+            self.width_sentinel,
+            self.union_physical_indices,
+            self.union_indices_sorted,
+            self.union_sort_order,
+            self.candidate_gather_indices,
+            self.union_count,
+            self.final_indices_i32,
+            self.final_relative_indices,
         )
-        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
-            tensors += (
-                self.row_seq_lens,
-                self.row_top_indices_i32,
-                self.token_indices,
-                self.width_sentinel,
-                self.union_physical_indices,
-                self.union_indices_sorted,
-                self.union_sort_order,
-                self.candidate_gather_indices,
-                self.union_count,
-                self.final_indices_i32,
-                self.final_relative_indices,
-            )
-        return tensors
 
     @staticmethod
     def planned_selection_bank_nbytes(
@@ -381,6 +328,8 @@ class _FixedUnionWorkspace:
         max_requests: int,
     ) -> int:
         """Compute the deferred bank size without allocating a tensor."""
+        if selection_backend != "cute_dsl_topk":
+            raise ValueError(f"unsupported fixed union selection backend: {selection_backend}")
         dtype_bytes = torch.finfo(dtype).bits // 8
         long_bytes = 8
         int_bytes = 4
@@ -390,27 +339,19 @@ class _FixedUnionWorkspace:
             + 2 * rows * dtype_bytes
             + width * dtype_bytes
             + width * long_bytes
-            + rows * keep_count * dtype_bytes
             + rows * keep_count * long_bytes
             + width
             + width * dtype_bytes
-            + dtype_bytes
-            + keep_count * dtype_bytes
             + 3 * keep_count * long_bytes
+            + rows * int_bytes
+            + rows * keep_count * int_bytes
+            + width * long_bytes
+            + long_bytes
+            + 4 * width * long_bytes
+            + int_bytes
+            + keep_count * int_bytes
+            + keep_count * long_bytes
         )
-        if selection_backend in ("indexer_topk", "cute_dsl_topk"):
-            scratch_bytes += (
-                rows * int_bytes
-                + rows * keep_count * int_bytes
-                + width * long_bytes
-                + long_bytes
-                + 4 * width * long_bytes
-                + int_bytes
-                + keep_count * int_bytes
-                + keep_count * long_bytes
-            )
-        elif selection_backend != "torch_topk":
-            raise ValueError(f"unsupported fixed union selection backend: {selection_backend}")
         return scratch_bytes + max_requests * total_keep * long_bytes
 
     def shared_selection_slot(self) -> "_FixedUnionWorkspace":
@@ -432,27 +373,23 @@ class _FixedUnionWorkspace:
         slot.row_std = self.row_std
         slot.combined = self.combined
         slot.combined_argmax = self.combined_argmax
-        slot.row_top_values = self.row_top_values
         slot.row_top_indices = self.row_top_indices
         slot.union_mask = self.union_mask
         slot.candidates = self.candidates
-        slot.negative_inf = self.negative_inf
-        slot.final_values = self.final_values
         slot.final_indices = self.final_indices
         slot.sorted_indices = self.sorted_indices
         slot.sort_order = self.sort_order
-        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
-            slot.row_seq_lens = self.row_seq_lens
-            slot.row_top_indices_i32 = self.row_top_indices_i32
-            slot.token_indices = self.token_indices
-            slot.width_sentinel = self.width_sentinel
-            slot.union_physical_indices = self.union_physical_indices
-            slot.union_indices_sorted = self.union_indices_sorted
-            slot.union_sort_order = self.union_sort_order
-            slot.candidate_gather_indices = self.candidate_gather_indices
-            slot.union_count = self.union_count
-            slot.final_indices_i32 = self.final_indices_i32
-            slot.final_relative_indices = self.final_relative_indices
+        slot.row_seq_lens = self.row_seq_lens
+        slot.row_top_indices_i32 = self.row_top_indices_i32
+        slot.token_indices = self.token_indices
+        slot.width_sentinel = self.width_sentinel
+        slot.union_physical_indices = self.union_physical_indices
+        slot.union_indices_sorted = self.union_indices_sorted
+        slot.union_sort_order = self.union_sort_order
+        slot.candidate_gather_indices = self.candidate_gather_indices
+        slot.union_count = self.union_count
+        slot.final_indices_i32 = self.final_indices_i32
+        slot.final_relative_indices = self.final_relative_indices
         slot.keep = torch.empty_like(self.keep)
         if self.prompt_len:
             slot.keep[: self.prompt_len].copy_(self.keep[: self.prompt_len])
@@ -473,82 +410,55 @@ class _FixedUnionWorkspace:
             dim=0,
             out=(self.combined, self.combined_argmax),
         )
-        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
-            _topk_indices_into(
-                self.selection_backend,
-                per_head_scores,
-                self.row_seq_lens,
-                self.row_top_indices_i32,
-                self.keep_count,
-            )
-            self.row_top_indices.copy_(self.row_top_indices_i32)
-        else:
-            torch.topk(
-                per_head_scores,
-                self.keep_count,
-                dim=1,
-                largest=True,
-                sorted=False,
-                out=(self.row_top_values, self.row_top_indices),
-            )
+        _topk_indices_into(
+            per_head_scores,
+            self.row_seq_lens,
+            self.row_top_indices_i32,
+            self.keep_count,
+        )
+        self.row_top_indices.copy_(self.row_top_indices_i32)
         self.union_mask.zero_()
         self.union_mask.scatter_(0, self.row_top_indices.reshape(-1), True)
-        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
-            torch.where(
-                self.union_mask,
-                self.token_indices,
-                self.width_sentinel,
-                out=self.union_physical_indices,
-            )
-            torch.sort(
-                self.union_physical_indices,
-                out=(self.union_indices_sorted, self.union_sort_order),
-            )
-            torch.clamp(
-                self.union_indices_sorted,
-                max=self.width - 1,
-                out=self.candidate_gather_indices,
-            )
-            torch.gather(
-                self.combined,
-                0,
-                self.candidate_gather_indices,
-                out=self.candidates,
-            )
-            torch.sum(
-                self.union_mask,
-                dim=0,
-                dtype=torch.int32,
-                out=self.union_count[0],
-            )
-            _topk_indices_into(
-                self.selection_backend,
-                self.candidates.view(1, self.width),
-                self.union_count,
-                self.final_indices_i32.view(1, self.keep_count),
-                self.keep_count,
-            )
-            self.final_relative_indices.copy_(self.final_indices_i32)
-            torch.gather(
-                self.union_indices_sorted,
-                0,
-                self.final_relative_indices,
-                out=self.final_indices,
-            )
-        else:
-            torch.where(
-                self.union_mask,
-                self.combined,
-                self.negative_inf,
-                out=self.candidates,
-            )
-            torch.topk(
-                self.candidates,
-                self.keep_count,
-                largest=True,
-                sorted=False,
-                out=(self.final_values, self.final_indices),
-            )
+        torch.where(
+            self.union_mask,
+            self.token_indices,
+            self.width_sentinel,
+            out=self.union_physical_indices,
+        )
+        torch.sort(
+            self.union_physical_indices,
+            out=(self.union_indices_sorted, self.union_sort_order),
+        )
+        torch.clamp(
+            self.union_indices_sorted,
+            max=self.width - 1,
+            out=self.candidate_gather_indices,
+        )
+        torch.gather(
+            self.combined,
+            0,
+            self.candidate_gather_indices,
+            out=self.candidates,
+        )
+        torch.sum(
+            self.union_mask,
+            dim=0,
+            dtype=torch.int32,
+            out=self.union_count[0],
+        )
+        _topk_indices_into(
+            self.candidates.view(1, self.width),
+            self.union_count,
+            self.final_indices_i32.view(1, self.keep_count),
+            self.keep_count,
+        )
+        self.final_relative_indices.copy_(self.final_indices_i32)
+        torch.gather(
+            self.union_indices_sorted,
+            0,
+            self.final_relative_indices,
+            out=self.final_indices,
+        )
         torch.sort(
             self.final_indices,
             out=(self.sorted_indices, self.sort_order),
@@ -677,40 +587,6 @@ class _CrossRequestSelectionPlan(NamedTuple):
 class _BatchedFixedUnionWorkspace:
     """Persistent request-major buffers for one upper-bound selection bucket."""
 
-    _TENSOR_NAMES = (
-        "input_scores",
-        "row_mean",
-        "row_std",
-        "combined",
-        "combined_argmax",
-        "row_top_values",
-        "row_top_indices",
-        "union_mask",
-        "candidates",
-        "negative_inf",
-        "final_values",
-        "final_indices",
-        "sorted_indices",
-        "sort_order",
-        "keep",
-        "valid_widths",
-        "valid_scale",
-        "token_indices",
-        "invalid_mask",
-    )
-    _INDEXER_TENSOR_NAMES = (
-        "row_seq_lens",
-        "row_top_indices_i32",
-        "width_sentinel",
-        "union_physical_indices",
-        "union_indices_sorted",
-        "union_sort_order",
-        "candidate_gather_indices",
-        "union_counts",
-        "final_indices_i32",
-        "final_relative_indices",
-    )
-
     def __init__(
         self,
         rows: int,
@@ -727,7 +603,7 @@ class _BatchedFixedUnionWorkspace:
             raise ValueError("cross-request selection requires rows > 0 and width > keep_count > 0")
         if max_requests <= 0:
             raise ValueError("cross-request selection requires a positive request capacity")
-        if selection_backend not in ("torch_topk", "indexer_topk", "cute_dsl_topk"):
+        if selection_backend != "cute_dsl_topk":
             raise ValueError(f"unsupported cross-request selection backend: {selection_backend}")
         self.max_requests = max_requests
         self.selection_backend = selection_backend
@@ -747,16 +623,11 @@ class _BatchedFixedUnionWorkspace:
         self.combined_argmax = torch.empty(
             (max_requests, width), dtype=torch.long, device=self.device
         )
-        self.row_top_values = torch.empty(
-            (max_requests, rows, keep_count), dtype=dtype, device=self.device
-        )
         self.row_top_indices = torch.empty(
             (max_requests, rows, keep_count), dtype=torch.long, device=self.device
         )
         self.union_mask = torch.empty((max_requests, width), dtype=torch.bool, device=self.device)
         self.candidates = torch.empty_like(self.combined)
-        self.negative_inf = torch.full((), float("-inf"), dtype=dtype, device=self.device)
-        self.final_values = torch.empty((max_requests, keep_count), dtype=dtype, device=self.device)
         self.final_indices = torch.empty(
             (max_requests, keep_count), dtype=torch.long, device=self.device
         )
@@ -776,25 +647,24 @@ class _BatchedFixedUnionWorkspace:
         if prompt_len:
             prompt = torch.arange(prompt_len, dtype=torch.long, device=self.device)
             self.keep[:, :prompt_len].copy_(prompt.expand(max_requests, -1))
-        if selection_backend in ("indexer_topk", "cute_dsl_topk"):
-            self.row_seq_lens = torch.full(
-                (max_requests * rows,), width, dtype=torch.int32, device=self.device
-            )
-            self.row_top_indices_i32 = torch.empty(
-                (max_requests, rows, keep_count), dtype=torch.int32, device=self.device
-            )
-            self.width_sentinel = torch.full((), width, dtype=torch.long, device=self.device)
-            self.union_physical_indices = torch.empty(
-                (max_requests, width), dtype=torch.long, device=self.device
-            )
-            self.union_indices_sorted = torch.empty_like(self.union_physical_indices)
-            self.union_sort_order = torch.empty_like(self.union_physical_indices)
-            self.candidate_gather_indices = torch.empty_like(self.union_physical_indices)
-            self.union_counts = torch.empty(max_requests, dtype=torch.int32, device=self.device)
-            self.final_indices_i32 = torch.empty(
-                (max_requests, keep_count), dtype=torch.int32, device=self.device
-            )
-            self.final_relative_indices = torch.empty_like(self.final_indices)
+        self.row_seq_lens = torch.full(
+            (max_requests * rows,), width, dtype=torch.int32, device=self.device
+        )
+        self.row_top_indices_i32 = torch.empty(
+            (max_requests, rows, keep_count), dtype=torch.int32, device=self.device
+        )
+        self.width_sentinel = torch.full((), width, dtype=torch.long, device=self.device)
+        self.union_physical_indices = torch.empty(
+            (max_requests, width), dtype=torch.long, device=self.device
+        )
+        self.union_indices_sorted = torch.empty_like(self.union_physical_indices)
+        self.union_sort_order = torch.empty_like(self.union_physical_indices)
+        self.candidate_gather_indices = torch.empty_like(self.union_physical_indices)
+        self.union_counts = torch.empty(max_requests, dtype=torch.int32, device=self.device)
+        self.final_indices_i32 = torch.empty(
+            (max_requests, keep_count), dtype=torch.int32, device=self.device
+        )
+        self.final_relative_indices = torch.empty_like(self.final_indices)
         self.request_workspaces = tuple(
             self._request_workspace(request_index) for request_index in range(max_requests)
         )
@@ -810,6 +680,8 @@ class _BatchedFixedUnionWorkspace:
         max_requests: int,
     ) -> int:
         """Compute request-major workspace bytes without allocating a tensor."""
+        if selection_backend != "cute_dsl_topk":
+            raise ValueError(f"unsupported cross-request selection backend: {selection_backend}")
         dtype_bytes = torch.finfo(dtype).bits // 8
         long_bytes = 8
         int_bytes = 4
@@ -819,30 +691,25 @@ class _BatchedFixedUnionWorkspace:
             + 2 * rows * dtype_bytes
             + width * dtype_bytes
             + width * long_bytes
-            + rows * keep_count * dtype_bytes
             + rows * keep_count * long_bytes
             + width
             + width * dtype_bytes
-            + keep_count * dtype_bytes
             + 3 * keep_count * long_bytes
             + total_keep * long_bytes
             + int_bytes
             + dtype_bytes
             + width
         )
-        total = max_requests * per_request + dtype_bytes + width * long_bytes
-        if selection_backend in ("indexer_topk", "cute_dsl_topk"):
-            total += max_requests * (
-                rows * int_bytes
-                + rows * keep_count * int_bytes
-                + 4 * width * long_bytes
-                + int_bytes
-                + keep_count * int_bytes
-                + keep_count * long_bytes
-            )
-            total += long_bytes
-        elif selection_backend != "torch_topk":
-            raise ValueError(f"unsupported cross-request selection backend: {selection_backend}")
+        total = max_requests * per_request + width * long_bytes
+        total += max_requests * (
+            rows * int_bytes
+            + rows * keep_count * int_bytes
+            + 4 * width * long_bytes
+            + int_bytes
+            + keep_count * int_bytes
+            + keep_count * long_bytes
+        )
+        total += long_bytes
         return total
 
     def _request_workspace(self, request_index: int) -> _FixedUnionWorkspace:
@@ -861,29 +728,25 @@ class _BatchedFixedUnionWorkspace:
         workspace.row_std = self.row_std[request_index]
         workspace.combined = self.combined[request_index]
         workspace.combined_argmax = self.combined_argmax[request_index]
-        workspace.row_top_values = self.row_top_values[request_index]
         workspace.row_top_indices = self.row_top_indices[request_index]
         workspace.union_mask = self.union_mask[request_index]
         workspace.candidates = self.candidates[request_index]
-        workspace.negative_inf = self.negative_inf
-        workspace.final_values = self.final_values[request_index]
         workspace.final_indices = self.final_indices[request_index]
         workspace.sorted_indices = self.sorted_indices[request_index]
         workspace.sort_order = self.sort_order[request_index]
         workspace.keep = self.keep[request_index]
-        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
-            row_start = request_index * self.rows
-            workspace.row_seq_lens = self.row_seq_lens[row_start : row_start + self.rows]
-            workspace.row_top_indices_i32 = self.row_top_indices_i32[request_index]
-            workspace.token_indices = self.token_indices
-            workspace.width_sentinel = self.width_sentinel
-            workspace.union_physical_indices = self.union_physical_indices[request_index]
-            workspace.union_indices_sorted = self.union_indices_sorted[request_index]
-            workspace.union_sort_order = self.union_sort_order[request_index]
-            workspace.candidate_gather_indices = self.candidate_gather_indices[request_index]
-            workspace.union_count = self.union_counts[request_index : request_index + 1]
-            workspace.final_indices_i32 = self.final_indices_i32[request_index]
-            workspace.final_relative_indices = self.final_relative_indices[request_index]
+        row_start = request_index * self.rows
+        workspace.row_seq_lens = self.row_seq_lens[row_start : row_start + self.rows]
+        workspace.row_top_indices_i32 = self.row_top_indices_i32[request_index]
+        workspace.token_indices = self.token_indices
+        workspace.width_sentinel = self.width_sentinel
+        workspace.union_physical_indices = self.union_physical_indices[request_index]
+        workspace.union_indices_sorted = self.union_indices_sorted[request_index]
+        workspace.union_sort_order = self.union_sort_order[request_index]
+        workspace.candidate_gather_indices = self.candidate_gather_indices[request_index]
+        workspace.union_count = self.union_counts[request_index : request_index + 1]
+        workspace.final_indices_i32 = self.final_indices_i32[request_index]
+        workspace.final_relative_indices = self.final_relative_indices[request_index]
         workspace.selection_only = True
         workspace._compaction_buffers = {}
         workspace.prewarm_attempted = True
@@ -904,12 +767,9 @@ class _BatchedFixedUnionWorkspace:
             ("row_std", self.row_std),
             ("combined", self.combined),
             ("combined_argmax", self.combined_argmax),
-            ("row_top_values", self.row_top_values),
             ("row_top_indices", self.row_top_indices),
             ("union_mask", self.union_mask),
             ("candidates", self.candidates),
-            ("negative_inf", self.negative_inf),
-            ("final_values", self.final_values),
             ("final_indices", self.final_indices),
             ("sorted_indices", self.sorted_indices),
             ("sort_order", self.sort_order),
@@ -919,20 +779,18 @@ class _BatchedFixedUnionWorkspace:
             ("token_indices", self.token_indices),
             ("invalid_mask", self.invalid_mask),
         )
-        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
-            tensors += (
-                ("row_seq_lens", self.row_seq_lens),
-                ("row_top_indices_i32", self.row_top_indices_i32),
-                ("width_sentinel", self.width_sentinel),
-                ("union_physical_indices", self.union_physical_indices),
-                ("union_indices_sorted", self.union_indices_sorted),
-                ("union_sort_order", self.union_sort_order),
-                ("candidate_gather_indices", self.candidate_gather_indices),
-                ("union_counts", self.union_counts),
-                ("final_indices_i32", self.final_indices_i32),
-                ("final_relative_indices", self.final_relative_indices),
-            )
-        return tensors
+        return tensors + (
+            ("row_seq_lens", self.row_seq_lens),
+            ("row_top_indices_i32", self.row_top_indices_i32),
+            ("width_sentinel", self.width_sentinel),
+            ("union_physical_indices", self.union_physical_indices),
+            ("union_indices_sorted", self.union_indices_sorted),
+            ("union_sort_order", self.union_sort_order),
+            ("candidate_gather_indices", self.candidate_gather_indices),
+            ("union_counts", self.union_counts),
+            ("final_indices_i32", self.final_indices_i32),
+            ("final_relative_indices", self.final_relative_indices),
+        )
 
     def pointer_snapshot(self) -> Dict[str, tuple]:
         """Return stable addresses and geometry for runtime validation."""
@@ -1000,91 +858,66 @@ class _BatchedFixedUnionWorkspace:
 
         combined = self.combined[:request_count]
         combined_argmax = self.combined_argmax[:request_count]
-        row_top_values = self.row_top_values[:request_count]
         row_top_indices = self.row_top_indices[:request_count]
         union_mask = self.union_mask[:request_count]
         candidates = self.candidates[:request_count]
-        final_values = self.final_values[:request_count]
         final_indices = self.final_indices[:request_count]
         sorted_indices = self.sorted_indices[:request_count]
         sort_order = self.sort_order[:request_count]
 
         torch.max(input_scores, dim=1, out=(combined, combined_argmax))
-        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
-            row_count = request_count * self.rows
-            row_indices_i32 = self.row_top_indices_i32[:request_count]
-            self.row_seq_lens[:row_count].view(request_count, self.rows).copy_(
-                valid_widths.view(request_count, 1).expand(-1, self.rows)
-            )
-            _topk_indices_into(
-                self.selection_backend,
-                input_scores.view(row_count, self.width),
-                self.row_seq_lens[:row_count],
-                row_indices_i32.view(row_count, self.keep_count),
-                self.keep_count,
-            )
-            row_top_indices.copy_(row_indices_i32)
-        else:
-            torch.topk(
-                input_scores,
-                self.keep_count,
-                dim=2,
-                largest=True,
-                sorted=False,
-                out=(row_top_values, row_top_indices),
-            )
+        row_count = request_count * self.rows
+        row_indices_i32 = self.row_top_indices_i32[:request_count]
+        self.row_seq_lens[:row_count].view(request_count, self.rows).copy_(
+            valid_widths.view(request_count, 1).expand(-1, self.rows)
+        )
+        _topk_indices_into(
+            input_scores.view(row_count, self.width),
+            self.row_seq_lens[:row_count],
+            row_indices_i32.view(row_count, self.keep_count),
+            self.keep_count,
+        )
+        row_top_indices.copy_(row_indices_i32)
         union_mask.zero_()
         union_mask.scatter_(1, row_top_indices.reshape(request_count, -1), True)
-        if self.selection_backend in ("indexer_topk", "cute_dsl_topk"):
-            union_physical_indices = self.union_physical_indices[:request_count]
-            union_indices_sorted = self.union_indices_sorted[:request_count]
-            union_sort_order = self.union_sort_order[:request_count]
-            candidate_gather_indices = self.candidate_gather_indices[:request_count]
-            union_counts = self.union_counts[:request_count]
-            final_indices_i32 = self.final_indices_i32[:request_count]
-            final_relative_indices = self.final_relative_indices[:request_count]
-            torch.where(
-                union_mask,
-                self.token_indices,
-                self.width_sentinel,
-                out=union_physical_indices,
-            )
-            torch.sort(
-                union_physical_indices,
-                dim=1,
-                out=(union_indices_sorted, union_sort_order),
-            )
-            torch.clamp(
-                union_indices_sorted,
-                max=self.width - 1,
-                out=candidate_gather_indices,
-            )
-            torch.gather(combined, 1, candidate_gather_indices, out=candidates)
-            torch.sum(union_mask, dim=1, dtype=torch.int32, out=union_counts)
-            _topk_indices_into(
-                self.selection_backend,
-                candidates,
-                union_counts,
-                final_indices_i32,
-                self.keep_count,
-            )
-            final_relative_indices.copy_(final_indices_i32)
-            torch.gather(
-                union_indices_sorted,
-                1,
-                final_relative_indices,
-                out=final_indices,
-            )
-        else:
-            torch.where(union_mask, combined, self.negative_inf, out=candidates)
-            torch.topk(
-                candidates,
-                self.keep_count,
-                dim=1,
-                largest=True,
-                sorted=False,
-                out=(final_values, final_indices),
-            )
+        union_physical_indices = self.union_physical_indices[:request_count]
+        union_indices_sorted = self.union_indices_sorted[:request_count]
+        union_sort_order = self.union_sort_order[:request_count]
+        candidate_gather_indices = self.candidate_gather_indices[:request_count]
+        union_counts = self.union_counts[:request_count]
+        final_indices_i32 = self.final_indices_i32[:request_count]
+        final_relative_indices = self.final_relative_indices[:request_count]
+        torch.where(
+            union_mask,
+            self.token_indices,
+            self.width_sentinel,
+            out=union_physical_indices,
+        )
+        torch.sort(
+            union_physical_indices,
+            dim=1,
+            out=(union_indices_sorted, union_sort_order),
+        )
+        torch.clamp(
+            union_indices_sorted,
+            max=self.width - 1,
+            out=candidate_gather_indices,
+        )
+        torch.gather(combined, 1, candidate_gather_indices, out=candidates)
+        torch.sum(union_mask, dim=1, dtype=torch.int32, out=union_counts)
+        _topk_indices_into(
+            candidates,
+            union_counts,
+            final_indices_i32,
+            self.keep_count,
+        )
+        final_relative_indices.copy_(final_indices_i32)
+        torch.gather(
+            union_indices_sorted,
+            1,
+            final_relative_indices,
+            out=final_indices,
+        )
         torch.sort(final_indices, dim=1, out=(sorted_indices, sort_order))
         torch.add(
             sorted_indices,
@@ -1534,33 +1367,20 @@ class TriAttention(BaseKVCacheCompressionManager):
     same request-wide cached length.
     """
 
-    # The TRT-LLM IndexerTopK op's single-block kernel sizes dynamic shared memory
-    # as k * 4 bytes with no opt-in past the 48 KB per-block cap; its heuristic
-    # only supports k in {512, 1024, 2048}, so k above 2048 must fall back.
-    # Independently of k, the op splits a row into multiple 2048-column sub-blocks
-    # once the score width reaches 4096. That path requires caller-owned radix
-    # scratch, which this caller does not provide. torch.topk is exact for both
-    # unsupported cases, so either boundary can fall back without changing the
-    # retained set.
-    _INDEXER_TOPK_MAX_K = 2048
-    _CUTE_DSL_TOPK_MAX_K = 4096  # filtered_topk_max_k staging raised 2048 -> 4096
+    # Fixed union workspaces remain the optimized/capturable route for large K.
+    # Smaller or non-union shapes use the same CuTE-DSL op through an eager
+    # scratch allocation; this threshold never selects another top-k backend.
+    _FIXED_UNION_MIN_KEEP = 2048
 
     def _selection_backend_for(self, width: int, keep_count: int) -> str:
-        """One decision point for the union-select backend.
-
-        ``TRIATTN_SELECT_BACKEND=cute_dsl`` opts into the Blackwell CuTE-DSL
-        radix top-k (correct + 3-5x vs torch.topk up to k=4096 after the
-        staging raise); otherwise the established indexer/torch routing.
-        """
-        if (
-            os.environ.get("TRIATTN_SELECT_BACKEND") == "cute_dsl"
-            and keep_count <= self._CUTE_DSL_TOPK_MAX_K
-            and hasattr(torch.ops.trtllm, "cute_dsl_indexer_topk_decode")
-        ):
-            return "cute_dsl_topk"
-        return "indexer_topk" if self._indexer_topk_supported(width, keep_count) else "torch_topk"
-
-    _INDEXER_TOPK_SUBBLOCK = 2048
+        """Require the Blackwell CuTE-DSL selector for every eviction mode."""
+        if keep_count <= 0:
+            raise RuntimeError("TriAttention top-k keep_count must be positive")
+        if width < keep_count:
+            raise RuntimeError(
+                f"TriAttention top-k width={width} is smaller than keep_count={keep_count}"
+            )
+        return "cute_dsl_topk"
 
     def __init__(
         self,
@@ -1962,10 +1782,8 @@ class TriAttention(BaseKVCacheCompressionManager):
             try:
                 if self._cross_request_selection_enabled:
                     # Length is dynamic inside an upper-bound graph bucket. Prompt
-                    # and retained geometry plus the actual selection backend band
-                    # remain exact because they define selection and destination
-                    # layout. In particular, widths 4095 and 4096 cannot share an
-                    # IndexerTopK/torch.topk workspace.
+                    # and retained geometry remain exact because they define
+                    # selection and destination layout. Every bucket uses CuTE-DSL.
                     graph_groups = {}
                     for request, rid in evict_now:
                         seq_len = self._confirmed_kv_lengths[rid]
@@ -2069,7 +1887,7 @@ class TriAttention(BaseKVCacheCompressionManager):
     ) -> tuple:
         """Return a provenance key containing geometry but no request identity."""
         decode_width = future_seq_len - prompt_len
-        use_fixed_workspace = self.top_B > self._INDEXER_TOPK_MAX_K
+        use_fixed_workspace = self.top_B > self._FIXED_UNION_MIN_KEEP
         selection_backend = (
             f"{'fixed_union' if use_fixed_workspace else 'eager_union'}."
             f"{self._selection_backend_for(decode_width, self.top_B)}"
@@ -2196,25 +2014,15 @@ class TriAttention(BaseKVCacheCompressionManager):
         self,
         shapes: List[Tuple[int, int]],
     ) -> List[Tuple[int, int]]:
-        """Emit one upper bucket per prompt and actual selection-backend band."""
-        upper_by_band = {}
-        indexer_width_limit = 2 * self._INDEXER_TOPK_SUBBLOCK - 1
+        """Emit one CuTE-DSL upper bucket per prompt length."""
+        upper_by_prompt = {}
         for prompt_len, maximum_width in shapes:
-            if self.top_B <= self._INDEXER_TOPK_MAX_K:
-                indexer_upper = min(maximum_width, indexer_width_limit)
-                if indexer_upper > self.top_B:
-                    upper_by_band[(prompt_len, "indexer_topk")] = max(
-                        indexer_upper,
-                        upper_by_band.get((prompt_len, "indexer_topk"), 0),
-                    )
-            if maximum_width > indexer_width_limit or self.top_B > self._INDEXER_TOPK_MAX_K:
-                upper_by_band[(prompt_len, "torch_topk")] = max(
+            if maximum_width > self.top_B:
+                upper_by_prompt[prompt_len] = max(
                     maximum_width,
-                    upper_by_band.get((prompt_len, "torch_topk"), 0),
+                    upper_by_prompt.get(prompt_len, 0),
                 )
-        return sorted(
-            (prompt_len, decode_width) for (prompt_len, _), decode_width in upper_by_band.items()
-        )
+        return sorted(upper_by_prompt.items())
 
     def prewarm(self) -> None:
         """Warm explicitly configured fixed-buffer buckets before graph capture.
@@ -2288,7 +2096,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 f"({prompt_len}:{decode_width}); skipping prewarm"
             )
             return
-        use_fixed_workspace = self.top_B > self._INDEXER_TOPK_MAX_K
+        use_fixed_workspace = self.top_B > self._FIXED_UNION_MIN_KEEP
         seq_len = prompt_len + decode_width
         first_pool = layer_pools[dense_layers[0]]
         rows = len(dense_layers) * int(self._H)
@@ -2865,7 +2673,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         kept SET is what matters (the result is sorted by slot)."""
         rows, decode_count = scores.shape
         k = min(decode_budget, decode_count)
-        decode_idx = self._indexer_topk_idx(scores, k) + decode_start  # [rows, k]
+        decode_idx = self._cute_dsl_topk_idx(scores, k) + decode_start  # [rows, k]
         prefill_idx = torch.arange(decode_start, device=scores.device, dtype=torch.long).expand(
             rows, decode_start
         )
@@ -3245,10 +3053,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         if not self._fixed_union_enabled or scores.ndim != 2:
             return None
         rows, width = (int(value) for value in scores.shape)
-        # The fixed P0 uses torch.topk for both selection stages. Requiring a k
-        # above IndexerTopK's cap preserves that route even after union packing.
-        uses_torch_topk = keep_count > self._INDEXER_TOPK_MAX_K
-        if rows <= 0 or keep_count <= 0 or width <= keep_count or not uses_torch_topk:
+        uses_fixed_route = keep_count > self._FIXED_UNION_MIN_KEEP
+        if rows <= 0 or keep_count <= 0 or width <= keep_count or not uses_fixed_route:
             return None
         shape_key = self._fixed_union_workspace_shape_key(
             rows,
@@ -3286,28 +3092,21 @@ class TriAttention(BaseKVCacheCompressionManager):
             workspaces[key] = workspace
         return workspace
 
-    def _indexer_topk_idx(self, scores: "torch.Tensor", k: int) -> "torch.Tensor":
-        """Top-k indices per row via the TRT-LLM IndexerTopK op (AIR-TopK) — the
-        fastest available top-k for the dense ``[rows, seq]`` eviction select
-        (~4-6x faster than torch.topk at scale, same kept SET for distinct
-        scores). Returns ``[rows, k]`` int64 slot indices in ``[0, seq)``,
-        unsorted (the caller scatters into a mask / re-sorts by slot). Falls back
-        to ``torch.topk`` when either ``k`` exceeds the launch cap or the score
-        width requires the unsupported multi-block radix path."""
-        rows, seq = scores.shape
+    def _cute_dsl_topk_idx(self, scores: "torch.Tensor", k: int) -> "torch.Tensor":
+        """Return unsorted per-row indices from the required CuTE-DSL top-k op."""
+        if scores.ndim != 2:
+            raise ValueError("TriAttention top-k scores must be two-dimensional")
+        rows, width = scores.shape
         k = int(k)
-        if not self._indexer_topk_supported(seq, k):
-            return torch.topk(scores, k, dim=1, sorted=False).indices.to(torch.long)
+        if rows <= 0:
+            raise ValueError("TriAttention top-k requires at least one score row")
+        self._selection_backend_for(int(width), k)
+        if width == k:
+            return torch.arange(width, device=scores.device, dtype=torch.long).expand(rows, -1)
         out = torch.empty((rows, k), dtype=torch.int32, device=scores.device)
-        seq_lens = torch.full((rows,), seq, dtype=torch.int32, device=scores.device)
-        torch.ops.trtllm.indexer_topk_decode(
-            scores.contiguous().to(torch.float32), seq_lens, out, 1, k
-        )
+        seq_lens = torch.full((rows,), width, dtype=torch.int32, device=scores.device)
+        torch.ops.trtllm.cute_dsl_indexer_topk_decode(scores.contiguous(), seq_lens, out, k, 1)
         return out.to(torch.long)
-
-    def _indexer_topk_supported(self, width: int, k: int) -> bool:
-        """Return whether the production selection route uses IndexerTopK."""
-        return int(k) <= self._INDEXER_TOPK_MAX_K and int(width) < 2 * self._INDEXER_TOPK_SUBBLOCK
 
     def _select_union(
         self, per_head_scores: "torch.Tensor", combined: "torch.Tensor", keep_count: int
@@ -3321,23 +3120,23 @@ class TriAttention(BaseKVCacheCompressionManager):
             return torch.arange(n, device=combined.device, dtype=torch.long)
         union_mask = torch.zeros(n, device=combined.device, dtype=torch.bool)
         quota = min(keep_count, n)
-        # Top-k over all (layer x head) rows at once via the TRT-LLM IndexerTopK
+        # Top-k over all (layer x head) rows at once via the TRT-LLM CuTE-DSL
         # op: each row's top-quota is computed independently, collapsing H per-row
         # launches into one (H = num_layers * num_q_heads = 1152 for Qwen3-8B --
         # this was the dominant high-BS eviction cost). The union_mask scatter
         # below is order-independent, so the (unsorted) indices are fine.
-        top_idx = self._indexer_topk_idx(per_head_scores, quota)
+        top_idx = self._cute_dsl_topk_idx(per_head_scores, quota)
         union_mask[top_idx.reshape(-1)] = True
         union_idx = torch.nonzero(union_mask, as_tuple=False).view(-1)
         if union_idx.numel() >= keep_count:
             subset = combined.index_select(0, union_idx)
-            top_subset = self._indexer_topk_idx(subset.unsqueeze(0), keep_count).squeeze(0)
+            top_subset = self._cute_dsl_topk_idx(subset.unsqueeze(0), keep_count).squeeze(0)
             return union_idx.index_select(0, torch.sort(top_subset).values)
         remaining = keep_count - int(union_idx.numel())
         if remaining > 0:
             residual = combined.clone()
             residual[union_mask] = float("-inf")
-            extra = self._indexer_topk_idx(
+            extra = self._cute_dsl_topk_idx(
                 residual.unsqueeze(0), min(remaining, n - int(union_idx.numel()))
             ).squeeze(0)
             union_idx = torch.cat([union_idx, extra])

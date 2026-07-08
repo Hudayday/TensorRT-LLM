@@ -34,8 +34,10 @@ is covered by the NIAH end-to-end run.
 """
 
 import ast
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -70,6 +72,105 @@ CUDA_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="_resolve_calibration moves the loaded tensors to cuda",
 )
+
+_TORCH_TOPK_ORACLE = torch.topk
+
+
+def _fake_cute_dsl_topk(
+    values: torch.Tensor,
+    seq_lens: torch.Tensor,
+    output: torch.Tensor,
+    top_k: int,
+    next_n: int,
+) -> None:
+    """CPU oracle for the CUDA-only CuTE-DSL selector custom op."""
+    assert next_n == 1
+    for row in range(int(values.shape[0])):
+        width = int(seq_lens[row])
+        selected = _TORCH_TOPK_ORACLE(
+            values[row, :width],
+            top_k,
+            sorted=False,
+        ).indices
+        output[row].copy_(selected.to(torch.int32))
+
+
+@contextmanager
+def _mock_cute_topk_without_fallbacks():
+    """Provide the CuTE op while making both retired fallbacks fatal."""
+    with (
+        mock.patch.object(
+            torch.ops.trtllm,
+            "cute_dsl_indexer_topk_decode",
+            side_effect=_fake_cute_dsl_topk,
+            create=True,
+        ) as cute_topk,
+        mock.patch.object(
+            torch.ops.trtllm,
+            "indexer_topk_decode",
+            side_effect=AssertionError("native IndexerTopK fallback is forbidden"),
+            create=True,
+        ),
+        mock.patch.object(
+            torch,
+            "topk",
+            side_effect=AssertionError("torch.topk production fallback is forbidden"),
+        ),
+    ):
+        yield cute_topk
+
+
+def _topk_oracle(scores: torch.Tensor, keep_count: int) -> torch.Tensor:
+    """Return sorted per-row indices for an independent expected result."""
+    return torch.sort(
+        _TORCH_TOPK_ORACLE(scores, keep_count, dim=1, sorted=False).indices,
+        dim=1,
+    ).values
+
+
+def _union_oracle(scores: torch.Tensor, keep_count: int) -> torch.Tensor:
+    """Independent expected-result implementation of union selection."""
+    combined = scores.max(dim=0).values
+    row_top = _TORCH_TOPK_ORACLE(
+        scores,
+        keep_count,
+        dim=1,
+        sorted=False,
+    ).indices
+    union_mask = torch.zeros(scores.shape[1], dtype=torch.bool, device=scores.device)
+    union_mask.scatter_(0, row_top.reshape(-1), True)
+    union_indices = torch.nonzero(union_mask, as_tuple=False).flatten()
+    if union_indices.numel() >= keep_count:
+        candidates = combined.index_select(0, union_indices)
+        relative = _TORCH_TOPK_ORACLE(
+            candidates,
+            keep_count,
+            sorted=False,
+        ).indices
+        return torch.sort(union_indices.index_select(0, relative)).values
+
+    remaining = keep_count - int(union_indices.numel())
+    residual = combined.clone()
+    residual[union_mask] = float("-inf")
+    extra = _TORCH_TOPK_ORACLE(
+        residual,
+        remaining,
+        sorted=False,
+    ).indices
+    return torch.sort(torch.cat((union_indices, extra))).values
+
+
+def _distinct_topk_scores(width: int, rows: int = 2) -> torch.Tensor:
+    """Create deterministic finite rows without top-k boundary ties."""
+    token = torch.arange(width, dtype=torch.float32)
+    return torch.stack(
+        [
+            torch.sin(token * (0.0017 + row * 0.0003))
+            + token * (0.00011 + row * 0.000013)
+            + row * 0.000001
+            for row in range(rows)
+        ]
+    )
 
 
 @pytest.fixture
@@ -1483,67 +1584,126 @@ class TestStepEndHookRefactor:
 
 
 class TestTopKRouting:
-    def test_indexer_route_predicate_preserves_prior_dispatch_domain(self):
-        mgr = _make_triattention()
+    @pytest.mark.parametrize("keep_count", [4096, 8192])
+    def test_eager_topk_uses_cute_without_fallback(self, keep_count):
+        width = keep_count + 64
+        scores = _distinct_topk_scores(width, rows=3)
+        expected = _topk_oracle(scores, keep_count)
+        manager = _make_triattention(top_B=keep_count)
 
-        for width in (1, 4095, 4096, 8191):
-            for k in (1, 2048, 2049, 4096):
-                prior_route = not (
-                    k > mgr._INDEXER_TOPK_MAX_K or width >= 2 * mgr._INDEXER_TOPK_SUBBLOCK
+        with _mock_cute_topk_without_fallbacks() as cute_topk:
+            actual = manager._cute_dsl_topk_idx(scores, keep_count)
+
+        cute_topk.assert_called_once()
+        assert actual.dtype == torch.long
+        assert torch.equal(torch.sort(actual, dim=1).values, expected)
+
+    @pytest.mark.parametrize("keep_count", [4096, 8192])
+    def test_eager_union_uses_cute_without_fallback(self, keep_count):
+        width = keep_count + 64
+        scores = _distinct_topk_scores(width)
+        combined = scores.max(dim=0).values
+        expected = _union_oracle(scores, keep_count)
+        manager = _make_triattention(top_B=keep_count)
+
+        with _mock_cute_topk_without_fallbacks() as cute_topk:
+            actual = manager._select_union(scores, combined, keep_count)
+
+        assert cute_topk.call_count >= 2
+        assert torch.equal(actual, expected)
+
+    @pytest.mark.parametrize("keep_count", [4096, 8192])
+    @pytest.mark.parametrize("eviction_mode", ["per_head", "per_layer_perhead"])
+    def test_per_head_modes_use_cute_without_fallback(self, keep_count, eviction_mode):
+        width = keep_count + 64
+        first = _distinct_topk_scores(width)
+        second = _distinct_topk_scores(width).flip(1) + 0.000003
+        per_layer_scores = [first, second]
+        manager = _make_triattention(top_B=keep_count, eviction_mode=eviction_mode)
+        manager._dense_layers = mock.Mock(return_value=[0, 1])
+        manager._compact_perhead_layers = mock.Mock()
+        request = SimpleNamespace(py_request_id=7)
+
+        with _mock_cute_topk_without_fallbacks() as cute_topk:
+            if eviction_mode == "per_head":
+                kept_count = manager._evict_per_head(
+                    request,
+                    2,
+                    width,
+                    0,
+                    keep_count,
+                    per_layer_scores,
                 )
-                assert mgr._indexer_topk_supported(width, k) is prior_route
+                expected = [_topk_oracle(torch.stack(per_layer_scores).mean(dim=0), keep_count)]
+            else:
+                kept_count = manager._evict_per_layer_perhead(
+                    request,
+                    2,
+                    width,
+                    0,
+                    keep_count,
+                    per_layer_scores,
+                )
+                expected = [_topk_oracle(scores, keep_count) for scores in per_layer_scores]
 
-    def test_score_width_4095_k2048_routes_to_native_indexer_topk(self):
-        from unittest import mock
-
-        mgr = _make_triattention()
-        scores = torch.arange(2 * 4095, dtype=torch.float32).reshape(2, 4095)
-
-        def fake_indexer(values, seq_lens, output, next_n, k):
-            assert values.shape == scores.shape
-            assert values.dtype == scores.dtype
-            assert values.device == scores.device
-            assert seq_lens.tolist() == [4095, 4095]
-            assert next_n == 1
-            assert k == 2048
-            output.copy_(torch.arange(k, dtype=torch.int32, device=output.device).expand(2, -1))
-
-        with (
-            mock.patch.object(
-                torch.ops.trtllm,
-                "indexer_topk_decode",
-                side_effect=fake_indexer,
-            ) as indexer,
-            mock.patch.object(
-                torch,
-                "topk",
-                side_effect=AssertionError("4095 must stay on native IndexerTopK"),
-            ),
+        assert kept_count == keep_count
+        assert cute_topk.call_count == len(expected)
+        assert manager._compact_perhead_layers.call_count == len(expected)
+        for call, expected_keep in zip(
+            manager._compact_perhead_layers.call_args_list,
+            expected,
         ):
-            result = mgr._indexer_topk_idx(scores, 2048)
+            assert torch.equal(call.args[2], expected_keep)
 
-        indexer.assert_called_once()
-        assert result.shape == (2, 2048)
-        assert result.dtype == torch.long
-        assert torch.equal(result[0], torch.arange(2048))
+    @pytest.mark.parametrize("keep_count", [4096, 8192])
+    def test_fixed_union_uses_cute_without_fallback(self, keep_count):
+        width = keep_count + 64
+        scores = _distinct_topk_scores(width)
+        expected = _union_oracle(scores, keep_count)
+        workspace = _FixedUnionWorkspace(
+            scores.shape[0],
+            width,
+            keep_count,
+            0,
+            dtype=scores.dtype,
+            device=scores.device,
+            selection_backend="cute_dsl_topk",
+        )
 
-    def test_score_width_4096_k2048_routes_to_torch_topk(self):
-        from unittest import mock
+        with _mock_cute_topk_without_fallbacks() as cute_topk:
+            actual = workspace.select(scores)
 
-        mgr = _make_triattention()
-        scores = torch.arange(2 * 4096, dtype=torch.float32).reshape(2, 4096)
-        real_topk = torch.topk
+        assert cute_topk.call_count == 2
+        assert torch.equal(actual, expected)
 
-        with mock.patch.object(torch, "topk", wraps=real_topk) as topk:
-            result = mgr._indexer_topk_idx(scores, 2048)
+    @pytest.mark.parametrize("keep_count", [4096, 8192])
+    def test_cross_request_union_uses_cute_without_fallback(self, keep_count):
+        width = keep_count + 64
+        request_scores = [
+            _distinct_topk_scores(width),
+            _distinct_topk_scores(width).roll(17, dims=1) + 0.000007,
+        ]
+        expected = [_union_oracle(scores, keep_count) for scores in request_scores]
+        workspace = _BatchedFixedUnionWorkspace(
+            request_scores[0].shape[0],
+            width,
+            keep_count,
+            0,
+            dtype=request_scores[0].dtype,
+            device=request_scores[0].device,
+            selection_backend="cute_dsl_topk",
+            max_requests=len(request_scores),
+        )
 
-        topk.assert_called_once()
-        args, kwargs = topk.call_args
-        assert args[0] is scores
-        assert args[1:] == (2048,)
-        assert kwargs == {"dim": 1, "sorted": False}
-        assert result.shape == (2, 2048)
-        assert result.dtype == torch.long
+        with _mock_cute_topk_without_fallbacks() as cute_topk:
+            selected = workspace.select_requests(
+                [[scores] for scores in request_scores],
+                normalize_scores=False,
+            )
+
+        assert cute_topk.call_count == 2
+        for actual, expected_keep in zip(selected, expected):
+            assert torch.equal(actual.keep, expected_keep)
 
 
 def _torch_tri_score_oracle(
@@ -2541,7 +2701,6 @@ class TestFixedScoreMetadata:
             )
             manager._dense_layers = lambda num_layers: [0, 1]
             manager._global_layer_id = lambda layer, num_layers: layer
-            manager._indexer_topk_supported = lambda width, k: False
             manager._fixed_union_enabled = False
             manager._fixed_union_active = {}
             manager._fixed_shape_selection_enabled = fixed_shape
@@ -2769,7 +2928,6 @@ class TestFixedScoreMetadata:
             manager._offsets = offsets
             manager._attention_layer_partition = lambda num_layers: ([1, 2], [0], 2)
             manager._local_to_global_layers_cache = [0, 1, 2]
-            manager._indexer_topk_supported = lambda width, k: False
             manager._fixed_union_enabled = False
             manager._fixed_union_prewarm_enabled = False
             manager._fixed_union_compaction_enabled = False
@@ -3076,8 +3234,6 @@ class TestFixedUnionWorkspace:
 
         manager, pools = self._make_mocked_prewarm_manager()
         manager.top_B = 2048
-        manager._INDEXER_TOPK_MAX_K = 2048
-        manager._INDEXER_TOPK_SUBBLOCK = 2048
         layer_pools, dense_layers, storage_groups = manager._fixed_union_live_geometry(2)
 
         with (
@@ -3143,11 +3299,9 @@ class TestFixedUnionWorkspace:
 
         assert first == second
 
-    def test_prewarm_key_records_exact_4095_indexer_boundary(self):
+    def test_prewarm_key_records_cute_backend_for_eager_and_fixed_shapes(self):
         manager, pools = self._make_mocked_prewarm_manager()
         manager.top_B = 2048
-        manager._INDEXER_TOPK_MAX_K = 2048
-        manager._INDEXER_TOPK_SUBBLOCK = 2048
 
         native = manager._fixed_union_prewarm_key(
             pools,
@@ -3176,9 +3330,9 @@ class TestFixedUnionWorkspace:
         )
 
         assert native[0] == "triattention.fixed-prewarm.v3"
-        assert native[9] == "eager_union.indexer_topk"
-        assert eager[9] == "eager_union.torch_topk"
-        assert fixed[9] == "fixed_union.torch_topk"
+        assert native[9] == "eager_union.cute_dsl_topk"
+        assert eager[9] == "eager_union.cute_dsl_topk"
+        assert fixed[9] == "fixed_union.cute_dsl_topk"
         assert native[12:17] == (1024 + 4095, 1024, 2048, 4, 4095)
         assert native != eager
 
@@ -3196,7 +3350,6 @@ class TestFixedUnionWorkspace:
         manager = _make_triattention()
         manager.kv_cache_manager = SimpleNamespace(get_buffers=lambda layer, **kwargs: pools[layer])
         manager.top_B = 4
-        manager._INDEXER_TOPK_MAX_K = 2
         manager._H = 2
         manager._F = 1
         manager._offset_max_length = 1
@@ -3273,7 +3426,7 @@ class TestFixedUnionWorkspace:
                 "nvtx_range",
                 return_value=contextlib.nullcontext(),
             ) as nvtx,
-            mock.patch.object(torch, "topk", wraps=torch.topk) as topk,
+            _mock_cute_topk_without_fallbacks() as cute_topk,
             mock.patch.object(torch.cuda, "Event") as event,
             mock.patch.object(torch.cuda, "synchronize") as synchronize,
         ):
@@ -3302,7 +3455,7 @@ class TestFixedUnionWorkspace:
             "triattention.prewarm.select",
             "triattention.prewarm.compact",
         ]
-        assert topk.call_count == 2
+        assert cute_topk.call_count == 2
         event.assert_not_called()
         synchronize.assert_not_called()
         assert seen_page_ids[0].tolist() == [0, 1]
@@ -3338,7 +3491,7 @@ class TestFixedUnionWorkspace:
         for pool, before in zip(pools, live_before):
             assert torch.equal(pool, before)
 
-    def test_startup_prewarm_executes_exact_4095_native_indexer_bucket(self):
+    def test_startup_prewarm_executes_exact_4095_cute_bucket(self):
         import contextlib
         from unittest import mock
 
@@ -3347,43 +3500,24 @@ class TestFixedUnionWorkspace:
 
         manager, pools = self._make_mocked_prewarm_manager()
         manager.top_B = 2048
-        manager._INDEXER_TOPK_MAX_K = 2048
-        manager._INDEXER_TOPK_SUBBLOCK = 2048
         live_before = [pool.clone() for pool in pools]
         live_ptrs = [pool.untyped_storage().data_ptr() for pool in pools]
         layer_pools, dense_layers, storage_groups = manager._fixed_union_live_geometry(2)
-        seen_indexer_calls = []
 
         def fake_score(*args, **kwargs):
             seq_len = 1024 + 4095
             values = torch.zeros((2, 2 * seq_len), dtype=torch.float32)
             return values, torch.tensor([0, seq_len, 2 * seq_len], dtype=torch.int32), []
 
-        def fake_indexer(scores, k):
-            rows, width = scores.shape
-            seen_indexer_calls.append((rows, width, k))
-            assert width == 4095
-            assert k == 2048
-            if rows == 1:
-                return torch.arange(width - k, width, dtype=torch.long, device=scores.device)
-            low = torch.arange(k, dtype=torch.long, device=scores.device)
-            high = torch.arange(width - k, width, dtype=torch.long, device=scores.device)
-            return torch.stack([high if row % 2 == 0 else low for row in range(rows)])
-
         with (
             mock.patch.object(kernels, "triton_tri_score_perhead", side_effect=fake_score),
             mock.patch.object(kernels, "cpp_sparse_compact") as compact,
-            mock.patch.object(manager, "_indexer_topk_idx", side_effect=fake_indexer),
             mock.patch.object(
                 tri_module,
                 "nvtx_range",
                 side_effect=lambda *args, **kwargs: contextlib.nullcontext(),
             ),
-            mock.patch.object(
-                torch,
-                "topk",
-                side_effect=AssertionError("native prewarm must not call torch.topk"),
-            ),
+            _mock_cute_topk_without_fallbacks() as cute_topk,
         ):
             manager._prewarm_fixed_union_bucket(
                 layer_pools,
@@ -3394,7 +3528,11 @@ class TestFixedUnionWorkspace:
                 decode_width=4095,
             )
 
-        assert seen_indexer_calls == [(4, 4095, 2048), (1, 4095, 2048)]
+        assert [tuple(call.args[0].shape) for call in cute_topk.call_args_list] == [
+            (4, 4095),
+            (1, 4095),
+        ]
+        assert all(call.args[3] == 2048 for call in cute_topk.call_args_list)
         compact.assert_called_once()
         assert compact.call_args.args[3] == [1024 + 4095]
         keep = compact.call_args.args[2][0]
@@ -3405,7 +3543,7 @@ class TestFixedUnionWorkspace:
         for pool, before in zip(pools, live_before):
             assert torch.equal(pool, before)
 
-    def test_startup_prewarm_executes_exact_4096_torch_topk_bucket(self):
+    def test_startup_prewarm_executes_exact_4096_cute_bucket(self):
         import contextlib
         from unittest import mock
 
@@ -3414,8 +3552,6 @@ class TestFixedUnionWorkspace:
 
         manager, pools = self._make_mocked_prewarm_manager()
         manager.top_B = 2048
-        manager._INDEXER_TOPK_MAX_K = 2048
-        manager._INDEXER_TOPK_SUBBLOCK = 2048
         live_before = [pool.clone() for pool in pools]
         live_ptrs = [pool.untyped_storage().data_ptr() for pool in pools]
         layer_pools, dense_layers, storage_groups = manager._fixed_union_live_geometry(2)
@@ -3425,7 +3561,6 @@ class TestFixedUnionWorkspace:
             values = torch.zeros((2, 2 * seq_len), dtype=torch.float32)
             return values, torch.tensor([0, seq_len, 2 * seq_len], dtype=torch.int32), []
 
-        real_topk = torch.topk
         with (
             mock.patch.object(kernels, "triton_tri_score_perhead", side_effect=fake_score),
             mock.patch.object(kernels, "cpp_sparse_compact") as compact,
@@ -3434,7 +3569,7 @@ class TestFixedUnionWorkspace:
                 "nvtx_range",
                 side_effect=lambda *args, **kwargs: contextlib.nullcontext(),
             ),
-            mock.patch.object(torch, "topk", wraps=real_topk) as topk,
+            _mock_cute_topk_without_fallbacks() as cute_topk,
         ):
             manager._prewarm_fixed_union_bucket(
                 layer_pools,
@@ -3445,19 +3580,18 @@ class TestFixedUnionWorkspace:
                 decode_width=4096,
             )
 
-        assert [tuple(call.args[0].shape) for call in topk.call_args_list] == [
+        assert [tuple(call.args[0].shape) for call in cute_topk.call_args_list] == [
             (4, 4096),
             (1, 4096),
         ]
-        assert all(call.args[1] == 2048 for call in topk.call_args_list)
-        assert all(call.kwargs == {"dim": 1, "sorted": False} for call in topk.call_args_list)
+        assert all(call.args[3] == 2048 for call in cute_topk.call_args_list)
         compact.assert_called_once()
         assert compact.call_args.args[3] == [1024 + 4096]
         keep = compact.call_args.args[2][0]
         assert keep.shape == (1024 + 2048,)
         assert list(manager._fixed_union_prewarm_states.values()) == ["ready"]
         key = next(iter(manager._fixed_union_prewarm_states))
-        assert key[9] == "eager_union.torch_topk"
+        assert key[9] == "eager_union.cute_dsl_topk"
         assert not manager._fixed_union_prewarmed_workspaces
         assert live_ptrs == [pool.untyped_storage().data_ptr() for pool in pools]
         for pool, before in zip(pools, live_before):
@@ -3520,8 +3654,6 @@ class TestFixedUnionWorkspace:
 
         manager, pools = self._make_mocked_prewarm_manager()
         manager.top_B = 2
-        manager._INDEXER_TOPK_MAX_K = 2
-        manager._INDEXER_TOPK_SUBBLOCK = 2
         live_before = [pool.clone() for pool in pools]
         layer_pools, dense_layers, storage_groups = manager._fixed_union_live_geometry(2)
 
@@ -3833,7 +3965,6 @@ class TestFixedUnionWorkspace:
         manager = _make_triattention()
         manager.top_B = 8
         manager.normalize_scores = True
-        manager._indexer_topk_supported = lambda width, keep: False
         manager._fixed_shape_selection_enabled = True
         manager._fixed_shape_selection_prewarm_states = {}
         manager._fixed_shape_selection_workspaces = {}
@@ -3913,7 +4044,6 @@ class TestFixedUnionWorkspace:
         failed = _make_triattention()
         failed.top_B = 8
         failed.normalize_scores = True
-        failed._indexer_topk_supported = lambda width, keep: False
         failed._fixed_shape_selection_enabled = True
         failed._fixed_shape_selection_prewarm_states = {}
         failed._fixed_shape_selection_workspaces = {}
@@ -3946,11 +4076,11 @@ class TestFixedUnionWorkspace:
         assert not failed_base._segment_buffers_prepared
         assert not hasattr(failed_base, "input_scores")
 
-    def test_indexer_bucket_prewarm_builds_exact_shared_workspace(self):
+    def test_cute_bucket_prewarm_builds_exact_shared_workspace(self):
         from types import SimpleNamespace
         from unittest import mock
 
-        key = ("indexer-bucket",)
+        key = ("cute-bucket",)
         scores_by_layer = {
             0: torch.arange(2 * 19, dtype=torch.float32).view(2, 19),
             1: torch.arange(2 * 19, dtype=torch.float32).view(2, 19).flip(1),
@@ -3966,13 +4096,6 @@ class TestFixedUnionWorkspace:
         manager._fixed_shape_selection_bank_bytes = {}
         manager._fixed_union_prewarmed_workspaces = {}
         manager._fixed_shape_selection_materialization_state = "pending"
-        manager._indexer_topk_supported = lambda width, keep: True
-
-        def fake_indexer(scores, seq_lens, output, _num_experts, top_k):
-            for row in range(int(scores.shape[0])):
-                seq_len = int(seq_lens[row])
-                selected = torch.topk(scores[row, :seq_len], top_k, sorted=False).indices
-                output[row].copy_(selected.to(torch.int32))
 
         original_init = _FixedUnionWorkspace.__init__
         with (
@@ -3982,11 +4105,7 @@ class TestFixedUnionWorkspace:
                 autospec=True,
                 side_effect=original_init,
             ) as workspace_init,
-            mock.patch.object(
-                torch.ops.trtllm,
-                "indexer_topk_decode",
-                side_effect=fake_indexer,
-            ) as indexer,
+            _mock_cute_topk_without_fallbacks() as cute_topk,
             mock.patch.object(
                 manager,
                 "_warm_fixed_shape_selection_workspace",
@@ -4012,23 +4131,23 @@ class TestFixedUnionWorkspace:
 
         assert workspace_init.call_count == 1
         assert warm_bank.call_count == 1
-        assert indexer.call_count == 2
+        assert cute_topk.call_count == 2
         bank = manager._fixed_shape_selection_workspaces[key]
         assert manager._fixed_shape_selection_prewarm_states[key] == "ready"
         assert len(bank) == 3
-        assert all(item.selection_backend == "indexer_topk" for item in bank)
+        assert all(item.selection_backend == "cute_dsl_topk" for item in bank)
         assert len({item.keep.data_ptr() for item in bank}) == 3
         keep_bytes = bank[0].keep.numel() * bank[0].keep.element_size()
         assert manager._fixed_shape_selection_bank_bytes[key] == (
             bank[0].selection_buffer_nbytes() + keep_bytes * (len(bank) - 1)
         )
-        for name in (
-            *_FixedUnionWorkspace._SELECTION_SCRATCH_NAMES,
-            *_FixedUnionWorkspace._INDEXER_SCRATCH_NAMES,
-        ):
-            assert len({getattr(item, name).data_ptr() for item in bank}) == 1
+        for tensor_index in range(len(bank[0]._selection_scratch_tensors())):
+            assert (
+                len({item._selection_scratch_tensors()[tensor_index].data_ptr() for item in bank})
+                == 1
+            )
 
-    def test_singleton_indexer_selection_cannot_allocate_fixed_compaction(self):
+    def test_singleton_cute_selection_cannot_allocate_fixed_compaction(self):
         from types import SimpleNamespace
 
         workspace = _FixedUnionWorkspace(
@@ -4038,7 +4157,7 @@ class TestFixedUnionWorkspace:
             2,
             dtype=torch.float32,
             device=torch.device("cpu"),
-            selection_backend="indexer_topk",
+            selection_backend="cute_dsl_topk",
         )
         workspace.selection_only = True
         pool = SimpleNamespace(is_cuda=True, device=workspace.device, ndim=5)
@@ -4053,9 +4172,7 @@ class TestFixedUnionWorkspace:
             workspace.prepare_compaction(pool, page_ids, seq_len=33)
         assert not workspace._compaction_buffers
 
-    def test_indexer_fixed_selection_matches_eager_subset_without_nonzero(self):
-        from unittest import mock
-
+    def test_cute_fixed_selection_matches_eager_subset_without_nonzero(self):
         width = 31
         keep_count = 8
         prompt_len = 2
@@ -4073,21 +4190,11 @@ class TestFixedUnionWorkspace:
             dtype=torch.float32,
             device=torch.device("cpu"),
             allocate_segment_buffers=True,
-            selection_backend="indexer_topk",
+            selection_backend="cute_dsl_topk",
         )
 
-        def fake_indexer(values, seq_lens, output, _num_experts, top_k):
-            for row in range(int(values.shape[0])):
-                seq_len = int(seq_lens[row])
-                selected = torch.topk(values[row, :seq_len], top_k, sorted=False).indices
-                output[row].copy_(selected.to(torch.int32))
-
         with (
-            mock.patch.object(
-                torch.ops.trtllm,
-                "indexer_topk_decode",
-                side_effect=fake_indexer,
-            ) as indexer,
+            _mock_cute_topk_without_fallbacks() as cute_topk,
             mock.patch.object(
                 torch,
                 "nonzero",
@@ -4096,13 +4203,13 @@ class TestFixedUnionWorkspace:
         ):
             selected = workspace.select_segments(segments, normalize_scores=False).clone()
 
-        assert indexer.call_count == 2
+        assert cute_topk.call_count == 2
         combined = scores.max(dim=0).values
-        row_top = torch.topk(scores, keep_count, dim=1, sorted=False).indices
+        row_top = _TORCH_TOPK_ORACLE(scores, keep_count, dim=1, sorted=False).indices
         union_mask = torch.zeros(width, dtype=torch.bool)
         union_mask.scatter_(0, row_top.reshape(-1), True)
         union_indices = torch.arange(width)[union_mask]
-        relative = torch.topk(
+        relative = _TORCH_TOPK_ORACLE(
             combined.index_select(0, union_indices), keep_count, sorted=False
         ).indices
         expected_decode = torch.sort(union_indices.index_select(0, relative)).values
@@ -4172,7 +4279,6 @@ class TestFixedUnionWorkspace:
             manager.kv_cache_manager = SimpleNamespace(get_buffers=lambda layer, kv_layout: pool)
             manager._dense_layers = lambda num_layers: [0, 1]
             manager._global_layer_id = lambda layer, num_layers: layer
-            manager._indexer_topk_supported = lambda width, k: False
             manager._fixed_union_enabled = False
             manager._fixed_union_active = {}
             manager._fixed_shape_selection_enabled = fixed
@@ -4359,7 +4465,7 @@ class TestFixedUnionWorkspace:
             combined.index_select(0, reference).sort().values,
         )
 
-    def test_manager_routes_only_large_torch_topk_bucket(self):
+    def test_manager_uses_fixed_workspace_only_when_requested(self):
         from types import SimpleNamespace
 
         mgr = _make_triattention()
@@ -4369,18 +4475,20 @@ class TestFixedUnionWorkspace:
         request = SimpleNamespace(py_request_id=7)
         large = torch.arange(2 * 4096, dtype=torch.float32).reshape(2, 4096)
         keep_count = 3072
-        fallback = mgr._evict_union(request, 1, 4100, 4, keep_count, large)
+        with _mock_cute_topk_without_fallbacks():
+            fallback = mgr._evict_union(request, 1, 4100, 4, keep_count, large)
 
         assert not mgr._fixed_union_workspaces
-        fixed = mgr._evict_union(
-            request,
-            1,
-            4100,
-            4,
-            keep_count,
-            large,
-            use_fixed_workspace=True,
-        )
+        with _mock_cute_topk_without_fallbacks():
+            fixed = mgr._evict_union(
+                request,
+                1,
+                4100,
+                4,
+                keep_count,
+                large,
+                use_fixed_workspace=True,
+            )
         workspace = mgr._get_fixed_union_workspace(7, large, keep_count, 4)
 
         assert workspace is not None
@@ -4463,7 +4571,7 @@ class TestCrossRequestFixedUnionWorkspace:
 
     @pytest.mark.parametrize(
         ("width", "selection_backend"),
-        [(4095, "indexer_topk"), (4096, "torch_topk")],
+        [(4095, "cute_dsl_topk"), (4096, "cute_dsl_topk")],
     )
     def test_prewarm_records_tensor_free_exact_scenario_b_plan(self, width, selection_backend):
         from unittest import mock
@@ -4493,10 +4601,7 @@ class TestCrossRequestFixedUnionWorkspace:
         assert plan.keep_count == 2048
         assert plan.prompt_len == 1024
         assert plan.selection_backend == selection_backend
-        expected_backend = (
-            "indexer_topk" if manager._indexer_topk_supported(width, 2048) else "torch_topk"
-        )
-        assert selection_backend == expected_backend
+        assert selection_backend == "cute_dsl_topk"
         assert not any(isinstance(field, torch.Tensor) for field in plan)
         assert plan.materialized_nbytes == (
             _BatchedFixedUnionWorkspace.planned_selection_bank_nbytes(
@@ -4516,7 +4621,7 @@ class TestCrossRequestFixedUnionWorkspace:
         from unittest import mock
 
         key = ("bucket",)
-        stage3_plan = self._stage3_plan(17, "torch_topk", max_requests=3)
+        stage3_plan = self._stage3_plan(17, "cute_dsl_topk", max_requests=3)
         manager = self._manager()
         manager._fixed_shape_selection_prewarm_states = {key: "ready"}
         manager._prewarm_cross_request_selection_bucket(key, stage3_plan)
@@ -4548,7 +4653,7 @@ class TestCrossRequestFixedUnionWorkspace:
             2,
             dtype=torch.float32,
             device=torch.device("cpu"),
-            selection_backend="indexer_topk",
+            selection_backend="cute_dsl_topk",
             max_requests=max_requests,
         )
 
@@ -4572,7 +4677,7 @@ class TestCrossRequestFixedUnionWorkspace:
         from unittest import mock
 
         key = ("bucket",)
-        stage3_plan = self._stage3_plan(17, "torch_topk", max_requests=3)
+        stage3_plan = self._stage3_plan(17, "cute_dsl_topk", max_requests=3)
         stage3_bank = tuple(SimpleNamespace(prewarmed=True) for _ in range(3))
         manager = self._manager()
         manager._fixed_shape_selection_enabled = True
@@ -4618,7 +4723,7 @@ class TestCrossRequestFixedUnionWorkspace:
             prompt_len,
             dtype=torch.float32,
             device=torch.device("cpu"),
-            selection_backend="torch_topk",
+            selection_backend="cute_dsl_topk",
             max_requests=max_requests,
         )
         pointers = workspace.pointer_snapshot()
@@ -4681,7 +4786,7 @@ class TestCrossRequestFixedUnionWorkspace:
             prompt_len,
             dtype=torch.float32,
             device=torch.device("cpu"),
-            selection_backend="torch_topk",
+            selection_backend="cute_dsl_topk",
             max_requests=2,
         )
         pointer_snapshot = workspace.pointer_snapshot()
@@ -4730,7 +4835,7 @@ class TestCrossRequestFixedUnionWorkspace:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     @pytest.mark.parametrize(
         ("width", "selection_backend"),
-        [(4095, "indexer_topk"), (4096, "torch_topk")],
+        [(4095, "cute_dsl_topk"), (4096, "cute_dsl_topk")],
     )
     def test_exact_scenario_b_cuda_r1_r7_r8_matches_stage3(self, width, selection_backend):
         rows = 4
@@ -4806,7 +4911,7 @@ class TestCrossRequestFixedUnionWorkspace:
             2,
             dtype=torch.float32,
             device=torch.device("cpu"),
-            selection_backend="torch_topk",
+            selection_backend="cute_dsl_topk",
             max_requests=3,
         )
         manager = self._manager()
@@ -4855,7 +4960,7 @@ class TestCrossRequestFixedUnionWorkspace:
             2,
             dtype=torch.float32,
             device=torch.device("cpu"),
-            selection_backend="torch_topk",
+            selection_backend="cute_dsl_topk",
             max_requests=2,
         )
         score_output = torch.arange(2 * 2 * 8, dtype=torch.float32).view(1, -1)
@@ -4883,7 +4988,6 @@ class TestCrossRequestFixedUnionWorkspace:
         manager.normalize_scores = False
         manager.score_aggregation = "mean"
         manager._offsets = torch.ones(1)
-        manager._indexer_topk_supported = lambda width, k: False
         active_sentinel = object()
         manager._fixed_union_active = {99: active_sentinel}
         manager._fixed_union_compaction_enabled = True

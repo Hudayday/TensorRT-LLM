@@ -29,6 +29,7 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
     TriAttention,
     _BatchedFixedUnionWorkspace,
     _FixedScoreMetadataWorkspace,
+    _FixedUnionWorkspace,
 )
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
     cpp_sparse_compact,
@@ -36,6 +37,52 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels 
 )
 
 CUDA_REQUIRED = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+_TORCH_TOPK_ORACLE = torch.topk
+
+
+def _fake_cute_dsl_topk_decode(scores, seq_lens, output, top_k, next_n):
+    """Write CuTE-op-shaped results while retaining torch.topk only as an oracle."""
+    assert next_n == 1
+    for row in range(scores.shape[0]):
+        width = int(seq_lens[row].item())
+        indices = _TORCH_TOPK_ORACLE(
+            scores[row, :width],
+            int(top_k),
+            sorted=False,
+        ).indices
+        output[row].copy_(indices.to(dtype=torch.int32))
+
+
+def _union_keep_oracle(scores, keep_count):
+    """Return the fixed-union contract without invoking a production selector."""
+    combined = scores.max(dim=0).values
+    row_indices = _TORCH_TOPK_ORACLE(
+        scores,
+        keep_count,
+        dim=1,
+        sorted=False,
+    ).indices
+    union_mask = torch.zeros(scores.shape[1], dtype=torch.bool, device=scores.device)
+    union_mask[row_indices.reshape(-1)] = True
+    union_indices = torch.nonzero(union_mask, as_tuple=False).view(-1)
+    if union_indices.numel() >= keep_count:
+        relative = _TORCH_TOPK_ORACLE(
+            combined.index_select(0, union_indices),
+            keep_count,
+            sorted=False,
+        ).indices
+        union_indices = union_indices.index_select(0, relative)
+    else:
+        remaining = keep_count - int(union_indices.numel())
+        residual = combined.clone()
+        residual[union_mask] = float("-inf")
+        extra = _TORCH_TOPK_ORACLE(
+            residual,
+            remaining,
+            sorted=False,
+        ).indices
+        union_indices = torch.cat((union_indices, extra))
+    return torch.sort(union_indices).values
 
 
 class _FakeEvent:
@@ -469,6 +516,120 @@ class TestStandaloneEvictionGraphCache:
         assert cache.snapshot()["active_entries"] == 0
 
 
+class TestCuTEDSLGraphSelection:
+    @staticmethod
+    def _scores(width, seed):
+        generator = torch.Generator().manual_seed(seed)
+        return torch.rand((2, width), generator=generator, dtype=torch.float32)
+
+    @pytest.mark.parametrize(
+        "keep_count,width",
+        [(4096, 4224), (8192, 9216)],
+        ids=("k4096", "k8192"),
+    )
+    def test_fixed_graph_workspace_has_no_legacy_topk_fallback(self, keep_count, width):
+        prompt_len = 13
+        scores = self._scores(width, seed=keep_count)
+        expected_decode = _union_keep_oracle(scores, keep_count)
+        expected = torch.cat(
+            (
+                torch.arange(prompt_len, dtype=torch.long),
+                expected_decode + prompt_len,
+            )
+        )
+        workspace = _FixedUnionWorkspace(
+            rows=2,
+            width=width,
+            keep_count=keep_count,
+            prompt_len=prompt_len,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            selection_backend="cute_dsl_topk",
+        )
+
+        with (
+            mock.patch.object(
+                torch.ops.trtllm,
+                "cute_dsl_indexer_topk_decode",
+                side_effect=_fake_cute_dsl_topk_decode,
+                create=True,
+            ) as cute_topk,
+            mock.patch.object(
+                torch.ops.trtllm,
+                "indexer_topk_decode",
+                side_effect=AssertionError("legacy IndexerTopK fallback was called"),
+                create=True,
+            ),
+            mock.patch.object(
+                torch,
+                "topk",
+                side_effect=AssertionError("torch.topk fallback was called"),
+            ),
+        ):
+            actual = workspace.select(scores).clone()
+
+        assert cute_topk.call_count == 2
+        assert torch.equal(actual, expected)
+
+    @pytest.mark.parametrize(
+        "keep_count,width",
+        [(4096, 4224), (8192, 9216)],
+        ids=("k4096", "k8192"),
+    )
+    def test_cross_request_graph_workspace_has_no_legacy_topk_fallback(self, keep_count, width):
+        prompt_len = 17
+        request_scores = [
+            self._scores(width, seed=keep_count + request_index + 1) for request_index in range(2)
+        ]
+        expected = [
+            torch.cat(
+                (
+                    torch.arange(prompt_len, dtype=torch.long),
+                    _union_keep_oracle(scores, keep_count) + prompt_len,
+                )
+            )
+            for scores in request_scores
+        ]
+        workspace = _BatchedFixedUnionWorkspace(
+            rows=2,
+            width=width,
+            keep_count=keep_count,
+            prompt_len=prompt_len,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            selection_backend="cute_dsl_topk",
+            max_requests=2,
+        )
+
+        with (
+            mock.patch.object(
+                torch.ops.trtllm,
+                "cute_dsl_indexer_topk_decode",
+                side_effect=_fake_cute_dsl_topk_decode,
+                create=True,
+            ) as cute_topk,
+            mock.patch.object(
+                torch.ops.trtllm,
+                "indexer_topk_decode",
+                side_effect=AssertionError("legacy IndexerTopK fallback was called"),
+                create=True,
+            ),
+            mock.patch.object(
+                torch,
+                "topk",
+                side_effect=AssertionError("torch.topk fallback was called"),
+            ),
+        ):
+            selected = workspace.select_requests(
+                [[scores] for scores in request_scores],
+                normalize_scores=False,
+            )
+            actual = [request_workspace.keep.clone() for request_workspace in selected]
+
+        assert cute_topk.call_count == 2
+        assert all(torch.equal(result, oracle) for result, oracle in zip(actual, expected))
+
+
 class TestStandaloneGraphBuckets:
     @staticmethod
     def _mark_ready(manager, score, selection):
@@ -488,16 +649,16 @@ class TestStandaloneGraphBuckets:
     @pytest.mark.parametrize(
         "prompt_len,width,budget,backend,request_count",
         [
-            (0, 2175, 2048, "indexer_topk", 1),
-            (256, 3072, 2048, "indexer_topk", 2),
-            (1024, 4095, 2048, "indexer_topk", 4),
-            (1024, 4096, 2048, "torch_topk", 7),
-            (1536, 4223, 4096, "torch_topk", 8),
-            (1024, 4224, 4096, "torch_topk", 8),
-            (1024, 5119, 4096, "torch_topk", 16),
-            (1024, 8191, 4096, "torch_topk", 1),
-            (2048, 8192, 4096, "torch_topk", 31),
-            (1024, 9216, 8192, "torch_topk", 32),
+            (0, 2175, 2048, "cute_dsl_topk", 1),
+            (256, 3072, 2048, "cute_dsl_topk", 2),
+            (1024, 4095, 2048, "cute_dsl_topk", 4),
+            (1024, 4096, 2048, "cute_dsl_topk", 7),
+            (1536, 4223, 4096, "cute_dsl_topk", 8),
+            (1024, 4224, 4096, "cute_dsl_topk", 8),
+            (1024, 5119, 4096, "cute_dsl_topk", 16),
+            (1024, 8191, 4096, "cute_dsl_topk", 1),
+            (2048, 8192, 4096, "cute_dsl_topk", 31),
+            (1024, 9216, 8192, "cute_dsl_topk", 32),
         ],
     )
     def test_ready_upper_bucket_is_accepted(
@@ -553,7 +714,7 @@ class TestStandaloneGraphBuckets:
         ]
         score = SimpleNamespace(prewarm_key=("upper",), max_requests=8)
         selection = SimpleNamespace(
-            selection_backend="indexer_topk",
+            selection_backend="cute_dsl_topk",
             max_requests=8,
             prompt_len=2,
             width=12,
@@ -564,9 +725,9 @@ class TestStandaloneGraphBuckets:
         key = manager._standalone_graph_bucket_for(prepared, score, selection)
 
         assert key is not None
-        assert key[2:7] == (2, 14, 2, 8, "indexer_topk")
+        assert key[2:7] == (2, 14, 2, 8, "cute_dsl_topk")
 
-    def test_actual_backend_boundary_cannot_share_one_upper_bucket(self):
+    def test_old_backend_boundary_shares_one_cute_upper_bucket(self):
         manager = _make_triattention()
         manager.top_B = 2048
         manager._standalone_cuda_graph_enabled = True
@@ -578,9 +739,9 @@ class TestStandaloneGraphBuckets:
             }
             for width in (4095, 4096)
         ]
-        score = SimpleNamespace(prewarm_key=("torch-upper",), max_requests=8)
+        score = SimpleNamespace(prewarm_key=("cute-upper",), max_requests=8)
         selection = SimpleNamespace(
-            selection_backend="torch_topk",
+            selection_backend="cute_dsl_topk",
             max_requests=8,
             prompt_len=0,
             width=4096,
@@ -588,14 +749,17 @@ class TestStandaloneGraphBuckets:
         )
         self._mark_ready(manager, score, selection)
 
-        assert manager._standalone_graph_bucket_for(prepared, score, selection) is None
+        key = manager._standalone_graph_bucket_for(prepared, score, selection)
+
+        assert key is not None
+        assert key[2:7] == (2, 4096, 0, 2048, "cute_dsl_topk")
 
     @pytest.mark.parametrize(
         "budget,beta,bucket_width,valid_widths,backend",
         [
-            (32, 4, 36, [34, 36], "indexer_topk"),
-            (4096, 128, 4228, [4225, 4228], "torch_topk"),
-            (4096, 4096, 8196, [8193, 8196], "torch_topk"),
+            (32, 4, 36, [34, 36], "cute_dsl_topk"),
+            (4096, 128, 4228, [4225, 4228], "cute_dsl_topk"),
+            (4096, 4096, 8196, [8193, 8196], "cute_dsl_topk"),
         ],
     )
     def test_budget_beta_k4_graph_key_is_shape_stable_and_overflow_rejected(
@@ -646,7 +810,7 @@ class TestStandaloneGraphBuckets:
             is None
         )
 
-    def test_budget2048_k4_uses_distinct_indexer_and_torch_graph_keys(self):
+    def test_budget2048_uses_one_backend_with_distinct_shape_keys(self):
         prompt_len = 1024
         budget = 2048
         manager = _make_triattention()
@@ -677,32 +841,33 @@ class TestStandaloneGraphBuckets:
             ]
             return manager._standalone_graph_bucket_for(prepared, score, selection)
 
-        indexer_key = key_for(4095, [4092, 4095], "indexer_topk")
-        torch_key = key_for(4100, [4096, 4100], "torch_topk")
+        lower_key = key_for(4095, [4092, 4095], "cute_dsl_topk")
+        upper_key = key_for(4100, [4096, 4100], "cute_dsl_topk")
 
-        assert indexer_key is not None
-        assert torch_key is not None
-        assert indexer_key != torch_key
-        assert indexer_key[3:7] == (
+        assert lower_key is not None
+        assert upper_key is not None
+        assert lower_key != upper_key
+        assert lower_key[3:7] == (
             prompt_len + 4095,
             prompt_len,
             budget,
-            "indexer_topk",
+            "cute_dsl_topk",
         )
-        assert torch_key[3:7] == (
+        assert upper_key[3:7] == (
             prompt_len + 4100,
             prompt_len,
             budget,
-            "torch_topk",
+            "cute_dsl_topk",
         )
 
     @pytest.mark.parametrize(
         "request_count,prompt_len,width,budget,backend,ready",
         [
-            (0, 1024, 4095, 2048, "indexer_topk", True),
-            (33, 1024, 4095, 2048, "indexer_topk", True),
+            (0, 1024, 4095, 2048, "cute_dsl_topk", True),
+            (33, 1024, 4095, 2048, "cute_dsl_topk", True),
             (1, 1024, 4095, 2048, "torch_topk", True),
-            (1, 1024, 4095, 2048, "indexer_topk", False),
+            (1, 1024, 4095, 2048, "indexer_topk", True),
+            (1, 1024, 4095, 2048, "cute_dsl_topk", False),
         ],
     )
     def test_unready_capacity_or_backend_mismatch_falls_back(
@@ -750,7 +915,7 @@ class TestStandaloneGraphBuckets:
         ]
         score = SimpleNamespace(prewarm_key=("mixed",), max_requests=32)
         selection = SimpleNamespace(
-            selection_backend="indexer_topk",
+            selection_backend="cute_dsl_topk",
             max_requests=32,
             prompt_len=1024,
             width=4095,
@@ -851,7 +1016,7 @@ class TestStandaloneGraphBuckets:
             mean_sin=torch.zeros(8, 1),
         )
         selection = SimpleNamespace(
-            selection_backend="indexer_topk",
+            selection_backend="cute_dsl_topk",
             max_requests=32,
             prompt_len=256,
             width=3072,
@@ -947,7 +1112,7 @@ class TestStandaloneGraphBuckets:
         ]
         score = SimpleNamespace(prewarm_key=("formal-a-first",), max_requests=8)
         selection = SimpleNamespace(
-            selection_backend="torch_topk",
+            selection_backend="cute_dsl_topk",
             max_requests=8,
             prompt_len=1024,
             width=8191,
@@ -1015,7 +1180,7 @@ class TestStandaloneGraphBuckets:
             stream=stream,
         )
         selection = SimpleNamespace(
-            selection_backend="torch_topk",
+            selection_backend="cute_dsl_topk",
             max_requests=8,
             prompt_len=1024,
             width=8191,
@@ -1260,7 +1425,7 @@ class TestFixedBatchedCompactionWorkspace:
         assert weak_snapshot(captured) == weak_snapshot(rebound)
         assert _tensor_fingerprint(captured) != _tensor_fingerprint(rebound)
 
-        selection = SimpleNamespace(selection_backend="torch_topk", keep=captured)
+        selection = SimpleNamespace(selection_backend="cute_dsl_topk", keep=captured)
 
         def named_tensors():
             return (("keep", selection.keep),)
@@ -1475,16 +1640,16 @@ class TestStandaloneGraphCuda:
     @pytest.mark.parametrize(
         "prompt_len,width,budget,backend,request_count",
         [
-            (0, 2175, 2048, "indexer_topk", 1),
-            (256, 3072, 2048, "indexer_topk", 2),
-            (1024, 4095, 2048, "indexer_topk", 4),
-            (1024, 4096, 2048, "torch_topk", 7),
-            (1536, 4223, 4096, "torch_topk", 8),
-            (1024, 4224, 4096, "torch_topk", 8),
-            (1024, 5119, 4096, "torch_topk", 16),
-            (1024, 8191, 4096, "torch_topk", 1),
-            (2048, 8192, 4096, "torch_topk", 31),
-            (1024, 9216, 8192, "torch_topk", 32),
+            (0, 2175, 2048, "cute_dsl_topk", 1),
+            (256, 3072, 2048, "cute_dsl_topk", 2),
+            (1024, 4095, 2048, "cute_dsl_topk", 4),
+            (1024, 4096, 2048, "cute_dsl_topk", 7),
+            (1536, 4223, 4096, "cute_dsl_topk", 8),
+            (1024, 4224, 4096, "cute_dsl_topk", 8),
+            (1024, 5119, 4096, "cute_dsl_topk", 16),
+            (1024, 8191, 4096, "cute_dsl_topk", 1),
+            (2048, 8192, 4096, "cute_dsl_topk", 31),
+            (1024, 9216, 8192, "cute_dsl_topk", 32),
         ],
     )
     @CUDA_REQUIRED
@@ -1603,7 +1768,7 @@ class TestStandaloneGraphCuda:
         eager = self._build_formal_path(
             width,
             budget,
-            "torch_topk",
+            "cute_dsl_topk",
             request_count,
             initial,
             prompt_len=prompt_len,
@@ -1611,7 +1776,7 @@ class TestStandaloneGraphCuda:
         graphed = self._build_formal_path(
             width,
             budget,
-            "torch_topk",
+            "cute_dsl_topk",
             request_count,
             initial,
             prompt_len=prompt_len,
@@ -1693,7 +1858,7 @@ class TestStandaloneGraphCuda:
                 keep_count=4,
                 width=6,
                 keep=keep.clone(),
-                selection_backend="torch_topk",
+                selection_backend="cute_dsl_topk",
                 named_tensors=lambda: (),
             )
             return FixedBatchedCompactionWorkspace(
