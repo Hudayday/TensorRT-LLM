@@ -1269,6 +1269,8 @@ class _FixedScoreMetadataWorkspace:
             offsets,
         )
         self.copy_done = torch.cuda.Event()
+        self.bulk_allocation_done = torch.cuda.Event()
+        self.bulk_copy_done = torch.cuda.Event()
         self.copy_pending = False
         self.stream = None
         self._bulk_offsets_dst: Optional[torch.Tensor] = None
@@ -1360,7 +1362,7 @@ class _FixedScoreMetadataWorkspace:
             get_batch_cache_indices = manager.get_batch_cache_indices
         staged_bulk = False
         if manager is not None:
-            staged_bulk = self._stage_page_tables_bulk(manager, request_ids)
+            staged_bulk = self._stage_page_tables_bulk(manager, request_ids, stream)
             if staged_bulk and os.environ.get("TRIATTN_PAGE_TABLE_CHECK") == "1":
                 self._assert_bulk_matches_legacy(manager, request_ids, num_blocks_per_seq)
         if not staged_bulk:
@@ -1406,7 +1408,12 @@ class _FixedScoreMetadataWorkspace:
             self.copy_pending = True
         return True
 
-    def _stage_page_tables_bulk(self, manager, request_ids: List[int]) -> bool:
+    def _stage_page_tables_bulk(
+        self,
+        manager,
+        request_ids: List[int],
+        current_stream: torch.cuda.Stream,
+    ) -> bool:
         """ONE bulk block-offset copy replaces 36 x R host round-trips.
 
         Reuses the exact attention-backend path (copy_batch_block_offsets over
@@ -1426,8 +1433,9 @@ class _FixedScoreMetadataWorkspace:
             return False
         request_count = len(request_ids)
         bulk = self._bulk_offsets_dst
+        allocated = False
         if bulk is None or bulk.shape[1] < self.max_requests:
-            bulk = torch.zeros(
+            bulk = torch.empty(
                 num_pools,
                 self.max_requests,
                 2,
@@ -1436,8 +1444,14 @@ class _FixedScoreMetadataWorkspace:
                 device=self.device,
             )
             self._bulk_offsets_dst = bulk
+            allocated = True
         try:
+            if allocated:
+                self.bulk_allocation_done.record(current_stream)
+                manager._stream.wait_event(self.bulk_allocation_done)
             manager.copy_batch_block_offsets(bulk, request_ids, 1, 0, request_count)
+            self.bulk_copy_done.record(manager._stream)
+            current_stream.wait_event(self.bulk_copy_done)
             for slot, global_layer in enumerate(self.global_representatives):
                 pool_id = pool_of[layer_offsets[global_layer]]
                 self.page_ids_device[slot, :request_count].copy_(

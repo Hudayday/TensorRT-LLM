@@ -1762,6 +1762,67 @@ class TestFixedScoreMetadata:
         group.stage_lengths.assert_called_once_with(workspace.valid_seq_lens_device, 2)
         workspace.copy_done.record.assert_called_once_with(stream)
 
+    def test_bulk_page_table_copy_waits_for_the_manager_stream(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            _FixedScoreMetadataWorkspace,
+        )
+
+        workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
+        workspace.device = torch.device("cuda")
+        workspace.max_requests = 2
+        workspace.page_count = 2
+        workspace.global_representatives = (10,)
+        workspace._bulk_stage_logged = True
+        workspace.bulk_allocation_done = mock.Mock()
+        workspace.bulk_copy_done = mock.Mock()
+        bulk = mock.MagicMock()
+        bulk.shape = (1, 2, 2, 4)
+        converted = mock.Mock()
+        bulk.__getitem__.return_value.__floordiv__.return_value = converted
+        workspace._bulk_offsets_dst = None
+        page_destination = mock.Mock()
+        workspace.page_ids_device = mock.MagicMock()
+        workspace.page_ids_device.__getitem__.return_value = page_destination
+
+        manager_stream = mock.Mock()
+        manager = SimpleNamespace(
+            host_kv_cache_block_offsets=SimpleNamespace(
+                shape=(1, 8, 2, 4), dtype=torch.int32
+            ),
+            kv_factor=2,
+            layer_offsets={10: 0},
+            layer_to_pool_mapping_dict={0: 0},
+            copy_batch_block_offsets=mock.Mock(),
+            _stream=manager_stream,
+        )
+        current_stream = mock.Mock()
+        calls = mock.Mock()
+        workspace.bulk_allocation_done.record.side_effect = lambda *args: calls.allocation_record()
+        manager_stream.wait_event.side_effect = lambda *args: calls.manager_wait()
+        manager.copy_batch_block_offsets.side_effect = lambda *args: calls.copy()
+        workspace.bulk_copy_done.record.side_effect = lambda *args: calls.record()
+        current_stream.wait_event.side_effect = lambda *args: calls.wait()
+        page_destination.copy_.side_effect = lambda *args: calls.read()
+
+        with mock.patch.object(torch, "empty", return_value=bulk):
+            assert workspace._stage_page_tables_bulk(manager, [7], current_stream)
+
+        assert calls.mock_calls == [
+            mock.call.allocation_record(),
+            mock.call.manager_wait(),
+            mock.call.copy(),
+            mock.call.record(),
+            mock.call.wait(),
+            mock.call.read(),
+        ]
+        workspace.bulk_allocation_done.record.assert_called_once_with(current_stream)
+        manager_stream.wait_event.assert_called_once_with(workspace.bulk_allocation_done)
+        workspace.bulk_copy_done.record.assert_called_once_with(manager_stream)
+        current_stream.wait_event.assert_called_once_with(workspace.bulk_copy_done)
+
     def test_stage2_gate_requires_stage1_prewarm(self):
         import os
         from unittest import mock
