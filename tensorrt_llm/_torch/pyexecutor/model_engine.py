@@ -1216,7 +1216,7 @@ class PyTorchModelEngine(ModelEngine):
     def _run_attention_warmup(self,
                               resource_manager: ResourceManager,
                               can_run_general_warmup: bool = True) -> None:
-        if not issubclass(self.attn_metadata_cls, TrtllmAttentionMetadata):
+        if not issubclass(self.attn_backend.Metadata, TrtllmAttentionMetadata):
             return
 
         @contextlib.contextmanager
@@ -2071,7 +2071,7 @@ class PyTorchModelEngine(ModelEngine):
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
                 or self.attn_runtime_features.chunked_prefill)
-        cache_indirection = self.cache_indirection_attention if self.attn_metadata_cls is TrtllmAttentionMetadata else None
+        cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
         num_attention_heads = getattr(self.model.model_config.pretrained_config,
                                       'num_attention_heads', None)
         config = self.model.model_config.pretrained_config
@@ -5736,7 +5736,7 @@ class PyTorchModelEngine(ModelEngine):
             self.sparse_attention_config.to_sparse_metadata_params(
                 pretrained_config=self.model.model_config.pretrained_config)
             if self.sparse_attention_config is not None else None)
-        encoder_attn_metadata = self.attn_metadata_cls(
+        encoder_attn_metadata = self.attn_backend.Metadata(
             max_num_requests=self.batch_size,
             max_num_tokens=self.max_num_tokens,
             max_num_sequences=self.batch_size * self.max_beam_width,
