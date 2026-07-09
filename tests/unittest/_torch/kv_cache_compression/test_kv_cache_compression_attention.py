@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.kv_cache_compression.attention import (
+from tensorrt_llm._torch.kv_cache_compression.attention_metadata import (
     KVCacheCompressionTrtllmAttentionMetadata,
     get_kv_cache_compression_attention_metadata,
     requires_kv_cache_compression_attention_metadata,

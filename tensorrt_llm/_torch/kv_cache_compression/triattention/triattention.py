@@ -54,7 +54,9 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
-from tensorrt_llm._torch.kv_cache_compression.attention import requires_paged_draft_kv_length_domain
+from tensorrt_llm._torch.kv_cache_compression.attention_metadata import (
+    requires_paged_draft_kv_length_domain,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import BaseKVCacheCompressionManager
