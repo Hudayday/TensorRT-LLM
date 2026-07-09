@@ -37,7 +37,7 @@ namespace kernels
 //! indices must be strictly increasing and destination[i] <= source[i]. This
 //! monotonic-left contract makes the in-place operation safe without scratch.
 template <typename T>
-void invokeSparseKvCacheCompactV2(T* pool, int32_t const* pageTable, int32_t maxPagesPerSeq,
+void invokeSparseKvCacheCompactV2(T* pool, int64_t pageStrideElements, int32_t const* pageTable, int32_t maxPagesPerSeq,
     int32_t const* sparseKvIndices, int32_t const* sparseKvOffsets, int32_t const* destinationIndices,
     bool destinationPerHead, int32_t batchSize, int32_t numKvHeads, int32_t tokensPerBlock, int32_t headDim,
     cudaStream_t stream);

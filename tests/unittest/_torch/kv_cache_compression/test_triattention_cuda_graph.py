@@ -34,6 +34,7 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
 )
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
     cpp_sparse_compact,
+    cpp_sparse_compact_supported,
     fixed_perhead_segment_views,
 )
 
@@ -1591,6 +1592,36 @@ class TestFixedBatchedCompactionWorkspace:
                     after[request].index_select(2, destination),
                     before[request].index_select(2, source),
                 ), f"reuse layer={layer}, request={request}"
+
+    @CUDA_REQUIRED
+    def test_cpp_compact_supports_v1_multilayer_pool_view(self):
+        """Honor the physical page stride of a layer sliced from a V1 pool."""
+        device = torch.device("cuda")
+        pages, layers, heads, tokens_per_block, head_dim = 4, 3, 2, 4, 16
+        backing = torch.arange(
+            pages * layers * 2 * heads * tokens_per_block * head_dim,
+            dtype=torch.float32,
+            device=device,
+        ).view(pages, layers, 2, heads, tokens_per_block, head_dim)
+        pool = backing[:, 1]
+        assert not pool.is_contiguous()
+        assert cpp_sparse_compact_supported(pool)
+
+        page_table = torch.tensor([[2, 0, 3]], dtype=torch.int64, device=device)
+        source = torch.tensor([0, 2, 5, 7, 9], dtype=torch.int64, device=device)
+        before = self._logical_tokens(pool, page_table).clone()
+        sibling_before = torch.stack((backing[:, 0].clone(), backing[:, 2].clone()))
+
+        cpp_sparse_compact(pool, [page_table[0]], [source], [10])
+        torch.cuda.synchronize(device)
+
+        after = self._logical_tokens(pool, page_table)
+        assert torch.equal(
+            after[0, :, :, : source.numel()],
+            before[0].index_select(2, source),
+        )
+        assert torch.equal(backing[:, 0], sibling_before[0])
+        assert torch.equal(backing[:, 2], sibling_before[1])
 
     def test_tensor_fingerprint_changes_for_view_offset_and_stride(self):
         base = torch.arange(16)

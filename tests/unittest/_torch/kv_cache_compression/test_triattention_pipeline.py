@@ -224,6 +224,43 @@ def _make_fake_cpp_hybrid(*, is_draft=False, max_seq_len=512):
     manager.impl = object()
     manager.host_kv_cache_block_offsets = torch.empty(1, dtype=torch.int64)
     manager.max_seq_len = max_seq_len
+    manager.kv_factor = 2
+    manager.mapping = SimpleNamespace(enable_attention_dp=False)
+    manager.kv_connector_manager = None
+    manager.num_extra_kv_tokens = 0
+    manager._kv_reserve_draft_tokens = 3
+    if is_draft:
+        manager.pp_layers = [2]
+        manager.mamba_pp_layers = []
+        manager.layer_offsets = {2: 0}
+        manager.kv_cache_pool_mapping = [(0, 0)]
+    else:
+        manager.pp_layers = [0, 1]
+        manager.mamba_pp_layers = [0]
+        manager.layer_offsets = {0: 0, 1: 1}
+        manager.kv_cache_pool_mapping = [(0, 0), (1, 0)]
+    return manager
+
+
+def _make_fake_mixed_hybrid(*, is_draft=False, max_seq_len=512):
+    """Build the separate attention/Mamba owner used for safe hybrid eviction."""
+    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MixedMambaHybridCacheManager
+
+    manager = MixedMambaHybridCacheManager.__new__(MixedMambaHybridCacheManager)
+    manager.enable_block_reuse = False
+    manager.is_draft = is_draft
+    manager.impl = object()
+    manager.host_kv_cache_block_offsets = torch.empty(1, dtype=torch.int64)
+    manager.max_seq_len = max_seq_len
+    manager.kv_factor = 2
+    manager.mapping = SimpleNamespace(enable_attention_dp=False, pp_size=1)
+    manager.kv_connector_manager = None
+    manager.num_extra_kv_tokens = 0
+    manager._kv_reserve_draft_tokens = 3
+    manager.pp_layers = [2] if is_draft else [1]
+    manager.layer_offsets = {layer: offset for offset, layer in enumerate(manager.pp_layers)}
+    manager.kv_cache_pool_mapping = torch.tensor([[0, 0]], dtype=torch.int32)
+    manager.blocks_per_window = {max_seq_len: (1024, 0)}
     return manager
 
 
@@ -747,13 +784,92 @@ class TestStepEndHookRefactor:
         manager.free_resources(request)
         assert manager._initialized_request_ids == set()
 
-    def test_qwen_next_mtp_hybrid_evicting_config_fails_closed(self):
+    def test_qwen_next_mtp_mixed_hybrid_evicting_config_uses_attention_layers_only(self):
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+        target = _make_fake_mixed_hybrid()
+        draft = _make_fake_mixed_hybrid(is_draft=True)
+
+        manager = TriAttention(
+            target,
+            top_B=target.max_seq_len - 1,
+            skip_swa=False,
+            spec_config=MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True),
+            draft_kv_cache_manager=draft,
+        )
+
+        manager._validate_cache_compatibility()
+
+        assert manager._local_to_global_layers(1) == [1]
+        assert manager._num_layers_from_manager() == 1
+        assert manager._page_table_pool_keys([0], [1]) == [("pool", 0)]
+
+    def test_qwen_next_mtp_mixed_hybrid_rewinds_only_target_attention_owner(self):
+        from unittest import mock
+
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+        target = _make_fake_mixed_hybrid()
+        draft = _make_fake_mixed_hybrid(is_draft=True)
+        target_tokens = {7: 26}
+        target.impl = mock.Mock()
+        target._impl = mock.Mock()
+        target.impl.get_token_count.side_effect = lambda request_id: target_tokens[request_id]
+        target.impl.rewind_kv_cache.side_effect = (
+            lambda request_id, count: target_tokens.__setitem__(
+                request_id, target_tokens[request_id] - count
+            )
+        )
+        draft.impl = mock.Mock()
+        draft._impl = mock.Mock()
+        target.num_extra_kv_tokens = 2
+        manager = TriAttention(
+            target,
+            top_B=8,
+            beta=1,
+            skip_swa=False,
+            spec_config=MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True),
+            draft_kv_cache_manager=draft,
+        )
+        request = _make_request(7)
+        batch = SimpleNamespace(generation_requests=[request])
+        manager._calibrated = True
+        manager._initialized_request_ids = {7}
+        manager._L = 1
+        manager._prepared_generation_growth = {7: 4}
+        manager._prepared_batch = SimpleNamespace(generation_requests=[])
+        event = mock.Mock()
+
+        with (
+            mock.patch.object(manager, "_ensure_configured_graph_buckets"),
+            mock.patch.object(manager, "_evict_requests", return_value=[(7, 8)]),
+            mock.patch.object(manager, "_rebase_protected_tail") as rebase,
+            mock.patch.object(torch.cuda, "Event", return_value=event),
+        ):
+            manager._periodic_evict(batch)
+
+        target.impl.rewind_kv_cache.assert_called_once_with(7, 12)
+        target.impl.get_token_count.assert_called()
+        draft.impl.rewind_kv_cache.assert_not_called()
+        rebase.assert_called_once_with(
+            request,
+            source_start=20,
+            destination_start=8,
+            token_count=6,
+        )
+        assert not target._impl.mock_calls
+        assert not draft._impl.mock_calls
+        assert target_tokens[7] == 14
+        assert manager._confirmed_kv_lengths[7] == 8
+        assert manager._evicted[7] == 12
+
+    def test_qwen_next_mtp_cpp_hybrid_eviction_fails_closed(self):
         from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
         target = _make_fake_cpp_hybrid()
         draft = _make_fake_cpp_hybrid(is_draft=True)
 
-        with pytest.raises(ValueError, match="physical eviction requires KVCacheManagerV2"):
+        with pytest.raises(ValueError, match="MixedMambaHybridCacheManager"):
             TriAttention(
                 target,
                 top_B=target.max_seq_len - 1,
@@ -1327,6 +1443,20 @@ class TestStepEndHookRefactor:
 
         assert triattention._prepared_batch is batch
         assert triattention._prepared_generation_growth == {7: 4}
+
+    def test_prepare_protects_reserved_draft_width(self):
+        manager = _make_fake_v2()
+        manager._kv_reserve_draft_tokens = 6
+        manager.kv_cache_map = {7: SimpleNamespace(capacity=106, is_active=True)}
+        triattention = TriAttention(manager, top_B=8, skip_swa=False)
+        batch = SimpleNamespace(
+            context_requests=[],
+            generation_requests=[_make_request(7, py_draft_tokens=[1, 2])],
+        )
+
+        triattention.prepare_resources(batch)
+
+        assert triattention._prepared_generation_growth == {7: 7}
 
     @pytest.mark.parametrize("native_cached", [63, 69, 104])
     def test_overlap_metadata_preserves_native_length_without_eviction(self, native_cached):

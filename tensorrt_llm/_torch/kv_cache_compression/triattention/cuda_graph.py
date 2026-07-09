@@ -26,6 +26,8 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
+from .triattention_kernels import cpp_sparse_compact_supported
+
 
 def _tensor_fingerprint(tensor: torch.Tensor) -> tuple:
     """Return allocation-address and tensor-layout fields used by a graph."""
@@ -138,16 +140,14 @@ class FixedBatchedCompactionWorkspace:
         cpp_num_kv_heads = int(first_dense_pool.shape[2]) if first_dense_pool.ndim == 5 else -1
         supported_pools = all(
             layer_pools[layer].ndim == 5
-            and layer_pools[layer].shape[1] == 2
             and layer_pools[layer].device == self.device
             and int(layer_pools[layer].shape[2]) == cpp_num_kv_heads
-            and layer_pools[layer].is_contiguous()
-            and layer_pools[layer].dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and cpp_sparse_compact_supported(layer_pools[layer])
             for layer in (*self.dense_layers, *self.swa_layers)
         )
         if not supported_pools:
             raise ValueError(
-                "fixed graph compaction requires contiguous interleaved BF16/FP16/FP32 pools "
+                "fixed graph compaction requires inner-contiguous interleaved BF16/FP16/FP32 pools "
                 "with one common KV-head count"
             )
         self.cpp_num_kv_heads = cpp_num_kv_heads

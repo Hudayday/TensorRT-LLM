@@ -55,6 +55,7 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._torch.kv_cache_compression.attention import requires_paged_draft_kv_length_domain
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -472,6 +473,8 @@ class _FixedUnionWorkspace:
 
     def can_compact(self, pool: torch.Tensor, page_ids: torch.Tensor, seq_len: int) -> bool:
         """Whether the fixed one-request compact launcher supports this pool."""
+        from .triattention_kernels import cpp_sparse_compact_supported
+
         return (
             not self.selection_only
             and pool.is_cuda
@@ -480,9 +483,7 @@ class _FixedUnionWorkspace:
             and page_ids.ndim == 1
             and page_ids.device == self.device
             and page_ids.dtype == torch.int64
-            and pool.shape[1] == 2
-            and pool.is_contiguous()
-            and pool.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and cpp_sparse_compact_supported(pool)
             and self.total_keep < seq_len
         )
 
@@ -1555,11 +1556,12 @@ class _FixedScoreMetadataWorkspace:
         base_page * index_scales; our HND page index is that value // kv_factor
         (the same formula _get_batch_cache_indices_by_pool_id applies on host).
         """
+        if not isinstance(manager, KVCacheManagerV2):
+            return False
         try:
             host_table = manager.host_kv_cache_block_offsets
             kv_factor = int(manager.kv_factor)
             layer_offsets = manager.layer_offsets
-            pool_of = manager.layer_to_pool_mapping_dict
         except AttributeError:
             return False
         num_pools, _, _, max_blocks = host_table.shape
@@ -1587,7 +1589,8 @@ class _FixedScoreMetadataWorkspace:
             self.bulk_copy_done.record(manager._stream)
             current_stream.wait_event(self.bulk_copy_done)
             for slot, global_layer in enumerate(self.global_representatives):
-                pool_id = pool_of[layer_offsets[global_layer]]
+                layer_offset = layer_offsets[global_layer]
+                pool_id = manager.layer_to_pool_mapping_dict[layer_offset]
                 self.page_ids_device[slot, :request_count].copy_(
                     bulk[pool_id, :request_count, 0, : self.page_count] // kv_factor
                 )
@@ -1674,13 +1677,14 @@ class TriAttention(BaseKVCacheCompressionManager):
                 "TriAttention is running in inert no-eviction mode because "
                 f"top_B={top_B} is at least max_seq_len={kv_cache_manager.max_seq_len}"
             )
-        elif not isinstance(kv_cache_manager, KVCacheManagerV2):
+        elif not isinstance(
+            kv_cache_manager, (KVCacheManagerV2, MixedMambaHybridCacheManager)
+        ):
             raise ValueError(
-                "TriAttention physical eviction requires KVCacheManagerV2; "
-                "legacy and hybrid KV cache managers are supported only when "
-                "top_B >= max_seq_len, where eviction is impossible"
+                "TriAttention physical eviction requires KVCacheManagerV2 or "
+                "MixedMambaHybridCacheManager"
             )
-        else:
+        elif isinstance(kv_cache_manager, KVCacheManagerV2):
             kv_cache_manager.generation_capacity_only = True
         self.spec_config = spec_config
         self._publish_draft_kv_length_delta = (
@@ -1826,7 +1830,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             self._initialized_request_ids.add(request_id)
             return
         if request_id not in self._initialized_request_ids:
-            self._validate_v2_compatibility()
+            self._validate_cache_compatibility()
             num_layers = self._num_layers_from_manager()
             self._attention_layer_partition(num_layers)
             self._initialized_request_ids.add(request_id)
@@ -1853,11 +1857,16 @@ class TriAttention(BaseKVCacheCompressionManager):
         ).contiguous()
         self._calibrated = True
 
-    def _validate_v2_compatibility(self) -> None:
-        """Reject runtime modes outside the V2 physical-compaction contract."""
+    def _validate_cache_compatibility(self) -> None:
+        """Reject runtime modes outside the physical-compaction contract."""
         manager = self.kv_cache_manager
-        if not isinstance(manager, KVCacheManagerV2):
-            raise ValueError("TriAttention physical eviction requires KVCacheManagerV2")
+        is_v2 = isinstance(manager, KVCacheManagerV2)
+        is_mixed_hybrid = isinstance(manager, MixedMambaHybridCacheManager)
+        if not (is_v2 or is_mixed_hybrid):
+            raise ValueError(
+                "TriAttention physical eviction requires KVCacheManagerV2 or "
+                "MixedMambaHybridCacheManager"
+            )
         if manager.kv_factor != 2:
             raise ValueError(
                 "TriAttention requires a standard key/value KV cache; "
@@ -1865,10 +1874,13 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
         if manager.mapping.enable_attention_dp:
             raise ValueError("TriAttention does not support attention DP")
-        if manager.is_disagg:
+        if is_v2:
+            if manager.is_disagg:
+                raise ValueError("TriAttention does not support disaggregated serving")
+            if manager.max_beam_width != 1:
+                raise ValueError("TriAttention requires beam-width-one decoding")
+        elif manager.kv_connector_manager is not None:
             raise ValueError("TriAttention does not support disaggregated serving")
-        if manager.max_beam_width != 1:
-            raise ValueError("TriAttention requires beam-width-one decoding")
         if self.spec_config is not None:
             if not self.spec_config.is_linear_tree:
                 raise ValueError("TriAttention speculative compatibility requires linear drafting")
@@ -1900,14 +1912,34 @@ class TriAttention(BaseKVCacheCompressionManager):
                     "TriAttention speculative compatibility requires the actual "
                     "separate draft KV cache manager"
                 )
-        if any(window is not None for window in manager.max_attention_window_vec) or any(
-            not isinstance(layer, AttentionLayerConfig) or layer.sliding_window_size is not None
-            for layer in manager.kv_cache_manager_py_config.layers
-        ):
-            raise ValueError(
-                "TriAttention requires full-attention V2 lifecycles; native SWA, "
-                "VSWA, and SSM pools are not supported"
-            )
+        if is_v2:
+            if any(window is not None for window in manager.max_attention_window_vec) or any(
+                not isinstance(layer, AttentionLayerConfig)
+                or layer.sliding_window_size is not None
+                for layer in manager.kv_cache_manager_py_config.layers
+            ):
+                raise ValueError(
+                    "TriAttention requires full-attention V2 lifecycles; native SWA, "
+                    "VSWA, and SSM pools are not supported"
+                )
+        else:
+            if self.spec_config is None or not self.spec_config.spec_dec_mode.is_mtp_one_model():
+                raise ValueError(
+                    "MixedMambaHybridCacheManager eviction is supported only for one-model MTP"
+                )
+            if manager.mapping.pp_size != 1:
+                raise ValueError("TriAttention hybrid MTP eviction requires pipeline parallel size one")
+            if manager.enable_block_reuse:
+                raise ValueError("TriAttention hybrid MTP eviction requires block reuse to be disabled")
+            if any(secondary_blocks for _, secondary_blocks in manager.blocks_per_window.values()):
+                raise ValueError("TriAttention hybrid MTP eviction does not support host KV offload")
+            if not self._hybrid_attention_layers():
+                raise ValueError("the target hybrid KV cache has no full-attention layers")
+
+    # Retain the old private name for focused callers while the implementation
+    # supports both V2 and the separate-pool hybrid owner.
+    def _validate_v2_compatibility(self) -> None:
+        self._validate_cache_compatibility()
 
     # The framework drives startup prewarm and all request-lifecycle hooks.
     # TriAttention overrides prewarm plus three lifecycle hooks: on_request_init
@@ -1940,7 +1972,10 @@ class TriAttention(BaseKVCacheCompressionManager):
         generation_growth = {}
         for request in scheduled_batch.generation_requests:
             request_id = request.py_request_id
-            growth = 1 + get_draft_token_length(request)
+            growth = 1 + max(
+                get_draft_token_length(request),
+                self.kv_cache_manager._kv_reserve_draft_tokens,
+            )
             generation_growth[request_id] = growth
         self._prepared_batch = scheduled_batch
         self._prepared_generation_growth = generation_growth
@@ -1969,15 +2004,16 @@ class TriAttention(BaseKVCacheCompressionManager):
                 LlmRequestState.CONTEXT_INIT,
             ):
                 continue
-            kv_cache = self.kv_cache_manager.kv_cache_map.get(request.py_request_id)
-            if kv_cache is None:
-                continue
-            if not kv_cache.is_active:
-                raise RuntimeError(
-                    "TriAttention cannot finalize a suspended target KV cache; "
-                    f"request {request.py_request_id} must be resumed before "
-                    "the final update hook"
-                )
+            if isinstance(self.kv_cache_manager, KVCacheManagerV2):
+                kv_cache = self.kv_cache_manager.kv_cache_map.get(request.py_request_id)
+                if kv_cache is None:
+                    continue
+                if not kv_cache.is_active:
+                    raise RuntimeError(
+                        "TriAttention cannot finalize a suspended target KV cache; "
+                        f"request {request.py_request_id} must be resumed before "
+                        "the final update hook"
+                    )
             if request.py_request_id not in self._initialized_request_ids:
                 self.on_request_init(request)
             active_requests.append(request)
@@ -1991,10 +2027,14 @@ class TriAttention(BaseKVCacheCompressionManager):
         evict_now = []
         for request in active_requests:
             rid = request.py_request_id
-            kv_cache = mgr.kv_cache_map.get(rid)
-            if kv_cache is None or not kv_cache.is_active:
-                continue
-            raw_capacity = int(kv_cache.capacity)
+            kv_cache = None
+            if isinstance(mgr, KVCacheManagerV2):
+                kv_cache = mgr.kv_cache_map.get(rid)
+                if kv_cache is None or not kv_cache.is_active:
+                    continue
+                raw_capacity = int(kv_cache.capacity)
+            else:
+                raw_capacity = int(mgr.get_num_tokens(request))
             # One-engine speculative decoding keeps a fixed reserve E. Under
             # overlap, B(n) is allocated/enqueued before finalizing B(n-1), so
             # its exact scheduler growth Q is also opaque. Both spans are
@@ -2009,7 +2049,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                     f"confirmed={seq_len}, capacity={raw_capacity}, "
                     f"protected_tail={protected_tail}"
                 )
-            if seq_len < kv_cache.history_length:
+            if kv_cache is not None and seq_len < kv_cache.history_length:
                 raise RuntimeError(
                     f"Request {rid} KV length {seq_len} is below finalized "
                     f"history {kv_cache.history_length}"
@@ -2076,21 +2116,38 @@ class TriAttention(BaseKVCacheCompressionManager):
                 compaction_event.record()
                 compaction_event.synchronize()
                 for rid, target_capacity in capacity_targets:
-                    kv_cache = mgr.kv_cache_map.get(rid)
-                    if kv_cache is None or not kv_cache.is_active:
-                        continue
-                    if target_capacity > kv_cache.capacity:
-                        raise RuntimeError(
-                            f"Request {rid} compacted capacity {target_capacity} exceeds "
-                            f"current capacity {kv_cache.capacity}"
-                        )
+                    request = protected_tails[rid][0]
                     protected_tail = protected_tails[rid][2]
                     resized_capacity = target_capacity + protected_tail
-                    if not kv_cache.resize(resized_capacity, None):
-                        raise RuntimeError(
-                            f"Failed to resize compacted KV cache for request {rid} "
-                            f"to {resized_capacity} tokens"
-                        )
+                    if isinstance(mgr, KVCacheManagerV2):
+                        kv_cache = mgr.kv_cache_map.get(rid)
+                        if kv_cache is None or not kv_cache.is_active:
+                            continue
+                        if target_capacity > kv_cache.capacity:
+                            raise RuntimeError(
+                                f"Request {rid} compacted capacity {target_capacity} exceeds "
+                                f"current capacity {kv_cache.capacity}"
+                            )
+                        if not kv_cache.resize(resized_capacity, None):
+                            raise RuntimeError(
+                                f"Failed to resize compacted KV cache for request {rid} "
+                                f"to {resized_capacity} tokens"
+                            )
+                    else:
+                        current_capacity = int(mgr.get_num_tokens(request))
+                        rewind_length = current_capacity - resized_capacity
+                        if rewind_length < 0:
+                            raise RuntimeError(
+                                f"Request {rid} compacted capacity {resized_capacity} exceeds "
+                                f"current capacity {current_capacity}"
+                            )
+                        mgr.rewind_kv_cache(request, rewind_length)
+                        actual_capacity = int(mgr.get_num_tokens(request))
+                        if actual_capacity != resized_capacity:
+                            raise RuntimeError(
+                                f"Request {rid} hybrid KV rewind produced {actual_capacity} "
+                                f"tokens, expected {resized_capacity}"
+                            )
                     source_capacity = protected_tails[rid][1]
                     evicted = source_capacity - target_capacity
                     self._evicted[rid] = self._evicted.get(rid, 0) + evicted
@@ -2382,7 +2439,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
             return
         try:
-            self._validate_v2_compatibility()
+            self._validate_cache_compatibility()
             self._ensure_calibrated()
             num_layers = self._num_layers_from_manager()
             layer_pools, dense_layers, storage_groups = self._fixed_union_live_geometry(num_layers)
@@ -3424,7 +3481,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         return out.to(torch.long)
 
     def _local_to_global_layers(self, num_layers: int) -> List[int]:
-        """Return V2's global layer id for every local TriAttention layer slot."""
+        """Return each full-attention layer owned by the target cache."""
         cached = self._local_to_global_layers_cache
         if cached is not None:
             if len(cached) != num_layers:
@@ -3433,10 +3490,13 @@ class TriAttention(BaseKVCacheCompressionManager):
                 )
             return cached
 
-        global_layers = [int(layer) for layer in self.kv_cache_manager.pp_layers]
+        if isinstance(self.kv_cache_manager, MixedMambaHybridCacheManager):
+            global_layers = self._hybrid_attention_layers()
+        else:
+            global_layers = [int(layer) for layer in self.kv_cache_manager.pp_layers]
         if len(global_layers) != num_layers:
             raise ValueError(
-                f"KVCacheManagerV2 exposes {len(global_layers)} PP layers, "
+                f"target KV cache exposes {len(global_layers)} attention layers, "
                 f"but TriAttention received {num_layers} local layers"
             )
         self._local_to_global_layers_cache = global_layers
@@ -3605,17 +3665,25 @@ class TriAttention(BaseKVCacheCompressionManager):
         representatives: List[int],
         global_layers: List[int],
     ) -> List[object]:
-        """Return stable V2-pool keys for the representative layers."""
-        manager = self.kv_cache_manager
-        layer_offsets = manager.layer_offsets
-        layer_to_pool = manager.layer_to_pool_mapping_dict
+        """Return stable target-pool keys for the representative layers."""
         try:
             return [
-                ("pool", int(layer_to_pool[layer_offsets[global_layers[layer]]]))
+                ("pool", self._pool_id_for_global_layer(global_layers[layer]))
                 for layer in representatives
             ]
-        except (IndexError, KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError("KVCacheManagerV2 exposes an invalid layer-to-pool mapping") from exc
+        except (IndexError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+            raise RuntimeError("target KV cache exposes an invalid layer-to-pool mapping") from exc
+
+    def _pool_id_for_global_layer(self, global_layer: int) -> int:
+        """Return the physical pool that stores one target attention layer."""
+        manager = self.kv_cache_manager
+        layer_offset = manager.layer_offsets[global_layer]
+        if isinstance(manager, KVCacheManagerV2):
+            return int(manager.layer_to_pool_mapping_dict[layer_offset])
+        mapping = manager.kv_cache_pool_mapping
+        if mapping is None or mapping.ndim != 2 or mapping.shape[1] < 1:
+            raise RuntimeError("hybrid target cache has no layer-to-pool mapping")
+        return int(mapping[layer_offset, 0])
 
     def _dense_layer_pool_groups(
         self,
@@ -4198,7 +4266,15 @@ class TriAttention(BaseKVCacheCompressionManager):
         return None
 
     def _num_layers_from_manager(self) -> int:
+        if isinstance(self.kv_cache_manager, MixedMambaHybridCacheManager):
+            return len(self._hybrid_attention_layers())
         return len(self.kv_cache_manager.pp_layers)
+
+    def _hybrid_attention_layers(self) -> List[int]:
+        manager = self.kv_cache_manager
+        if not isinstance(manager, MixedMambaHybridCacheManager):
+            raise TypeError("hybrid attention layers require MixedMambaHybridCacheManager")
+        return [int(layer) for layer in manager.pp_layers]
 
     # ------------------------------------------------------------------ #
     # Helpers: calibration loading                                       #
