@@ -60,10 +60,18 @@ def get_kv_cache_compression_attention_metadata_cls(
 
 @dataclass(kw_only=True)
 class KVCacheCompressionAwareTrtllmAttentionMetadata(TrtllmAttentionMetadata):
-    """Expose compressed target and dense draft lengths to attention.
+    """Provide independent target and draft KV lengths to TRT-LLM attention.
 
-    This adapter materializes attention parameters. It does not run cache
-    compression, resize either cache, or alter the speculative algorithm.
+    Physical compression shortens only the target cache, while one-model
+    speculative decoding keeps its draft cache dense. The fused attention op
+    consumes both host and device length metadata, and CUDA Graph replay
+    requires their storage addresses to remain stable. This adapter
+    materializes both length views and selects the matching view when the
+    existing speculative path switches the active KV cache manager.
+
+    It does not select or move KV entries, resize either cache, or change token
+    proposal and acceptance. Those responsibilities remain with the compression
+    manager, KV cache managers, and speculative decoding implementation.
     """
 
     draft_kv_length_delta: list[int] | None = None
@@ -191,9 +199,6 @@ class KVCacheCompressionAwareTrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def on_kv_cache_manager_changed(self) -> None:
         """Select lengths for the active target or draft KV cache manager."""
         super().on_kv_cache_manager_changed()
-        self.activate_kv_length_domain()
-
-    def activate_kv_length_domain(self) -> None:
         use_draft = (
             self.draft_kv_length_delta is not None
             and self.draft_kv_cache_manager is not None
@@ -207,9 +212,6 @@ class KVCacheCompressionAwareTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.kv_lens_runtime = self.draft_kv_lens_runtime[: self.num_seqs]
             self.host_total_kv_lens = self.draft_host_total_kv_lens
             return
-        self.restore_target_kv_length_domain()
-
-    def restore_target_kv_length_domain(self) -> None:
         if self.target_kv_lens_cuda_runtime is not None:
             self.kv_lens_cuda_runtime = self.target_kv_lens_cuda_runtime
         if self.target_kv_lens_runtime is not None:

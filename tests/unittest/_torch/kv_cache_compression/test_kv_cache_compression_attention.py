@@ -143,22 +143,23 @@ def test_paged_draft_modes_and_dflash_select_expected_length_domain() -> None:
 
 
 def test_target_and_draft_cpu_length_domains_are_independent() -> None:
-    metadata, _, draft_manager = _metadata_with_separate_draft_cache()
+    metadata, target_manager, draft_manager = _metadata_with_separate_draft_cache()
     metadata._materialize_draft_device_kv_lengths()
     metadata._materialize_draft_host_kv_lengths()
 
-    metadata.activate_kv_length_domain()
+    metadata.on_kv_cache_manager_changed()
     assert metadata.kv_lens_cuda_runtime.tolist() == [41, 92]
     assert metadata.kv_lens_runtime.tolist() == [41, 92]
     assert metadata.host_total_kv_lens is metadata.target_host_total_kv_lens
 
     metadata.kv_cache_manager = draft_manager
-    metadata.activate_kv_length_domain()
+    metadata.on_kv_cache_manager_changed()
     assert metadata.kv_lens_cuda_runtime.tolist() == [41, 129]
     assert metadata.kv_lens_runtime.tolist() == [41, 129]
     assert metadata.host_total_kv_lens.tolist() == [41, 129]
 
-    metadata.restore_target_kv_length_domain()
+    metadata.kv_cache_manager = target_manager
+    metadata.on_kv_cache_manager_changed()
     assert metadata.kv_lens_cuda_runtime is metadata.target_kv_lens_cuda_runtime
     assert metadata.kv_lens_runtime is metadata.target_kv_lens_runtime
     assert metadata.host_total_kv_lens is metadata.target_host_total_kv_lens
@@ -235,7 +236,7 @@ def test_cuda_draft_length_refresh_reuses_graph_stable_buffers() -> None:
     metadata.target_kv_lens_runtime.add_(torch.tensor([2, 5], dtype=torch.int32))
     graph.replay()
     metadata.kv_cache_manager = draft_manager
-    metadata.activate_kv_length_domain()
+    metadata.on_kv_cache_manager_changed()
 
     assert metadata.draft_kv_lens_cuda_runtime.data_ptr() == draft_output_pointer
     assert metadata.draft_kv_length_delta_cuda.data_ptr() == delta_pointer
@@ -296,7 +297,7 @@ def test_native_speculative_update_refreshes_device_domain(
 
     update(metadata)
     metadata.kv_cache_manager = draft_manager
-    metadata.activate_kv_length_domain()
+    metadata.on_kv_cache_manager_changed()
 
     assert metadata.target_kv_lens_cuda_runtime.data_ptr() == metadata.kv_lens_cuda.data_ptr()
     assert metadata.kv_lens_cuda_runtime.tolist() == [41, 130]
@@ -313,7 +314,7 @@ def test_restore_from_spec_dec_refreshes_device_domain() -> None:
 
     metadata.restore_from_spec_dec()
     metadata.kv_cache_manager = draft_manager
-    metadata.activate_kv_length_domain()
+    metadata.on_kv_cache_manager_changed()
 
     assert metadata.kv_lens_cuda is original_kv_lens_cuda
     assert metadata.target_kv_lens_cuda_runtime.data_ptr() == original_kv_lens_cuda.data_ptr()
