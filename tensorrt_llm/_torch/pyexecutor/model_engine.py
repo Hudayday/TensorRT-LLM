@@ -2792,6 +2792,13 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata, new_tensors_device, num_accepted_tokens_device,
                 resource_manager)
 
+    def _prepare_self_attention_metadata(
+            self, attn_metadata: AttentionMetadata) -> None:
+        if self._step_kv_compression_manager is not None:
+            self._step_kv_compression_manager.adjust_attention_metadata(
+                attn_metadata)
+        attn_metadata.prepare()
+
     @nvtx_range("_prepare_incremental_update_metadata")
     def _prepare_incremental_update_metadata(
             self,
@@ -2827,12 +2834,7 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
             num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
         attn_metadata.kv_cache_manager = kv_cache_manager
-        # Overlap fast path: reconcile the compacted cache before prepare() (same
-        # hook as the full path; manager resolved at the _prepare_tp_inputs entry).
-        if self._step_kv_compression_manager is not None:
-            self._step_kv_compression_manager.adjust_attention_metadata(
-                attn_metadata)
-        attn_metadata.prepare()
+        self._prepare_self_attention_metadata(attn_metadata)
 
         # Get LoRA parameters
         lora_params = self._get_lora_params_from_requests(
@@ -4170,13 +4172,7 @@ class PyTorchModelEngine(ModelEngine):
 
         if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
             attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
-        # Full path: reconcile the compacted cache before prepare() so it builds
-        # the kernel KV lengths from the compacted cache (manager resolved at the
-        # _prepare_tp_inputs entry; no-op when no compression manager runs).
-        if self._step_kv_compression_manager is not None:
-            self._step_kv_compression_manager.adjust_attention_metadata(
-                attn_metadata)
-        attn_metadata.prepare()
+        self._prepare_self_attention_metadata(attn_metadata)
         cross_attention_inputs = (self._prepare_enc_dec_cross_attn_inputs(
             cross_encoder_hidden_states,
             cross_encoder_seq_lens,
