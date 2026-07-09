@@ -95,30 +95,6 @@ def _batch(context=(), generation=(), last_chunk=()):
     return b
 
 
-def _role_kv_cache_manager(*, is_draft):
-    manager = MagicMock()
-    manager.enable_block_reuse = False
-    manager.is_draft = is_draft
-    manager.max_seq_len = 65536
-    manager.impl = object()
-    manager.kv_cache_map = {}
-    manager.host_kv_cache_block_offsets = torch.empty(1, dtype=torch.int64)
-    return manager
-
-
-def _hybrid_role_kv_cache_manager(*, is_draft):
-    """Build the production hybrid owner shape without V2-only fields."""
-    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import CppMambaHybridCacheManager
-
-    manager = CppMambaHybridCacheManager.__new__(CppMambaHybridCacheManager)
-    manager.enable_block_reuse = False
-    manager.is_draft = is_draft
-    manager.max_seq_len = 65536
-    manager.impl = object()
-    manager.host_kv_cache_block_offsets = torch.empty(1, dtype=torch.int64)
-    return manager
-
-
 def _v2_role_kv_cache_manager(*, is_draft):
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 
@@ -166,8 +142,8 @@ class TestBaseABC:
         assert m.get_needed_resource_to_completion(MagicMock()) == 0
 
     def test_framework_owns_independent_target_and_draft_roles(self):
-        target = _role_kv_cache_manager(is_draft=False)
-        draft = _role_kv_cache_manager(is_draft=True)
+        target = _v2_role_kv_cache_manager(is_draft=False)
+        draft = _v2_role_kv_cache_manager(is_draft=True)
 
         manager = BaseKVCacheCompressionManager(target, draft)
 
@@ -176,33 +152,23 @@ class TestBaseABC:
         assert manager.has_independent_draft_kv_cache
 
     def test_framework_rejects_draft_as_the_only_primary_owner(self):
-        draft = _role_kv_cache_manager(is_draft=True)
+        draft = _v2_role_kv_cache_manager(is_draft=True)
 
         with pytest.raises(ValueError, match="must own target KV state"):
             BaseKVCacheCompressionManager(draft)
 
     def test_framework_rejects_shared_target_and_draft_state(self):
-        target = _role_kv_cache_manager(is_draft=False)
-        draft = _role_kv_cache_manager(is_draft=True)
+        target = _v2_role_kv_cache_manager(is_draft=False)
+        draft = _v2_role_kv_cache_manager(is_draft=True)
         draft.impl = target.impl
 
         with pytest.raises(ValueError, match="share physical state"):
             BaseKVCacheCompressionManager(target, draft)
 
-    def test_framework_accepts_independent_cpp_hybrid_target_and_draft(self):
-        target = _hybrid_role_kv_cache_manager(is_draft=False)
-        draft = _hybrid_role_kv_cache_manager(is_draft=True)
-
-        manager = BaseKVCacheCompressionManager(target, draft)
-
-        assert manager.kv_cache_manager is target
-        assert manager.draft_kv_cache_manager is draft
-        assert manager.has_independent_draft_kv_cache
-
     @pytest.mark.parametrize("shared_field", ["impl", "page_table"])
-    def test_framework_rejects_shared_cpp_hybrid_state(self, shared_field):
-        target = _hybrid_role_kv_cache_manager(is_draft=False)
-        draft = _hybrid_role_kv_cache_manager(is_draft=True)
+    def test_framework_rejects_shared_v2_state(self, shared_field):
+        target = _v2_role_kv_cache_manager(is_draft=False)
+        draft = _v2_role_kv_cache_manager(is_draft=True)
         if shared_field == "impl":
             draft.impl = target.impl
             error = "share physical state"
@@ -214,8 +180,8 @@ class TestBaseABC:
             BaseKVCacheCompressionManager(target, draft)
 
     def test_framework_accepts_independent_empty_page_tables(self):
-        target = _hybrid_role_kv_cache_manager(is_draft=False)
-        draft = _hybrid_role_kv_cache_manager(is_draft=True)
+        target = _v2_role_kv_cache_manager(is_draft=False)
+        draft = _v2_role_kv_cache_manager(is_draft=True)
         target.host_kv_cache_block_offsets = torch.empty(0, dtype=torch.int64)
         draft.host_kv_cache_block_offsets = torch.empty(0, dtype=torch.int64)
 
@@ -224,8 +190,8 @@ class TestBaseABC:
         assert manager.has_independent_draft_kv_cache
 
     def test_framework_rejects_page_table_views_of_shared_storage(self):
-        target = _hybrid_role_kv_cache_manager(is_draft=False)
-        draft = _hybrid_role_kv_cache_manager(is_draft=True)
+        target = _v2_role_kv_cache_manager(is_draft=False)
+        draft = _v2_role_kv_cache_manager(is_draft=True)
         shared_storage = torch.empty(4, dtype=torch.int64)
         target.host_kv_cache_block_offsets = shared_storage[:2]
         draft.host_kv_cache_block_offsets = shared_storage[1:3]
@@ -247,8 +213,8 @@ class TestBaseABC:
                 self.delta = list(delta)
 
         manager = BaseKVCacheCompressionManager(
-            _role_kv_cache_manager(is_draft=False),
-            _role_kv_cache_manager(is_draft=True),
+            _v2_role_kv_cache_manager(is_draft=False),
+            _v2_role_kv_cache_manager(is_draft=True),
         )
         metadata = Metadata()
 

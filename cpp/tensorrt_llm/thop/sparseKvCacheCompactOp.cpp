@@ -30,8 +30,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-//! In-place sparse compaction of one per-layer HND pool. The page axis may be
-//! strided when KVCacheManager stores several layers in one physical pool.
+//! In-place sparse compaction of one KVCacheManagerV2 per-layer HND pool.
 //! pool:                [pages, 2, kv_heads, tokens_per_block, head_dim]
 //! pageTable:           [batch, max_pages_per_seq] int32
 //! sourceIndices:       [kv_heads, total_moves] int32
@@ -50,16 +49,7 @@ void sparseKvCacheCompact(th::Tensor pool, th::Tensor const& pageTable, th::Tens
     TORCH_CHECK(pool.dim() == 5 && pool.size(1) == 2,
         "sparse_kv_cache_compact: pool must be [pages, 2, kv_heads, "
         "tokens_per_block, head_dim]");
-    auto const numKvHeads = static_cast<int32_t>(pool.size(2));
-    auto const tokensPerBlock = static_cast<int32_t>(pool.size(3));
-    auto const headDim = static_cast<int32_t>(pool.size(4));
-    int64_t const headStride = static_cast<int64_t>(tokensPerBlock) * headDim;
-    int64_t const kvStride = static_cast<int64_t>(numKvHeads) * headStride;
-    int64_t const minimumPageStride = 2 * kvStride;
-    TORCH_CHECK(pool.stride(4) == 1 && pool.stride(3) == headDim && pool.stride(2) == headStride
-            && pool.stride(1) == kvStride && pool.stride(0) >= minimumPageStride,
-        "sparse_kv_cache_compact: pool must be inner-contiguous HND with "
-        "a non-overlapping page stride");
+    TORCH_CHECK(pool.is_contiguous(), "sparse_kv_cache_compact: pool must be contiguous");
     TORCH_CHECK(pageTable.dim() == 2 && pageTable.scalar_type() == th::kInt32 && pageTable.is_contiguous(),
         "sparse_kv_cache_compact: page_table must be contiguous [batch, "
         "max_pages] int32");
@@ -70,6 +60,9 @@ void sparseKvCacheCompact(th::Tensor pool, th::Tensor const& pageTable, th::Tens
         "sparse_kv_cache_compact: source_offsets must be contiguous "
         "[batch + 1] int32");
 
+    auto const numKvHeads = static_cast<int32_t>(pool.size(2));
+    auto const tokensPerBlock = static_cast<int32_t>(pool.size(3));
+    auto const headDim = static_cast<int32_t>(pool.size(4));
     auto const batchSize = static_cast<int32_t>(pageTable.size(0));
     auto const maxPagesPerSeq = static_cast<int32_t>(pageTable.size(1));
     TORCH_CHECK(sourceIndices.size(0) == numKvHeads, "sparse_kv_cache_compact: source_indices head dimension mismatch");
@@ -109,22 +102,21 @@ void sparseKvCacheCompact(th::Tensor pool, th::Tensor const& pageTable, th::Tens
     if (dtype == th::kBFloat16)
     {
         tk::invokeSparseKvCacheCompactV2<__nv_bfloat16>(reinterpret_cast<__nv_bfloat16*>(pool.data_ptr()),
-            pool.stride(0), pageTable.data_ptr<int32_t>(), maxPagesPerSeq, sourceIndices.data_ptr<int32_t>(),
+            pageTable.data_ptr<int32_t>(), maxPagesPerSeq, sourceIndices.data_ptr<int32_t>(),
             sourceOffsets.data_ptr<int32_t>(), destinationPtr, destinationPerHead, batchSize, numKvHeads,
             tokensPerBlock, headDim, stream);
     }
     else if (dtype == th::kHalf)
     {
-        tk::invokeSparseKvCacheCompactV2<half>(reinterpret_cast<half*>(pool.data_ptr()), pool.stride(0),
-            pageTable.data_ptr<int32_t>(), maxPagesPerSeq, sourceIndices.data_ptr<int32_t>(),
-            sourceOffsets.data_ptr<int32_t>(), destinationPtr, destinationPerHead, batchSize, numKvHeads,
-            tokensPerBlock, headDim, stream);
+        tk::invokeSparseKvCacheCompactV2<half>(reinterpret_cast<half*>(pool.data_ptr()), pageTable.data_ptr<int32_t>(),
+            maxPagesPerSeq, sourceIndices.data_ptr<int32_t>(), sourceOffsets.data_ptr<int32_t>(), destinationPtr,
+            destinationPerHead, batchSize, numKvHeads, tokensPerBlock, headDim, stream);
     }
     else if (dtype == th::kFloat)
     {
-        tk::invokeSparseKvCacheCompactV2<float>(pool.data_ptr<float>(), pool.stride(0), pageTable.data_ptr<int32_t>(),
-            maxPagesPerSeq, sourceIndices.data_ptr<int32_t>(), sourceOffsets.data_ptr<int32_t>(), destinationPtr,
-            destinationPerHead, batchSize, numKvHeads, tokensPerBlock, headDim, stream);
+        tk::invokeSparseKvCacheCompactV2<float>(pool.data_ptr<float>(), pageTable.data_ptr<int32_t>(), maxPagesPerSeq,
+            sourceIndices.data_ptr<int32_t>(), sourceOffsets.data_ptr<int32_t>(), destinationPtr, destinationPerHead,
+            batchSize, numKvHeads, tokensPerBlock, headDim, stream);
     }
     else
     {

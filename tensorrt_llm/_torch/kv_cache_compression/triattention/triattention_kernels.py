@@ -34,16 +34,10 @@ import triton.language as tl
 
 def cpp_sparse_compact_supported(pool: torch.Tensor) -> bool:
     """Return whether ``pool`` satisfies the C++ compact op layout contract."""
-    if pool.ndim != 5:
-        return False
-    _, kv_factor, num_kv_heads, tokens_per_block, head_dim = pool.shape
-    head_stride = int(tokens_per_block) * int(head_dim)
-    kv_stride = int(num_kv_heads) * head_stride
     return (
-        kv_factor == 2
-        and tuple(int(value) for value in pool.stride()[1:])
-        == (kv_stride, head_stride, int(head_dim), 1)
-        and int(pool.stride(0)) >= 2 * kv_stride
+        pool.ndim == 5
+        and pool.shape[1] == 2
+        and pool.is_contiguous()
         and pool.dtype in (torch.bfloat16, torch.float16, torch.float32)
     )
 
@@ -68,7 +62,7 @@ def cpp_sparse_compact(
     """
     if not cpp_sparse_compact_supported(pool):
         raise ValueError(
-            "cpp_sparse_compact requires an inner-contiguous [pages, 2, heads, tokens, dim] "
+            "cpp_sparse_compact requires a contiguous [pages, 2, heads, tokens, dim] "
             "BF16/FP16/FP32 pool"
         )
     if not (len(page_ids_list) == len(source_list) == len(seq_len_list)):

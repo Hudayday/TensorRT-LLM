@@ -68,6 +68,8 @@ if TYPE_CHECKING:
         AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
+    from .kv_cache_manager_v2 import KVCacheManagerV2
+
 BlocksPerWindow = Dict[int, Tuple[
     int,
     int]]  # window_size -> (blocks_in_primary_pool, blocks_in_secondary_pool)
@@ -2338,16 +2340,6 @@ class KVCacheCompressionMetadata(Protocol):
         """Publish ``dense draft length - compressed target length`` per row."""
 
 
-class KVCacheCompressionCacheOwner(Protocol):
-    """Physical-ownership fields shared by V1 and V2 KV cache managers."""
-
-    enable_block_reuse: bool
-    is_draft: bool
-    max_seq_len: int
-    impl: object
-    host_kv_cache_block_offsets: torch.Tensor
-
-
 class BaseKVCacheCompressionManager(BaseResourceManager):
     """Framework-level base class for all KV-cache compression managers.
 
@@ -2366,16 +2358,14 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
 
     def __init__(
         self,
-        kv_cache_manager: KVCacheCompressionCacheOwner,
-        draft_kv_cache_manager: Optional[KVCacheCompressionCacheOwner] = None,
-        *,
-        mutates_kv_cache: bool = True,
+        kv_cache_manager: "KVCacheManagerV2",
+        draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None,
     ):
         self.kv_cache_manager = kv_cache_manager
         self.draft_kv_cache_manager = draft_kv_cache_manager
         # Compression evicts/rewrites stored keys and values, so a shared prefix
         # block is no longer safe to reuse (same constraint as RocketKVCacheManager).
-        if mutates_kv_cache and kv_cache_manager.enable_block_reuse:
+        if kv_cache_manager.enable_block_reuse:
             raise ValueError(
                 f"{type(self).__name__} changes stored keys and values and cannot "
                 f"run with KV-cache block reuse. Set "
@@ -2400,13 +2390,7 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         if target.impl is draft.impl:
             raise ValueError(
                 "target and draft KV cache managers share physical state")
-        from .kv_cache_manager_v2 import KVCacheManagerV2
-
-        if (
-            isinstance(target, KVCacheManagerV2)
-            and isinstance(draft, KVCacheManagerV2)
-            and target.kv_cache_map is draft.kv_cache_map
-        ):
+        if target.kv_cache_map is draft.kv_cache_map:
             raise ValueError(
                 "target and draft KV cache managers share physical state")
         target_offsets = target.host_kv_cache_block_offsets

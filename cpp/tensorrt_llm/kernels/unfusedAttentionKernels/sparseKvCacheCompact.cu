@@ -156,7 +156,7 @@ bool supportsOptimizedPrefixCompact(int32_t headDim)
 }
 
 template <typename T>
-void invokeSparseKvCacheCompactV2(T* pool, int64_t pageStrideElements, int32_t const* pageTable, int32_t maxPagesPerSeq,
+void invokeSparseKvCacheCompactV2(T* pool, int32_t const* pageTable, int32_t maxPagesPerSeq,
     int32_t const* sparseKvIndices, int32_t const* sparseKvOffsets, int32_t const* destinationIndices,
     bool destinationPerHead, int32_t batchSize, int32_t numKvHeads, int32_t tokensPerBlock, int32_t headDim,
     cudaStream_t stream)
@@ -167,7 +167,7 @@ void invokeSparseKvCacheCompactV2(T* pool, int64_t pageStrideElements, int32_t c
     buffer.maxPagesPerSeq = maxPagesPerSeq;
     buffer.tokensPerBlock = tokensPerBlock;
     buffer.bytesPerKvHalf = static_cast<size_t>(numKvHeads) * tokensPerBlock * headDim * sizeof(T);
-    buffer.bytesPerPage = static_cast<size_t>(pageStrideElements) * sizeof(T);
+    buffer.bytesPerPage = 2 * buffer.bytesPerKvHalf;
 
     if (destinationIndices != nullptr || !supportsOptimizedPrefixCompact<T>(headDim))
     {
@@ -186,13 +186,13 @@ void invokeSparseKvCacheCompactV2(T* pool, int64_t pageStrideElements, int32_t c
     invokeUpdateSparseKvCacheAfterFmha<T, T, KvCacheV2PoolBuffer>(params, stream);
 }
 
-template void invokeSparseKvCacheCompactV2<half>(half*, int64_t, int32_t const*, int32_t, int32_t const*,
-    int32_t const*, int32_t const*, bool, int32_t, int32_t, int32_t, int32_t, cudaStream_t);
-template void invokeSparseKvCacheCompactV2<float>(float*, int64_t, int32_t const*, int32_t, int32_t const*,
-    int32_t const*, int32_t const*, bool, int32_t, int32_t, int32_t, int32_t, cudaStream_t);
+template void invokeSparseKvCacheCompactV2<half>(half*, int32_t const*, int32_t, int32_t const*, int32_t const*,
+    int32_t const*, bool, int32_t, int32_t, int32_t, int32_t, cudaStream_t);
+template void invokeSparseKvCacheCompactV2<float>(float*, int32_t const*, int32_t, int32_t const*, int32_t const*,
+    int32_t const*, bool, int32_t, int32_t, int32_t, int32_t, cudaStream_t);
 #ifdef ENABLE_BF16
-template void invokeSparseKvCacheCompactV2<__nv_bfloat16>(__nv_bfloat16*, int64_t, int32_t const*, int32_t,
-    int32_t const*, int32_t const*, int32_t const*, bool, int32_t, int32_t, int32_t, int32_t, cudaStream_t);
+template void invokeSparseKvCacheCompactV2<__nv_bfloat16>(__nv_bfloat16*, int32_t const*, int32_t, int32_t const*,
+    int32_t const*, int32_t const*, bool, int32_t, int32_t, int32_t, int32_t, cudaStream_t);
 #endif
 
 } // namespace kernels
