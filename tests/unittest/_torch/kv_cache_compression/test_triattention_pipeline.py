@@ -695,7 +695,10 @@ class TestStepEndHookRefactor:
             TriAttention(SimpleNamespace(), top_B=top_B)
 
     def test_non_v2_draft_manager_is_rejected(self):
-        with pytest.raises(TypeError, match="requires draft KVCacheManagerV2"):
+        with pytest.raises(
+            TypeError,
+            match="draft KV-cache compression requires KVCacheManagerV2",
+        ):
             TriAttention(
                 _make_fake_v2(),
                 top_B=8,
@@ -830,7 +833,8 @@ class TestStepEndHookRefactor:
         event.synchronize.side_effect = lambda: timeline.append("sync")
         cache = mgr.kv_cache_manager.kv_cache_map[7]
 
-        def compact(*args):
+        def compact(*args, protected_tail_lengths):
+            assert protected_tail_lengths == {7: 0}
             timeline.append("stage5_dispatch")
             return [(7, 1024 + 4096)]
 
@@ -905,7 +909,8 @@ class TestStepEndHookRefactor:
         mgr._standalone_cuda_graph_enabled = True
         event = mock.Mock()
 
-        def compact(group, _num_layers):
+        def compact(group, _num_layers, *, protected_tail_lengths):
+            assert protected_tail_lengths == {7: 0, 8: 0, 9: 0}
             return [
                 (rid, mgr._minimum_evictable_length(request, mgr._confirmed_kv_lengths[rid]))
                 for request, rid in group
@@ -952,7 +957,8 @@ class TestStepEndHookRefactor:
         mgr._cross_request_selection_enabled = True
         event = mock.Mock()
 
-        def compact(group, _num_layers):
+        def compact(group, _num_layers, *, protected_tail_lengths):
+            assert protected_tail_lengths == {7: 0, 8: 0}
             return [(rid, prompt_len + mgr.top_B) for _, rid in group]
 
         with (
@@ -3090,6 +3096,7 @@ class TestFixedUnionWorkspace:
             prewarm_key=upper_key,
             prompt_len=64,
             bucket_seq_len=200,
+            page_table_token_capacity=200,
             max_requests=2,
             matches=mock.Mock(return_value=True),
         )

@@ -1852,6 +1852,7 @@ class TestFixedBatchedCompactionWorkspace:
         workspace.seq_len = 8
         workspace.prompt_len = 2
         workspace.decode_keep_count = 4
+        workspace.protected_tail_lengths = (0,)
         workspace.dense_layers = ()
         workspace.swa_layers = ()
         workspace.global_layers = ()
