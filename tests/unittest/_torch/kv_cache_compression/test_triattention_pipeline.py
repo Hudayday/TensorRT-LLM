@@ -435,6 +435,7 @@ class TestTriAttentionClass:
         assert manager._fixed_union_active == {}
         assert manager._fixed_score_runtime_counts == {}
         assert manager._standalone_graph_cache is None
+        assert manager._runtime_kv_layout_cache is None
 
     def test_resolve_requires_calibration_path(self):
         mgr = _make_triattention()
@@ -1666,6 +1667,92 @@ def _torch_union_keep(head_scores, prompt_len, budget):
 
 
 class TestFixedScoreMetadata:
+    def test_live_geometry_caches_v2_pool_views_for_manager_lifetime(self):
+        pools = [torch.empty(2, 2, 1, 8, 2), torch.empty(2, 2, 1, 8, 2)]
+        get_buffers = mock.Mock(side_effect=lambda layer, **kwargs: pools[layer - 10])
+        manager = _make_triattention()
+        manager._local_to_global_layers = mock.Mock(return_value=[10, 11])
+        manager.kv_cache_manager = SimpleNamespace(
+            get_buffers=get_buffers,
+            layer_offsets={10: 100, 11: 101},
+            layer_to_pool_mapping_dict={100: 3, 101: 4},
+        )
+
+        first = manager._fixed_union_live_geometry(2)
+        second = manager._fixed_union_live_geometry(2)
+
+        assert second[0] is first[0]
+        assert second[1] is first[1]
+        # Two calls build the layer views. Two representative calls validate
+        # the two distinct physical pools on cache reuse.
+        assert get_buffers.call_count == 4
+
+    def test_live_geometry_rejects_changed_layer_count_before_pool_lookup(self):
+        pools = [torch.empty(2, 2, 1, 8, 2), torch.empty(2, 2, 1, 8, 2)]
+        get_buffers = mock.Mock(side_effect=lambda layer, **kwargs: pools[layer - 10])
+        manager = _make_triattention()
+        manager._local_to_global_layers = mock.Mock(return_value=[10, 11])
+        manager.kv_cache_manager = SimpleNamespace(
+            get_buffers=get_buffers,
+            layer_offsets={10: 100, 11: 101},
+            layer_to_pool_mapping_dict={100: 3, 101: 3},
+        )
+        manager._runtime_kv_layout(2)
+
+        with pytest.raises(ValueError, match="layer count changed"):
+            manager._runtime_kv_layout(3)
+
+        assert get_buffers.call_count == 2
+
+    def test_live_geometry_rejects_target_manager_replacement(self):
+        pools = [torch.empty(2, 2, 1, 8, 2), torch.empty(2, 2, 1, 8, 2)]
+        manager = _make_triattention()
+        manager._local_to_global_layers = mock.Mock(return_value=[10, 11])
+        manager.kv_cache_manager = SimpleNamespace(
+            get_buffers=lambda layer, **kwargs: pools[layer - 10],
+            layer_offsets={10: 100, 11: 101},
+            layer_to_pool_mapping_dict={100: 3, 101: 3},
+        )
+        manager._runtime_kv_layout(2)
+        replacement_get_buffers = mock.Mock()
+        manager.kv_cache_manager = SimpleNamespace(get_buffers=replacement_get_buffers)
+
+        with pytest.raises(RuntimeError, match="manager changed"):
+            manager._runtime_kv_layout(2)
+
+        replacement_get_buffers.assert_not_called()
+
+    def test_live_geometry_rejects_changed_v2_pool_view(self):
+        pools = [torch.empty(2, 2, 1, 8, 2), torch.empty(2, 2, 1, 8, 2)]
+        manager = _make_triattention()
+        manager._local_to_global_layers = mock.Mock(return_value=[10, 11])
+        manager.kv_cache_manager = SimpleNamespace(
+            get_buffers=lambda layer, **kwargs: pools[layer - 10],
+            layer_offsets={10: 100, 11: 101},
+            layer_to_pool_mapping_dict={100: 3, 101: 3},
+        )
+        manager._runtime_kv_layout(2)
+        pools[0] = torch.empty(3, 2, 1, 8, 2)
+
+        with pytest.raises(RuntimeError, match="pool layout changed"):
+            manager._runtime_kv_layout(2)
+
+    def test_live_geometry_missing_pool_does_not_populate_cache(self):
+        manager = _make_triattention()
+        manager._local_to_global_layers = mock.Mock(return_value=[10, 11])
+        manager.kv_cache_manager = SimpleNamespace(
+            get_buffers=lambda layer, **kwargs: (
+                torch.empty(2, 2, 1, 8, 2) if layer == 10 else None
+            ),
+            layer_offsets={10: 100, 11: 101},
+            layer_to_pool_mapping_dict={100: 3, 101: 3},
+        )
+
+        with pytest.raises(RuntimeError, match="Missing KV pools"):
+            manager._runtime_kv_layout(2)
+
+        assert manager._runtime_kv_layout_cache is None
+
     def test_live_geometry_groups_by_v2_pool_not_tensor_storage(self):
         base = torch.empty(4, 2, 1, 8, 2)
         shared_storage = [base[:2], base[2:]]
@@ -1683,13 +1770,16 @@ class TestFixedScoreMetadata:
         assert groups == [[0], [1]]
 
         separate_storage = [torch.empty_like(base[:2]), torch.empty_like(base[:2])]
-        manager.kv_cache_manager = SimpleNamespace(
+        second_manager = _make_triattention()
+        second_manager._dense_layers = mock.Mock(return_value=[0, 1])
+        second_manager._local_to_global_layers = mock.Mock(return_value=[10, 11])
+        second_manager.kv_cache_manager = SimpleNamespace(
             get_buffers=lambda layer, **kwargs: separate_storage[layer - 10],
             layer_offsets={10: 100, 11: 101},
             layer_to_pool_mapping_dict={100: 3, 101: 3},
         )
 
-        _, _, groups = manager._fixed_union_live_geometry(2)
+        _, _, groups = second_manager._fixed_union_live_geometry(2)
 
         assert groups == [[0, 1]]
 

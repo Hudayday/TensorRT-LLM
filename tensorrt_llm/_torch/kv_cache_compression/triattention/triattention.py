@@ -586,6 +586,24 @@ class _CrossRequestSelectionPlan(NamedTuple):
     materialized_nbytes: int
 
 
+class _RuntimeKVLayout(NamedTuple):
+    """Manager-lifetime layer and pool views used by every eviction replay."""
+
+    manager: object
+    num_layers: int
+    global_layers: List[int]
+    layer_pools: List[torch.Tensor]
+    dense_layers: List[int]
+    swa_layers: List[int]
+    swa_window: Optional[int]
+    device: torch.device
+    storage_groups: Dict[object, List[int]]
+    dense_group_representatives: List[int]
+    layer_group_representative: Dict[int, int]
+    pool_representatives: Tuple[int, ...]
+    pool_view_fingerprint: Tuple[tuple, ...]
+
+
 class _BatchedFixedUnionWorkspace:
     """Persistent ``[request, ...]`` buffers for union selection."""
 
@@ -1810,6 +1828,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._attention_layer_partition_cache: Optional[
             Tuple[List[int], List[int], Optional[int]]
         ] = None
+        self._runtime_kv_layout_cache: Optional[_RuntimeKVLayout] = None
 
     def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
         """Mark capacity-only decode and resolve calibration once.
@@ -2199,16 +2218,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         num_layers: int,
     ) -> Tuple[List[torch.Tensor], List[int], List[List[int]]]:
         """Read live pool metadata without exposing its storage to prewarm kernels."""
-        get_buffers = self.kv_cache_manager.get_buffers
-        global_layers = self._local_to_global_layers(num_layers)
-        layer_pools = [get_buffers(layer, kv_layout="HND") for layer in global_layers]
-        if any(pool is None for pool in layer_pools):
-            raise RuntimeError("TriAttention fixed prewarm could not resolve every KV pool")
-        dense_layers = self._dense_layers(num_layers)
-        if not dense_layers:
-            raise ValueError("TriAttention requires at least one full-attention layer")
-        groups = self._dense_layer_pool_groups(dense_layers, global_layers)
-        return layer_pools, dense_layers, list(groups.values())
+        layout = self._runtime_kv_layout(num_layers)
+        return layout.layer_pools, layout.dense_layers, list(layout.storage_groups.values())
 
     def _ensure_configured_graph_buckets(self, evict_now, num_layers: int) -> None:
         """Materialize every due mode-specific bucket from config and live geometry."""
@@ -3578,6 +3589,107 @@ class TriAttention(BaseKVCacheCompressionManager):
         """Return full-attention layers used for TriAttention scoring."""
         return self._attention_layer_partition(num_layers)[0]
 
+    def _runtime_kv_layout(self, num_layers: int) -> _RuntimeKVLayout:
+        """Return stable V2 pool views and layer groups for graph replay.
+
+        KVCacheManagerV2 keeps GPU virtual addresses and layer grouping stable,
+        while opt-in pool rebalance can change the page dimension. Cache all
+        layer views, then validate one fresh representative per physical pool
+        before reuse. The standalone graph fingerprint separately validates the
+        allocation pointers used by each replay.
+        """
+        cached = self._runtime_kv_layout_cache
+        manager = self.kv_cache_manager
+        if cached is not None:
+            if cached.num_layers != num_layers:
+                raise ValueError(
+                    f"TriAttention layer count changed from {cached.num_layers} "
+                    f"to {num_layers}"
+                )
+            if cached.manager is not manager:
+                raise RuntimeError("TriAttention target KV cache manager changed at runtime")
+            representative_pools = [
+                manager.get_buffers(
+                    cached.global_layers[layer],
+                    kv_layout="HND",
+                )
+                for layer in cached.pool_representatives
+            ]
+            if any(pool is None for pool in representative_pools):
+                raise RuntimeError("TriAttention could not validate every cached V2 KV pool")
+            current_fingerprint = self._pool_view_fingerprint(
+                [pool for pool in representative_pools if pool is not None]
+            )
+            if current_fingerprint != cached.pool_view_fingerprint:
+                raise RuntimeError(
+                    "TriAttention V2 pool layout changed after graph initialization; "
+                    "KV pool rebalance is not supported"
+                )
+            return cached
+
+        global_layers = self._local_to_global_layers(num_layers)
+        maybe_layer_pools = [
+            manager.get_buffers(layer, kv_layout="HND") for layer in global_layers
+        ]
+        if any(pool is None for pool in maybe_layer_pools):
+            missing = [
+                layer
+                for layer, pool in zip(global_layers, maybe_layer_pools)
+                if pool is None
+            ]
+            raise RuntimeError(f"Missing KV pools for attention layers {missing}")
+        layer_pools = [pool for pool in maybe_layer_pools if pool is not None]
+
+        dense_layers, swa_layers, swa_window = self._attention_layer_partition(num_layers)
+        if not dense_layers:
+            raise ValueError("TriAttention requires at least one full-attention layer")
+        storage_groups = self._dense_layer_pool_groups(dense_layers, global_layers)
+        dense_group_representatives = [layers[0] for layers in storage_groups.values()]
+        layer_group_representative = {
+            layer: layers[0] for layers in storage_groups.values() for layer in layers
+        }
+        all_layers = list(range(num_layers))
+        all_storage_groups: Dict[object, List[int]] = {}
+        for layer, pool_key in zip(
+            all_layers,
+            self._page_table_pool_keys(all_layers, global_layers),
+        ):
+            all_storage_groups.setdefault(pool_key, []).append(layer)
+        pool_representatives = tuple(layers[0] for layers in all_storage_groups.values())
+        layout = _RuntimeKVLayout(
+            manager=manager,
+            num_layers=num_layers,
+            global_layers=global_layers,
+            layer_pools=layer_pools,
+            dense_layers=dense_layers,
+            swa_layers=swa_layers,
+            swa_window=swa_window,
+            device=layer_pools[dense_layers[0]].device,
+            storage_groups=storage_groups,
+            dense_group_representatives=dense_group_representatives,
+            layer_group_representative=layer_group_representative,
+            pool_representatives=pool_representatives,
+            pool_view_fingerprint=self._pool_view_fingerprint(
+                [layer_pools[layer] for layer in pool_representatives]
+            ),
+        )
+        self._runtime_kv_layout_cache = layout
+        return layout
+
+    @staticmethod
+    def _pool_view_fingerprint(pools: List[torch.Tensor]) -> Tuple[tuple, ...]:
+        """Identify the V2 pool properties consumed by score and compact kernels."""
+        return tuple(
+            (
+                pool.data_ptr(),
+                tuple(int(value) for value in pool.shape),
+                tuple(int(value) for value in pool.stride()),
+                pool.dtype,
+                pool.device,
+            )
+            for pool in pools
+        )
+
     def _record_fixed_score_runtime(self, key: Optional[tuple], outcome: str) -> None:
         if key is None:
             return
@@ -4056,26 +4168,17 @@ class TriAttention(BaseKVCacheCompressionManager):
         if protected_tail_lengths is None:
             protected_tail_lengths = {}
         protected_tail_capacity = self._configured_protected_tail_capacity()
-        mgr = self.kv_cache_manager
-        get_buffers = mgr.get_buffers
         with nvtx_range_debug("triattention.resolve_layout", color="blue"):
-            global_layers = self._local_to_global_layers(num_layers)
-            layer_pools = [get_buffers(layer, kv_layout="HND") for layer in global_layers]
-            if any(p is None for p in layer_pools):
-                missing = [layer for layer, pool in zip(global_layers, layer_pools) if pool is None]
-                raise RuntimeError(f"Missing KV pools for attention layers {missing}")
-            dense_layers, swa_layers, swa_window = self._attention_layer_partition(num_layers)
-            if not dense_layers:
-                raise ValueError("TriAttention requires at least one full-attention layer")
-            first_dense_layer = dense_layers[0]
-            device = layer_pools[first_dense_layer].device
-
-            # Layers share page indices only when V2 maps them to the same pool.
-            storage_groups = self._dense_layer_pool_groups(dense_layers, global_layers)
-            dense_group_representatives = [layers[0] for layers in storage_groups.values()]
-            layer_group_representative = {
-                layer: layers[0] for layers in storage_groups.values() for layer in layers
-            }
+            layout = self._runtime_kv_layout(num_layers)
+            global_layers = layout.global_layers
+            layer_pools = layout.layer_pools
+            dense_layers = layout.dense_layers
+            swa_layers = layout.swa_layers
+            swa_window = layout.swa_window
+            device = layout.device
+            storage_groups = layout.storage_groups
+            dense_group_representatives = layout.dense_group_representatives
+            layer_group_representative = layout.layer_group_representative
 
         # Resolve request length and page metadata before mutating any layer.
         prepared = []
