@@ -2361,6 +2361,14 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         kv_cache_manager: "KVCacheManagerV2",
         draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None,
     ):
+        from .kv_cache_manager_v2 import KVCacheManagerV2
+
+        if not isinstance(kv_cache_manager, KVCacheManagerV2):
+            raise TypeError("KV-cache compression requires KVCacheManagerV2")
+        if draft_kv_cache_manager is not None and not isinstance(
+                draft_kv_cache_manager, KVCacheManagerV2):
+            raise TypeError(
+                "draft KV-cache compression requires KVCacheManagerV2")
         self.kv_cache_manager = kv_cache_manager
         self.draft_kv_cache_manager = draft_kv_cache_manager
         # Compression evicts/rewrites stored keys and values, so a shared prefix
@@ -2370,39 +2378,6 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
                 f"{type(self).__name__} changes stored keys and values and cannot "
                 f"run with KV-cache block reuse. Set "
                 f"KvCacheConfig.enable_block_reuse to False.")
-        self._validate_kv_cache_ownership()
-
-    def _validate_kv_cache_ownership(self) -> None:
-        """Verify that an optional draft KVCM owns independent physical state."""
-        target = self.kv_cache_manager
-        if target.is_draft:
-            raise ValueError(
-                "the primary KV cache manager must own target KV state")
-        draft = self.draft_kv_cache_manager
-        if draft is None:
-            return
-        if target is draft:
-            raise ValueError(
-                "target and draft KV cache managers must be distinct")
-        if not draft.is_draft:
-            raise ValueError(
-                "target and draft KV cache manager roles are inconsistent")
-        if target.impl is draft.impl:
-            raise ValueError(
-                "target and draft KV cache managers share physical state")
-        if target.kv_cache_map is draft.kv_cache_map:
-            raise ValueError(
-                "target and draft KV cache managers share physical state")
-        target_offsets = target.host_kv_cache_block_offsets
-        draft_offsets = draft.host_kv_cache_block_offsets
-        if target_offsets is draft_offsets or (
-            target_offsets.numel() > 0
-            and draft_offsets.numel() > 0
-            and target_offsets.untyped_storage().data_ptr()
-            == draft_offsets.untyped_storage().data_ptr()
-        ):
-            raise ValueError(
-                "target and draft KV cache managers share a page table")
 
     @property
     def has_independent_draft_kv_cache(self) -> bool:

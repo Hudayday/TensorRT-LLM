@@ -16,6 +16,11 @@ from tensorrt_llm._torch.kv_cache_compression.attention_metadata import (
     requires_paged_draft_kv_length_domain,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    BaseKVCacheCompressionManager,
+    ResourceManager,
+    ResourceManagerType,
+)
 from tensorrt_llm._torch.speculative.interface import (
     SpecWorkerBase,
     prepare_attn_metadata_for_draft_replay,
@@ -310,23 +315,42 @@ def test_restore_from_spec_dec_refreshes_device_domain() -> None:
 def test_model_engine_adjusts_compression_metadata_before_prepare() -> None:
     calls = []
     engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
-    engine._step_kv_compression_manager = mock.Mock()
+    engine.is_draft_model = False
+    compression_manager = mock.Mock(spec=BaseKVCacheCompressionManager)
+    resource_manager = ResourceManager(
+        {
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER: compression_manager,
+        }
+    )
     metadata = mock.Mock()
-    engine._step_kv_compression_manager.adjust_attention_metadata.side_effect = (
-        lambda value: calls.append(("adjust", value))
+    compression_manager.adjust_attention_metadata.side_effect = lambda value: calls.append(
+        ("adjust", value)
     )
     metadata.prepare.side_effect = lambda: calls.append(("prepare", metadata))
 
-    engine._prepare_self_attention_metadata(metadata)
+    engine._prepare_self_attention_metadata(metadata, resource_manager)
 
     assert calls == [("adjust", metadata), ("prepare", metadata)]
 
 
-def test_model_engine_prepares_metadata_without_compression_manager() -> None:
+def test_model_engine_skips_inactive_compression_manager() -> None:
     engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
-    engine._step_kv_compression_manager = None
+    engine.is_draft_model = False
     metadata = mock.Mock()
 
-    engine._prepare_self_attention_metadata(metadata)
+    engine._prepare_self_attention_metadata(metadata, ResourceManager({}))
 
     metadata.prepare.assert_called_once_with()
+    engine.is_draft_model = True
+    compression_manager = mock.Mock(spec=BaseKVCacheCompressionManager)
+    resource_manager = ResourceManager(
+        {
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER: compression_manager,
+        }
+    )
+    draft_metadata = mock.Mock()
+
+    engine._prepare_self_attention_metadata(draft_metadata, resource_manager)
+
+    compression_manager.adjust_attention_metadata.assert_not_called()
+    draft_metadata.prepare.assert_called_once_with()

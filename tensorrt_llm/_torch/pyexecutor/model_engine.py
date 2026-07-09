@@ -95,7 +95,8 @@ from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
                           get_multimodal_embedding_lengths)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
-from .resource_manager import (BaseResourceManager, KVCacheManager,
+from .resource_manager import (BaseKVCacheCompressionManager,
+                               BaseResourceManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
@@ -550,14 +551,6 @@ class PyTorchModelEngine(ModelEngine):
         self.attn_backend = get_attention_backend(
             self.llm_args.attn_backend,
             sparse_attention_config=self.sparse_attention_config)
-        from ..kv_cache_compression.attention_metadata import \
-            get_kv_cache_compression_attention_metadata_cls
-        self.attn_metadata_cls = get_kv_cache_compression_attention_metadata_cls(
-            self.llm_args.kv_cache_compression_config,
-            self.spec_config,
-            self.attn_backend.Metadata,
-        )
-        self._step_kv_compression_manager = None
 
         self.get_runtime_tokens_per_gen_step = spec_config.get_runtime_tokens_per_gen_step if spec_config is not None else lambda runtime_draft_len: 1
 
@@ -1105,6 +1098,8 @@ class PyTorchModelEngine(ModelEngine):
         kv_compression_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER)
         if kv_compression_manager is not None:
+            # Compression may use fixed-shape eviction CUDA Graphs. Prepare
+            # their stable buffers and kernels before model graph capture.
             kv_compression_manager.prewarm()
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
@@ -2089,7 +2084,20 @@ class PyTorchModelEngine(ModelEngine):
         else:
             num_heads_per_kv = 1
 
-        metadata_cls = self.attn_metadata_cls
+        metadata_cls = self.attn_backend.Metadata
+        compression_config = self.llm_args.kv_cache_compression_config
+        # Only target attention with a separate draft KVCM needs independent
+        # target and draft KV-length views.
+        if (kv_cache_manager is not None and draft_kv_cache_manager is not None
+                and not self.is_draft_model and compression_config is not None):
+            from ..kv_cache_compression.attention_metadata import \
+                get_kv_cache_compression_attention_metadata_cls
+
+            metadata_cls = get_kv_cache_compression_attention_metadata_cls(
+                compression_config,
+                self.spec_config,
+                metadata_cls,
+            )
         sparse_metadata_params = (
             self.sparse_attention_config.to_sparse_metadata_params(
                 pretrained_config=config)
@@ -2793,10 +2801,18 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager)
 
     def _prepare_self_attention_metadata(
-            self, attn_metadata: AttentionMetadata) -> None:
-        if self._step_kv_compression_manager is not None:
-            self._step_kv_compression_manager.adjust_attention_metadata(
-                attn_metadata)
+            self, attn_metadata: AttentionMetadata,
+            resource_manager: Optional[ResourceManager]) -> None:
+        kv_compression_manager = None
+        if resource_manager is not None and not self.is_draft_model:
+            kv_compression_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER)
+        if kv_compression_manager is not None:
+            assert isinstance(kv_compression_manager,
+                              BaseKVCacheCompressionManager)
+            # Reconcile physical KV lengths before prepare materializes the
+            # kernel-visible attention metadata.
+            kv_compression_manager.adjust_attention_metadata(attn_metadata)
         attn_metadata.prepare()
 
     @nvtx_range("_prepare_incremental_update_metadata")
@@ -2811,7 +2827,8 @@ class PyTorchModelEngine(ModelEngine):
             total_num_tokens: int,
             num_generation_tokens: int,
             request_accepted_path: Optional[Dict[int, Any]] = None,
-            num_extend_ctx_requests: int = 0):
+            num_extend_ctx_requests: int = 0,
+            resource_manager: Optional[ResourceManager] = None):
         """
         Common metadata preparation logic for incremental updates.
         """
@@ -2834,7 +2851,7 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
             num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
         attn_metadata.kv_cache_manager = kv_cache_manager
-        self._prepare_self_attention_metadata(attn_metadata)
+        self._prepare_self_attention_metadata(attn_metadata, resource_manager)
 
         # Get LoRA parameters
         lora_params = self._get_lora_params_from_requests(
@@ -3186,7 +3203,8 @@ class PyTorchModelEngine(ModelEngine):
             total_num_tokens=virtual_num_tokens,
             num_generation_tokens=num_generation_tokens,
             request_accepted_path=request_accepted_path,
-            num_extend_ctx_requests=num_extend_ctx_requests)
+            num_extend_ctx_requests=num_extend_ctx_requests,
+            resource_manager=resource_manager)
 
         # No padding because there are only generation requests.
         attn_metadata.padded_num_tokens = None
@@ -3251,16 +3269,6 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests,
                 new_tokens=new_tokens_device,
                 runtime_draft_len=self.runtime_draft_len)
-
-        # Resolve the active KV-cache compression manager once for this step. Both
-        # the incremental (overlap) path delegated just below and the full path
-        # further down reconcile the attention metadata through it before
-        # attn_metadata.prepare(). No-op for the draft engine / when none runs.
-        self._step_kv_compression_manager = (
-            resource_manager.get_resource_manager(
-                ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER) if
-            (resource_manager is not None
-             and not self.is_draft_model) else None)
 
         if self._can_use_incremental_update(scheduled_requests,
                                             new_tokens_device,
@@ -4172,7 +4180,7 @@ class PyTorchModelEngine(ModelEngine):
 
         if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
             attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
-        self._prepare_self_attention_metadata(attn_metadata)
+        self._prepare_self_attention_metadata(attn_metadata, resource_manager)
         cross_attention_inputs = (self._prepare_enc_dec_cross_attn_inputs(
             cross_encoder_hidden_states,
             cross_encoder_seq_lens,

@@ -25,7 +25,6 @@ lives in ``_util.py`` next to ``_create_kv_cache_manager``.
 from unittest.mock import MagicMock, patch
 
 import pytest
-import torch
 
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
@@ -74,10 +73,7 @@ class _MockCompressionManager(_RecordingMixin, BaseKVCacheCompressionManager):
 def fake_kv_cache_manager():
     """A stand-in KVCacheManagerV2. The framework reads enable_block_reuse off
     it in __init__; default it to False, like a normal run with reuse off."""
-    m = MagicMock(name="fake_KVCacheManagerV2")
-    m.enable_block_reuse = False
-    m.is_draft = False
-    return m
+    return _v2_role_kv_cache_manager(is_draft=False)
 
 
 def _req(rid, first_chunk=True):
@@ -102,9 +98,6 @@ def _v2_role_kv_cache_manager(*, is_draft):
     manager.enable_block_reuse = False
     manager.is_draft = is_draft
     manager.max_seq_len = 65536
-    manager.impl = object()
-    manager.kv_cache_map = {}
-    manager.host_kv_cache_block_offsets = torch.empty(1, dtype=torch.int64)
     return manager
 
 
@@ -151,61 +144,16 @@ class TestBaseABC:
         assert manager.draft_kv_cache_manager is draft
         assert manager.has_independent_draft_kv_cache
 
-    def test_framework_rejects_draft_as_the_only_primary_owner(self):
-        draft = _v2_role_kv_cache_manager(is_draft=True)
+    def test_rejects_non_v2_target_manager(self):
+        with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
+            BaseKVCacheCompressionManager(MagicMock())
 
-        with pytest.raises(ValueError, match="must own target KV state"):
-            BaseKVCacheCompressionManager(draft)
-
-    def test_framework_rejects_shared_target_and_draft_state(self):
-        target = _v2_role_kv_cache_manager(is_draft=False)
-        draft = _v2_role_kv_cache_manager(is_draft=True)
-        draft.impl = target.impl
-
-        with pytest.raises(ValueError, match="share physical state"):
-            BaseKVCacheCompressionManager(target, draft)
-
-    @pytest.mark.parametrize("shared_field", ["impl", "page_table"])
-    def test_framework_rejects_shared_v2_state(self, shared_field):
-        target = _v2_role_kv_cache_manager(is_draft=False)
-        draft = _v2_role_kv_cache_manager(is_draft=True)
-        if shared_field == "impl":
-            draft.impl = target.impl
-            error = "share physical state"
-        else:
-            draft.host_kv_cache_block_offsets = target.host_kv_cache_block_offsets
-            error = "share a page table"
-
-        with pytest.raises(ValueError, match=error):
-            BaseKVCacheCompressionManager(target, draft)
-
-    def test_framework_accepts_independent_empty_page_tables(self):
-        target = _v2_role_kv_cache_manager(is_draft=False)
-        draft = _v2_role_kv_cache_manager(is_draft=True)
-        target.host_kv_cache_block_offsets = torch.empty(0, dtype=torch.int64)
-        draft.host_kv_cache_block_offsets = torch.empty(0, dtype=torch.int64)
-
-        manager = BaseKVCacheCompressionManager(target, draft)
-
-        assert manager.has_independent_draft_kv_cache
-
-    def test_framework_rejects_page_table_views_of_shared_storage(self):
-        target = _v2_role_kv_cache_manager(is_draft=False)
-        draft = _v2_role_kv_cache_manager(is_draft=True)
-        shared_storage = torch.empty(4, dtype=torch.int64)
-        target.host_kv_cache_block_offsets = shared_storage[:2]
-        draft.host_kv_cache_block_offsets = shared_storage[1:3]
-
-        with pytest.raises(ValueError, match="share a page table"):
-            BaseKVCacheCompressionManager(target, draft)
-
-    def test_framework_rejects_shared_v2_request_map(self):
-        target = _v2_role_kv_cache_manager(is_draft=False)
-        draft = _v2_role_kv_cache_manager(is_draft=True)
-        draft.kv_cache_map = target.kv_cache_map
-
-        with pytest.raises(ValueError, match="share physical state"):
-            BaseKVCacheCompressionManager(target, draft)
+    def test_rejects_non_v2_draft_manager(self):
+        with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
+            BaseKVCacheCompressionManager(
+                _v2_role_kv_cache_manager(is_draft=False),
+                MagicMock(),
+            )
 
     def test_framework_publishes_typed_draft_length_delta(self):
         class Metadata:
@@ -367,9 +315,8 @@ class TestBlockReuseGuard:
     and values, the same check RocketKVCacheManager makes."""
 
     def _mgr(self, enable_block_reuse):
-        m = MagicMock(name="KVCacheManagerV2")
+        m = _v2_role_kv_cache_manager(is_draft=False)
         m.enable_block_reuse = enable_block_reuse
-        m.is_draft = False
         return m
 
     def test_raises_when_reuse_on(self):

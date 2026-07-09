@@ -1658,12 +1658,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         skip_swa: bool = True,
         spec_config: Optional["SpeculativeConfig"] = None,
     ):
-        if not isinstance(kv_cache_manager, KVCacheManagerV2):
-            raise TypeError("TriAttention requires KVCacheManagerV2")
-        if draft_kv_cache_manager is not None and not isinstance(
-            draft_kv_cache_manager, KVCacheManagerV2
-        ):
-            raise TypeError("TriAttention requires draft KVCacheManagerV2")
         super().__init__(kv_cache_manager, draft_kv_cache_manager)
         kv_cache_manager.generation_capacity_only = True
         self.spec_config = spec_config
@@ -2894,7 +2888,9 @@ class TriAttention(BaseKVCacheCompressionManager):
             try:
                 workspace = self._build_cross_request_selection_workspace(plan)
                 if workspace.selection_buffer_nbytes() != plan.materialized_nbytes:
-                    raise RuntimeError("request-batched selection workspace size differs from its plan")
+                    raise RuntimeError(
+                        "request-batched selection workspace size differs from its plan"
+                    )
                 workspace.warm(normalize_scores=self.normalize_scores)
             except Exception as exc:
                 states[key] = "failed"
