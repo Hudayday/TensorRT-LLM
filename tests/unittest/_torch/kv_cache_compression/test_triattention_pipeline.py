@@ -3169,7 +3169,10 @@ class TestFixedUnionWorkspace:
         assert len(graph_keys) == 2
         assert {(key[3], key[4]) for key in graph_keys} == {(1, 200), (2, 200)}
 
-    def test_runtime_graph_bucket_fails_when_configured_upper_shape_is_too_small(self):
+    @pytest.mark.parametrize("configured_width", [128, 136])
+    def test_runtime_graph_bucket_fails_when_configured_upper_shape_is_too_small(
+        self, configured_width
+    ):
         import os
         from unittest import mock
 
@@ -3182,13 +3185,49 @@ class TestFixedUnionWorkspace:
         with (
             mock.patch.dict(
                 os.environ,
-                {"TRIATTN_FIXED_PREWARM_SHAPES": "64:136"},
+                {"TRIATTN_FIXED_PREWARM_SHAPES": f"64:{configured_width}"},
             ),
             pytest.raises(RuntimeError, match="no configured upper bucket covering"),
         ):
             manager._ensure_configured_graph_buckets(evict_now, num_layers=1)
 
         manager._prewarm_fixed_union_bucket.assert_not_called()
+
+    def test_runtime_graph_bucket_uses_exact_width_without_startup_shapes(self):
+        import os
+        from unittest import mock
+
+        manager = _make_triattention(top_B=4096, beta=4096)
+        manager._confirmed_kv_lengths = {7: 163 + 8192}
+        layer_pools = [object()]
+        dense_layers = [0]
+        storage_groups = [[0]]
+        runtime_key = (163, 8192)
+        manager._fixed_union_live_geometry = mock.Mock(
+            return_value=(layer_pools, dense_layers, storage_groups)
+        )
+        manager._fixed_union_prewarm_key = mock.Mock(return_value=runtime_key)
+
+        def mark_ready(*args):
+            assert args[-2:] == runtime_key
+            manager._fixed_union_prewarm_states[runtime_key] = "ready"
+            manager._fixed_score_prewarm_states[runtime_key] = "ready"
+            manager._cross_request_selection_prewarm_states[runtime_key] = "ready"
+
+        manager._prewarm_fixed_union_bucket = mock.Mock(side_effect=mark_ready)
+        manager._materialize_cross_request_selection_banks = mock.Mock()
+
+        with mock.patch.dict(
+            os.environ,
+            {"TRIATTN_FIXED_PREWARM_SHAPES": ""},
+        ):
+            manager._ensure_configured_graph_buckets(
+                [(SimpleNamespace(py_prompt_len=163), 7)],
+                num_layers=1,
+            )
+
+        manager._prewarm_fixed_union_bucket.assert_called_once()
+        manager._materialize_cross_request_selection_banks.assert_called_once_with()
 
     def test_dummy_pool_preserves_geometry_without_aliasing_live_storage(self):
         live = torch.arange(3 * 2 * 2 * 4 * 3, dtype=torch.float32).reshape(3, 2, 2, 4, 3)

@@ -2340,9 +2340,11 @@ class TriAttention(BaseKVCacheCompressionManager):
         """Return the canonical upper buckets sealed in the runtime config."""
         raw_shapes = os.environ.get("TRIATTN_FIXED_PREWARM_SHAPES", "")
         try:
-            return self._upper_prewarm_shapes_by_backend(
-                self._parse_fixed_prewarm_shapes(raw_shapes)
-            )
+            parsed_shapes = self._parse_fixed_prewarm_shapes(raw_shapes)
+            upper_shapes = self._upper_prewarm_shapes_by_backend(parsed_shapes)
+            # Preserve an explicit but non-evicting contract so it cannot be
+            # mistaken for an absent contract and widened dynamically.
+            return upper_shapes or parsed_shapes
         except ValueError as exc:
             raise RuntimeError(
                 "TriAttention fixed-buffer prewarm configuration is invalid"
@@ -2355,6 +2357,10 @@ class TriAttention(BaseKVCacheCompressionManager):
         decode_width: int,
     ) -> int:
         """Select the smallest configured upper bucket covering one runtime width."""
+        if not configured_shapes:
+            # Startup cannot know request-specific prompt lengths. Without an
+            # explicit shape contract, capture the exact shape on first use.
+            return decode_width
         selection_backend = self._selection_backend_for(decode_width, self.top_B)
         candidates = [
             configured_width
