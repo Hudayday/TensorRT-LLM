@@ -16,18 +16,6 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig, SpeculativeConfig
 
 
-def requires_kv_cache_compression_attention_metadata(
-    compression_config: "KvCacheCompressionConfig | None",
-    spec_config: "SpeculativeConfig | None",
-) -> bool:
-    """Return whether target compression creates a paged draft length domain."""
-    return (
-        compression_config is not None
-        and compression_config.adjusts_generation_kv_length
-        and requires_paged_draft_kv_length_domain(spec_config)
-    )
-
-
 def requires_paged_draft_kv_length_domain(
     spec_config: "SpeculativeConfig | None",
 ) -> bool:
@@ -53,14 +41,16 @@ def requires_paged_draft_kv_length_domain(
     )
 
 
-def get_kv_cache_compression_attention_metadata(
+def get_kv_cache_compression_attention_metadata_cls(
     compression_config: "KvCacheCompressionConfig | None",
     spec_config: "SpeculativeConfig | None",
     metadata_cls: type[AttentionMetadata],
 ) -> type[AttentionMetadata]:
     """Select metadata that tracks independent target and draft KV lengths."""
-    if not requires_kv_cache_compression_attention_metadata(
-        compression_config, spec_config
+    if (
+        compression_config is None
+        or not compression_config.adjusts_generation_kv_length
+        or not requires_paged_draft_kv_length_domain(spec_config)
     ):
         return metadata_cls
     if metadata_cls is not TrtllmAttentionMetadata:
@@ -239,11 +229,3 @@ class KVCacheCompressionTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.kv_lens_runtime = self.target_kv_lens_runtime
         if self.target_host_total_kv_lens is not None:
             self.host_total_kv_lens = self.target_host_total_kv_lens
-
-
-__all__ = [
-    "KVCacheCompressionTrtllmAttentionMetadata",
-    "get_kv_cache_compression_attention_metadata",
-    "requires_kv_cache_compression_attention_metadata",
-    "requires_paged_draft_kv_length_domain",
-]

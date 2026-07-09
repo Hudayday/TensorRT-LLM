@@ -12,8 +12,7 @@ import torch
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.kv_cache_compression.attention_metadata import (
     KVCacheCompressionTrtllmAttentionMetadata,
-    get_kv_cache_compression_attention_metadata,
-    requires_kv_cache_compression_attention_metadata,
+    get_kv_cache_compression_attention_metadata_cls,
     requires_paged_draft_kv_length_domain,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
@@ -77,19 +76,22 @@ def test_generation_length_capability_gates_adapter() -> None:
 
     mtp = MTPDecodingConfig(max_draft_len=3)
 
-    assert not requires_kv_cache_compression_attention_metadata(None, mtp)
-    assert not requires_kv_cache_compression_attention_metadata(
-        _compression_capability(adjusts_generation_kv_length=False), mtp
-    )
-    assert requires_kv_cache_compression_attention_metadata(
-        _LengthAdjustingCompressionConfig(), mtp
-    )
     assert (
-        get_kv_cache_compression_attention_metadata(None, mtp, TrtllmAttentionMetadata)
+        get_kv_cache_compression_attention_metadata_cls(
+            None, mtp, TrtllmAttentionMetadata
+        )
         is TrtllmAttentionMetadata
     )
     assert (
-        get_kv_cache_compression_attention_metadata(
+        get_kv_cache_compression_attention_metadata_cls(
+            _compression_capability(adjusts_generation_kv_length=False),
+            mtp,
+            TrtllmAttentionMetadata,
+        )
+        is TrtllmAttentionMetadata
+    )
+    assert (
+        get_kv_cache_compression_attention_metadata_cls(
             _LengthAdjustingCompressionConfig(), mtp, TrtllmAttentionMetadata
         )
         is KVCacheCompressionTrtllmAttentionMetadata
@@ -120,11 +122,21 @@ def test_paged_draft_modes_and_dflash_select_expected_length_domain() -> None:
 
     for config in (eagle3, mtp, draft_target, pard):
         assert requires_paged_draft_kv_length_domain(config)
-        assert requires_kv_cache_compression_attention_metadata(compression, config)
+        assert (
+            get_kv_cache_compression_attention_metadata_cls(
+                compression, config, TrtllmAttentionMetadata
+            )
+            is KVCacheCompressionTrtllmAttentionMetadata
+        )
 
     for config in (dflash,):
         assert not requires_paged_draft_kv_length_domain(config)
-        assert not requires_kv_cache_compression_attention_metadata(compression, config)
+        assert (
+            get_kv_cache_compression_attention_metadata_cls(
+                compression, config, TrtllmAttentionMetadata
+            )
+            is TrtllmAttentionMetadata
+        )
 
 
 def test_target_and_draft_cpu_length_domains_are_independent() -> None:

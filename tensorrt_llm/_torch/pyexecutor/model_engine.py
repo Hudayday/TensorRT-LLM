@@ -550,9 +550,9 @@ class PyTorchModelEngine(ModelEngine):
         self.attn_backend = get_attention_backend(
             self.llm_args.attn_backend,
             sparse_attention_config=self.sparse_attention_config)
-        from ..kv_cache_compression import \
-            get_kv_cache_compression_attention_metadata
-        self.attn_metadata_cls = get_kv_cache_compression_attention_metadata(
+        from ..kv_cache_compression.attention_metadata import \
+            get_kv_cache_compression_attention_metadata_cls
+        self.attn_metadata_cls = get_kv_cache_compression_attention_metadata_cls(
             self.llm_args.kv_cache_compression_config,
             self.spec_config,
             self.attn_backend.Metadata,
