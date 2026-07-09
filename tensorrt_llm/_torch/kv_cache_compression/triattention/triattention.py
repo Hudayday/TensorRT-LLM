@@ -60,7 +60,7 @@ from tensorrt_llm._torch.kv_cache_compression.attention_metadata import (
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import BaseKVCacheCompressionManager
-from tensorrt_llm._utils import nvtx_range, prefer_pinned
+from tensorrt_llm._utils import nvtx_range, nvtx_range_debug, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
@@ -1922,7 +1922,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         compaction after that reader, and resize happens only after compaction is
         complete so released pages cannot be reused early.
         """
-        self._periodic_evict(scheduled_batch)
+        with nvtx_range_debug("triattention.generation_step_end", color="blue"):
+            self._periodic_evict(scheduled_batch)
 
     def prepare_resources(self, scheduled_batch: "ScheduledRequests") -> None:
         """Snapshot fixed-linear target growth; mutation remains in final update."""
@@ -2046,54 +2047,65 @@ class TriAttention(BaseKVCacheCompressionManager):
                         graph_groups.setdefault(key, []).append((request, rid))
                     capacity_targets = []
                     for group in graph_groups.values():
-                        capacity_targets.extend(
-                            self._evict_requests(
-                                group,
-                                num_layers,
-                                protected_tail_lengths=protected_tail_lengths,
+                        with nvtx_range_debug(
+                            "triattention.evict_request_group", color="purple"
+                        ):
+                            capacity_targets.extend(
+                                self._evict_requests(
+                                    group,
+                                    num_layers,
+                                    protected_tail_lengths=protected_tail_lengths,
+                                )
                             )
-                        )
                 else:
-                    capacity_targets = self._evict_requests(
-                        evict_now,
-                        num_layers,
-                        protected_tail_lengths=protected_tail_lengths,
-                    )
+                    with nvtx_range_debug(
+                        "triattention.evict_request_group", color="purple"
+                    ):
+                        capacity_targets = self._evict_requests(
+                            evict_now,
+                            num_layers,
+                            protected_tail_lengths=protected_tail_lengths,
+                        )
             finally:
                 # _evict_requests is also a directly testable execution primitive
                 # and publishes its result. The lifecycle hook keeps that result
                 # provisional until compaction synchronization and resize pass.
-                self._evicted.clear()
-                self._evicted.update(evicted_before)
-                self._confirmed_kv_lengths.clear()
-                self._confirmed_kv_lengths.update(confirmed_before)
+                with nvtx_range_debug(
+                    "triattention.restore_provisional_state", color="orange"
+                ):
+                    self._evicted.clear()
+                    self._evicted.update(evicted_before)
+                    self._confirmed_kv_lengths.clear()
+                    self._confirmed_kv_lengths.update(confirmed_before)
         else:
             capacity_targets = []
         if capacity_targets:
             with nvtx_range("triattention.resize", color="red"):
-                compaction_event = torch.cuda.Event()
-                compaction_event.record()
-                compaction_event.synchronize()
-                for rid, target_capacity in capacity_targets:
-                    kv_cache = mgr.kv_cache_map.get(rid)
-                    if kv_cache is None or not kv_cache.is_active:
-                        continue
-                    if target_capacity > kv_cache.capacity:
-                        raise RuntimeError(
-                            f"Request {rid} compacted capacity {target_capacity} exceeds "
-                            f"current capacity {kv_cache.capacity}"
-                        )
-                    protected_tail = protected_tails[rid][2]
-                    resized_capacity = target_capacity + protected_tail
-                    if not kv_cache.resize(resized_capacity, None):
-                        raise RuntimeError(
-                            f"Failed to resize compacted KV cache for request {rid} "
-                            f"to {resized_capacity} tokens"
-                        )
-                    source_capacity = protected_tails[rid][1]
-                    evicted = source_capacity - target_capacity
-                    self._evicted[rid] = self._evicted.get(rid, 0) + evicted
-                    self._confirmed_kv_lengths[rid] = target_capacity
+                with nvtx_range_debug("triattention.compaction_wait", color="yellow"):
+                    compaction_event = torch.cuda.Event()
+                    compaction_event.record()
+                    compaction_event.synchronize()
+                with nvtx_range_debug("triattention.v2_resize", color="red"):
+                    for rid, target_capacity in capacity_targets:
+                        kv_cache = mgr.kv_cache_map.get(rid)
+                        if kv_cache is None or not kv_cache.is_active:
+                            continue
+                        if target_capacity > kv_cache.capacity:
+                            raise RuntimeError(
+                                f"Request {rid} compacted capacity {target_capacity} exceeds "
+                                f"current capacity {kv_cache.capacity}"
+                            )
+                        protected_tail = protected_tails[rid][2]
+                        resized_capacity = target_capacity + protected_tail
+                        if not kv_cache.resize(resized_capacity, None):
+                            raise RuntimeError(
+                                f"Failed to resize compacted KV cache for request {rid} "
+                                f"to {resized_capacity} tokens"
+                            )
+                        source_capacity = protected_tails[rid][1]
+                        evicted = source_capacity - target_capacity
+                        self._evicted[rid] = self._evicted.get(rid, 0) + evicted
+                        self._confirmed_kv_lengths[rid] = target_capacity
 
     def _minimum_evictable_length(self, request: "LlmRequest", seq_len: int) -> int:
         """Return the largest cache length for which selection is an identity.
@@ -3886,11 +3898,12 @@ class TriAttention(BaseKVCacheCompressionManager):
         if not self._standalone_cuda_graph_enabled:
             return None
         self._record_standalone_graph_runtime("attempt", request_count)
-        key = self._standalone_graph_bucket_for(
-            prepared,
-            score_workspace,
-            selection_workspace,
-        )
+        with nvtx_range_debug("triattention.graph_bucket_lookup", color="blue"):
+            key = self._standalone_graph_bucket_for(
+                prepared,
+                score_workspace,
+                selection_workspace,
+            )
         if key is None:
             self._record_standalone_graph_runtime("admission_rejected", request_count)
             raise RuntimeError("TriAttention CUDA Graph rejected its configured runtime bucket")
@@ -3913,22 +3926,24 @@ class TriAttention(BaseKVCacheCompressionManager):
                 "TriAttention graph replay must use the fixed staging CUDA stream"
             )
         try:
-            workspace = self._standalone_graph_workspace_for(
-                key=key,
-                layer_pools=layer_pools,
-                dense_layers=dense_layers,
-                swa_layers=swa_layers,
-                layer_group_representative=layer_group_representative,
-                global_layers=global_layers,
-                score_workspace=score_workspace,
-                selection_workspace=selection_workspace,
-                request_count=request_count,
-                seq_len=seq_len,
-                prompt_len=prompt_len,
-                swa_window=swa_window,
-                protected_tail_lengths=[item["protected_tail"] for item in prepared],
-            )
-            fingerprint = workspace.pointer_fingerprint(stream)
+            with nvtx_range_debug("triattention.graph_workspace_lookup", color="blue"):
+                workspace = self._standalone_graph_workspace_for(
+                    key=key,
+                    layer_pools=layer_pools,
+                    dense_layers=dense_layers,
+                    swa_layers=swa_layers,
+                    layer_group_representative=layer_group_representative,
+                    global_layers=global_layers,
+                    score_workspace=score_workspace,
+                    selection_workspace=selection_workspace,
+                    request_count=request_count,
+                    seq_len=seq_len,
+                    prompt_len=prompt_len,
+                    swa_window=swa_window,
+                    protected_tail_lengths=[item["protected_tail"] for item in prepared],
+                )
+            with nvtx_range_debug("triattention.graph_pointer_fingerprint", color="blue"):
+                fingerprint = workspace.pointer_fingerprint(stream)
         except (RuntimeError, ValueError) as exc:
             cache.record_rejection(key=key, request_count=request_count)
             self._record_standalone_graph_runtime("workspace_rejected", request_count)
@@ -3995,18 +4010,19 @@ class TriAttention(BaseKVCacheCompressionManager):
         if outcome == "rejected":
             self._record_standalone_graph_runtime("rejected", request_count)
             raise RuntimeError("TriAttention standalone CUDA Graph execution was rejected")
-        self._record_standalone_graph_runtime("success", request_count)
+        with nvtx_range_debug("triattention.graph_result_bookkeeping", color="orange"):
+            self._record_standalone_graph_runtime("success", request_count)
 
-        capacity_targets = []
-        for request_index, item in enumerate(prepared):
-            keep_count = item["expected_keep_count"]
-            evicted = item["seq_len"] - keep_count
-            if evicted <= 0:
-                raise RuntimeError("standalone eviction graph captured an identity compaction")
-            request_id = item["request_id"]
-            self._evicted[request_id] = self._evicted.get(request_id, 0) + evicted
-            self._confirmed_kv_lengths[request_id] = keep_count
-            capacity_targets.append((request_id, keep_count))
+            capacity_targets = []
+            for request_index, item in enumerate(prepared):
+                keep_count = item["expected_keep_count"]
+                evicted = item["seq_len"] - keep_count
+                if evicted <= 0:
+                    raise RuntimeError("standalone eviction graph captured an identity compaction")
+                request_id = item["request_id"]
+                self._evicted[request_id] = self._evicted.get(request_id, 0) + evicted
+                self._confirmed_kv_lengths[request_id] = keep_count
+                capacity_targets.append((request_id, keep_count))
         return capacity_targets
 
     def _standalone_cuda_graph_stats(self) -> dict:
@@ -4042,23 +4058,24 @@ class TriAttention(BaseKVCacheCompressionManager):
         protected_tail_capacity = self._configured_protected_tail_capacity()
         mgr = self.kv_cache_manager
         get_buffers = mgr.get_buffers
-        global_layers = self._local_to_global_layers(num_layers)
-        layer_pools = [get_buffers(layer, kv_layout="HND") for layer in global_layers]
-        if any(p is None for p in layer_pools):
-            missing = [layer for layer, pool in zip(global_layers, layer_pools) if pool is None]
-            raise RuntimeError(f"Missing KV pools for attention layers {missing}")
-        dense_layers, swa_layers, swa_window = self._attention_layer_partition(num_layers)
-        if not dense_layers:
-            raise ValueError("TriAttention requires at least one full-attention layer")
-        first_dense_layer = dense_layers[0]
-        device = layer_pools[first_dense_layer].device
+        with nvtx_range_debug("triattention.resolve_layout", color="blue"):
+            global_layers = self._local_to_global_layers(num_layers)
+            layer_pools = [get_buffers(layer, kv_layout="HND") for layer in global_layers]
+            if any(p is None for p in layer_pools):
+                missing = [layer for layer, pool in zip(global_layers, layer_pools) if pool is None]
+                raise RuntimeError(f"Missing KV pools for attention layers {missing}")
+            dense_layers, swa_layers, swa_window = self._attention_layer_partition(num_layers)
+            if not dense_layers:
+                raise ValueError("TriAttention requires at least one full-attention layer")
+            first_dense_layer = dense_layers[0]
+            device = layer_pools[first_dense_layer].device
 
-        # Layers share page indices only when V2 maps them to the same pool.
-        storage_groups = self._dense_layer_pool_groups(dense_layers, global_layers)
-        dense_group_representatives = [layers[0] for layers in storage_groups.values()]
-        layer_group_representative = {
-            layer: layers[0] for layers in storage_groups.values() for layer in layers
-        }
+            # Layers share page indices only when V2 maps them to the same pool.
+            storage_groups = self._dense_layer_pool_groups(dense_layers, global_layers)
+            dense_group_representatives = [layers[0] for layers in storage_groups.values()]
+            layer_group_representative = {
+                layer: layers[0] for layers in storage_groups.values() for layer in layers
+            }
 
         # Resolve request length and page metadata before mutating any layer.
         prepared = []
@@ -4101,40 +4118,44 @@ class TriAttention(BaseKVCacheCompressionManager):
         if not prepared:
             return []
         dense_groups = list(storage_groups.values())
-        fixed_score_workspace = self._fixed_score_workspace_for(
-            layer_pools,
-            dense_layers,
-            dense_groups,
-            swa_layers,
-            num_layers,
-            prepared,
-        )
-        fixed_score_active = self._attach_page_ids(
-            prepared,
-            dense_group_representatives,
-            swa_layers,
-            layer_pools,
-            global_layers,
-            fixed_score_workspace,
-        )
-        cross_request_selection = (
-            self._cross_request_selection_for(fixed_score_workspace, len(prepared))
-            if fixed_score_active
-            else None
-        )
-        graph_capacity_targets = self._try_standalone_cuda_graph(
-            prepared=prepared,
-            layer_pools=layer_pools,
-            dense_layers=dense_layers,
-            dense_groups=dense_groups,
-            swa_layers=swa_layers,
-            swa_window=swa_window,
-            layer_group_representative=layer_group_representative,
-            global_layers=global_layers,
-            score_workspace=fixed_score_workspace if fixed_score_active else None,
-            selection_workspace=cross_request_selection,
-            fixed_perhead_segment_views=fixed_perhead_segment_views,
-        )
+        with nvtx_range_debug("triattention.score_workspace_lookup", color="blue"):
+            fixed_score_workspace = self._fixed_score_workspace_for(
+                layer_pools,
+                dense_layers,
+                dense_groups,
+                swa_layers,
+                num_layers,
+                prepared,
+            )
+        with nvtx_range_debug("triattention.page_table_stage", color="orange"):
+            fixed_score_active = self._attach_page_ids(
+                prepared,
+                dense_group_representatives,
+                swa_layers,
+                layer_pools,
+                global_layers,
+                fixed_score_workspace,
+            )
+        with nvtx_range_debug("triattention.selection_workspace_lookup", color="blue"):
+            cross_request_selection = (
+                self._cross_request_selection_for(fixed_score_workspace, len(prepared))
+                if fixed_score_active
+                else None
+            )
+        with nvtx_range_debug("triattention.graph_admission", color="purple"):
+            graph_capacity_targets = self._try_standalone_cuda_graph(
+                prepared=prepared,
+                layer_pools=layer_pools,
+                dense_layers=dense_layers,
+                dense_groups=dense_groups,
+                swa_layers=swa_layers,
+                swa_window=swa_window,
+                layer_group_representative=layer_group_representative,
+                global_layers=global_layers,
+                score_workspace=fixed_score_workspace if fixed_score_active else None,
+                selection_workspace=cross_request_selection,
+                fixed_perhead_segment_views=fixed_perhead_segment_views,
+            )
         if graph_capacity_targets is not None:
             return graph_capacity_targets
         raise RuntimeError(
