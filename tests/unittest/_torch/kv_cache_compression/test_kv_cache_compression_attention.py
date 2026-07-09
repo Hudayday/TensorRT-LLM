@@ -77,9 +77,7 @@ def test_generation_length_capability_gates_adapter() -> None:
     mtp = MTPDecodingConfig(max_draft_len=3)
 
     assert (
-        get_kv_cache_compression_attention_metadata_cls(
-            None, mtp, TrtllmAttentionMetadata
-        )
+        get_kv_cache_compression_attention_metadata_cls(None, mtp, TrtllmAttentionMetadata)
         is TrtllmAttentionMetadata
     )
     assert (
