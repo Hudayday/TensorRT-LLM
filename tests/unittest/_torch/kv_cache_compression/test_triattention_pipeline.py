@@ -195,6 +195,7 @@ def _make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     fake_v2 = KVCacheManagerV2.__new__(KVCacheManagerV2)
     fake_v2.enable_block_reuse = enable_block_reuse
     fake_v2.is_draft = is_draft
+    fake_v2.generation_capacity_only = False
     fake_v2.kv_factor = 2
     fake_v2.mapping = SimpleNamespace(enable_attention_dp=False)
     fake_v2.is_disagg = False
@@ -466,6 +467,7 @@ class TestTriAttentionClass:
         triattention.on_request_init(first)
         triattention.on_request_init(second)
 
+        assert triattention.adjusts_generation_kv_length is True
         assert manager.generation_capacity_only
         assert triattention._initialized_request_ids == {11, 12}
 
@@ -1067,16 +1069,18 @@ class TestStepEndHookRefactor:
         from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
         spec_config = MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True)
+        draft_manager = _make_fake_v2(is_draft=True)
         manager = TriAttention(
             _make_fake_v2(),
             top_B=8,
             skip_swa=False,
             spec_config=spec_config,
-            draft_kv_cache_manager=_make_fake_v2(is_draft=True),
+            draft_kv_cache_manager=draft_manager,
         )
 
         manager._validate_v2_compatibility()
         assert manager.kv_cache_manager.generation_capacity_only is True
+        assert draft_manager.generation_capacity_only is False
 
     def test_mtp_eagle_paged_draft_length_contract_is_accepted(self):
         from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig

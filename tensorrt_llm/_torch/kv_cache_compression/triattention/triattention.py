@@ -50,7 +50,7 @@ The scoring math follows the same upstream reference (``methods/pruning_utils.py
 """
 
 import os
-from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, ClassVar, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -1648,6 +1648,8 @@ class TriAttention(BaseKVCacheCompressionManager):
     same request-wide cached length.
     """
 
+    adjusts_generation_kv_length: ClassVar[bool] = True
+
     def _selection_backend_for(self, width: int, keep_count: int) -> str:
         """Require the Blackwell CuTE-DSL selector for every eviction mode."""
         if keep_count <= 0:
@@ -1677,7 +1679,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         spec_config: Optional["SpeculativeConfig"] = None,
     ):
         super().__init__(kv_cache_manager, draft_kv_cache_manager)
-        kv_cache_manager.generation_capacity_only = True
         self.spec_config = spec_config
         self._publish_draft_kv_length_delta = (
             self.has_independent_draft_kv_cache

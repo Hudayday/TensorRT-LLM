@@ -69,6 +69,10 @@ class _MockCompressionManager(_RecordingMixin, BaseKVCacheCompressionManager):
         self._record("on_request_finish")
 
 
+class _LengthAdjustingCompressionManager(BaseKVCacheCompressionManager):
+    adjusts_generation_kv_length = True
+
+
 @pytest.fixture
 def fake_kv_cache_manager():
     """A stand-in KVCacheManagerV2. The framework reads enable_block_reuse off
@@ -97,6 +101,7 @@ def _v2_role_kv_cache_manager(*, is_draft):
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
     manager.enable_block_reuse = False
     manager.is_draft = is_draft
+    manager.generation_capacity_only = False
     manager.max_seq_len = 65536
     return manager
 
@@ -143,6 +148,18 @@ class TestBaseABC:
         assert manager.kv_cache_manager is target
         assert manager.draft_kv_cache_manager is draft
         assert manager.has_independent_draft_kv_cache
+        assert target.generation_capacity_only is False
+        assert draft.generation_capacity_only is False
+
+    def test_length_adjusting_capability_enables_only_target_policy(self):
+        target = _v2_role_kv_cache_manager(is_draft=False)
+        draft = _v2_role_kv_cache_manager(is_draft=True)
+
+        manager = _LengthAdjustingCompressionManager(target, draft)
+
+        assert manager.adjusts_generation_kv_length is True
+        assert target.generation_capacity_only is True
+        assert draft.generation_capacity_only is False
 
     def test_rejects_non_v2_target_manager(self):
         with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
@@ -322,6 +339,14 @@ class TestBlockReuseGuard:
     def test_raises_when_reuse_on(self):
         with pytest.raises(ValueError, match="block reuse"):
             BaseKVCacheCompressionManager(self._mgr(enable_block_reuse=True))
+
+    def test_rejection_does_not_mutate_target_capacity_policy(self):
+        target = self._mgr(enable_block_reuse=True)
+
+        with pytest.raises(ValueError, match="block reuse"):
+            _LengthAdjustingCompressionManager(target)
+
+        assert target.generation_capacity_only is False
 
     def test_ok_when_reuse_off(self):
         BaseKVCacheCompressionManager(self._mgr(enable_block_reuse=False))  # no raise

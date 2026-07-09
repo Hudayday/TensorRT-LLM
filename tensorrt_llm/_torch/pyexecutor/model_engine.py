@@ -2087,16 +2087,16 @@ class PyTorchModelEngine(ModelEngine):
             num_heads_per_kv = 1
 
         metadata_cls = self.attn_backend.Metadata
-        compression_config = self.llm_args.kv_cache_compression_config
         # Only target attention with a separate draft KVCM needs independent
         # target and draft KV-length views.
-        if (kv_cache_manager is not None and draft_kv_cache_manager is not None
-                and not self.is_draft_model and compression_config is not None):
+        if (isinstance(kv_cache_manager, KVCacheManagerV2)
+                and draft_kv_cache_manager is not None
+                and not self.is_draft_model):
             from ..kv_cache_compression.attention_metadata import \
                 get_kv_cache_compression_attention_metadata_cls
 
             metadata_cls = get_kv_cache_compression_attention_metadata_cls(
-                compression_config,
+                kv_cache_manager,
                 self.spec_config,
                 metadata_cls,
             )

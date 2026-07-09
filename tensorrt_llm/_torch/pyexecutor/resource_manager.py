@@ -19,8 +19,8 @@ import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Protocol,
-                    Sequence, Set, Tuple, Union, runtime_checkable)
+from typing import (TYPE_CHECKING, ClassVar, Dict, Iterable, List, Optional,
+                    Protocol, Sequence, Set, Tuple, Union, runtime_checkable)
 
 import torch
 from mpi4py import MPI
@@ -2356,6 +2356,9 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
     *what* physical KV exists. Subclasses hold ``KVCacheManagerV2`` as a tool.
     """
 
+    adjusts_generation_kv_length: ClassVar[bool] = False
+    """Whether this manager can make target and logical KV lengths diverge."""
+
     def __init__(
         self,
         kv_cache_manager: "KVCacheManagerV2",
@@ -2378,6 +2381,7 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
                 f"{type(self).__name__} changes stored keys and values and cannot "
                 f"run with KV-cache block reuse. Set "
                 f"KvCacheConfig.enable_block_reuse to False.")
+        kv_cache_manager.generation_capacity_only = self.adjusts_generation_kv_length
 
     @property
     def has_independent_draft_kv_cache(self) -> bool:

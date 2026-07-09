@@ -3,7 +3,6 @@
 
 from collections.abc import Callable
 from types import SimpleNamespace
-from typing import ClassVar, Literal
 from unittest import mock
 
 import pytest
@@ -15,6 +14,7 @@ from tensorrt_llm._torch.kv_cache_compression.attention_metadata import (
     get_kv_cache_compression_attention_metadata_cls,
     requires_paged_draft_kv_length_domain,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseKVCacheCompressionManager,
@@ -26,18 +26,12 @@ from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
 
 
-class _LengthAdjustingCompressionConfig(KvCacheCompressionConfig):
-    adjusts_generation_kv_length: ClassVar[bool] = True
-    algorithm: Literal["test_length_adjustment"] = "test_length_adjustment"
-
-
-def _compression_capability(*, adjusts_generation_kv_length: bool) -> SimpleNamespace:
-    return SimpleNamespace(
-        adjusts_generation_kv_length=adjusts_generation_kv_length,
-    )
+def _kv_cache_manager(*, generation_capacity_only: bool) -> KVCacheManagerV2:
+    manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    manager.generation_capacity_only = generation_capacity_only
+    return manager
 
 
 def _metadata_with_separate_draft_cache(
@@ -76,7 +70,7 @@ def _metadata_with_separate_draft_cache(
     return metadata, target_manager, draft_manager
 
 
-def test_generation_length_capability_gates_adapter() -> None:
+def test_target_kv_cache_runtime_policy_gates_adapter() -> None:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
     mtp = MTPDecodingConfig(max_draft_len=3)
@@ -87,7 +81,7 @@ def test_generation_length_capability_gates_adapter() -> None:
     )
     assert (
         get_kv_cache_compression_attention_metadata_cls(
-            _compression_capability(adjusts_generation_kv_length=False),
+            _kv_cache_manager(generation_capacity_only=False),
             mtp,
             TrtllmAttentionMetadata,
         )
@@ -95,7 +89,9 @@ def test_generation_length_capability_gates_adapter() -> None:
     )
     assert (
         get_kv_cache_compression_attention_metadata_cls(
-            _LengthAdjustingCompressionConfig(), mtp, TrtllmAttentionMetadata
+            _kv_cache_manager(generation_capacity_only=True),
+            mtp,
+            TrtllmAttentionMetadata,
         )
         is KVCacheCompressionAwareTrtllmAttentionMetadata
     )
@@ -110,7 +106,7 @@ def test_paged_draft_modes_and_dflash_select_expected_length_domain() -> None:
         PARDDecodingConfig,
     )
 
-    compression = _compression_capability(adjusts_generation_kv_length=True)
+    target_kv_cache_manager = _kv_cache_manager(generation_capacity_only=True)
     eagle3 = Eagle3DecodingConfig(
         max_draft_len=4,
         speculative_model="/tmp/qwen3-eagle3-draft",
@@ -127,7 +123,7 @@ def test_paged_draft_modes_and_dflash_select_expected_length_domain() -> None:
         assert requires_paged_draft_kv_length_domain(config)
         assert (
             get_kv_cache_compression_attention_metadata_cls(
-                compression, config, TrtllmAttentionMetadata
+                target_kv_cache_manager, config, TrtllmAttentionMetadata
             )
             is KVCacheCompressionAwareTrtllmAttentionMetadata
         )
@@ -136,7 +132,7 @@ def test_paged_draft_modes_and_dflash_select_expected_length_domain() -> None:
         assert not requires_paged_draft_kv_length_domain(config)
         assert (
             get_kv_cache_compression_attention_metadata_cls(
-                compression, config, TrtllmAttentionMetadata
+                target_kv_cache_manager, config, TrtllmAttentionMetadata
             )
             is TrtllmAttentionMetadata
         )

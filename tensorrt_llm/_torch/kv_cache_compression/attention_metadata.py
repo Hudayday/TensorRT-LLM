@@ -13,7 +13,8 @@ from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._utils import prefer_pinned
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig, SpeculativeConfig
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm.llmapi.llm_args import SpeculativeConfig
 
 
 def requires_paged_draft_kv_length_domain(
@@ -42,14 +43,14 @@ def requires_paged_draft_kv_length_domain(
 
 
 def get_kv_cache_compression_attention_metadata_cls(
-    compression_config: "KvCacheCompressionConfig | None",
+    kv_cache_manager: "KVCacheManagerV2 | None",
     spec_config: "SpeculativeConfig | None",
     metadata_cls: type[AttentionMetadata],
 ) -> type[AttentionMetadata]:
     """Select metadata that tracks independent target and draft KV lengths."""
     if (
-        compression_config is None
-        or not compression_config.adjusts_generation_kv_length
+        kv_cache_manager is None
+        or not kv_cache_manager.generation_capacity_only
         or not requires_paged_draft_kv_length_domain(spec_config)
     ):
         return metadata_cls

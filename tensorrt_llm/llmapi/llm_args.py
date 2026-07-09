@@ -3262,9 +3262,6 @@ class KvCacheCompressionConfig(StrictBaseModel):
     as a resource manager in create_py_executor (_util.py), like the KV cache
     manager itself. Concrete algorithms subclass this and add their parameters.
     """
-    adjusts_generation_kv_length: ClassVar[bool] = False
-    """Whether the algorithm can make target and logical KV lengths diverge."""
-
     algorithm: str = Field(
         description=
         "Name of the KV-cache compression algorithm to run; selects which "
@@ -3287,7 +3284,6 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
     compacted cache, and the manager reconciles the cached-token count via the
     framework's ``adjust_attention_metadata`` hook.
     """
-    adjusts_generation_kv_length: ClassVar[bool] = True
     algorithm: Literal["triattention"] = "triattention"
     eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
         default="union",
