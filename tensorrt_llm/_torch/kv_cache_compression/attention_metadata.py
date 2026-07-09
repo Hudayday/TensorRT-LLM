@@ -55,21 +55,23 @@ def get_kv_cache_compression_attention_metadata_cls(
         return metadata_cls
     if metadata_cls is not TrtllmAttentionMetadata:
         raise ValueError("KV cache compression currently requires TRTLLM attention")
-    return KVCacheCompressionTrtllmAttentionMetadata
+    return KVCacheCompressionAwareTrtllmAttentionMetadata
 
 
 @dataclass(kw_only=True)
-class KVCacheCompressionTrtllmAttentionMetadata(TrtllmAttentionMetadata):
-    """Select graph-stable KV lengths for the currently active KVCM."""
+class KVCacheCompressionAwareTrtllmAttentionMetadata(TrtllmAttentionMetadata):
+    """Expose compressed target and dense draft lengths to attention.
+
+    This adapter materializes attention parameters. It does not run cache
+    compression, resize either cache, or alter the speculative algorithm.
+    """
 
     draft_kv_length_delta: list[int] | None = None
     draft_kv_length_delta_cuda: torch.Tensor | None = field(default=None, init=False, repr=False)
     draft_kv_length_delta_cpu: torch.Tensor | None = field(default=None, init=False, repr=False)
     draft_kv_lens_cuda_runtime: torch.Tensor | None = field(default=None, init=False, repr=False)
     draft_kv_lens_runtime: torch.Tensor | None = field(default=None, init=False, repr=False)
-    target_kv_lens_cuda_runtime: torch.Tensor | None = field(
-        default=None, init=False, repr=False
-    )
+    target_kv_lens_cuda_runtime: torch.Tensor | None = field(default=None, init=False, repr=False)
     target_kv_lens_runtime: torch.Tensor | None = field(default=None, init=False, repr=False)
     target_host_total_kv_lens: torch.Tensor | None = field(default=None, init=False, repr=False)
     draft_host_total_kv_lens: torch.Tensor | None = field(default=None, init=False, repr=False)
@@ -78,7 +80,11 @@ class KVCacheCompressionTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         super()._post_init_with_buffers(buffers)
         self.target_host_total_kv_lens = self.host_total_kv_lens
         if self.draft_kv_cache_manager is None:
-            return
+            raise ValueError(
+                "compression-aware attention metadata requires a draft KV cache manager"
+            )
+        # TRT-LLM attention consumes device lengths, host lengths, and host
+        # totals. Keep a separate graph-stable draft domain for all three.
         capture_graph = self.is_cuda_graph
         self.draft_kv_length_delta_cuda = self.get_empty_like(
             buffers,
@@ -107,25 +113,6 @@ class KVCacheCompressionTrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def set_draft_kv_length_delta(self, delta: Sequence[int]) -> None:
         self.draft_kv_length_delta = list(delta)
 
-    def _bind_runtime_views(
-        self,
-        *,
-        kv_lens_cuda: torch.Tensor,
-        kv_lens: torch.Tensor,
-        prompt_lens_cuda: torch.Tensor,
-        prompt_lens_cpu: torch.Tensor,
-        host_request_types: torch.Tensor,
-    ) -> None:
-        super()._bind_runtime_views(
-            kv_lens_cuda=kv_lens_cuda,
-            kv_lens=kv_lens,
-            prompt_lens_cuda=prompt_lens_cuda,
-            prompt_lens_cpu=prompt_lens_cpu,
-            host_request_types=host_request_types,
-        )
-        self.target_kv_lens_cuda_runtime = kv_lens_cuda
-        self.target_kv_lens_runtime = kv_lens
-
     def prepare(self) -> None:
         if self.target_host_total_kv_lens is not None:
             self.host_total_kv_lens = self.target_host_total_kv_lens
@@ -151,7 +138,7 @@ class KVCacheCompressionTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.draft_kv_length_delta_cuda[:batch_size].copy_(
             self.draft_kv_length_delta_cpu[:batch_size], non_blocking=True
         )
-        self._refresh_draft_kv_length_domain(refresh_host=True)
+        self._materialize_draft_host_kv_lengths()
 
     def on_update_kv_lens(self) -> None:
         """Follow in-place KV-length mutations from vanilla speculative decoding."""
@@ -171,9 +158,9 @@ class KVCacheCompressionTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self.draft_kv_length_delta is None:
             return
         self.target_kv_lens_cuda_runtime = self.kv_lens_cuda[: self.num_seqs]
-        self._refresh_draft_kv_length_domain(refresh_host=False)
+        self._materialize_draft_device_kv_lengths()
 
-    def _refresh_draft_kv_length_domain(self, *, refresh_host: bool) -> None:
+    def _materialize_draft_device_kv_lengths(self) -> None:
         batch_size = self.num_seqs
         assert self.target_kv_lens_cuda_runtime is not None
         assert self.draft_kv_length_delta_cuda is not None
@@ -183,9 +170,9 @@ class KVCacheCompressionTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.draft_kv_length_delta_cuda[:batch_size],
             out=self.draft_kv_lens_cuda_runtime[:batch_size],
         )
-        if not refresh_host:
-            return
 
+    def _materialize_draft_host_kv_lengths(self) -> None:
+        batch_size = self.num_seqs
         assert self.target_kv_lens_runtime is not None
         assert self.draft_kv_length_delta_cpu is not None
         assert self.draft_kv_lens_runtime is not None

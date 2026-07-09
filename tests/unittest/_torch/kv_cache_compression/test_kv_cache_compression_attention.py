@@ -11,7 +11,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.kv_cache_compression.attention_metadata import (
-    KVCacheCompressionTrtllmAttentionMetadata,
+    KVCacheCompressionAwareTrtllmAttentionMetadata,
     get_kv_cache_compression_attention_metadata_cls,
     requires_paged_draft_kv_length_domain,
 )
@@ -43,9 +43,9 @@ def _compression_capability(*, adjusts_generation_kv_length: bool) -> SimpleName
 def _metadata_with_separate_draft_cache(
     *,
     cuda_device: str | torch.device = "cpu",
-) -> tuple[KVCacheCompressionTrtllmAttentionMetadata, object, object]:
-    metadata = KVCacheCompressionTrtllmAttentionMetadata.__new__(
-        KVCacheCompressionTrtllmAttentionMetadata
+) -> tuple[KVCacheCompressionAwareTrtllmAttentionMetadata, object, object]:
+    metadata = KVCacheCompressionAwareTrtllmAttentionMetadata.__new__(
+        KVCacheCompressionAwareTrtllmAttentionMetadata
     )
     target_manager = SimpleNamespace()
     draft_manager = SimpleNamespace(
@@ -97,7 +97,7 @@ def test_generation_length_capability_gates_adapter() -> None:
         get_kv_cache_compression_attention_metadata_cls(
             _LengthAdjustingCompressionConfig(), mtp, TrtllmAttentionMetadata
         )
-        is KVCacheCompressionTrtllmAttentionMetadata
+        is KVCacheCompressionAwareTrtllmAttentionMetadata
     )
 
 
@@ -129,7 +129,7 @@ def test_paged_draft_modes_and_dflash_select_expected_length_domain() -> None:
             get_kv_cache_compression_attention_metadata_cls(
                 compression, config, TrtllmAttentionMetadata
             )
-            is KVCacheCompressionTrtllmAttentionMetadata
+            is KVCacheCompressionAwareTrtllmAttentionMetadata
         )
 
     for config in (dflash,):
@@ -144,7 +144,8 @@ def test_paged_draft_modes_and_dflash_select_expected_length_domain() -> None:
 
 def test_target_and_draft_cpu_length_domains_are_independent() -> None:
     metadata, _, draft_manager = _metadata_with_separate_draft_cache()
-    metadata._refresh_draft_kv_length_domain(refresh_host=True)
+    metadata._materialize_draft_device_kv_lengths()
+    metadata._materialize_draft_host_kv_lengths()
 
     metadata.activate_kv_length_domain()
     assert metadata.kv_lens_cuda_runtime.tolist() == [41, 92]
@@ -171,7 +172,8 @@ def test_native_draft_cache_context_selects_and_restores_length_domain() -> None
     metadata.kv_cache_block_offsets = target_offsets
     metadata.draft_kv_cache_block_offsets = draft_offsets
     metadata.host_kv_cache_block_offsets = target_host_offsets
-    metadata._refresh_draft_kv_length_domain(refresh_host=True)
+    metadata._materialize_draft_device_kv_lengths()
+    metadata._materialize_draft_host_kv_lengths()
 
     saved = prepare_attn_metadata_for_draft_replay(metadata, draft_manager)
     assert metadata.kv_cache_manager is draft_manager
@@ -194,7 +196,8 @@ def test_eager_draft_cache_context_selects_and_restores_length_domain() -> None:
     metadata.kv_cache_block_offsets = target_offsets
     metadata.draft_kv_cache_block_offsets = draft_offsets
     metadata.host_kv_cache_block_offsets = target_host_offsets
-    metadata._refresh_draft_kv_length_domain(refresh_host=True)
+    metadata._materialize_draft_device_kv_lengths()
+    metadata._materialize_draft_host_kv_lengths()
 
     worker = object()
     with SpecWorkerBase.draft_kv_cache_context(worker, metadata, draft_manager):
@@ -211,7 +214,8 @@ def test_eager_draft_cache_context_selects_and_restores_length_domain() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_draft_length_refresh_reuses_graph_stable_buffers() -> None:
     metadata, _, draft_manager = _metadata_with_separate_draft_cache(cuda_device="cuda")
-    metadata._refresh_draft_kv_length_domain(refresh_host=True)
+    metadata._materialize_draft_device_kv_lengths()
+    metadata._materialize_draft_host_kv_lengths()
     draft_output_pointer = metadata.draft_kv_lens_cuda_runtime.data_ptr()
     delta_pointer = metadata.draft_kv_length_delta_cuda.data_ptr()
     draft_cpu_output_pointer = metadata.draft_kv_lens_runtime.data_ptr()
@@ -220,7 +224,7 @@ def test_cuda_draft_length_refresh_reuses_graph_stable_buffers() -> None:
     graph = torch.cuda.CUDAGraph()
     torch.cuda.synchronize()
     with torch.cuda.graph(graph):
-        metadata._refresh_draft_kv_length_domain(refresh_host=False)
+        metadata._materialize_draft_device_kv_lengths()
 
     metadata.target_kv_lens_cuda_runtime.add_(
         torch.tensor([2, 5], dtype=torch.int32, device="cuda")
@@ -249,7 +253,8 @@ def test_prepare_captures_runtime_views_from_base_metadata() -> None:
     metadata.target_kv_lens_cuda_runtime = None
     metadata.target_kv_lens_runtime = None
 
-    def base_prepare(instance: KVCacheCompressionTrtllmAttentionMetadata) -> None:
+    def base_prepare(instance: KVCacheCompressionAwareTrtllmAttentionMetadata) -> None:
+        instance.kv_lens_cuda = target_cuda
         instance.kv_lens_cuda_runtime = target_cuda
         instance.kv_lens_runtime = target_cpu
         instance.host_total_kv_lens = target_totals
@@ -260,29 +265,32 @@ def test_prepare_captures_runtime_views_from_base_metadata() -> None:
     assert metadata.target_kv_lens_cuda_runtime is target_cuda
     assert metadata.target_kv_lens_runtime is target_cpu
     assert metadata.target_host_total_kv_lens is target_totals
-    assert metadata.draft_kv_lens_cuda_runtime.tolist() == [10, 57]
     assert metadata.draft_kv_lens_runtime.tolist() == [10, 57]
     assert metadata.draft_host_total_kv_lens.tolist() == [10, 57]
+
+    metadata._refresh_device_kv_length_domain()
+    assert metadata.draft_kv_lens_cuda_runtime.tolist() == [10, 57]
 
 
 @pytest.mark.parametrize(
     "update",
     [
         pytest.param(
-            KVCacheCompressionTrtllmAttentionMetadata.on_update_kv_lens,
+            KVCacheCompressionAwareTrtllmAttentionMetadata.on_update_kv_lens,
             id="on-update-kv-lens",
         ),
         pytest.param(
-            KVCacheCompressionTrtllmAttentionMetadata.update_for_spec_dec,
+            KVCacheCompressionAwareTrtllmAttentionMetadata.update_for_spec_dec,
             id="update-for-spec-dec",
         ),
     ],
 )
 def test_native_speculative_update_refreshes_device_domain(
-    update: Callable[[KVCacheCompressionTrtllmAttentionMetadata], None],
+    update: Callable[[KVCacheCompressionAwareTrtllmAttentionMetadata], None],
 ) -> None:
     metadata, _, draft_manager = _metadata_with_separate_draft_cache()
-    metadata._refresh_draft_kv_length_domain(refresh_host=True)
+    metadata._materialize_draft_device_kv_lengths()
+    metadata._materialize_draft_host_kv_lengths()
     metadata.kv_lens_cuda = metadata.kv_lens_cuda.clone()
     metadata.kv_lens_cuda[1].add_(1)
 
