@@ -70,10 +70,9 @@ def _run_cpp_compact(
 class FixedBatchedCompactionWorkspace:
     """Fixed-shape buffers for graph-captured compaction.
 
-    Dense layers move only selected decode slots. The finalized prompt is never
-    a destination and therefore remains byte-untouched. Kernel-masked SWA
-    layers use their own page table and copy only the latest window to the new
-    compacted tail.
+    Dense layers compact the selected prefix and append any target KV reserved
+    for the next overlapped forward. Kernel-masked SWA layers use their own page
+    table and compact the latest window plus the same protected target tail.
     """
 
     def __init__(
@@ -93,6 +92,7 @@ class FixedBatchedCompactionWorkspace:
         decode_keep_count: int,
         swa_window: Optional[int],
         arena_generation: int,
+        protected_tail_lengths: Optional[List[int]] = None,
     ) -> None:
         if eviction_mode not in ("union", "per_head", "per_layer_perhead"):
             raise ValueError(f"unsupported graph compaction mode: {eviction_mode}")
@@ -121,6 +121,16 @@ class FixedBatchedCompactionWorkspace:
         self.prompt_len = int(prompt_len)
         self.decode_keep_count = int(decode_keep_count)
         self.keep_count = self.prompt_len + self.decode_keep_count
+        if protected_tail_lengths is None:
+            protected_tail_lengths = [0] * self.request_count
+        if len(protected_tail_lengths) != self.request_count or any(
+            length < 0 for length in protected_tail_lengths
+        ):
+            raise ValueError("protected-tail lengths must match the graph request count")
+        self.protected_tail_lengths = tuple(int(length) for length in protected_tail_lengths)
+        self._uniform_protected_tail_length = (
+            self.protected_tail_lengths[0] if len(set(self.protected_tail_lengths)) == 1 else None
+        )
         self.arena_generation = int(arena_generation)
         self.dense_layers = tuple(int(layer) for layer in dense_layers)
         self.swa_layers = tuple(int(layer) for layer in swa_layers)
@@ -153,15 +163,33 @@ class FixedBatchedCompactionWorkspace:
         self.cpp_num_kv_heads = cpp_num_kv_heads
         if selection_workspace.num_kv_heads != cpp_num_kv_heads:
             raise ValueError("fixed graph selection KV-head count does not match the pool")
+        move_counts = [self.keep_count + length for length in self.protected_tail_lengths]
+        move_offsets = [0]
+        for count in move_counts:
+            move_offsets.append(move_offsets[-1] + count)
+        self._move_offsets = tuple(move_offsets)
         self.cpp_indices = torch.empty(
             cpp_num_kv_heads,
-            self.request_count * self.keep_count,
+            move_offsets[-1],
             dtype=torch.int32,
             device=self.device,
         )
-        self.cpp_offsets = (
-            torch.arange(self.request_count + 1, dtype=torch.int32, device=self.device)
-            * self.keep_count
+        self.cpp_offsets = torch.tensor(
+            move_offsets,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        max_protected_tail = max(self.protected_tail_lengths, default=0)
+        self.protected_tail_offsets = torch.arange(
+            max_protected_tail,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.protected_tail_source = torch.empty(
+            self.request_count,
+            max_protected_tail,
+            dtype=torch.int32,
+            device=self.device,
         )
         self.cpp_page_tables = {}
         self.cpp_dense_ops = []
@@ -202,18 +230,20 @@ class FixedBatchedCompactionWorkspace:
         if self.swa_layers:
             if swa_window is None or swa_window <= 0 or self.keep_count < swa_window:
                 raise ValueError("fixed graph SWA compaction requires a valid retained window")
-            total_swa = self.request_count * int(swa_window)
-            self.swa_source_offsets = torch.arange(
-                -int(swa_window),
-                0,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            destination = torch.arange(
-                self.keep_count - int(swa_window),
-                self.keep_count,
-                dtype=torch.int32,
-                device=self.device,
+            swa_move_counts = [int(swa_window) + length for length in self.protected_tail_lengths]
+            swa_move_offsets = [0]
+            for count in swa_move_counts:
+                swa_move_offsets.append(swa_move_offsets[-1] + count)
+            self._swa_move_offsets = tuple(swa_move_offsets)
+            total_swa = swa_move_offsets[-1]
+            self.swa_source_offsets = tuple(
+                torch.arange(
+                    -int(swa_window),
+                    length,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                for length in self.protected_tail_lengths
             )
             self.swa_source = torch.empty(total_swa, dtype=torch.int32, device=self.device)
             self.swa_indices = torch.empty(
@@ -222,21 +252,35 @@ class FixedBatchedCompactionWorkspace:
                 dtype=torch.int32,
                 device=self.device,
             )
-            self.swa_destination = destination.repeat(self.request_count)
-            self.swa_offsets = torch.arange(
-                self.request_count + 1, dtype=torch.int32, device=self.device
-            ) * int(swa_window)
+            self.swa_destination = torch.cat(
+                [
+                    torch.arange(
+                        self.keep_count - int(swa_window),
+                        self.keep_count + length,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    for length in self.protected_tail_lengths
+                ]
+            )
+            self.swa_offsets = torch.tensor(
+                swa_move_offsets,
+                dtype=torch.int32,
+                device=self.device,
+            )
             for layer in self.swa_layers:
                 self.cpp_swa_ops.append((layer_pools[layer], page_table_for(layer)))
 
         owned_tensors = [
             self.cpp_indices,
             self.cpp_offsets,
+            self.protected_tail_offsets,
+            self.protected_tail_source,
         ]
         if self.swa_source_offsets is not None:
             owned_tensors.extend(
                 (
-                    self.swa_source_offsets,
+                    *self.swa_source_offsets,
                     self.swa_source,
                     self.swa_indices,
                     self.swa_destination,
@@ -256,13 +300,25 @@ class FixedBatchedCompactionWorkspace:
         if self.swa_source is not None:
             assert self.swa_source_offsets is not None
             assert self.swa_indices is not None
-            torch.add(
-                self.score_workspace.valid_seq_lens_device[: self.request_count].view(
-                    self.request_count, 1
-                ),
-                self.swa_source_offsets.view(1, -1),
-                out=self.swa_source.view(self.request_count, -1),
-            )
+            uniform_tail = self._uniform_protected_tail_length
+            if uniform_tail is not None:
+                source_offsets = self.swa_source_offsets[0]
+                torch.add(
+                    self.score_workspace.valid_seq_lens_device[: self.request_count].view(
+                        self.request_count, 1
+                    ),
+                    source_offsets.view(1, -1),
+                    out=self.swa_source.view(self.request_count, -1),
+                )
+            else:
+                for request_index, source_offsets in enumerate(self.swa_source_offsets):
+                    begin = self._swa_move_offsets[request_index]
+                    end = self._swa_move_offsets[request_index + 1]
+                    torch.add(
+                        self.score_workspace.valid_seq_lens_device[request_index],
+                        source_offsets,
+                        out=self.swa_source[begin:end],
+                    )
             self.swa_indices.copy_(self.swa_source.reshape(1, -1).expand(self.cpp_num_kv_heads, -1))
         for source_pages, staged_i32 in self.cpp_page_tables.values():
             staged_i32.copy_(source_pages)
@@ -291,26 +347,70 @@ class FixedBatchedCompactionWorkspace:
                 )
 
     def _stage_dense_indices(self, layer_slot: int) -> None:
-        """Pack retained token indices into the C++ operation input layout."""
-        target = self.cpp_indices.view(
-            self.cpp_num_kv_heads,
-            self.request_count,
-            self.keep_count,
-        )
+        """Pack selected prefix and opaque protected tail into one operation."""
         keep = self.selection_workspace.keep[: self.request_count]
-        if self.eviction_mode == "union":
-            target.copy_(keep.view(1, self.request_count, self.keep_count).expand_as(target))
+        per_layer = None
+        if self.eviction_mode == "per_layer_perhead":
+            per_layer = keep.view(
+                self.request_count,
+                len(self.dense_layers),
+                self.cpp_num_kv_heads,
+                self.keep_count,
+            )
+        uniform_tail = self._uniform_protected_tail_length
+        if uniform_tail is not None:
+            move_count = self.keep_count + uniform_tail
+            target = self.cpp_indices.view(
+                self.cpp_num_kv_heads,
+                self.request_count,
+                move_count,
+            )
+            target_keep = target[:, :, : self.keep_count]
+            if self.eviction_mode == "union":
+                target_keep.copy_(keep.view(1, self.request_count, self.keep_count))
+            elif self.eviction_mode == "per_head":
+                target_keep.copy_(keep.permute(1, 0, 2))
+            else:
+                assert per_layer is not None
+                target_keep.copy_(per_layer[:, layer_slot].permute(1, 0, 2))
+            if uniform_tail:
+                torch.add(
+                    self.score_workspace.valid_seq_lens_device[: self.request_count].view(
+                        self.request_count, 1
+                    ),
+                    self.protected_tail_offsets[:uniform_tail].view(1, uniform_tail),
+                    out=self.protected_tail_source[:, :uniform_tail],
+                )
+                target[:, :, self.keep_count :].copy_(
+                    self.protected_tail_source[:, :uniform_tail]
+                    .view(1, self.request_count, uniform_tail)
+                    .expand(self.cpp_num_kv_heads, self.request_count, uniform_tail)
+                )
             return
-        if self.eviction_mode == "per_head":
-            target.copy_(keep.permute(1, 0, 2))
-            return
-        per_layer = keep.view(
-            self.request_count,
-            len(self.dense_layers),
-            self.cpp_num_kv_heads,
-            self.keep_count,
-        )
-        target.copy_(per_layer[:, layer_slot].permute(1, 0, 2))
+        for request_index, tail_length in enumerate(self.protected_tail_lengths):
+            begin = self._move_offsets[request_index]
+            keep_end = begin + self.keep_count
+            target_keep = self.cpp_indices[:, begin:keep_end]
+            if self.eviction_mode == "union":
+                target_keep.copy_(
+                    keep[request_index].view(1, self.keep_count).expand_as(target_keep)
+                )
+            elif self.eviction_mode == "per_head":
+                target_keep.copy_(keep[request_index])
+            else:
+                assert per_layer is not None
+                target_keep.copy_(per_layer[request_index, layer_slot])
+            if tail_length:
+                torch.add(
+                    self.score_workspace.valid_seq_lens_device[request_index],
+                    self.protected_tail_offsets[:tail_length],
+                    out=self.protected_tail_source[request_index, :tail_length],
+                )
+                self.cpp_indices[:, keep_end : keep_end + tail_length].copy_(
+                    self.protected_tail_source[request_index, :tail_length]
+                    .view(1, tail_length)
+                    .expand(self.cpp_num_kv_heads, tail_length)
+                )
 
     def matches_runtime(
         self,
@@ -378,12 +478,13 @@ class FixedBatchedCompactionWorkspace:
         )
         context_token = int(torch.cuda.current_blas_handle())
         return (
-            "triattention.standalone-eviction-graph.v3",
+            "triattention.standalone-eviction-graph.v4",
             self.eviction_mode,
             self.request_count,
             self.seq_len,
             self.prompt_len,
             self.decode_keep_count,
+            self.protected_tail_lengths,
             self.dense_layers,
             self.swa_layers,
             self.global_layers,

@@ -28,8 +28,8 @@ kernel over the compacted cache. TriAttention derives each request's effective
 confirmed physical length after V2's native update/rewind and writes that value
 through ``adjust_attention_metadata`` just before ``attn_metadata.prepare()``.
 Physical reclaim uses V2's existing resize path directly after compaction. An
-already-enqueued speculative suffix is excluded from scoring, rebased unchanged,
-and retained after the compressed prefix.
+already-enqueued speculative suffix is excluded from scoring and appended
+unchanged to the retained prefix by the same per-layer compact operation.
 
 KV layout: the decode kernel stores keys in HND layout
 ``[num_pages, kv_factor, num_kv_heads, tokens_per_block, head_dim]``. The Python
@@ -1303,6 +1303,7 @@ class _FixedScoreMetadataWorkspace:
         omega: torch.Tensor,
         page_table_keys: Optional[List[object]] = None,
         prompt_len: int = 0,
+        page_table_token_capacity: Optional[int] = None,
     ) -> None:
         from .triattention_kernels import _FixedScoreGroup
 
@@ -1315,6 +1316,11 @@ class _FixedScoreMetadataWorkspace:
             raise ValueError("fixed score metadata is CUDA-only")
         self.max_requests = max_requests
         self.bucket_seq_len = seq_len
+        if page_table_token_capacity is None:
+            page_table_token_capacity = seq_len
+        if page_table_token_capacity < seq_len:
+            raise ValueError("page-table capacity cannot be smaller than the score bucket")
+        self.page_table_token_capacity = int(page_table_token_capacity)
         if prompt_len < 0 or prompt_len > seq_len:
             raise ValueError("fixed score metadata prompt length is outside its bucket")
         self.prompt_len = prompt_len
@@ -1338,9 +1344,12 @@ class _FixedScoreMetadataWorkspace:
         )
         tokens_per_block = int(layer_pools[page_representatives[0]].shape[3])
         self.tokens_per_block = tokens_per_block
-        self.page_count = (seq_len + tokens_per_block - 1) // tokens_per_block
+        self.page_count = (
+            self.page_table_token_capacity + tokens_per_block - 1
+        ) // tokens_per_block
         if any(
-            (seq_len + int(layer_pools[layer].shape[3]) - 1) // int(layer_pools[layer].shape[3])
+            (self.page_table_token_capacity + int(layer_pools[layer].shape[3]) - 1)
+            // int(layer_pools[layer].shape[3])
             != self.page_count
             for layer in page_representatives
         ):
@@ -1457,6 +1466,7 @@ class _FixedScoreMetadataWorkspace:
         request_ids: List[int],
         round_starts: List[float],
         seq_lens: Optional[List[int]] = None,
+        page_table_seq_lens: Optional[List[int]] = None,
     ) -> bool:
         """Copy one request group's metadata into fixed buffers."""
         request_count = len(request_ids)
@@ -1487,8 +1497,16 @@ class _FixedScoreMetadataWorkspace:
             seq_len <= 0 or seq_len > self.bucket_seq_len for seq_len in seq_lens
         ):
             return False
+        if page_table_seq_lens is None:
+            page_table_seq_lens = seq_lens
+        if len(page_table_seq_lens) != request_count or any(
+            page_seq_len < seq_len or page_seq_len > self.page_table_token_capacity
+            for seq_len, page_seq_len in zip(seq_lens, page_table_seq_lens)
+        ):
+            return False
         num_blocks_per_seq = [
-            (seq_len + self.tokens_per_block - 1) // self.tokens_per_block for seq_len in seq_lens
+            (seq_len + self.tokens_per_block - 1) // self.tokens_per_block
+            for seq_len in page_table_seq_lens
         ]
         if callable(cache_source):
             manager = None
@@ -2002,6 +2020,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         # the unreachable tail directly through V2's public resize primitive.
         if evict_now:
             self._ensure_configured_graph_buckets(evict_now, num_layers)
+            protected_tail_lengths = {rid: protected_tails[rid][2] for _, rid in evict_now}
             evicted_before = self._evicted.copy()
             confirmed_before = self._confirmed_kv_lengths.copy()
             try:
@@ -2018,17 +2037,31 @@ class TriAttention(BaseKVCacheCompressionManager):
                             seq_len - prompt_len,
                             self.top_B,
                         )
-                        key = (prompt_len, keep_count, selection_backend)
+                        key = (
+                            prompt_len,
+                            keep_count,
+                            selection_backend,
+                        )
                         graph_groups.setdefault(key, []).append((request, rid))
                     capacity_targets = []
                     for group in graph_groups.values():
-                        capacity_targets.extend(self._evict_requests(group, num_layers))
+                        capacity_targets.extend(
+                            self._evict_requests(
+                                group,
+                                num_layers,
+                                protected_tail_lengths=protected_tail_lengths,
+                            )
+                        )
                 else:
-                    capacity_targets = self._evict_requests(evict_now, num_layers)
+                    capacity_targets = self._evict_requests(
+                        evict_now,
+                        num_layers,
+                        protected_tail_lengths=protected_tail_lengths,
+                    )
             finally:
                 # _evict_requests is also a directly testable execution primitive
                 # and publishes its result. The lifecycle hook keeps that result
-                # provisional until tail rebase, synchronization, and resize pass.
+                # provisional until compaction synchronization and resize pass.
                 self._evicted.clear()
                 self._evicted.update(evicted_before)
                 self._confirmed_kv_lengths.clear()
@@ -2037,15 +2070,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             capacity_targets = []
         if capacity_targets:
             with nvtx_range("triattention.resize", color="red"):
-                for rid, target_capacity in capacity_targets:
-                    request, source_start, protected_tail = protected_tails[rid]
-                    if protected_tail:
-                        self._rebase_protected_tail(
-                            request,
-                            source_start=source_start,
-                            destination_start=target_capacity,
-                            token_count=protected_tail,
-                        )
                 compaction_event = torch.cuda.Event()
                 compaction_event.record()
                 compaction_event.synchronize()
@@ -2116,11 +2140,13 @@ class TriAttention(BaseKVCacheCompressionManager):
             f"fixed_{self.eviction_mode}.{self._selection_backend_for(decode_width, self.top_B)}"
         )
         compaction_backend = "cpp_sparse_kv_cache_compact"
+        protected_tail_capacity = self._configured_protected_tail_capacity()
         pool_geometry = []
         for lids in storage_groups:
             pool = layer_pools[lids[0]]
             tokens_per_block = int(pool.shape[3])
-            num_pages = (future_seq_len + tokens_per_block - 1) // tokens_per_block
+            page_table_capacity = future_seq_len + protected_tail_capacity
+            num_pages = (page_table_capacity + tokens_per_block - 1) // tokens_per_block
             device = _FixedUnionWorkspace._canonical_device(pool.device)
             pool_geometry.append(
                 (
@@ -2133,7 +2159,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 )
             )
         return (
-            "triattention.fixed-prewarm.v5",
+            "triattention.fixed-prewarm.v6",
             num_layers,
             tuple(dense_layers),
             int(self._H),
@@ -2145,6 +2171,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             selection_backend,
             compaction_backend,
             future_seq_len,
+            protected_tail_capacity,
             prompt_len,
             self.top_B,
             len(dense_layers) * int(self._H),
@@ -2283,6 +2310,17 @@ class TriAttention(BaseKVCacheCompressionManager):
                 )
             shapes.append((prompt_len, decode_width))
         return list(dict.fromkeys(shapes))
+
+    def _configured_protected_tail_capacity(self) -> int:
+        """Return the largest target tail reserved by the native V2 lifecycle."""
+        capacity = (
+            int(self.kv_cache_manager.num_extra_kv_tokens)
+            + int(self.kv_cache_manager._kv_reserve_draft_tokens)
+            + 1
+        )
+        if capacity <= 0:
+            raise RuntimeError("KVCacheManagerV2 exposes an invalid protected-tail capacity")
+        return capacity
 
     def _upper_prewarm_shapes_by_backend(
         self,
@@ -2572,6 +2610,9 @@ class TriAttention(BaseKVCacheCompressionManager):
                         global_layers,
                     ),
                     prompt_len=prompt_len,
+                    page_table_token_capacity=(
+                        seq_len + self._configured_protected_tail_capacity()
+                    ),
                 )
                 score_workspace.prewarm_key = key
                 self._fixed_score_workspaces[key] = score_workspace
@@ -3556,6 +3597,8 @@ class TriAttention(BaseKVCacheCompressionManager):
                 self._fixed_score_prewarm_states.get(key) == "ready"
                 and workspace.prompt_len == prompt_len
                 and workspace.bucket_seq_len >= max_seq_len
+                and workspace.page_table_token_capacity
+                >= max(item["seq_len"] + item["protected_tail"] for item in prepared)
                 and len(prepared) <= workspace.max_requests
                 and (
                     not self._cross_request_selection_enabled
@@ -3622,6 +3665,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                     [item["request_id"] for item in prepared],
                     [item["round_start"] for item in prepared],
                     [item["seq_len"] for item in prepared],
+                    [item["seq_len"] + item["protected_tail"] for item in prepared],
                 )
             except _FixedScoreStreamMismatch:
                 self._record_fixed_score_runtime(workspace.prewarm_key, "rejected")
@@ -3655,7 +3699,8 @@ class TriAttention(BaseKVCacheCompressionManager):
                 page_ids = self._resolve_page_ids(
                     request,
                     layer,
-                    (item["seq_len"] + tokens_per_block - 1) // tokens_per_block,
+                    (item["seq_len"] + item["protected_tail"] + tokens_per_block - 1)
+                    // tokens_per_block,
                 )
                 if not page_ids:
                     raise RuntimeError(
@@ -3700,6 +3745,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         prompt_len = next(iter(prompt_lens))
         bucket_seq_len = score_workspace.bucket_seq_len
         width = bucket_seq_len - prompt_len
+        protected_tail_lengths = tuple(int(item["protected_tail"]) for item in prepared)
         actual_backends = {
             self._selection_backend_for(seq_len - prompt_len, self.top_B) for seq_len in seq_lens
         }
@@ -3708,6 +3754,12 @@ class TriAttention(BaseKVCacheCompressionManager):
         expected_backend = next(iter(actual_backends))
         if (
             max(seq_lens) > bucket_seq_len
+            or max(seq_len + tail for seq_len, tail in zip(seq_lens, protected_tail_lengths))
+            > score_workspace.page_table_token_capacity
+            or any(
+                tail < 0 or tail > self._configured_protected_tail_capacity()
+                for tail in protected_tail_lengths
+            )
             or min(seq_len - prompt_len for seq_len in seq_lens) <= self.top_B
             or selection_workspace.eviction_mode != self.eviction_mode
             or selection_workspace.selection_backend != expected_backend
@@ -3720,7 +3772,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         if min(score_workspace.max_requests, selection_workspace.max_requests) < request_count:
             return None
         return (
-            "triattention.standalone-eviction-graph.bucket.v3",
+            "triattention.standalone-eviction-graph.bucket.v4",
             self.eviction_mode,
             prewarm_key,
             request_count,
@@ -3731,6 +3783,8 @@ class TriAttention(BaseKVCacheCompressionManager):
             selection_workspace.dense_layers,
             selection_workspace.num_query_heads,
             selection_workspace.num_kv_heads,
+            protected_tail_lengths,
+            score_workspace.page_table_token_capacity,
         )
 
     def _record_standalone_graph_runtime(self, outcome: str, request_count: int) -> None:
@@ -3766,6 +3820,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         seq_len: int,
         prompt_len: int,
         swa_window: Optional[int],
+        protected_tail_lengths: List[int],
     ):
         cache = self._standalone_graph_cache_for()
         workspace = cache.workspace_for(key)
@@ -3798,6 +3853,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             decode_keep_count=self.top_B,
             swa_window=swa_window,
             arena_generation=self._standalone_graph_arena_generation,
+            protected_tail_lengths=protected_tail_lengths,
         )
         return workspace
 
@@ -3863,6 +3919,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 seq_len=seq_len,
                 prompt_len=prompt_len,
                 swa_window=swa_window,
+                protected_tail_lengths=[item["protected_tail"] for item in prepared],
             )
             fingerprint = workspace.pointer_fingerprint(stream)
         except (RuntimeError, ValueError) as exc:
@@ -3959,7 +4016,12 @@ class TriAttention(BaseKVCacheCompressionManager):
             "runtime": dict(self._standalone_graph_runtime_counts),
         }
 
-    def _evict_requests(self, evict_reqs, num_layers: int) -> List[Tuple[int, int]]:
+    def _evict_requests(
+        self,
+        evict_reqs,
+        num_layers: int,
+        protected_tail_lengths: Optional[Dict[int, int]] = None,
+    ) -> List[Tuple[int, int]]:
         """Score and compact requests, returning ``(request_id, capacity)`` targets.
 
         Only full-attention layers participate in scoring. For kernel-masked SWA
@@ -3968,6 +4030,9 @@ class TriAttention(BaseKVCacheCompressionManager):
         """
         from .triattention_kernels import fixed_perhead_segment_views
 
+        if protected_tail_lengths is None:
+            protected_tail_lengths = {}
+        protected_tail_capacity = self._configured_protected_tail_capacity()
         mgr = self.kv_cache_manager
         get_buffers = mgr.get_buffers
         global_layers = self._local_to_global_layers(num_layers)
@@ -4001,6 +4066,12 @@ class TriAttention(BaseKVCacheCompressionManager):
                 if seq_len <= self._minimum_evictable_length(request, seq_len):
                     continue
                 expected_keep_count = self._minimum_evictable_length(request, seq_len)
+                protected_tail = int(protected_tail_lengths.get(rid, 0))
+                if protected_tail < 0 or protected_tail > protected_tail_capacity:
+                    raise RuntimeError(
+                        f"Request {rid} protected tail {protected_tail} exceeds "
+                        f"configured capacity {protected_tail_capacity}"
+                    )
                 swa_source = None
                 swa_destination = None
                 if swa_layers:
@@ -4015,6 +4086,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                         "seq_len": int(seq_len),
                         "round_start": float(round_start),
                         "expected_keep_count": expected_keep_count,
+                        "protected_tail": protected_tail,
                         "swa_source": swa_source,
                         "swa_destination": swa_destination,
                     }
@@ -4065,67 +4137,6 @@ class TriAttention(BaseKVCacheCompressionManager):
     # ------------------------------------------------------------------ #
     # V2-manager cache access + physical eviction (HND physical layout)  #
     # ------------------------------------------------------------------ #
-
-    def _rebase_protected_tail(
-        self,
-        request: "LlmRequest",
-        *,
-        source_start: int,
-        destination_start: int,
-        token_count: int,
-    ) -> None:
-        """Move an in-flight speculative suffix without inspecting its tokens.
-
-        Native speculative acceptance and V2 rewind run before this hook. The
-        remaining suffix belongs to the next forward, which overlap scheduling
-        has already enqueued. It is outside TriAttention's selection domain, but
-        shrinking the confirmed prefix changes its ordinal. Rebase the suffix
-        identically for every target layer before releasing tail pages.
-        """
-        if token_count <= 0 or source_start == destination_start:
-            return
-        if min(source_start, destination_start) < 0:
-            raise ValueError("protected-tail offsets must be non-negative")
-
-        from .triattention_kernels import cpp_sparse_compact
-
-        num_layers = self._num_layers_from_manager()
-        source = None
-        destination = None
-        source_end = source_start + token_count
-        for local_layer in range(num_layers):
-            global_layer = self._global_layer_id(local_layer, num_layers)
-            pool = self.kv_cache_manager.get_buffers(global_layer, kv_layout="HND")
-            if pool is None:
-                raise RuntimeError(f"Missing KV pool for protected-tail layer {global_layer}")
-            tokens_per_block = int(pool.shape[3])
-            page_count = (source_end + tokens_per_block - 1) // tokens_per_block
-            page_ids = self._resolve_page_ids(request, local_layer, page_count)
-            if not page_ids:
-                raise RuntimeError(
-                    f"Missing KV page ids for protected tail of request "
-                    f"{request.py_request_id}, layer {global_layer}"
-                )
-            if source is None:
-                source = torch.arange(
-                    source_start,
-                    source_end,
-                    dtype=torch.long,
-                    device=pool.device,
-                )
-                destination = torch.arange(
-                    destination_start,
-                    destination_start + token_count,
-                    dtype=torch.long,
-                    device=pool.device,
-                )
-            cpp_sparse_compact(
-                pool,
-                [torch.as_tensor(page_ids, dtype=torch.long, device=pool.device)],
-                [source],
-                [source_end],
-                dest_list=[destination],
-            )
 
     def _resolve_page_ids(
         self,

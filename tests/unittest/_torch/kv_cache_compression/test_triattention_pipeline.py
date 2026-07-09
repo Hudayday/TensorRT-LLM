@@ -856,7 +856,7 @@ class TestStepEndHookRefactor:
             mgr._periodic_evict(batch)
 
         ensure_buckets.assert_called_once_with([(request, 7)], 2)
-        evict.assert_called_once_with([(request, 7)], 2)
+        evict.assert_called_once_with([(request, 7)], 2, protected_tail_lengths={7: 0})
         event.record.assert_called_once_with()
         event.synchronize.assert_called_once_with()
         cache.resize.assert_called_once_with(1024 + 4096, None)
@@ -918,7 +918,11 @@ class TestStepEndHookRefactor:
         ):
             mgr._periodic_evict(batch)
 
-        evict.assert_called_once_with([(request_a, 7), (request_b, 8), (request_c, 9)], 2)
+        evict.assert_called_once_with(
+            [(request_a, 7), (request_b, 8), (request_c, 9)],
+            2,
+            protected_tail_lengths={7: 0, 8: 0, 9: 0},
+        )
         mgr.kv_cache_manager.kv_cache_map[7].resize.assert_called_once_with(1024 + 4096, None)
         cache_b.resize.assert_called_once_with(1024 + 4096, None)
         cache_c.resize.assert_called_once_with(1024 + 4096, None)
@@ -958,7 +962,11 @@ class TestStepEndHookRefactor:
         ):
             mgr._periodic_evict(batch)
 
-        evict.assert_called_once_with([(request_a, 7), (request_b, 8)], 2)
+        evict.assert_called_once_with(
+            [(request_a, 7), (request_b, 8)],
+            2,
+            protected_tail_lengths={7: 0, 8: 0},
+        )
 
     def test_resize_failure_is_reported(self):
         from unittest import mock
@@ -979,7 +987,7 @@ class TestStepEndHookRefactor:
         event.synchronize.assert_called_once_with()
 
     @pytest.mark.parametrize("accepted", [0, 1, 2, 3])
-    def test_overlap_exact_allocation_tail_is_excluded_rebased_and_retained(self, accepted):
+    def test_overlap_tail_is_excluded_from_selection_and_passed_to_graph(self, accepted):
         from unittest import mock
 
         from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
@@ -1003,55 +1011,13 @@ class TestStepEndHookRefactor:
         with (
             mock.patch.object(mgr, "_ensure_configured_graph_buckets"),
             mock.patch.object(mgr, "_evict_requests", return_value=[(7, retained)]) as evict,
-            mock.patch.object(mgr, "_rebase_protected_tail") as rebase,
             mock.patch.object(torch.cuda, "Event", return_value=event),
         ):
             mgr._periodic_evict(batch)
 
-        evict.assert_called_once_with([(request, 7)], 2)
+        evict.assert_called_once_with([(request, 7)], 2, protected_tail_lengths={7: tail})
         assert mgr._confirmed_kv_lengths[7] == retained
-        rebase.assert_called_once_with(
-            request,
-            source_start=confirmed,
-            destination_start=retained,
-            token_count=tail,
-        )
         cache.resize.assert_called_once_with(retained + tail, None)
-
-    @CUDA_REQUIRED
-    def test_protected_tail_rebase_preserves_exact_cross_page_bytes(self):
-        tokens_per_block = 4
-        pool = torch.arange(
-            3 * 2 * 1 * tokens_per_block * 2,
-            dtype=torch.float32,
-            device="cuda",
-        ).view(3, 2, 1, tokens_per_block, 2)
-        manager = _make_fake_v2()
-        manager.pp_layers = [0]
-        manager.get_buffers = lambda layer, kv_layout: pool
-        manager.get_batch_cache_indices = lambda request_ids, layer, num_blocks_per_seq: [[0, 1, 2]]
-        triattention = TriAttention(manager, top_B=2, skip_swa=False)
-        source_start = 6
-        destination_start = 3
-        token_count = 5
-        before = pool.permute(1, 2, 0, 3, 4).contiguous().reshape(2, 1, 3 * tokens_per_block, 2)
-        expected = before[:, :, source_start : source_start + token_count].clone()
-
-        triattention._rebase_protected_tail(
-            _make_request(7),
-            source_start=source_start,
-            destination_start=destination_start,
-            token_count=token_count,
-        )
-        torch.cuda.synchronize()
-
-        after = pool.permute(1, 2, 0, 3, 4).contiguous().reshape(2, 1, 3 * tokens_per_block, 2)
-        torch.testing.assert_close(
-            after[:, :, destination_start : destination_start + token_count],
-            expected,
-            rtol=0,
-            atol=0,
-        )
 
     def test_confirmed_length_comes_from_capacity_ledger_not_logical_length(self):
         from unittest import mock
@@ -1376,6 +1342,8 @@ class TestStepEndHookRefactor:
             pp_layers=[0, 1],
             layer_offsets={0: 0, 1: 1},
             layer_to_pool_mapping_dict={0: 0, 1: 1},
+            num_extra_kv_tokens=0,
+            _kv_reserve_draft_tokens=0,
         )
         request = _make_request(7, py_prompt_len=2, max_beam_num_tokens=999)
         mgr = _make_triattention()
@@ -1425,6 +1393,7 @@ class TestStepEndHookRefactor:
         assert item["seq_len"] == 8
         assert item["round_start"] == 13.0
         assert item["expected_keep_count"] == 6
+        assert item["protected_tail"] == 0
         assert item["swa_source"].tolist() == [6, 7]
         assert item["swa_destination"].tolist() == [4, 5]
         mgr._attach_page_ids.assert_called_once()
@@ -1439,6 +1408,8 @@ class TestStepEndHookRefactor:
             pp_layers=[0, 1],
             layer_offsets={0: 0, 1: 1},
             layer_to_pool_mapping_dict={0: 10, 1: 20},
+            num_extra_kv_tokens=0,
+            _kv_reserve_draft_tokens=0,
         )
         mgr._evicted = {}
         mgr._confirmed_kv_lengths = {7: 8}
@@ -1782,6 +1753,7 @@ class TestFixedScoreMetadata:
         workspace.global_representatives = (10,)
         workspace.page_count = 2
         workspace.bucket_seq_len = 8
+        workspace.page_table_token_capacity = 8
         workspace.tokens_per_block = 4
         stream = object()
         get_batch = mock.Mock(return_value=[[7, -1]])
@@ -1812,6 +1784,7 @@ class TestFixedScoreMetadata:
         workspace.global_representatives = (10,)
         workspace.page_count = 3
         workspace.bucket_seq_len = 12
+        workspace.page_table_token_capacity = 12
         workspace.tokens_per_block = 4
         workspace.page_ids_host = torch.empty((1, 2, 3), dtype=torch.int64)
         workspace.round_starts_host = torch.empty(2, dtype=torch.float32)
@@ -1825,7 +1798,13 @@ class TestFixedScoreMetadata:
         get_batch = mock.Mock(return_value=[[10, 11], [20, 21, 22]])
 
         with mock.patch.object(torch.cuda, "current_stream", return_value=stream):
-            assert workspace.stage(get_batch, [42, 43], [8.0, 9.0], [5, 9])
+            assert workspace.stage(
+                get_batch,
+                [42, 43],
+                [8.0, 9.0],
+                [5, 9],
+                [7, 11],
+            )
 
         get_batch.assert_called_once_with([42, 43], 10, num_blocks_per_seq=[2, 3])
         assert workspace.page_ids_host.tolist() == [[[10, 11, 11], [20, 21, 22]]]
@@ -1934,6 +1913,7 @@ class TestFixedScoreMetadata:
             max_requests=8,
             prompt_len=2,
             bucket_seq_len=10,
+            page_table_token_capacity=11,
             matches=mock.Mock(return_value=True),
             prewarm_key=("bucket",),
         )
@@ -1945,6 +1925,7 @@ class TestFixedScoreMetadata:
             {
                 "request": SimpleNamespace(py_prompt_len=2),
                 "seq_len": 8 + request_index % 3,
+                "protected_tail": 0,
             }
             for request_index in range(request_count)
         ]
@@ -1982,6 +1963,7 @@ class TestFixedScoreMetadata:
         workspace.global_representatives = (10,)
         workspace.page_count = 2
         workspace.bucket_seq_len = 8
+        workspace.page_table_token_capacity = 8
         workspace.tokens_per_block = 4
         workspace.page_ids_host = torch.empty((1, 8, 2), dtype=torch.int64)
         workspace.round_starts_host = torch.empty(8, dtype=torch.float32)
@@ -2050,6 +2032,7 @@ class TestFixedScoreMetadata:
                 "request_id": 7,
                 "round_start": 8.0,
                 "seq_len": 8,
+                "protected_tail": 2,
             }
         ]
 
@@ -2062,7 +2045,7 @@ class TestFixedScoreMetadata:
                 global_layers=[0],
                 workspace=workspace,
             )
-        workspace.stage.assert_called_once_with(manager.kv_cache_manager, [7], [8.0], [8])
+        workspace.stage.assert_called_once_with(manager.kv_cache_manager, [7], [8.0], [8], [10])
         manager._resolve_page_ids.assert_not_called()
         assert manager._fixed_score_runtime_counts[("bucket",)]["rejected"] == 1
 
@@ -2082,6 +2065,7 @@ class TestFixedScoreMetadata:
         workspace.global_representatives = (0,)
         workspace.page_count = 1
         workspace.bucket_seq_len = 4
+        workspace.page_table_token_capacity = 4
         workspace.tokens_per_block = 4
         buffer = mock.MagicMock()
         buffer.__getitem__.return_value = buffer
@@ -2154,12 +2138,14 @@ class TestFixedScoreMetadata:
                 "request_id": 7,
                 "round_start": 8.0,
                 "seq_len": 8,
+                "protected_tail": 2,
             },
             {
                 "request": SimpleNamespace(),
                 "request_id": 8,
                 "round_start": 9.0,
                 "seq_len": 9,
+                "protected_tail": 3,
             },
         ]
 
@@ -2174,7 +2160,11 @@ class TestFixedScoreMetadata:
 
         assert result
         workspace.stage.assert_called_once_with(
-            manager.kv_cache_manager, [7, 8], [8.0, 9.0], [8, 9]
+            manager.kv_cache_manager,
+            [7, 8],
+            [8.0, 9.0],
+            [8, 9],
+            [10, 12],
         )
         manager._resolve_page_ids.assert_not_called()
         assert manager._fixed_score_runtime_counts[("bucket",)]["hit"] == 1
@@ -2195,8 +2185,9 @@ class TestFixedScoreMetadata:
 
         device = torch.device("cuda")
         max_requests = 8
-        page_count = 2
+        page_count = 3
         seq_len = 7
+        page_table_token_capacity = 11
         layer_elements = max_requests * page_count * 2 * 1 * 4 * 4
         shared = torch.randn(2 * layer_elements, device=device)
         pools = [
@@ -2232,7 +2223,11 @@ class TestFixedScoreMetadata:
             freq,
             offsets,
             omega,
+            page_table_token_capacity=page_table_token_capacity,
         )
+        assert workspace.bucket_seq_len == seq_len
+        assert workspace.page_table_token_capacity == page_table_token_capacity
+        assert workspace.page_count == page_count
         assert workspace.offsets.dtype == torch.float32
         assert workspace.offsets.is_contiguous()
         assert workspace.omega.dtype == torch.float32
@@ -2242,9 +2237,16 @@ class TestFixedScoreMetadata:
             assert calibration.dtype == torch.float32
             assert calibration.is_contiguous()
         tables = {
-            10: [[2 * request, 2 * request + 1] for request in range(request_count)],
-            12: [[2 * request + 1, 2 * request] for request in range(request_count)],
-            13: [[15 - 2 * request, 14 - 2 * request] for request in range(request_count)],
+            10: [
+                [3 * request, 3 * request + 1, 3 * request + 2] for request in range(request_count)
+            ],
+            12: [
+                [3 * request + 2, 3 * request + 1, 3 * request] for request in range(request_count)
+            ],
+            13: [
+                [23 - 3 * request, 22 - 3 * request, 21 - 3 * request]
+                for request in range(request_count)
+            ],
         }
 
         def get_batch_side_effect(request_ids, layer, num_blocks_per_seq=None):
@@ -2255,7 +2257,13 @@ class TestFixedScoreMetadata:
         request_ids = list(range(request_count))
         round_starts = [float(9 + request) for request in request_ids]
 
-        assert workspace.stage(get_batch, request_ids, round_starts)
+        assert workspace.stage(
+            get_batch,
+            request_ids,
+            round_starts,
+            [seq_len] * request_count,
+            [10] * request_count,
+        )
         torch.cuda.current_stream(device).synchronize()
         for slot, global_layer in enumerate((10, 12, 13)):
             expected = torch.tensor(tables[global_layer], dtype=torch.int64, device=device)
@@ -2831,9 +2839,7 @@ class TestFixedScoreMetadata:
                 dst[pool_id, :num_seqs, 0, : len(pages)] = page_offsets
 
         cache = SimpleNamespace(
-            host_kv_cache_block_offsets=torch.empty(
-                3, 8, 2, 2, dtype=torch.int32, pin_memory=True
-            ),
+            host_kv_cache_block_offsets=torch.empty(3, 8, 2, 2, dtype=torch.int32, pin_memory=True),
             kv_factor=2,
             layer_offsets=layer_offsets,
             layer_to_pool_mapping_dict=layer_to_pool,
@@ -3135,6 +3141,7 @@ class TestFixedUnionWorkspace:
                                 "seq_len": 64 + decode_width,
                                 "request": request,
                                 "expected_keep_count": 192,
+                                "protected_tail": 0,
                             }
                         )
                         request_id += 1
@@ -3254,11 +3261,19 @@ class TestFixedUnionWorkspace:
             prompt_len=1024,
         )
 
-        assert native[0] == "triattention.fixed-prewarm.v5"
+        assert native[0] == "triattention.fixed-prewarm.v6"
         assert native[9] == "fixed_union.cute_dsl_topk"
         assert eager[9] == "fixed_union.cute_dsl_topk"
         assert fixed[9] == "fixed_union.cute_dsl_topk"
-        assert native[11:17] == (1024 + 4095, 1024, 2048, 4, 4095, "union")
+        assert native[11:18] == (
+            1024 + 4095,
+            1,
+            1024,
+            2048,
+            4,
+            4095,
+            "union",
+        )
         assert native != eager
 
     @staticmethod
@@ -3277,6 +3292,8 @@ class TestFixedUnionWorkspace:
             get_buffers=lambda layer, **kwargs: pools[layer],
             layer_offsets={0: 0, 1: 1},
             layer_to_pool_mapping_dict={0: 0, 1: 0},
+            num_extra_kv_tokens=0,
+            _kv_reserve_draft_tokens=0,
         )
         manager.top_B = 4
         manager._H = 2
@@ -4287,11 +4304,7 @@ class TestFixedUnionWorkspace:
                     py_prompt_len=prompt_len,
                 )
 
-                with (
-                    _mock_cute_topk_without_fallbacks()
-                    if device.type == "cpu"
-                    else nullcontext()
-                ):
+                with _mock_cute_topk_without_fallbacks() if device.type == "cpu" else nullcontext():
                     fixed_keep = fixed_manager._evict_modes(
                         request,
                         2,
@@ -4371,11 +4384,7 @@ class TestFixedUnionWorkspace:
             allocate_segment_buffers=True,
         )
 
-        with (
-            _mock_cute_topk_without_fallbacks()
-            if device.type == "cpu"
-            else nullcontext()
-        ):
+        with _mock_cute_topk_without_fallbacks() if device.type == "cpu" else nullcontext():
             fixed = workspace.select_segments(
                 segments,
                 normalize_scores=False,
@@ -4576,9 +4585,7 @@ class TestCrossRequestFixedUnionWorkspace:
         stage3_plan = self._stage3_plan(17, "cute_dsl_topk", max_requests=3)
         manager = self._manager()
         manager._fixed_shape_selection_prewarm_states = {key: "ready"}
-        manager._prewarm_cross_request_selection_bucket(
-            key, stage3_plan, (0,), stage3_plan.rows, 1
-        )
+        manager._prewarm_cross_request_selection_bucket(key, stage3_plan, (0,), stage3_plan.rows, 1)
 
         with (
             _mock_cute_topk_without_fallbacks(),
@@ -4641,9 +4648,7 @@ class TestCrossRequestFixedUnionWorkspace:
         manager._fixed_shape_selection_prewarm_states = {key: "ready"}
         manager._fixed_shape_selection_workspaces = {key: stage3_bank}
         manager._fixed_shape_selection_runtime_counts = {}
-        manager._prewarm_cross_request_selection_bucket(
-            key, stage3_plan, (0,), stage3_plan.rows, 1
-        )
+        manager._prewarm_cross_request_selection_bucket(key, stage3_plan, (0,), stage3_plan.rows, 1)
         manager._build_cross_request_selection_workspace = mock.Mock(
             side_effect=torch.cuda.OutOfMemoryError("sealed Stage4 bank")
         )
@@ -4662,9 +4667,7 @@ class TestCrossRequestFixedUnionWorkspace:
 
         manager._cross_request_selection_materialization_state = "pending"
         manager._materialize_cross_request_selection_banks()
-        manager._prewarm_cross_request_selection_bucket(
-            key, stage3_plan, (0,), stage3_plan.rows, 1
-        )
+        manager._prewarm_cross_request_selection_bucket(key, stage3_plan, (0,), stage3_plan.rows, 1)
 
         assert manager._build_cross_request_selection_workspace.call_count == 1
         assert manager._cross_request_selection_prewarm_states[key] == "failed"
@@ -4912,6 +4915,7 @@ class TestCrossRequestFixedUnionWorkspace:
         import contextlib
 
         import tensorrt_llm._torch.kv_cache_compression.triattention.triattention as tri_module
+
         requests = [_make_request(request_id, py_prompt_len=2) for request_id in (7, 8)]
         key = ("cross-request",)
         selection = SimpleNamespace(
@@ -4980,6 +4984,7 @@ class TestCrossRequestFixedUnionWorkspace:
                 "request_id": request.py_request_id,
                 "seq_len": 8,
                 "expected_keep_count": 6,
+                "protected_tail": 0,
             }
             for request in requests
         ]

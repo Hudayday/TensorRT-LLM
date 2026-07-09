@@ -711,6 +711,9 @@ class TestStandaloneGraphBuckets:
         selection.num_query_heads = 1
         selection.num_kv_heads = 1
         score.bucket_seq_len = selection.prompt_len + selection.width
+        score.page_table_token_capacity = (
+            score.bucket_seq_len + manager._configured_protected_tail_capacity()
+        )
         score.valid_seq_lens_device = torch.full(
             (score.max_requests,),
             score.bucket_seq_len,
@@ -748,6 +751,7 @@ class TestStandaloneGraphBuckets:
                 "seq_len": prompt_len + width,
                 "request": SimpleNamespace(py_prompt_len=prompt_len),
                 "expected_keep_count": prompt_len + budget,
+                "protected_tail": 0,
             }
             for _ in range(request_count)
         ]
@@ -797,6 +801,7 @@ class TestStandaloneGraphBuckets:
             prewarm_key=("per-head", eviction_mode),
             max_requests=2,
             bucket_seq_len=14,
+            page_table_token_capacity=15,
         )
         manager._fixed_score_prewarm_states = {score.prewarm_key: "ready"}
         manager._fixed_score_workspaces = {score.prewarm_key: score}
@@ -807,6 +812,7 @@ class TestStandaloneGraphBuckets:
                 "seq_len": 14,
                 "request": SimpleNamespace(py_prompt_len=2),
                 "expected_keep_count": 10,
+                "protected_tail": 0,
             }
             for _ in range(2)
         ]
@@ -815,7 +821,7 @@ class TestStandaloneGraphBuckets:
 
         assert key is not None
         assert key[1] == eviction_mode
-        assert key[8:] == ((2,), 2, 1)
+        assert key[8:11] == ((2,), 2, 1)
 
     def test_different_valid_lengths_share_one_upper_bucket(self):
         manager = _make_triattention()
@@ -826,6 +832,7 @@ class TestStandaloneGraphBuckets:
                 "seq_len": seq_len,
                 "request": SimpleNamespace(py_prompt_len=2),
                 "expected_keep_count": 10,
+                "protected_tail": 0,
             }
             for seq_len in (11, 13)
         ]
@@ -844,6 +851,42 @@ class TestStandaloneGraphBuckets:
         assert key is not None
         assert key[3:8] == (2, 14, 2, 8, "cute_dsl_topk")
 
+    def test_protected_tail_geometry_is_explicit_in_graph_key(self):
+        manager = _make_triattention()
+        manager.top_B = 8
+        manager.kv_cache_manager._kv_reserve_draft_tokens = 3
+        manager._standalone_cuda_graph_enabled = True
+        score = SimpleNamespace(prewarm_key=("tail",), max_requests=8)
+        selection = SimpleNamespace(
+            selection_backend="cute_dsl_topk",
+            max_requests=8,
+            prompt_len=2,
+            width=12,
+            keep_count=8,
+        )
+        self._mark_ready(manager, score, selection)
+
+        def prepared(tails):
+            return [
+                {
+                    "seq_len": 14,
+                    "request": SimpleNamespace(py_prompt_len=2),
+                    "expected_keep_count": 10,
+                    "protected_tail": tail,
+                }
+                for tail in tails
+            ]
+
+        first = manager._standalone_graph_bucket_for(prepared([1, 3]), score, selection)
+        same = manager._standalone_graph_bucket_for(prepared([1, 3]), score, selection)
+        different = manager._standalone_graph_bucket_for(prepared([2, 2]), score, selection)
+
+        assert first == same
+        assert first is not None
+        assert first != different
+        assert first[-2:] == ((1, 3), 18)
+        assert manager._standalone_graph_bucket_for(prepared([1, 5]), score, selection) is None
+
     def test_old_backend_boundary_shares_one_cute_upper_bucket(self):
         manager = _make_triattention()
         manager.top_B = 2048
@@ -853,6 +896,7 @@ class TestStandaloneGraphBuckets:
                 "seq_len": width,
                 "request": SimpleNamespace(py_prompt_len=0),
                 "expected_keep_count": 2048,
+                "protected_tail": 0,
             }
             for width in (4095, 4096)
         ]
@@ -906,6 +950,7 @@ class TestStandaloneGraphBuckets:
                     "seq_len": prompt_len + width,
                     "request": SimpleNamespace(py_prompt_len=prompt_len),
                     "expected_keep_count": prompt_len + budget,
+                    "protected_tail": 0,
                 }
                 for width in widths
             ]
@@ -953,6 +998,7 @@ class TestStandaloneGraphBuckets:
                     "seq_len": prompt_len + width,
                     "request": SimpleNamespace(py_prompt_len=prompt_len),
                     "expected_keep_count": prompt_len + budget,
+                    "protected_tail": 0,
                 }
                 for width in valid_widths
             ]
@@ -998,6 +1044,7 @@ class TestStandaloneGraphBuckets:
                 "seq_len": prompt_len + width,
                 "request": SimpleNamespace(py_prompt_len=prompt_len),
                 "expected_keep_count": prompt_len + budget,
+                "protected_tail": 0,
             }
             for _ in range(request_count)
         ]
@@ -1023,11 +1070,13 @@ class TestStandaloneGraphBuckets:
                 "seq_len": 5119,
                 "request": SimpleNamespace(py_prompt_len=1024),
                 "expected_keep_count": 3072,
+                "protected_tail": 0,
             },
             {
                 "seq_len": 5375,
                 "request": SimpleNamespace(py_prompt_len=1280),
                 "expected_keep_count": 3328,
+                "protected_tail": 0,
             },
         ]
         score = SimpleNamespace(prewarm_key=("mixed",), max_requests=32)
@@ -1075,6 +1124,7 @@ class TestStandaloneGraphBuckets:
                 "seq_len": 5119,
                 "request": SimpleNamespace(py_prompt_len=1024),
                 "expected_keep_count": 3072,
+                "protected_tail": 0,
             }
         ]
 
@@ -1117,6 +1167,7 @@ class TestStandaloneGraphBuckets:
                 "request_id": 7,
                 "seq_len": 3328,
                 "expected_keep_count": 2304,
+                "protected_tail": 0,
             }
         ]
         score_output = torch.zeros(1, 3328)
@@ -1224,6 +1275,7 @@ class TestStandaloneGraphBuckets:
                 "request_id": 7,
                 "seq_len": 9215,
                 "expected_keep_count": 5120,
+                "protected_tail": 0,
             }
         ]
         score = SimpleNamespace(prewarm_key=("formal-a-first",), max_requests=8)
@@ -1285,6 +1337,7 @@ class TestStandaloneGraphBuckets:
                 "request_id": 7,
                 "seq_len": 9215,
                 "expected_keep_count": 5120,
+                "protected_tail": 0,
             }
         ]
         stream = SimpleNamespace(device=torch.device("cpu"), cuda_stream=9)
@@ -1360,9 +1413,9 @@ class TestFixedBatchedCompactionWorkspace:
             torch.zeros(4, 2, 1, 4, 2),
         ]
         score = SimpleNamespace(
-            page_count=2,
+            page_count=3,
             representative_slots={0: 0, 1: 1},
-            page_ids_device=torch.tensor([[[3, 1]], [[2, 0]]], dtype=torch.int64),
+            page_ids_device=torch.tensor([[[3, 1, 0]], [[2, 0, 1]]], dtype=torch.int64),
             valid_seq_lens_device=torch.tensor([8], dtype=torch.int32),
         )
         selection = SimpleNamespace(
@@ -1390,6 +1443,7 @@ class TestFixedBatchedCompactionWorkspace:
             decode_keep_count=4,
             swa_window=2,
             arena_generation=1,
+            protected_tail_lengths=[2],
         )
 
         with mock.patch(
@@ -1398,12 +1452,14 @@ class TestFixedBatchedCompactionWorkspace:
             workspace.launch()
 
         assert run.call_count == 2
-        assert workspace.cpp_indices.tolist() == [[0, 1, 2, 4, 5, 7]]
-        assert workspace.cpp_page_tables[0][1].tolist() == [[3, 1]]
-        assert workspace.cpp_page_tables[1][1].tolist() == [[2, 0]]
-        assert workspace.swa_source.tolist() == [6, 7]
-        assert workspace.swa_indices.tolist() == [[6, 7]]
-        assert workspace.swa_destination.tolist() == [4, 5]
+        assert workspace.cpp_indices.tolist() == [[0, 1, 2, 4, 5, 7, 8, 9]]
+        assert workspace.cpp_offsets.tolist() == [0, 8]
+        assert workspace.cpp_page_tables[0][1].tolist() == [[3, 1, 0]]
+        assert workspace.cpp_page_tables[1][1].tolist() == [[2, 0, 1]]
+        assert workspace.swa_source.tolist() == [6, 7, 8, 9]
+        assert workspace.swa_indices.tolist() == [[6, 7, 8, 9]]
+        assert workspace.swa_destination.tolist() == [4, 5, 6, 7]
+        assert run.call_args_list[0].args[-1] is None
 
     @pytest.mark.parametrize("eviction_mode", ["per_head", "per_layer_perhead"])
     def test_mode_specific_keep_sets_are_packed_per_layer_and_head(self, eviction_mode):
@@ -1485,6 +1541,135 @@ class TestFixedBatchedCompactionWorkspace:
                     .reshape(num_kv_heads, -1)
                 )
             assert torch.equal(actual, expected)
+
+    def test_ragged_protected_tails_are_appended_to_each_request_segment(self):
+        request_count = 2
+        pool = torch.zeros(8, 2, 1, 4, 2)
+        score = SimpleNamespace(
+            representative_slots={0: 0},
+            page_ids_device=torch.tensor([[[0, 1, 2], [3, 4, 5]]], dtype=torch.int64),
+            valid_seq_lens_device=torch.tensor([8, 9], dtype=torch.int32),
+        )
+        selection = SimpleNamespace(
+            eviction_mode="union",
+            dense_layers=(0,),
+            num_kv_heads=1,
+            max_requests=request_count,
+            prompt_len=1,
+            keep_count=2,
+            width=8,
+            keep=torch.tensor([[0, 2, 7], [0, 3, 8]], dtype=torch.int32),
+        )
+        workspace = FixedBatchedCompactionWorkspace(
+            eviction_mode="union",
+            layer_pools=[pool],
+            dense_layers=[0],
+            swa_layers=[],
+            layer_group_representative={0: 0},
+            global_layers=[0],
+            score_workspace=score,
+            selection_workspace=selection,
+            request_count=request_count,
+            seq_len=9,
+            prompt_len=1,
+            decode_keep_count=2,
+            swa_window=None,
+            arena_generation=1,
+            protected_tail_lengths=[1, 3],
+        )
+
+        with mock.patch(
+            "tensorrt_llm._torch.kv_cache_compression.triattention.cuda_graph._run_cpp_compact"
+        ) as run:
+            workspace.launch()
+
+        assert run.call_count == 1
+        assert workspace.cpp_offsets.tolist() == [0, 4, 10]
+        assert workspace.cpp_indices.tolist() == [[0, 2, 7, 8, 0, 3, 8, 9, 10, 11]]
+        assert run.call_args.args[-1] is None
+
+    @CUDA_REQUIRED
+    def test_graph_compaction_preserves_ragged_protected_tail_bytes(self):
+        device = torch.device("cuda")
+        request_count = 2
+        num_heads = 2
+        tokens_per_block = 4
+        head_dim = 16
+        page_table = torch.tensor(
+            [[2, 0, 3, 1], [6, 4, 7, 5]],
+            dtype=torch.int64,
+            device=device,
+        )
+        values = torch.arange(
+            8 * 2 * num_heads * tokens_per_block * head_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        pool = values.view(8, 2, num_heads, tokens_per_block, head_dim)
+        before = self._logical_tokens(pool.clone(), page_table)
+        seq_lens = [10, 11]
+        tail_lengths = [2, 3]
+        keep = torch.tensor(
+            [[0, 1, 3, 6, 9], [0, 1, 4, 8, 10]],
+            dtype=torch.int32,
+            device=device,
+        )
+        score = SimpleNamespace(
+            representative_slots={0: 0},
+            page_ids_device=page_table.view(1, request_count, -1),
+            valid_seq_lens_device=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+        )
+        selection = SimpleNamespace(
+            eviction_mode="union",
+            dense_layers=(0,),
+            num_kv_heads=num_heads,
+            max_requests=request_count,
+            prompt_len=2,
+            keep_count=3,
+            width=9,
+            keep=keep,
+        )
+        workspace = FixedBatchedCompactionWorkspace(
+            eviction_mode="union",
+            layer_pools=[pool],
+            dense_layers=[0],
+            swa_layers=[],
+            layer_group_representative={0: 0},
+            global_layers=[0],
+            score_workspace=score,
+            selection_workspace=selection,
+            request_count=request_count,
+            seq_len=11,
+            prompt_len=2,
+            decode_keep_count=3,
+            swa_window=None,
+            arena_generation=1,
+            protected_tail_lengths=tail_lengths,
+        )
+
+        workspace.launch()
+        torch.cuda.synchronize()
+        after = self._logical_tokens(pool, page_table)
+
+        for request_index, (seq_len, tail_length) in enumerate(zip(seq_lens, tail_lengths)):
+            source = torch.cat(
+                (
+                    keep[request_index].to(torch.long),
+                    torch.arange(
+                        seq_len,
+                        seq_len + tail_length,
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                )
+            )
+            expected = before[request_index].index_select(2, source)
+            torch.testing.assert_close(
+                after[request_index, :, :, : source.numel()],
+                expected,
+                rtol=0,
+                atol=0,
+            )
 
     @staticmethod
     def _logical_tokens(pool, page_table):
@@ -1984,9 +2169,7 @@ class TestStandaloneGraphCuda:
 
         def build():
             pools = [pool.clone() for pool in initial_pools]
-            q_real = (
-                torch.arange(8, dtype=torch.float32, device=device).view(2, 4, 1) + 1.0
-            ) / 8.0
+            q_real = (torch.arange(8, dtype=torch.float32, device=device).view(2, 4, 1) + 1.0) / 8.0
             q_imag = q_real.flip(1) * 0.25
             mlr = torch.full_like(q_real, 0.125)
             score = _FixedScoreMetadataWorkspace(
@@ -2043,8 +2226,12 @@ class TestStandaloneGraphCuda:
             ]
 
             def stage(round_shift=0, reverse_pages=False):
-                tables = [list(reversed(row)) if reverse_pages else list(row) for row in base_tables]
-                round_starts = [float(seq_len + round_shift + request * 11) for request in request_ids]
+                tables = [
+                    list(reversed(row)) if reverse_pages else list(row) for row in base_tables
+                ]
+                round_starts = [
+                    float(seq_len + round_shift + request * 11) for request in request_ids
+                ]
                 assert score.stage(
                     lambda _ids, _layer, num_blocks_per_seq=None: tables,
                     request_ids,
@@ -2230,12 +2417,14 @@ class TestStandaloneGraphCuda:
             device=device,
         )
         valid_seq_lens = torch.tensor([8, 7], dtype=torch.int32, device=device)
+        protected_tail_lengths = [2, 1]
+        page_ids_device = torch.stack((dense_tables, swa_tables))
 
         def build(pools):
             score = SimpleNamespace(
                 page_count=page_count,
                 representative_slots={0: 0, 1: 1},
-                page_ids_device=torch.stack((dense_tables, swa_tables)),
+                page_ids_device=page_ids_device,
                 valid_seq_lens_device=valid_seq_lens,
             )
             selection = SimpleNamespace(
@@ -2245,7 +2434,7 @@ class TestStandaloneGraphCuda:
                 max_requests=request_count,
                 prompt_len=2,
                 keep_count=4,
-                width=6,
+                width=7,
                 keep=keep.clone(),
                 selection_backend="cute_dsl_topk",
                 named_tensors=lambda: (),
@@ -2260,65 +2449,103 @@ class TestStandaloneGraphCuda:
                 score_workspace=score,
                 selection_workspace=selection,
                 request_count=request_count,
-                seq_len=8,
+                seq_len=9,
                 prompt_len=2,
                 decode_keep_count=4,
                 swa_window=2,
                 arena_generation=1,
+                protected_tail_lengths=protected_tail_lengths,
             )
 
         eager_pools = [pool.clone() for pool in base_pools]
         graph_pools = [pool.clone() for pool in base_pools]
         graphed = build(graph_pools)
-        cpp_sparse_compact(
-            eager_pools[0],
-            [dense_tables[request] for request in range(request_count)],
-            [keep[request] for request in range(request_count)],
-            valid_seq_lens.tolist(),
-        )
-        swa_sources = [
-            torch.arange(
-                int(valid_seq_len) - 2,
-                int(valid_seq_len),
-                dtype=torch.int64,
-                device=device,
-            )
-            for valid_seq_len in valid_seq_lens
-        ]
-        swa_destination = torch.tensor([4, 5], dtype=torch.int64, device=device)
-        cpp_sparse_compact(
-            eager_pools[1],
-            [swa_tables[request] for request in range(request_count)],
-            swa_sources,
-            valid_seq_lens.tolist(),
-            dest_list=[swa_destination] * request_count,
-        )
         cache = StandaloneEvictionGraphCache(max_entries=1, max_bytes=1024**3)
-        assert (
-            cache.execute(
-                key=("swa",),
+
+        for replay, round_seq_lens in enumerate(((8, 7), (9, 8))):
+            round_dense_tables = dense_tables.flip(1) if replay else dense_tables
+            round_swa_tables = swa_tables.flip(1) if replay else swa_tables
+            round_pools = [pool + replay * 10_000.0 for pool in base_pools]
+            for eager_pool, graph_pool, round_pool in zip(eager_pools, graph_pools, round_pools):
+                eager_pool.copy_(round_pool)
+                graph_pool.copy_(round_pool)
+            page_ids_device.copy_(torch.stack((round_dense_tables, round_swa_tables)))
+            valid_seq_lens.copy_(torch.tensor(round_seq_lens, dtype=torch.int32, device=device))
+
+            dense_sources = []
+            swa_sources = []
+            swa_destinations = []
+            physical_seq_lens = []
+            for request, (seq_len, tail_length) in enumerate(
+                zip(round_seq_lens, protected_tail_lengths)
+            ):
+                protected_tail = torch.arange(
+                    seq_len,
+                    seq_len + tail_length,
+                    dtype=torch.int64,
+                    device=device,
+                )
+                dense_sources.append(torch.cat((keep[request], protected_tail)))
+                swa_sources.append(
+                    torch.arange(
+                        seq_len - 2,
+                        seq_len + tail_length,
+                        dtype=torch.int64,
+                        device=device,
+                    )
+                )
+                swa_destinations.append(
+                    torch.arange(
+                        4,
+                        6 + tail_length,
+                        dtype=torch.int64,
+                        device=device,
+                    )
+                )
+                physical_seq_lens.append(seq_len + tail_length)
+
+            cpp_sparse_compact(
+                eager_pools[0],
+                [round_dense_tables[request] for request in range(request_count)],
+                dense_sources,
+                physical_seq_lens,
+            )
+            cpp_sparse_compact(
+                eager_pools[1],
+                [round_swa_tables[request] for request in range(request_count)],
+                swa_sources,
+                physical_seq_lens,
+                dest_list=swa_destinations,
+            )
+            assert cache.execute(
+                key=("swa-with-protected-tail",),
                 request_count=request_count,
-                fingerprint=("swa",),
+                fingerprint=("swa-with-protected-tail",),
                 workspace=graphed,
                 capture_body=graphed.launch,
-            )
-            == "capture"
-        )
-        torch.cuda.synchronize(device)
+            ) == ("capture" if replay == 0 else "replay")
+            torch.cuda.synchronize(device)
 
-        for eager_pool, graph_pool in zip(eager_pools, graph_pools):
-            assert torch.equal(eager_pool.view(torch.uint8), graph_pool.view(torch.uint8))
-        for request in range(request_count):
-            dense_ids = dense_tables[request]
-            swa_ids = swa_tables[request]
-            dense_before = base_pools[0][dense_ids].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
-            dense_after = graph_pools[0][dense_ids].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
-            swa_before = base_pools[1][swa_ids].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
-            swa_after = graph_pools[1][swa_ids].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
-            assert torch.equal(dense_after[:, :, :2], dense_before[:, :, :2])
-            assert torch.equal(swa_after[:, :, :2], swa_before[:, :, :2])
-            valid_seq_len = int(valid_seq_lens[request])
-            assert torch.equal(
-                swa_after[:, :, 4:6],
-                swa_before[:, :, valid_seq_len - 2 : valid_seq_len],
-            )
+            for eager_pool, graph_pool in zip(eager_pools, graph_pools):
+                assert torch.equal(eager_pool.view(torch.uint8), graph_pool.view(torch.uint8))
+            for request in range(request_count):
+                dense_ids = round_dense_tables[request]
+                swa_ids = round_swa_tables[request]
+                dense_before = round_pools[0][dense_ids].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
+                dense_after = graph_pools[0][dense_ids].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
+                swa_before = round_pools[1][swa_ids].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
+                swa_after = graph_pools[1][swa_ids].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
+                assert torch.equal(dense_after[:, :, :2], dense_before[:, :, :2])
+                assert torch.equal(swa_after[:, :, :2], swa_before[:, :, :2])
+                assert torch.equal(
+                    dense_after[:, :, : dense_sources[request].numel()],
+                    dense_before.index_select(2, dense_sources[request]),
+                )
+                assert torch.equal(
+                    swa_after.index_select(2, swa_destinations[request]),
+                    swa_before.index_select(2, swa_sources[request]),
+                )
+
+        assert cache.snapshot()["capture"] == 1
+        assert cache.snapshot()["cache_hit"] == 1
+        assert cache.snapshot()["rejected"] == 0
