@@ -1,40 +1,36 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""TRT-LLM attention metadata support for paged draft KV length domains."""
+"""TRT-LLM attention metadata for independent target and draft KV lengths."""
 
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Sequence, Tuple, Type
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionBackend, AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._utils import prefer_pinned
 
-_ATTENTION_BACKEND_ENABLED_KEY = "kv_cache_compression_attention_backend_enabled"
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig, SpeculativeConfig
 
 
-def configure_kv_cache_compression_attention_backend(
-    model_config: Any,
-    *,
-    enabled: bool,
-) -> None:
-    """Publish the internal backend choice through shared model config state."""
-    model_config.extra_attrs[_ATTENTION_BACKEND_ENABLED_KEY] = enabled
-
-
-def requires_kv_cache_compression_attention_backend(
-    compression_config: Any,
-    spec_config: Any,
+def requires_kv_cache_compression_attention_metadata(
+    compression_config: "KvCacheCompressionConfig | None",
+    spec_config: "SpeculativeConfig | None",
 ) -> bool:
-    """Whether compression needs the paged-draft KV length adapter."""
-    if compression_config is None or compression_config.algorithm != "triattention":
-        return False
-    return requires_paged_draft_kv_length_domain(spec_config)
+    """Return whether target compression creates a paged draft length domain."""
+    return (
+        compression_config is not None
+        and compression_config.adjusts_generation_kv_length
+        and requires_paged_draft_kv_length_domain(spec_config)
+    )
 
 
-def requires_paged_draft_kv_length_domain(spec_config: Any) -> bool:
+def requires_paged_draft_kv_length_domain(
+    spec_config: "SpeculativeConfig | None",
+) -> bool:
     """Whether a separate draft KVCM feeds standard paged attention.
 
     These modes execute their draft model through the regular attention stack,
@@ -57,36 +53,36 @@ def requires_paged_draft_kv_length_domain(spec_config: Any) -> bool:
     )
 
 
-def is_kv_cache_compression_attention_backend_enabled(model_config: Any) -> bool:
-    """Read the explicit model-construction contract."""
-    return bool(model_config.extra_attrs.get(_ATTENTION_BACKEND_ENABLED_KEY, False))
-
-
-def get_model_kv_cache_compression_attention_backend(
-    model_config: Any,
-    backend: Type[AttentionBackend],
-) -> Type[AttentionBackend]:
-    """Return the configured module/metadata backend for one model config."""
-    if not is_kv_cache_compression_attention_backend_enabled(model_config):
-        return backend
-    return get_kv_cache_compression_attention_backend(backend)
+def get_kv_cache_compression_attention_metadata(
+    compression_config: "KvCacheCompressionConfig | None",
+    spec_config: "SpeculativeConfig | None",
+    metadata_cls: type[AttentionMetadata],
+) -> type[AttentionMetadata]:
+    """Select metadata that tracks independent target and draft KV lengths."""
+    if not requires_kv_cache_compression_attention_metadata(
+        compression_config, spec_config
+    ):
+        return metadata_cls
+    if metadata_cls is not TrtllmAttentionMetadata:
+        raise ValueError("KV cache compression currently requires TRTLLM attention")
+    return KVCacheCompressionTrtllmAttentionMetadata
 
 
 @dataclass(kw_only=True)
 class KVCacheCompressionTrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Select graph-stable KV lengths for the currently active KVCM."""
 
-    draft_kv_length_delta: Optional[List[int]] = None
-    draft_kv_length_delta_cuda: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
-    draft_kv_length_delta_cpu: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
-    draft_kv_lens_cuda_runtime: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
-    draft_kv_lens_runtime: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
-    target_kv_lens_cuda_runtime: Optional[torch.Tensor] = field(
+    draft_kv_length_delta: list[int] | None = None
+    draft_kv_length_delta_cuda: torch.Tensor | None = field(default=None, init=False, repr=False)
+    draft_kv_length_delta_cpu: torch.Tensor | None = field(default=None, init=False, repr=False)
+    draft_kv_lens_cuda_runtime: torch.Tensor | None = field(default=None, init=False, repr=False)
+    draft_kv_lens_runtime: torch.Tensor | None = field(default=None, init=False, repr=False)
+    target_kv_lens_cuda_runtime: torch.Tensor | None = field(
         default=None, init=False, repr=False
     )
-    target_kv_lens_runtime: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
-    target_host_total_kv_lens: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
-    draft_host_total_kv_lens: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
+    target_kv_lens_runtime: torch.Tensor | None = field(default=None, init=False, repr=False)
+    target_host_total_kv_lens: torch.Tensor | None = field(default=None, init=False, repr=False)
+    draft_host_total_kv_lens: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def _post_init_with_buffers(self, buffers) -> None:
         super()._post_init_with_buffers(buffers)
@@ -215,6 +211,11 @@ class KVCacheCompressionTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.draft_host_total_kv_lens[0].add_(delta[: self.num_contexts].sum())
         self.draft_host_total_kv_lens[1].add_(delta[self.num_contexts : batch_size].sum())
 
+    def on_kv_cache_manager_changed(self) -> None:
+        """Select lengths for the active target or draft KV cache manager."""
+        super().on_kv_cache_manager_changed()
+        self.activate_kv_length_domain()
+
     def activate_kv_length_domain(self) -> None:
         use_draft = (
             self.draft_kv_length_delta is not None
@@ -240,41 +241,9 @@ class KVCacheCompressionTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.host_total_kv_lens = self.target_host_total_kv_lens
 
 
-class KVCacheCompressionTrtllmAttention(TrtllmAttention):
-    Metadata = KVCacheCompressionTrtllmAttentionMetadata
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: KVCacheCompressionTrtllmAttentionMetadata,
-        forward_args: Optional[AttentionForwardArgs] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        metadata.activate_kv_length_domain()
-        try:
-            return super().forward(q, k, v, metadata, forward_args, **kwargs)
-        finally:
-            metadata.restore_target_kv_length_domain()
-
-
-def get_kv_cache_compression_attention_backend(
-    backend: Type[AttentionBackend],
-) -> Type[AttentionBackend]:
-    """Wrap standard TRT-LLM attention with the compression metadata contract."""
-    if backend is not TrtllmAttention:
-        raise ValueError("KV cache compression currently requires TRTLLM attention")
-    return KVCacheCompressionTrtllmAttention
-
-
 __all__ = [
-    "KVCacheCompressionTrtllmAttention",
     "KVCacheCompressionTrtllmAttentionMetadata",
-    "configure_kv_cache_compression_attention_backend",
-    "get_kv_cache_compression_attention_backend",
-    "get_model_kv_cache_compression_attention_backend",
-    "is_kv_cache_compression_attention_backend_enabled",
+    "get_kv_cache_compression_attention_metadata",
+    "requires_kv_cache_compression_attention_metadata",
     "requires_paged_draft_kv_length_domain",
-    "requires_kv_cache_compression_attention_backend",
 ]

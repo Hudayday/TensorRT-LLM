@@ -387,17 +387,6 @@ class PyTorchModelEngine(ModelEngine):
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:
-            from ..kv_cache_compression import (
-                is_kv_cache_compression_attention_backend_enabled,
-                requires_kv_cache_compression_attention_backend)
-            if (requires_kv_cache_compression_attention_backend(
-                    llm_args.kv_cache_compression_config, self.spec_config)
-                    and not is_kv_cache_compression_attention_backend_enabled(
-                        model.model_config)):
-                raise ValueError(
-                    "prebuilt models used with speculative KV-cache compression "
-                    "must be constructed with the compression attention backend"
-                )
             self.model = model
         if drafting_loop_wrapper is not None:
             self.model = drafting_loop_wrapper(self.model)
@@ -562,9 +551,12 @@ class PyTorchModelEngine(ModelEngine):
             self.llm_args.attn_backend,
             sparse_attention_config=self.sparse_attention_config)
         from ..kv_cache_compression import \
-            get_model_kv_cache_compression_attention_backend
-        self.attn_backend = get_model_kv_cache_compression_attention_backend(
-            self.model.model_config, self.attn_backend)
+            get_kv_cache_compression_attention_metadata
+        self.attn_metadata_cls = get_kv_cache_compression_attention_metadata(
+            self.llm_args.kv_cache_compression_config,
+            self.spec_config,
+            self.attn_backend.Metadata,
+        )
         self._step_kv_compression_manager = None
 
         self.get_runtime_tokens_per_gen_step = spec_config.get_runtime_tokens_per_gen_step if spec_config is not None else lambda runtime_draft_len: 1
@@ -1224,7 +1216,7 @@ class PyTorchModelEngine(ModelEngine):
     def _run_attention_warmup(self,
                               resource_manager: ResourceManager,
                               can_run_general_warmup: bool = True) -> None:
-        if not issubclass(self.attn_backend.Metadata, TrtllmAttentionMetadata):
+        if not issubclass(self.attn_metadata_cls, TrtllmAttentionMetadata):
             return
 
         @contextlib.contextmanager
@@ -2079,7 +2071,7 @@ class PyTorchModelEngine(ModelEngine):
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
                 or self.attn_runtime_features.chunked_prefill)
-        cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
+        cache_indirection = self.cache_indirection_attention if self.attn_metadata_cls is TrtllmAttentionMetadata else None
         num_attention_heads = getattr(self.model.model_config.pretrained_config,
                                       'num_attention_heads', None)
         config = self.model.model_config.pretrained_config
@@ -2097,7 +2089,7 @@ class PyTorchModelEngine(ModelEngine):
         else:
             num_heads_per_kv = 1
 
-        metadata_cls = self.attn_backend.Metadata
+        metadata_cls = self.attn_metadata_cls
         sparse_metadata_params = (
             self.sparse_attention_config.to_sparse_metadata_params(
                 pretrained_config=config)
@@ -5748,7 +5740,7 @@ class PyTorchModelEngine(ModelEngine):
             self.sparse_attention_config.to_sparse_metadata_params(
                 pretrained_config=self.model.model_config.pretrained_config)
             if self.sparse_attention_config is not None else None)
-        encoder_attn_metadata = self.attn_backend.Metadata(
+        encoder_attn_metadata = self.attn_metadata_cls(
             max_num_requests=self.batch_size,
             max_num_tokens=self.max_num_tokens,
             max_num_sequences=self.batch_size * self.max_beam_width,
