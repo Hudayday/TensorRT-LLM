@@ -1137,6 +1137,7 @@ class TestStandaloneGraphBuckets:
                 swa_layers=[],
                 swa_window=None,
                 layer_group_representative={0: 0},
+                layer_pool_keys=[("pool", 0)],
                 global_layers=[0],
                 score_workspace=None,
                 selection_workspace=None,
@@ -1238,6 +1239,7 @@ class TestStandaloneGraphBuckets:
                 swa_layers=[],
                 swa_window=None,
                 layer_group_representative={0: 0},
+                layer_pool_keys=[("pool", 0)],
                 global_layers=[0],
                 score_workspace=score,
                 selection_workspace=selection,
@@ -1313,6 +1315,7 @@ class TestStandaloneGraphBuckets:
                     swa_layers=[],
                     swa_window=None,
                     layer_group_representative={0: 0},
+                    layer_pool_keys=[("pool", 0)],
                     global_layers=[0],
                     score_workspace=score,
                     selection_workspace=selection,
@@ -1372,6 +1375,7 @@ class TestStandaloneGraphBuckets:
             swa_layers=[],
             swa_window=None,
             layer_group_representative={0: 0},
+            layer_pool_keys=[("pool", 0)],
             global_layers=[0],
             score_workspace=score,
             selection_workspace=selection,
@@ -1447,7 +1451,7 @@ class TestFixedBatchedCompactionWorkspace:
         )
 
         with mock.patch(
-            "tensorrt_llm._torch.kv_cache_compression.triattention.cuda_graph._run_cpp_compact"
+            "tensorrt_llm._torch.kv_cache_compression.triattention.cuda_graph._run_cpp_compact_layers"
         ) as run:
             workspace.launch()
 
@@ -1516,18 +1520,26 @@ class TestFixedBatchedCompactionWorkspace:
             decode_keep_count=decode_keep_count,
             swa_window=None,
             arena_generation=1,
+            layer_pool_keys=[("pool", 0), ("pool", 0)],
         )
         launched_sources = []
 
-        def record_source(_pool, _page_table, source, _offsets, _destination):
-            launched_sources.append(source.clone())
+        def record_source(group, source, _offsets, _destination):
+            if source.ndim == 2:
+                launched_sources.extend(source.clone() for _ in group.layers)
+                return
+            assert group.source_layer_indices is not None
+            launched_sources.extend(
+                source[layer_slot].clone() for layer_slot in group.source_layer_indices.tolist()
+            )
 
         with mock.patch(
-            "tensorrt_llm._torch.kv_cache_compression.triattention.cuda_graph._run_cpp_compact",
+            "tensorrt_llm._torch.kv_cache_compression.triattention.cuda_graph._run_cpp_compact_layers",
             side_effect=record_source,
-        ):
+        ) as run:
             workspace.launch()
 
+        assert run.call_count == 1
         assert len(launched_sources) == len(dense_layers)
         for layer_slot, actual in enumerate(launched_sources):
             if eviction_mode == "per_head":
@@ -1579,7 +1591,7 @@ class TestFixedBatchedCompactionWorkspace:
         )
 
         with mock.patch(
-            "tensorrt_llm._torch.kv_cache_compression.triattention.cuda_graph._run_cpp_compact"
+            "tensorrt_llm._torch.kv_cache_compression.triattention.cuda_graph._run_cpp_compact_layers"
         ) as run:
             workspace.launch()
 
@@ -1856,6 +1868,7 @@ class TestFixedBatchedCompactionWorkspace:
         workspace.dense_layers = ()
         workspace.swa_layers = ()
         workspace.global_layers = ()
+        workspace.layer_pool_keys = ()
         workspace.storage_groups = ()
         workspace.arena_generation = 1
         workspace.layer_pools = ()
@@ -1887,12 +1900,14 @@ class TestFixedBatchedCompactionWorkspace:
         workspace.dense_layers = (0,)
         workspace.swa_layers = ()
         workspace.global_layers = (0,)
+        workspace.layer_pool_keys = (("layer", 0),)
         workspace.storage_groups = ((0, 0),)
 
         runtime = dict(
             dense_layers=[0],
             swa_layers=[],
             layer_group_representative={0: 0},
+            layer_pool_keys=[("layer", 0)],
             global_layers=[0],
             score_workspace=score_workspace,
             selection_workspace=selection_workspace,

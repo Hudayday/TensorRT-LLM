@@ -22,7 +22,7 @@ request bookkeeping, and KV-cache resize remain on the host path.
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -50,19 +50,32 @@ def _unique_tensor_nbytes(tensors: Iterable[torch.Tensor]) -> int:
     return sum(storages.values())
 
 
-def _run_cpp_compact(
-    pool: torch.Tensor,
-    page_table: torch.Tensor,
+class _CppCompactGroup(NamedTuple):
+    """Stable tensors for one multi-layer compact launch."""
+
+    layers: Tuple[int, ...]
+    pools: Tuple[torch.Tensor, ...]
+    page_tables: Tuple[torch.Tensor, ...]
+    pool_pointers: torch.Tensor
+    page_table_pointers: torch.Tensor
+    source_layer_indices: Optional[torch.Tensor]
+
+
+def _run_cpp_compact_layers(
+    group: _CppCompactGroup,
     source: torch.Tensor,
     offsets: torch.Tensor,
     destination: Optional[torch.Tensor],
 ) -> None:
-    """Issue the sole physical-compaction op used by a graph workspace."""
-    torch.ops.trtllm.sparse_kv_cache_compact(
-        pool,
-        page_table,
+    """Compact one uniform layer group with one CUDA kernel launch."""
+    torch.ops.trtllm.sparse_kv_cache_compact_layers(
+        list(group.pools),
+        group.pool_pointers,
+        list(group.page_tables),
+        group.page_table_pointers,
         source,
         offsets,
+        group.source_layer_indices,
         destination,
     )
 
@@ -93,6 +106,7 @@ class FixedBatchedCompactionWorkspace:
         swa_window: Optional[int],
         arena_generation: int,
         protected_tail_lengths: Optional[List[int]] = None,
+        layer_pool_keys: Optional[List[object]] = None,
     ) -> None:
         if eviction_mode not in ("union", "per_head", "per_layer_perhead"):
             raise ValueError(f"unsupported graph compaction mode: {eviction_mode}")
@@ -135,6 +149,11 @@ class FixedBatchedCompactionWorkspace:
         self.dense_layers = tuple(int(layer) for layer in dense_layers)
         self.swa_layers = tuple(int(layer) for layer in swa_layers)
         self.global_layers = tuple(int(layer) for layer in global_layers)
+        if layer_pool_keys is None:
+            layer_pool_keys = [("layer", layer) for layer in range(len(layer_pools))]
+        if len(layer_pool_keys) != len(layer_pools):
+            raise ValueError("fixed graph pool keys must match the layer-pool count")
+        self.layer_pool_keys = tuple(layer_pool_keys)
         self.storage_groups = tuple(
             (int(layer), int(layer_group_representative[layer])) for layer in dense_layers
         )
@@ -142,8 +161,8 @@ class FixedBatchedCompactionWorkspace:
         self.score_workspace = score_workspace
         self.layer_pools = tuple(layer_pools)
 
-        # C++ only: one sparse_kv_cache_compact op per layer. Fixed-shape int32
-        # buffers make page-table staging, index staging, and the op graph-safe.
+        # Fixed-shape buffers let each uniform V2 pool group compact all of its
+        # layers with one graph-safe C++ operation.
         first_dense_pool = layer_pools[self.dense_layers[0]]
         cpp_num_kv_heads = int(first_dense_pool.shape[2]) if first_dense_pool.ndim == 5 else -1
         supported_pools = all(
@@ -168,9 +187,13 @@ class FixedBatchedCompactionWorkspace:
         for count in move_counts:
             move_offsets.append(move_offsets[-1] + count)
         self._move_offsets = tuple(move_offsets)
+        cpp_index_shape = (
+            (len(self.dense_layers), cpp_num_kv_heads, move_offsets[-1])
+            if self.eviction_mode == "per_layer_perhead"
+            else (cpp_num_kv_heads, move_offsets[-1])
+        )
         self.cpp_indices = torch.empty(
-            cpp_num_kv_heads,
-            move_offsets[-1],
+            cpp_index_shape,
             dtype=torch.int32,
             device=self.device,
         )
@@ -192,7 +215,6 @@ class FixedBatchedCompactionWorkspace:
             device=self.device,
         )
         self.cpp_page_tables = {}
-        self.cpp_dense_ops = []
 
         def page_table_for(representative: int) -> torch.Tensor:
             if representative not in self.cpp_page_tables:
@@ -217,16 +239,21 @@ class FixedBatchedCompactionWorkspace:
                 )
             return self.cpp_page_tables[representative][1]
 
-        for layer in self.dense_layers:
-            representative = layer_group_representative[layer]
-            self.cpp_dense_ops.append((layer_pools[layer], page_table_for(representative)))
+        dense_entries = [
+            (
+                layer,
+                layer_pools[layer],
+                page_table_for(layer_group_representative[layer]),
+            )
+            for layer in self.dense_layers
+        ]
 
         self.swa_source = None
         self.swa_indices = None
         self.swa_destination = None
         self.swa_offsets = None
         self.swa_source_offsets = None
-        self.cpp_swa_ops = []
+        swa_entries = []
         if self.swa_layers:
             if swa_window is None or swa_window <= 0 or self.keep_count < swa_window:
                 raise ValueError("fixed graph SWA compaction requires a valid retained window")
@@ -269,7 +296,57 @@ class FixedBatchedCompactionWorkspace:
                 device=self.device,
             )
             for layer in self.swa_layers:
-                self.cpp_swa_ops.append((layer_pools[layer], page_table_for(layer)))
+                swa_entries.append((layer, layer_pools[layer], page_table_for(layer)))
+
+        dense_slot_by_layer = {layer: slot for slot, layer in enumerate(self.dense_layers)}
+
+        def compact_groups(entries, mode: str) -> Tuple[_CppCompactGroup, ...]:
+            grouped = OrderedDict()
+            for layer, pool, page_table in entries:
+                key = (
+                    self.layer_pool_keys[layer],
+                    mode,
+                    str(pool.dtype),
+                    str(pool.device),
+                    tuple(int(value) for value in pool.shape[1:]),
+                    tuple(int(value) for value in page_table.shape),
+                )
+                grouped.setdefault(key, []).append((layer, pool, page_table))
+
+            result = []
+            for group_entries in grouped.values():
+                layers = tuple(entry[0] for entry in group_entries)
+                pools = tuple(entry[1] for entry in group_entries)
+                page_tables = tuple(entry[2] for entry in group_entries)
+                source_layer_indices = None
+                if mode == "dense" and self.eviction_mode == "per_layer_perhead":
+                    source_layer_indices = torch.tensor(
+                        [dense_slot_by_layer[layer] for layer in layers],
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                result.append(
+                    _CppCompactGroup(
+                        layers=layers,
+                        pools=pools,
+                        page_tables=page_tables,
+                        pool_pointers=torch.tensor(
+                            [pool.data_ptr() for pool in pools],
+                            dtype=torch.int64,
+                            device=self.device,
+                        ),
+                        page_table_pointers=torch.tensor(
+                            [page_table.data_ptr() for page_table in page_tables],
+                            dtype=torch.int64,
+                            device=self.device,
+                        ),
+                        source_layer_indices=source_layer_indices,
+                    )
+                )
+            return tuple(result)
+
+        self.cpp_dense_groups = compact_groups(dense_entries, "dense")
+        self.cpp_swa_groups = compact_groups(swa_entries, "swa")
 
         owned_tensors = [
             self.cpp_indices,
@@ -277,6 +354,10 @@ class FixedBatchedCompactionWorkspace:
             self.protected_tail_offsets,
             self.protected_tail_source,
         ]
+        for group in (*self.cpp_dense_groups, *self.cpp_swa_groups):
+            owned_tensors.extend((group.pool_pointers, group.page_table_pointers))
+            if group.source_layer_indices is not None:
+                owned_tensors.append(group.source_layer_indices)
         if self.swa_source_offsets is not None:
             owned_tensors.extend(
                 (
@@ -322,14 +403,10 @@ class FixedBatchedCompactionWorkspace:
             self.swa_indices.copy_(self.swa_source.reshape(1, -1).expand(self.cpp_num_kv_heads, -1))
         for source_pages, staged_i32 in self.cpp_page_tables.values():
             staged_i32.copy_(source_pages)
-        if self.eviction_mode != "per_layer_perhead":
-            self._stage_dense_indices(0)
-        for layer_slot, (pool, page_table) in enumerate(self.cpp_dense_ops):
-            if self.eviction_mode == "per_layer_perhead":
-                self._stage_dense_indices(layer_slot)
-            _run_cpp_compact(
-                pool,
-                page_table,
+        self._stage_dense_indices()
+        for group in self.cpp_dense_groups:
+            _run_cpp_compact_layers(
+                group,
                 self.cpp_indices,
                 self.cpp_offsets,
                 None,
@@ -337,16 +414,15 @@ class FixedBatchedCompactionWorkspace:
         if self.swa_indices is not None:
             assert self.swa_offsets is not None
             assert self.swa_destination is not None
-            for pool, page_table in self.cpp_swa_ops:
-                _run_cpp_compact(
-                    pool,
-                    page_table,
+            for group in self.cpp_swa_groups:
+                _run_cpp_compact_layers(
+                    group,
                     self.swa_indices,
                     self.swa_offsets,
                     self.swa_destination,
                 )
 
-    def _stage_dense_indices(self, layer_slot: int) -> None:
+    def _stage_dense_indices(self) -> None:
         """Pack selected prefix and opaque protected tail into one operation."""
         keep = self.selection_workspace.keep[: self.request_count]
         per_layer = None
@@ -360,19 +436,27 @@ class FixedBatchedCompactionWorkspace:
         uniform_tail = self._uniform_protected_tail_length
         if uniform_tail is not None:
             move_count = self.keep_count + uniform_tail
-            target = self.cpp_indices.view(
-                self.cpp_num_kv_heads,
-                self.request_count,
-                move_count,
-            )
-            target_keep = target[:, :, : self.keep_count]
-            if self.eviction_mode == "union":
-                target_keep.copy_(keep.view(1, self.request_count, self.keep_count))
-            elif self.eviction_mode == "per_head":
-                target_keep.copy_(keep.permute(1, 0, 2))
-            else:
+            if self.eviction_mode == "per_layer_perhead":
                 assert per_layer is not None
-                target_keep.copy_(per_layer[:, layer_slot].permute(1, 0, 2))
+                target = self.cpp_indices.view(
+                    len(self.dense_layers),
+                    self.cpp_num_kv_heads,
+                    self.request_count,
+                    move_count,
+                )
+                target_keep = target[:, :, :, : self.keep_count]
+                target_keep.copy_(per_layer.permute(1, 2, 0, 3))
+            else:
+                target = self.cpp_indices.view(
+                    self.cpp_num_kv_heads,
+                    self.request_count,
+                    move_count,
+                )
+                target_keep = target[:, :, : self.keep_count]
+                if self.eviction_mode == "union":
+                    target_keep.copy_(keep.view(1, self.request_count, self.keep_count))
+                else:
+                    target_keep.copy_(keep.permute(1, 0, 2))
             if uniform_tail:
                 torch.add(
                     self.score_workspace.valid_seq_lens_device[: self.request_count].view(
@@ -381,36 +465,57 @@ class FixedBatchedCompactionWorkspace:
                     self.protected_tail_offsets[:uniform_tail].view(1, uniform_tail),
                     out=self.protected_tail_source[:, :uniform_tail],
                 )
-                target[:, :, self.keep_count :].copy_(
-                    self.protected_tail_source[:, :uniform_tail]
-                    .view(1, self.request_count, uniform_tail)
-                    .expand(self.cpp_num_kv_heads, self.request_count, uniform_tail)
-                )
+                tail_source = self.protected_tail_source[:, :uniform_tail]
+                if self.eviction_mode == "per_layer_perhead":
+                    target[:, :, :, self.keep_count :].copy_(
+                        tail_source.view(1, 1, self.request_count, uniform_tail).expand(
+                            len(self.dense_layers),
+                            self.cpp_num_kv_heads,
+                            self.request_count,
+                            uniform_tail,
+                        )
+                    )
+                else:
+                    target[:, :, self.keep_count :].copy_(
+                        tail_source.view(1, self.request_count, uniform_tail).expand(
+                            self.cpp_num_kv_heads,
+                            self.request_count,
+                            uniform_tail,
+                        )
+                    )
             return
         for request_index, tail_length in enumerate(self.protected_tail_lengths):
             begin = self._move_offsets[request_index]
             keep_end = begin + self.keep_count
-            target_keep = self.cpp_indices[:, begin:keep_end]
-            if self.eviction_mode == "union":
-                target_keep.copy_(
-                    keep[request_index].view(1, self.keep_count).expand_as(target_keep)
-                )
-            elif self.eviction_mode == "per_head":
-                target_keep.copy_(keep[request_index])
-            else:
+            if self.eviction_mode == "per_layer_perhead":
                 assert per_layer is not None
-                target_keep.copy_(per_layer[request_index, layer_slot])
+                target_keep = self.cpp_indices[:, :, begin:keep_end]
+                target_keep.copy_(per_layer[request_index])
+            else:
+                target_keep = self.cpp_indices[:, begin:keep_end]
+                if self.eviction_mode == "union":
+                    target_keep.copy_(
+                        keep[request_index].view(1, self.keep_count).expand_as(target_keep)
+                    )
+                else:
+                    target_keep.copy_(keep[request_index])
             if tail_length:
                 torch.add(
                     self.score_workspace.valid_seq_lens_device[request_index],
                     self.protected_tail_offsets[:tail_length],
                     out=self.protected_tail_source[request_index, :tail_length],
                 )
-                self.cpp_indices[:, keep_end : keep_end + tail_length].copy_(
-                    self.protected_tail_source[request_index, :tail_length]
-                    .view(1, tail_length)
-                    .expand(self.cpp_num_kv_heads, tail_length)
-                )
+                tail_source = self.protected_tail_source[request_index, :tail_length]
+                if self.eviction_mode == "per_layer_perhead":
+                    self.cpp_indices[:, :, keep_end : keep_end + tail_length].copy_(
+                        tail_source.view(1, 1, tail_length).expand(
+                            len(self.dense_layers), self.cpp_num_kv_heads, tail_length
+                        )
+                    )
+                else:
+                    self.cpp_indices[:, keep_end : keep_end + tail_length].copy_(
+                        tail_source.view(1, tail_length).expand(self.cpp_num_kv_heads, tail_length)
+                    )
 
     def matches_runtime(
         self,
@@ -419,6 +524,7 @@ class FixedBatchedCompactionWorkspace:
         dense_layers: List[int],
         swa_layers: List[int],
         layer_group_representative: Dict[int, int],
+        layer_pool_keys: List[object],
         global_layers: List[int],
         score_workspace,
         selection_workspace,
@@ -431,6 +537,7 @@ class FixedBatchedCompactionWorkspace:
             or tuple(dense_layers) != self.dense_layers
             or tuple(swa_layers) != self.swa_layers
             or tuple(global_layers) != self.global_layers
+            or tuple(layer_pool_keys) != self.layer_pool_keys
             or tuple((int(layer), int(layer_group_representative[layer])) for layer in dense_layers)
             != self.storage_groups
         ):
@@ -488,6 +595,7 @@ class FixedBatchedCompactionWorkspace:
             self.dense_layers,
             self.swa_layers,
             self.global_layers,
+            self.layer_pool_keys,
             self.storage_groups,
             self.selection_workspace.selection_backend,
             self.arena_generation,

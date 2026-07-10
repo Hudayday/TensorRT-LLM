@@ -600,6 +600,7 @@ class _RuntimeKVLayout(NamedTuple):
     storage_groups: Dict[object, List[int]]
     dense_group_representatives: List[int]
     layer_group_representative: Dict[int, int]
+    layer_pool_keys: Tuple[object, ...]
     pool_representatives: Tuple[int, ...]
     pool_view_fingerprint: Tuple[tuple, ...]
 
@@ -1938,8 +1939,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         The compression manager is ordered after KVCacheManagerV2, so capacity
         already reflects the written token and any rewind. The overlap scheduler
         may already have enqueued the next forward; CUDA stream ordering keeps
-        compaction after that reader, and resize happens only after compaction is
-        complete so released pages cannot be reused early.
+        compaction after that reader. Resize detaches the compacted tail without
+        blocking the host; V2's per-slot finish events prevent early page reuse.
         """
         with nvtx_range_debug("triattention.generation_step_end", color="blue"):
             self._periodic_evict(scheduled_batch)
@@ -2066,9 +2067,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                         graph_groups.setdefault(key, []).append((request, rid))
                     capacity_targets = []
                     for group in graph_groups.values():
-                        with nvtx_range_debug(
-                            "triattention.evict_request_group", color="purple"
-                        ):
+                        with nvtx_range_debug("triattention.evict_request_group", color="purple"):
                             capacity_targets.extend(
                                 self._evict_requests(
                                     group,
@@ -2077,9 +2076,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                                 )
                             )
                 else:
-                    with nvtx_range_debug(
-                        "triattention.evict_request_group", color="purple"
-                    ):
+                    with nvtx_range_debug("triattention.evict_request_group", color="purple"):
                         capacity_targets = self._evict_requests(
                             evict_now,
                             num_layers,
@@ -2089,9 +2086,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 # _evict_requests is also a directly testable execution primitive
                 # and publishes its result. The lifecycle hook keeps that result
                 # provisional until compaction synchronization and resize pass.
-                with nvtx_range_debug(
-                    "triattention.restore_provisional_state", color="orange"
-                ):
+                with nvtx_range_debug("triattention.restore_provisional_state", color="orange"):
                     self._evicted.clear()
                     self._evicted.update(evicted_before)
                     self._confirmed_kv_lengths.clear()
@@ -2100,10 +2095,15 @@ class TriAttention(BaseKVCacheCompressionManager):
             capacity_targets = []
         if capacity_targets:
             with nvtx_range("triattention.resize", color="red"):
-                with nvtx_range_debug("triattention.compaction_wait", color="yellow"):
+                with nvtx_range_debug("triattention.compaction_release_order", color="yellow"):
+                    # V2 records a finish event when resize detaches tail pages.
+                    # Reallocated pages retain that event and wait on it in their
+                    # consumer stream, so only stream ordering is required here.
+                    # Avoid a host synchronize while ensuring the V2 release event
+                    # is recorded after compaction when the streams differ.
                     compaction_event = torch.cuda.Event()
                     compaction_event.record()
-                    compaction_event.synchronize()
+                    mgr._stream.wait_event(compaction_event)
                 with nvtx_range_debug("triattention.v2_resize", color="red"):
                     for rid, target_capacity in capacity_targets:
                         kv_cache = mgr.kv_cache_map.get(rid)
@@ -3603,8 +3603,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         if cached is not None:
             if cached.num_layers != num_layers:
                 raise ValueError(
-                    f"TriAttention layer count changed from {cached.num_layers} "
-                    f"to {num_layers}"
+                    f"TriAttention layer count changed from {cached.num_layers} to {num_layers}"
                 )
             if cached.manager is not manager:
                 raise RuntimeError("TriAttention target KV cache manager changed at runtime")
@@ -3628,14 +3627,10 @@ class TriAttention(BaseKVCacheCompressionManager):
             return cached
 
         global_layers = self._local_to_global_layers(num_layers)
-        maybe_layer_pools = [
-            manager.get_buffers(layer, kv_layout="HND") for layer in global_layers
-        ]
+        maybe_layer_pools = [manager.get_buffers(layer, kv_layout="HND") for layer in global_layers]
         if any(pool is None for pool in maybe_layer_pools):
             missing = [
-                layer
-                for layer, pool in zip(global_layers, maybe_layer_pools)
-                if pool is None
+                layer for layer, pool in zip(global_layers, maybe_layer_pools) if pool is None
             ]
             raise RuntimeError(f"Missing KV pools for attention layers {missing}")
         layer_pools = [pool for pool in maybe_layer_pools if pool is not None]
@@ -3649,11 +3644,9 @@ class TriAttention(BaseKVCacheCompressionManager):
             layer: layers[0] for layers in storage_groups.values() for layer in layers
         }
         all_layers = list(range(num_layers))
+        layer_pool_keys = tuple(self._page_table_pool_keys(all_layers, global_layers))
         all_storage_groups: Dict[object, List[int]] = {}
-        for layer, pool_key in zip(
-            all_layers,
-            self._page_table_pool_keys(all_layers, global_layers),
-        ):
+        for layer, pool_key in zip(all_layers, layer_pool_keys):
             all_storage_groups.setdefault(pool_key, []).append(layer)
         pool_representatives = tuple(layers[0] for layers in all_storage_groups.values())
         layout = _RuntimeKVLayout(
@@ -3668,6 +3661,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             storage_groups=storage_groups,
             dense_group_representatives=dense_group_representatives,
             layer_group_representative=layer_group_representative,
+            layer_pool_keys=layer_pool_keys,
             pool_representatives=pool_representatives,
             pool_view_fingerprint=self._pool_view_fingerprint(
                 [layer_pools[layer] for layer in pool_representatives]
@@ -3944,6 +3938,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         dense_layers: List[int],
         swa_layers: List[int],
         layer_group_representative: Dict[int, int],
+        layer_pool_keys: Tuple[object, ...],
         global_layers: List[int],
         score_workspace: _FixedScoreMetadataWorkspace,
         selection_workspace: Union[_BatchedFixedUnionWorkspace, _BatchedFixedPerHeadWorkspace],
@@ -3960,6 +3955,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             dense_layers=dense_layers,
             swa_layers=swa_layers,
             layer_group_representative=layer_group_representative,
+            layer_pool_keys=layer_pool_keys,
             global_layers=global_layers,
             score_workspace=score_workspace,
             selection_workspace=selection_workspace,
@@ -3975,6 +3971,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             dense_layers=dense_layers,
             swa_layers=swa_layers,
             layer_group_representative=layer_group_representative,
+            layer_pool_keys=layer_pool_keys,
             global_layers=global_layers,
             score_workspace=score_workspace,
             selection_workspace=selection_workspace,
@@ -3998,6 +3995,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         swa_layers: List[int],
         swa_window: Optional[int],
         layer_group_representative: Dict[int, int],
+        layer_pool_keys: Tuple[object, ...],
         global_layers: List[int],
         score_workspace: Optional[_FixedScoreMetadataWorkspace],
         selection_workspace: Optional[
@@ -4045,6 +4043,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                     dense_layers=dense_layers,
                     swa_layers=swa_layers,
                     layer_group_representative=layer_group_representative,
+                    layer_pool_keys=layer_pool_keys,
                     global_layers=global_layers,
                     score_workspace=score_workspace,
                     selection_workspace=selection_workspace,
@@ -4179,6 +4178,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             storage_groups = layout.storage_groups
             dense_group_representatives = layout.dense_group_representatives
             layer_group_representative = layout.layer_group_representative
+            layer_pool_keys = layout.layer_pool_keys
 
         # Resolve request length and page metadata before mutating any layer.
         prepared = []
@@ -4254,6 +4254,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 swa_layers=swa_layers,
                 swa_window=swa_window,
                 layer_group_representative=layer_group_representative,
+                layer_pool_keys=layer_pool_keys,
                 global_layers=global_layers,
                 score_workspace=fixed_score_workspace if fixed_score_active else None,
                 selection_workspace=cross_request_selection,

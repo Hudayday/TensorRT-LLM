@@ -1,6 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
- *All rights reserved.
+ * All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +41,21 @@ void invokeSparseKvCacheCompactV2(T* pool, int32_t const* pageTable, int32_t max
     int32_t const* sparseKvIndices, int32_t const* sparseKvOffsets, int32_t const* destinationIndices,
     bool destinationPerHead, int32_t batchSize, int32_t numKvHeads, int32_t tokensPerBlock, int32_t headDim,
     cudaStream_t stream);
+
+//! Multi-layer variant of invokeSparseKvCacheCompactV2. All layers must share
+//! the same batch, KV-head, block, and head-dimension geometry. The pool and
+//! page-table pointer arrays reside on the device so CUDA Graph replay launches
+//! one kernel for the complete layer group without rebuilding host metadata.
+//! Source indices are either shared by all layers (sourceLayerStride == 0) or
+//! separated by sourceLayerStride elements. sourceLayerIndices maps each group
+//! layer to its row in a larger per-layer source tensor. Destination strides use
+//! the same convention and are ignored when destinationIndices is null.
+template <typename T>
+void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int64_t const* pageTablePointers,
+    int32_t numLayers, int32_t maxPagesPerSeq, int32_t const* sparseKvIndices, int32_t const* sourceLayerIndices,
+    int64_t sourceLayerStride, int32_t const* sparseKvOffsets, int32_t const* destinationIndices,
+    int64_t destinationLayerStride, int64_t destinationHeadStride, int32_t batchSize, int32_t numKvHeads,
+    int32_t tokensPerBlock, int32_t headDim, cudaStream_t stream);
 
 } // namespace kernels
 

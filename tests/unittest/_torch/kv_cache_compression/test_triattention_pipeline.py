@@ -833,7 +833,9 @@ class TestStepEndHookRefactor:
         timeline = []
         event = mock.Mock()
         event.record.side_effect = lambda: timeline.append("event")
-        event.synchronize.side_effect = lambda: timeline.append("sync")
+        mgr.kv_cache_manager._stream.wait_event.side_effect = lambda _: timeline.append(
+            "stream_wait"
+        )
         cache = mgr.kv_cache_manager.kv_cache_map[7]
 
         def compact(*args, protected_tail_lengths):
@@ -865,14 +867,15 @@ class TestStepEndHookRefactor:
         ensure_buckets.assert_called_once_with([(request, 7)], 2)
         evict.assert_called_once_with([(request, 7)], 2, protected_tail_lengths={7: 0})
         event.record.assert_called_once_with()
-        event.synchronize.assert_called_once_with()
+        event.synchronize.assert_not_called()
+        mgr.kv_cache_manager._stream.wait_event.assert_called_once_with(event)
         cache.resize.assert_called_once_with(1024 + 4096, None)
         assert timeline == [
             "ensure_graph_buckets",
             "stage5_dispatch",
             "enter:triattention.resize",
             "event",
-            "sync",
+            "stream_wait",
             "exit:triattention.resize",
         ]
 
@@ -993,7 +996,8 @@ class TestStepEndHookRefactor:
             with pytest.raises(RuntimeError, match="Failed to resize compacted KV cache"):
                 mgr._periodic_evict(batch)
 
-        event.synchronize.assert_called_once_with()
+        event.synchronize.assert_not_called()
+        mgr.kv_cache_manager._stream.wait_event.assert_called_once_with(event)
 
     @pytest.mark.parametrize("accepted", [0, 1, 2, 3])
     def test_overlap_tail_is_excluded_from_selection_and_passed_to_graph(self, accepted):
@@ -5146,6 +5150,7 @@ class TestCrossRequestFixedUnionWorkspace:
                 swa_layers=[],
                 swa_window=None,
                 layer_group_representative={0: 0, 1: 1},
+                layer_pool_keys=(("pool", 0), ("pool", 1)),
                 global_layers=[0, 1],
                 score_workspace=score_workspace,
                 selection_workspace=selection,
