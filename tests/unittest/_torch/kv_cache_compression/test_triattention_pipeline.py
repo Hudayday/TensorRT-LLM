@@ -1728,7 +1728,7 @@ class TestStepEndHookRefactor:
         assert captured["selection_workspace"] is selection_workspace
         assert captured["dense_layers"] == [1]
         assert captured["swa_layers"] == [0]
-        assert captured["dense_groups"] == [[1]]
+        assert mgr._fixed_score_workspace_for.call_args.args[2] == [[1]]
         item = captured["prepared"][0]
         assert item.request is request
         assert item.request_id == 7
@@ -2734,7 +2734,7 @@ class TestFixedScoreMetadata:
             staging_offset=0,
         )
         assert manager._fixed_score_runtime_counts[("bucket",)]["hit"] == 1
-        assert all("page_ids" not in item for item in prepared)
+        assert all(not hasattr(item, "page_ids") for item in prepared)
 
     @pytest.mark.parametrize("request_count", [1, 7, 8])
     @CUDA_REQUIRED
@@ -3705,6 +3705,7 @@ class TestGraphPrewarm:
             get_buffers=lambda layer, **kwargs: pools[layer],
             layer_offsets={0: 0, 1: 1},
             layer_to_pool_mapping_dict={0: 0, 1: 0},
+            max_batch_size=8,
             num_extra_kv_tokens=0,
             _kv_reserve_draft_tokens=0,
         )
@@ -3899,43 +3900,41 @@ class TestCrossRequestFixedUnionWorkspace:
         )
         pointers = _workspace_pointer_snapshot(workspace)
 
-        with (
-            _mock_cute_topk_without_fallbacks(),
-            mock.patch.object(
-                torch,
-                "nonzero",
-                side_effect=AssertionError("cross-request selection must not call nonzero"),
-            ),
-        ):
-            for iteration, request_count in enumerate((1, 7, 8, 1, 7, 8)):
-                workspace.input_scores.fill_(float("nan"))
-                workspace.keep[:, prompt_len:].fill_(-1)
-                request_ids = [iteration * 11 + request for request in range(request_count)]
-                segments_by_request = [
-                    self._segments(request_id, width) for request_id in request_ids
-                ]
+        for iteration, request_count in enumerate((1, 7, 8, 1, 7, 8)):
+            workspace.input_scores.fill_(float("nan"))
+            workspace.keep[:, prompt_len:].fill_(-1)
+            request_ids = [iteration * 11 + request for request in range(request_count)]
+            segments_by_request = [self._segments(request_id, width) for request_id in request_ids]
 
+            with (
+                _mock_cute_topk_without_fallbacks(),
+                mock.patch.object(
+                    torch,
+                    "nonzero",
+                    side_effect=AssertionError("cross-request selection must not call nonzero"),
+                ),
+            ):
                 workspace.select_requests(
                     segments_by_request,
                     normalize_scores=True,
                 )
                 selected = workspace.keep[:request_count].clone()
 
-                for request_index, segments in enumerate(segments_by_request):
-                    reference = _torch_union_keep(
-                        torch.cat(segments),
-                        prompt_len,
-                        keep_count,
-                    )
-                    assert torch.equal(selected[request_index], reference)
+            for request_index, segments in enumerate(segments_by_request):
+                reference = _torch_union_keep(
+                    torch.cat(segments),
+                    prompt_len,
+                    keep_count,
+                )
+                assert torch.equal(selected[request_index], reference)
 
-                if request_count < max_requests:
-                    assert torch.isnan(workspace.input_scores[request_count:]).all()
-                    assert torch.equal(
-                        workspace.keep[request_count:, prompt_len:],
-                        torch.full_like(workspace.keep[request_count:, prompt_len:], -1),
-                    )
-                assert _workspace_pointer_snapshot(workspace) == pointers
+            if request_count < max_requests:
+                assert torch.isnan(workspace.input_scores[request_count:]).all()
+                assert torch.equal(
+                    workspace.keep[request_count:, prompt_len:],
+                    torch.full_like(workspace.keep[request_count:, prompt_len:], -1),
+                )
+            assert _workspace_pointer_snapshot(workspace) == pointers
 
     def test_upper_bucket_masks_padded_scores_and_matches_per_request_reference(self):
         rows = 4
