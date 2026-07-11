@@ -3503,12 +3503,14 @@ class TestGraphPrewarm:
             page_ids_device=mock.Mock(),
             round_starts_device=mock.MagicMock(),
             valid_seq_lens_device=mock.MagicMock(),
+            mean_cos=mock.Mock(),
+            mean_sin=mock.Mock(),
             prepare_phase=mock.Mock(),
             fused_group=SimpleNamespace(
                 launch=mock.Mock(return_value=(torch.zeros(2, seq_len), None))
             ),
         )
-        live_score = SimpleNamespace(prewarm_key=None)
+        live_score = SimpleNamespace(prewarm_key=None, max_requests=8)
         score_views = torch.zeros(2, 1, 1, seq_len)
         selection = SimpleNamespace(
             stage_valid_widths_from_seq_lens=mock.Mock(),
