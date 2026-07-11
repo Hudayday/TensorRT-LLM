@@ -89,46 +89,11 @@ def _build_geometric_offsets(max_length: int, device: torch.device) -> torch.Ten
     return torch.tensor(offsets, device=device, dtype=torch.float32)
 
 
-def _validate_swa_rebase(seq_len: int, keep_count: int, window_size: int) -> None:
-    if window_size <= 0:
-        raise ValueError(f"SWA window size must be positive, got {window_size}")
-    if keep_count < window_size:
-        raise ValueError(
-            f"TriAttention compacted length {keep_count} must be at least the "
-            f"SWA window size {window_size}"
-        )
-    if keep_count > seq_len:
-        raise ValueError(
-            f"TriAttention compacted length {keep_count} exceeds cache length {seq_len}"
-        )
-
-
-def _build_swa_rebase_keep(
-    seq_len: int,
-    keep_count: int,
-    window_size: int,
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    """Return source slots that place the latest SWA window at the new tail."""
-    _validate_swa_rebase(seq_len, keep_count, window_size)
-    prefix = torch.arange(keep_count - window_size, device=device, dtype=torch.long)
-    recent = torch.arange(seq_len - window_size, seq_len, device=device, dtype=torch.long)
-    return torch.cat([prefix, recent])
-
-
-def _build_swa_rebase_copy(
-    seq_len: int,
-    keep_count: int,
-    window_size: int,
-    device: Optional[torch.device] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return the source and destination ranges needed for an SWA rebase."""
-    _validate_swa_rebase(seq_len, keep_count, window_size)
-    source = torch.arange(seq_len - window_size, seq_len, device=device, dtype=torch.long)
-    destination = torch.arange(
-        keep_count - window_size, keep_count, device=device, dtype=torch.long
-    )
-    return source, destination
+def _canonical_device(device: torch.device) -> torch.device:
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
 
 
 def _topk_indices_into(
@@ -173,436 +138,6 @@ def _deterministic_topk_indices_into(
     _topk_indices_into(scores, seq_lens, indices_i32, keep_count)
 
 
-class _FixedUnionWorkspace:
-    """Persistent buffers for one request's fixed-shape union eviction.
-
-    This workspace is intentionally internal and shape-specific. It removes the
-    dynamic ``nonzero`` and temporary allocation chain from the capturable
-    CuTE-DSL route. The caller owns this object for the request lifetime. Exact
-    TopK boundary ties are canonicalized by token index before both row and
-    final union selection, so repeated CUDA Graph replays keep the same token
-    set. Non-finite valid scores remain unsupported.
-    """
-
-    @staticmethod
-    def _canonical_device(device: torch.device) -> torch.device:
-        device = torch.device(device)
-        if device.type == "cuda" and device.index is None:
-            return torch.device("cuda", torch.cuda.current_device())
-        return device
-
-    def _matches_input(self, per_head_scores: torch.Tensor) -> bool:
-        return (
-            tuple(per_head_scores.shape) == (self.rows, self.width)
-            and per_head_scores.dtype == self.dtype
-            and per_head_scores.device == self.device
-        )
-
-    def __init__(
-        self,
-        rows: int,
-        width: int,
-        keep_count: int,
-        prompt_len: int,
-        *,
-        dtype: torch.dtype,
-        device: torch.device,
-        allocate_segment_buffers: bool = False,
-        selection_backend: str = "cute_dsl_topk",
-    ) -> None:
-        if rows <= 0 or width <= keep_count or keep_count <= 0:
-            raise ValueError("fixed union workspace requires rows > 0 and width > keep_count > 0")
-        if selection_backend != "cute_dsl_topk":
-            raise ValueError(f"unsupported fixed union selection backend: {selection_backend}")
-        self.rows = rows
-        self.width = width
-        self.keep_count = keep_count
-        self.prompt_len = prompt_len
-        self.total_keep = prompt_len + keep_count
-        self.dtype = dtype
-        device = self._canonical_device(device)
-        self.device = device
-        self.selection_backend = selection_backend
-        self.selection_only = False
-
-        self.combined = torch.empty(width, dtype=dtype, device=device)
-        self.combined_argmax = torch.empty(width, dtype=torch.long, device=device)
-        self.row_top_indices = torch.empty((rows, keep_count), dtype=torch.long, device=device)
-        self.union_mask = torch.empty(width, dtype=torch.bool, device=device)
-        self.candidates = torch.empty(width, dtype=dtype, device=device)
-        self.final_indices = torch.empty(keep_count, dtype=torch.long, device=device)
-        self.sorted_indices = torch.empty_like(self.final_indices)
-        self.sort_order = torch.empty_like(self.final_indices)
-        self.keep = torch.empty(self.total_keep, dtype=torch.long, device=device)
-        self.keep[:prompt_len].copy_(torch.arange(prompt_len, dtype=torch.long, device=device))
-        self.row_seq_lens = torch.full((rows,), width, dtype=torch.int32, device=device)
-        self.row_top_indices_i32 = torch.empty((rows, keep_count), dtype=torch.int32, device=device)
-        self.token_indices = torch.arange(width, dtype=torch.long, device=device)
-        self.width_sentinel = torch.full((), width, dtype=torch.long, device=device)
-        self.union_physical_indices = torch.empty(width, dtype=torch.long, device=device)
-        self.union_indices_sorted = torch.empty_like(self.union_physical_indices)
-        self.union_sort_order = torch.empty_like(self.union_physical_indices)
-        self.candidate_gather_indices = torch.empty_like(self.union_physical_indices)
-        self.union_count = torch.empty(1, dtype=torch.int32, device=device)
-        self.final_indices_i32 = torch.empty(keep_count, dtype=torch.int32, device=device)
-        self.final_relative_indices = torch.empty_like(self.final_indices)
-        self._compaction_buffers = {}
-        self.prewarm_attempted = False
-        self.prewarmed = False
-        self.prewarm_failed = False
-        self._segment_buffers_prepared = False
-        if allocate_segment_buffers:
-            self.prepare_segment_buffers()
-
-    def prepare_segment_buffers(self) -> None:
-        """Allocate fixed score-packing buffers as one complete set."""
-        if self._segment_buffers_prepared:
-            return
-        input_scores = torch.empty(
-            (self.rows, self.width),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        row_mean = torch.empty(
-            (self.rows, 1),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        row_std = torch.empty_like(row_mean)
-        self.input_scores = input_scores
-        self.row_mean = row_mean
-        self.row_std = row_std
-        self._segment_buffers_prepared = True
-
-    def release_segment_buffers(self) -> None:
-        """Release optional score-packing buffers."""
-        if not self._segment_buffers_prepared:
-            return
-        del self.input_scores
-        del self.row_mean
-        del self.row_std
-        self._segment_buffers_prepared = False
-
-    def select_segments(
-        self,
-        segments: List[torch.Tensor],
-        *,
-        normalize_scores: bool,
-    ) -> torch.Tensor:
-        """Pack fixed segment views and select without data-dependent outputs."""
-        if not self._segment_buffers_prepared:
-            raise RuntimeError("fixed union segment buffers were not preallocated")
-        if not segments or sum(int(segment.shape[0]) for segment in segments) != self.rows:
-            raise ValueError("fixed union segments do not match the workspace row count")
-        if any(
-            segment.ndim != 2
-            or int(segment.shape[1]) != self.width
-            or segment.dtype != self.dtype
-            or segment.device != self.device
-            for segment in segments
-        ):
-            raise ValueError("fixed union segment geometry no longer matches its bucket")
-        torch.cat(segments, dim=0, out=self.input_scores)
-        if normalize_scores:
-            torch.mean(self.input_scores, dim=1, keepdim=True, out=self.row_mean)
-            torch.std(
-                self.input_scores,
-                dim=1,
-                unbiased=False,
-                keepdim=True,
-                out=self.row_std,
-            )
-            self.row_std.clamp_min_(1e-6)
-            torch.sub(self.input_scores, self.row_mean, out=self.input_scores)
-            torch.div(self.input_scores, self.row_std, out=self.input_scores)
-        return self.select(self.input_scores)
-
-    def selection_buffer_nbytes(self) -> int:
-        """Return bytes owned by the fixed selection path, excluding compaction."""
-        if not self._segment_buffers_prepared:
-            raise RuntimeError("fixed union segment buffers were not preallocated")
-        tensors = self._selection_scratch_tensors() + (self.keep,)
-        return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
-
-    def _selection_scratch_tensors(self) -> Tuple[torch.Tensor, ...]:
-        return (
-            self.input_scores,
-            self.row_mean,
-            self.row_std,
-            self.combined,
-            self.combined_argmax,
-            self.row_top_indices,
-            self.union_mask,
-            self.candidates,
-            self.final_indices,
-            self.sorted_indices,
-            self.sort_order,
-            self.row_seq_lens,
-            self.row_top_indices_i32,
-            self.token_indices,
-            self.width_sentinel,
-            self.union_physical_indices,
-            self.union_indices_sorted,
-            self.union_sort_order,
-            self.candidate_gather_indices,
-            self.union_count,
-            self.final_indices_i32,
-            self.final_relative_indices,
-        )
-
-    @staticmethod
-    def planned_selection_bank_nbytes(
-        rows: int,
-        width: int,
-        keep_count: int,
-        prompt_len: int,
-        dtype: torch.dtype,
-        selection_backend: str,
-        max_requests: int,
-    ) -> int:
-        """Compute the deferred selection-buffer size without allocating it."""
-        if selection_backend != "cute_dsl_topk":
-            raise ValueError(f"unsupported fixed union selection backend: {selection_backend}")
-        dtype_bytes = torch.finfo(dtype).bits // 8
-        long_bytes = 8
-        int_bytes = 4
-        total_keep = prompt_len + keep_count
-        scratch_bytes = (
-            rows * width * dtype_bytes
-            + 2 * rows * dtype_bytes
-            + width * dtype_bytes
-            + width * long_bytes
-            + rows * keep_count * long_bytes
-            + width
-            + width * dtype_bytes
-            + 3 * keep_count * long_bytes
-            + rows * int_bytes
-            + rows * keep_count * int_bytes
-            + width * long_bytes
-            + long_bytes
-            + 4 * width * long_bytes
-            + int_bytes
-            + keep_count * int_bytes
-            + keep_count * long_bytes
-        )
-        return scratch_bytes + max_requests * total_keep * long_bytes
-
-    def shared_selection_slot(self) -> "_FixedUnionWorkspace":
-        """Allocate one stable keep output that aliases this bucket's scratch."""
-        if not self._segment_buffers_prepared:
-            raise RuntimeError("fixed union segment buffers were not preallocated")
-        slot = _FixedUnionWorkspace.__new__(_FixedUnionWorkspace)
-        slot.rows = self.rows
-        slot.width = self.width
-        slot.keep_count = self.keep_count
-        slot.prompt_len = self.prompt_len
-        slot.total_keep = self.total_keep
-        slot.dtype = self.dtype
-        slot.device = self.device
-        slot.selection_backend = self.selection_backend
-        slot.selection_only = self.selection_only
-        slot.input_scores = self.input_scores
-        slot.row_mean = self.row_mean
-        slot.row_std = self.row_std
-        slot.combined = self.combined
-        slot.combined_argmax = self.combined_argmax
-        slot.row_top_indices = self.row_top_indices
-        slot.union_mask = self.union_mask
-        slot.candidates = self.candidates
-        slot.final_indices = self.final_indices
-        slot.sorted_indices = self.sorted_indices
-        slot.sort_order = self.sort_order
-        slot.row_seq_lens = self.row_seq_lens
-        slot.row_top_indices_i32 = self.row_top_indices_i32
-        slot.token_indices = self.token_indices
-        slot.width_sentinel = self.width_sentinel
-        slot.union_physical_indices = self.union_physical_indices
-        slot.union_indices_sorted = self.union_indices_sorted
-        slot.union_sort_order = self.union_sort_order
-        slot.candidate_gather_indices = self.candidate_gather_indices
-        slot.union_count = self.union_count
-        slot.final_indices_i32 = self.final_indices_i32
-        slot.final_relative_indices = self.final_relative_indices
-        slot.keep = torch.empty_like(self.keep)
-        if self.prompt_len:
-            slot.keep[: self.prompt_len].copy_(self.keep[: self.prompt_len])
-        slot._compaction_buffers = {}
-        slot.prewarm_attempted = False
-        slot.prewarmed = False
-        slot.prewarm_failed = False
-        slot._segment_buffers_prepared = True
-        return slot
-
-    def select(self, per_head_scores: torch.Tensor) -> torch.Tensor:
-        """Return a persistent sorted keep tensor without dynamic output shapes."""
-        if not self._matches_input(per_head_scores):
-            raise ValueError("fixed union input no longer matches its workspace bucket")
-
-        torch.max(
-            per_head_scores,
-            dim=0,
-            out=(self.combined, self.combined_argmax),
-        )
-        _deterministic_topk_indices_into(
-            per_head_scores,
-            self.row_seq_lens,
-            self.row_top_indices_i32,
-            self.keep_count,
-        )
-        self.row_top_indices.copy_(self.row_top_indices_i32)
-        self.union_mask.zero_()
-        self.union_mask.scatter_(0, self.row_top_indices.reshape(-1), True)
-        torch.where(
-            self.union_mask,
-            self.token_indices,
-            self.width_sentinel,
-            out=self.union_physical_indices,
-        )
-        torch.sort(
-            self.union_physical_indices,
-            out=(self.union_indices_sorted, self.union_sort_order),
-        )
-        torch.clamp(
-            self.union_indices_sorted,
-            max=self.width - 1,
-            out=self.candidate_gather_indices,
-        )
-        torch.gather(
-            self.combined,
-            0,
-            self.candidate_gather_indices,
-            out=self.candidates,
-        )
-        torch.sum(
-            self.union_mask,
-            dim=0,
-            dtype=torch.int32,
-            out=self.union_count[0],
-        )
-        _deterministic_topk_indices_into(
-            self.candidates.view(1, self.width),
-            self.union_count,
-            self.final_indices_i32.view(1, self.keep_count),
-            self.keep_count,
-        )
-        self.final_relative_indices.copy_(self.final_indices_i32)
-        torch.gather(
-            self.union_indices_sorted,
-            0,
-            self.final_relative_indices,
-            out=self.final_indices,
-        )
-        torch.sort(
-            self.final_indices,
-            out=(self.sorted_indices, self.sort_order),
-        )
-        torch.add(
-            self.sorted_indices,
-            self.prompt_len,
-            out=self.keep[self.prompt_len :],
-        )
-        return self.keep
-
-    def can_compact(self, pool: torch.Tensor, page_ids: torch.Tensor, seq_len: int) -> bool:
-        """Whether the fixed one-request compact launcher supports this pool."""
-        return (
-            not self.selection_only
-            and pool.is_cuda
-            and pool.device == self.device
-            and pool.ndim == 5
-            and page_ids.ndim == 1
-            and page_ids.device == self.device
-            and page_ids.dtype == torch.int64
-            and pool.shape[1] == 2
-            and pool.is_contiguous()
-            and pool.dtype in (torch.bfloat16, torch.float16, torch.float32)
-            and self.total_keep < seq_len
-        )
-
-    @staticmethod
-    def _compaction_key(pool: torch.Tensor, page_ids: torch.Tensor) -> tuple:
-        _, kv_factor, num_kv_heads, tokens_per_block, head_dim = pool.shape
-        return (
-            str(pool.device),
-            pool.dtype,
-            int(page_ids.numel()),
-            int(kv_factor),
-            int(num_kv_heads),
-            int(tokens_per_block),
-            int(head_dim),
-        )
-
-    def prepare_compaction(
-        self,
-        pool: torch.Tensor,
-        page_ids: torch.Tensor,
-        seq_len: int,
-    ) -> tuple:
-        """Materialize fixed compaction buffers without launching a kernel."""
-        if not self.can_compact(pool, page_ids, seq_len):
-            raise ValueError("pool no longer matches the fixed union compaction bucket")
-        _, _, num_kv_heads, _, _ = pool.shape
-        key = self._compaction_key(pool, page_ids)
-        buffers = self._compaction_buffers.get(key)
-        if buffers is None:
-            page_table = torch.empty(
-                1,
-                page_ids.numel(),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            indices = torch.empty(
-                num_kv_heads,
-                self.total_keep,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            offsets = torch.tensor(
-                [0, self.total_keep],
-                dtype=torch.int32,
-                device=self.device,
-            )
-            buffers = (page_table, indices, offsets)
-            self._compaction_buffers[key] = buffers
-        return buffers
-
-    def compact(
-        self,
-        pool: torch.Tensor,
-        page_ids: torch.Tensor,
-        seq_len: int,
-        *,
-        copy_page_ids: bool = True,
-    ) -> None:
-        """Compact one HND layer using persistent C++ op inputs."""
-        buffers = self.prepare_compaction(pool, page_ids, seq_len)
-        page_table, indices, offsets = buffers
-        if copy_page_ids:
-            page_table[0].copy_(page_ids)
-        indices.copy_(self.keep.reshape(1, -1).expand(indices.shape[0], -1))
-        torch.ops.trtllm.sparse_kv_cache_compact(
-            pool,
-            page_table,
-            indices,
-            offsets,
-            None,
-        )
-
-
-class _FixedShapeSelectionPlan(NamedTuple):
-    """Tensor-free exact-bucket plan retained across model graph capture."""
-
-    rows: int
-    width: int
-    keep_count: int
-    prompt_len: int
-    dtype: torch.dtype
-    device: torch.device
-    selection_backend: str
-    max_requests: int
-    materialized_nbytes: int
-
-
 class _CrossRequestSelectionPlan(NamedTuple):
     """Selection dimensions saved before fixed request buffers are allocated."""
 
@@ -631,9 +166,7 @@ class _RuntimeKVLayout(NamedTuple):
     dense_layers: List[int]
     swa_layers: List[int]
     swa_window: Optional[int]
-    device: torch.device
     storage_groups: Dict[object, List[int]]
-    dense_group_representatives: List[int]
     layer_group_representative: Dict[int, int]
     layer_pool_keys: Tuple[object, ...]
     pool_representatives: Tuple[int, ...]
@@ -676,7 +209,7 @@ class _BatchedFixedUnionWorkspace:
         self.prompt_len = prompt_len
         self.total_keep = prompt_len + keep_count
         self.dtype = dtype
-        self.device = _FixedUnionWorkspace._canonical_device(device)
+        self.device = _canonical_device(device)
 
         shape = (max_requests, rows, width)
         self.input_scores = torch.empty(shape, dtype=dtype, device=self.device)
@@ -728,9 +261,6 @@ class _BatchedFixedUnionWorkspace:
             (max_requests, keep_count), dtype=torch.int32, device=self.device
         )
         self.final_relative_indices = torch.empty_like(self.final_indices)
-        self.request_workspaces = tuple(
-            self._request_workspace(request_index) for request_index in range(max_requests)
-        )
 
     @staticmethod
     def planned_selection_bank_nbytes(
@@ -775,49 +305,6 @@ class _BatchedFixedUnionWorkspace:
         total += long_bytes
         return total
 
-    def _request_workspace(self, request_index: int) -> _FixedUnionWorkspace:
-        """Build a union-selection view for one request."""
-        workspace = _FixedUnionWorkspace.__new__(_FixedUnionWorkspace)
-        workspace.rows = self.rows
-        workspace.width = self.width
-        workspace.keep_count = self.keep_count
-        workspace.prompt_len = self.prompt_len
-        workspace.total_keep = self.total_keep
-        workspace.dtype = self.dtype
-        workspace.device = self.device
-        workspace.selection_backend = self.selection_backend
-        workspace.input_scores = self.input_scores[request_index]
-        workspace.row_mean = self.row_mean[request_index]
-        workspace.row_std = self.row_std[request_index]
-        workspace.combined = self.combined[request_index]
-        workspace.combined_argmax = self.combined_argmax[request_index]
-        workspace.row_top_indices = self.row_top_indices[request_index]
-        workspace.union_mask = self.union_mask[request_index]
-        workspace.candidates = self.candidates[request_index]
-        workspace.final_indices = self.final_indices[request_index]
-        workspace.sorted_indices = self.sorted_indices[request_index]
-        workspace.sort_order = self.sort_order[request_index]
-        workspace.keep = self.keep[request_index]
-        row_start = request_index * self.rows
-        workspace.row_seq_lens = self.row_seq_lens[row_start : row_start + self.rows]
-        workspace.row_top_indices_i32 = self.row_top_indices_i32[request_index]
-        workspace.token_indices = self.token_indices
-        workspace.width_sentinel = self.width_sentinel
-        workspace.union_physical_indices = self.union_physical_indices[request_index]
-        workspace.union_indices_sorted = self.union_indices_sorted[request_index]
-        workspace.union_sort_order = self.union_sort_order[request_index]
-        workspace.candidate_gather_indices = self.candidate_gather_indices[request_index]
-        workspace.union_count = self.union_counts[request_index : request_index + 1]
-        workspace.final_indices_i32 = self.final_indices_i32[request_index]
-        workspace.final_relative_indices = self.final_relative_indices[request_index]
-        workspace.selection_only = True
-        workspace._compaction_buffers = {}
-        workspace.prewarm_attempted = True
-        workspace.prewarmed = True
-        workspace.prewarm_failed = False
-        workspace._segment_buffers_prepared = True
-        return workspace
-
     def selection_buffer_nbytes(self) -> int:
         """Return unique bytes owned by the fixed request selection workspace."""
         return sum(tensor.numel() * tensor.element_size() for _, tensor in self.named_tensors())
@@ -855,17 +342,6 @@ class _BatchedFixedUnionWorkspace:
             ("final_relative_indices", self.final_relative_indices),
         )
 
-    def pointer_snapshot(self) -> Dict[str, tuple]:
-        """Return stable addresses and geometry for runtime validation."""
-        return {
-            name: (
-                tensor.data_ptr(),
-                tuple(tensor.shape),
-                tuple(tensor.stride()),
-            )
-            for name, tensor in self.named_tensors()
-        }
-
     def stage_valid_widths_from_seq_lens(
         self,
         valid_seq_lens: torch.Tensor,
@@ -887,9 +363,7 @@ class _BatchedFixedUnionWorkspace:
             out=self.valid_widths[:request_count],
         )
 
-    def _select_input_scores(
-        self, request_count: int, *, normalize_scores: bool
-    ) -> Tuple[_FixedUnionWorkspace, ...]:
+    def _select_input_scores(self, request_count: int, *, normalize_scores: bool) -> None:
         input_scores = self.input_scores[:request_count]
         valid_widths = self.valid_widths[:request_count]
         invalid_mask = self.invalid_mask[:request_count]
@@ -987,8 +461,6 @@ class _BatchedFixedUnionWorkspace:
             self.prompt_len,
             out=self.keep[:request_count, self.prompt_len :],
         )
-        return self.request_workspaces[:request_count]
-
     def warm(self, *, normalize_scores: bool) -> None:
         """Warm both CuTe occupancy variants outside graph capture."""
         for request_count in dict.fromkeys((1, self.max_requests)):
@@ -1001,7 +473,7 @@ class _BatchedFixedUnionWorkspace:
         segments_by_request: List[List[torch.Tensor]],
         *,
         normalize_scores: bool,
-    ) -> Tuple[_FixedUnionWorkspace, ...]:
+    ) -> None:
         """Pack and select every request with one fixed-shape operation sequence."""
         request_count = len(segments_by_request)
         if request_count <= 0 or request_count > self.max_requests:
@@ -1026,7 +498,7 @@ class _BatchedFixedUnionWorkspace:
             dim=0,
             out=self.input_scores[:request_count].view(request_count * self.rows, self.width),
         )
-        return self._select_input_scores(request_count, normalize_scores=normalize_scores)
+        self._select_input_scores(request_count, normalize_scores=normalize_scores)
 
 
 class _BatchedFixedPerHeadWorkspace:
@@ -1075,7 +547,7 @@ class _BatchedFixedPerHeadWorkspace:
         self.prompt_len = int(prompt_len)
         self.total_keep = self.prompt_len + self.keep_count
         self.dtype = dtype
-        self.device = _FixedUnionWorkspace._canonical_device(device)
+        self.device = _canonical_device(device)
         self.selection_backend = selection_backend
         self.max_requests = int(max_requests)
 
@@ -1364,7 +836,7 @@ class _FixedScoreMetadataWorkspace:
 
         if not dense_groups or not page_representatives or max_requests <= 0:
             raise ValueError("fixed score metadata requires non-empty positive geometry")
-        self.device = _FixedUnionWorkspace._canonical_device(
+        self.device = _canonical_device(
             layer_pools[page_representatives[0]].device
         )
         if self.device.type != "cuda":
@@ -1925,11 +1397,9 @@ class TriAttention(BaseKVCacheCompressionManager):
         self.calibration: Optional[Dict[str, torch.Tensor]] = None
         self._calibrated = False
         # Calibration-derived dims + stats, filled in on_request_init.
-        self._L: Optional[int] = None
         self._H: Optional[int] = None
         self._F: Optional[int] = None
         self._freq_scale_sq: Optional[torch.Tensor] = None
-        self._attention_scale = 1.0
 
         # Geometric integration offsets (built lazily on first eviction so the
         # device matches the cache pool).
@@ -1955,31 +1425,14 @@ class TriAttention(BaseKVCacheCompressionManager):
         # Every eviction mode uses one fixed-buffer CUDA Graph. Its shape comes
         # from top_B, beta, the prompt length, and the current request count.
         graph_enabled = self.eviction_mode in ("union", "per_head", "per_layer_perhead")
-        union_mode = self.eviction_mode == "union"
-        self._fixed_union_enabled = union_mode
-        self._fixed_union_compaction_enabled = union_mode
         self._fixed_union_prewarm_enabled = graph_enabled
         self._fixed_score_metadata_enabled = graph_enabled
-        # The request-batched selector also handles a single request, so a
-        # second single-request selection buffer is unnecessary.
-        self._fixed_shape_selection_enabled = False
         self._cross_request_selection_enabled = graph_enabled
         self._standalone_cuda_graph_enabled = graph_enabled
-        self._fixed_union_workspaces = {}
-        self._fixed_union_active = {}
         self._fixed_union_prewarm_states = {}
-        self._fixed_union_prewarmed_workspaces = {}
         self._fixed_score_workspaces = {}
         self._fixed_score_prewarm_states = {}
         self._fixed_score_runtime_counts = {}
-        self._fixed_shape_selection_workspaces = {}
-        self._fixed_shape_selection_prewarm_states = {}
-        self._fixed_shape_selection_plans = {}
-        self._fixed_shape_selection_bank_bytes = {}
-        self._fixed_shape_selection_runtime_counts = {}
-        self._fixed_shape_selection_materialization_state = (
-            "pending" if self._fixed_shape_selection_enabled else "disabled"
-        )
         self._cross_request_selection_workspaces = {}
         self._cross_request_selection_prewarm_states = {}
         self._cross_request_selection_plans = {}
@@ -2050,12 +1503,10 @@ class TriAttention(BaseKVCacheCompressionManager):
         if self._calibrated:
             return
         self.calibration = self._resolve_calibration()
-        self._L = int(self.calibration["E_q"].shape[0])
         self._H = int(self.calibration["E_q"].shape[1])
         self._F = int(self.calibration["E_q"].shape[2])
         # Squared per-frequency RoPE scaling factor (required calibration key).
         self._freq_scale_sq = self.calibration["freq_scale_sq"].to(dtype=torch.float32)
-        self._attention_scale = float(self.calibration.get("attention_scale", 1.0))
         # Pre-split query stats + MLR coefficient for the Triton score kernel so
         # it doesn't recompute (E_q_norm - |E_q|) per call. Shapes [L, H, F].
         _Eq = self.calibration["E_q"]
@@ -2381,7 +1832,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             tokens_per_block = int(pool.shape[3])
             page_table_capacity = future_seq_len + protected_tail_capacity
             num_pages = (page_table_capacity + tokens_per_block - 1) // tokens_per_block
-            device = _FixedUnionWorkspace._canonical_device(pool.device)
+            device = _canonical_device(pool.device)
             pool_geometry.append(
                 (
                     len(lids),
@@ -2401,7 +1852,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             int(self._offset_max_length),
             self.score_aggregation,
             bool(self.normalize_scores),
-            "triton_tri_score_perhead",
+            "fixed_score_group",
             selection_backend,
             compaction_backend,
             future_seq_len,
@@ -2656,7 +2107,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         prompt_len: int,
         decode_width: int,
     ) -> None:
-        """Warm one upper-bound score/select/compact bucket using private dummy KV."""
+        """Warm the deployed score, selection, and compaction pipeline."""
         if decode_width <= self.top_B:
             logger.warning(
                 "TriAttention prewarm bucket has no eviction work "
@@ -2664,8 +2115,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
             return
         seq_len = prompt_len + decode_width
-        first_pool = layer_pools[dense_layers[0]]
-        rows = len(dense_layers) * int(self._H)
         key = self._fixed_union_prewarm_key(
             layer_pools,
             dense_layers,
@@ -2678,190 +2127,106 @@ class TriAttention(BaseKVCacheCompressionManager):
         if states.get(key) in ("running", "ready", "failed"):
             return
         states[key] = "running"
-        workspace = None
+        score_states = self._fixed_score_prewarm_states
+        score_states[key] = "running"
+        selection_states = self._cross_request_selection_prewarm_states
+        selection_states.pop(key, None)
         try:
-            with nvtx_range("triattention.prewarm", color="green"):
-                if self.eviction_mode == "union":
-                    workspace = _FixedUnionWorkspace(
-                        rows,
-                        decode_width,
-                        self.top_B,
-                        prompt_len,
-                        dtype=torch.float32,
-                        device=first_pool.device,
-                    )
-                    workspace.prewarm_attempted = True
-                dummy_pools: List[Optional[torch.Tensor]] = [None] * num_layers
-                group_inputs = []
-                page_ids_by_layer = {}
-                for lids in storage_groups:
-                    live_pool = layer_pools[lids[0]]
-                    tokens_per_block = int(live_pool.shape[3])
-                    num_pages = (seq_len + tokens_per_block - 1) // tokens_per_block
-                    dummy_pool = self._dummy_pool_like(live_pool, num_pages, zero=True)
-                    for layer in lids:
-                        # Aliasing only occurs among private dummy layer views.
-                        # The exact strides and launch geometry match production.
-                        dummy_pools[layer] = dummy_pool
-                    page_ids = torch.arange(
-                        num_pages,
-                        dtype=torch.int64,
-                        device=dummy_pool.device,
-                    )
-                    group_inputs.append((lids, dummy_pool, page_ids))
-                    for layer in lids:
-                        page_ids_by_layer[layer] = page_ids
+            first_pool = layer_pools[dense_layers[0]]
+            device = first_pool.device
+            if self._offsets is None:
+                self._offsets = _build_geometric_offsets(self._offset_max_length, device)
+            global_layers = self._local_to_global_layers(num_layers)
+            q_real, q_imag, mlr_coef = self._local_score_calibration(
+                num_layers,
+                global_layers,
+            )
+            _, swa_layers, swa_window = self._attention_layer_partition(num_layers)
+            representatives = [layers[0] for layers in storage_groups]
+            representatives.extend(layer for layer in swa_layers if layer not in representatives)
+            layer_pool_keys = tuple(
+                self._page_table_pool_keys(list(range(num_layers)), global_layers)
+            )
+            all_groups: Dict[object, List[int]] = {}
+            for layer, pool_key in enumerate(layer_pool_keys):
+                all_groups.setdefault(pool_key, []).append(layer)
 
-                device = first_pool.device
-                if self._offsets is None:
-                    self._offsets = _build_geometric_offsets(self._offset_max_length, device)
-                global_layers = self._local_to_global_layers(num_layers)
-                q_real, q_imag, mlr_coef = self._local_score_calibration(
-                    num_layers,
-                    global_layers,
-                )
-                from .triattention_kernels import triton_tri_score_perhead
+            protected_tail_capacity = self._configured_protected_tail_capacity()
+            page_table_token_capacity = seq_len + protected_tail_capacity
+            dummy_pools: List[Optional[torch.Tensor]] = [None] * num_layers
+            for layers in all_groups.values():
+                live_pool = layer_pools[layers[0]]
+                tokens_per_block = int(live_pool.shape[3])
+                num_pages = (
+                    page_table_token_capacity + tokens_per_block - 1
+                ) // tokens_per_block
+                dummy_pool = self._dummy_pool_like(live_pool, num_pages, zero=True)
+                for layer in layers:
+                    dummy_pools[layer] = dummy_pool
+            if any(pool is None for pool in dummy_pools):
+                raise RuntimeError("TriAttention could not build every dummy prewarm pool")
+            fixed_dummy_pools = [pool for pool in dummy_pools if pool is not None]
 
-                scores_by_layer = {}
-                with nvtx_range("triattention.prewarm.score", color="blue"):
-                    for lids, _, page_ids in group_inputs:
-                        per_head, _, _ = triton_tri_score_perhead(
-                            dummy_pools,
-                            [page_ids],
-                            [seq_len],
-                            [float(seq_len)],
-                            q_real,
-                            q_imag,
-                            mlr_coef,
-                            self._freq_scale_sq,
-                            self.calibration["omega"],
-                            self._offsets,
-                            self._H,
-                            score_aggregation=self.score_aggregation,
-                            layer_indices=lids,
-                        )
-                        for slot, layer in enumerate(lids):
-                            scores_by_layer[layer] = per_head.narrow(
-                                1,
-                                slot * seq_len,
-                                seq_len,
-                            )
-                with nvtx_range("triattention.prewarm.select", color="yellow"):
-                    if self.eviction_mode == "union":
-                        head_matrix = torch.cat(
-                            [
-                                self._zscore_decode(scores_by_layer[layer][:, prompt_len:seq_len])
-                                for layer in dense_layers
-                            ],
-                            dim=0,
-                        )
-                        assert workspace is not None
-                        workspace.select(head_matrix)
-                    else:
-                        per_head_workspace = _BatchedFixedPerHeadWorkspace(
-                            eviction_mode=self.eviction_mode,
-                            dense_layers=tuple(dense_layers),
-                            num_query_heads=int(self._H),
-                            num_kv_heads=int(first_pool.shape[2]),
-                            width=decode_width,
-                            keep_count=self.top_B,
-                            prompt_len=prompt_len,
-                            dtype=torch.float32,
-                            device=first_pool.device,
-                            selection_backend="cute_dsl_topk",
-                            max_requests=1,
-                        )
-                        per_head_workspace.select_requests(
-                            [
-                                [
-                                    scores_by_layer[layer][:, prompt_len:seq_len]
-                                    for layer in dense_layers
-                                ]
-                            ],
-                            normalize_scores=self.normalize_scores,
-                        )
-                with nvtx_range("triattention.prewarm.compact", color="purple"):
-                    if self.eviction_mode == "union":
-                        assert workspace is not None
-                        for _, dummy_pool, page_ids in group_inputs:
-                            workspace.compact(dummy_pool, page_ids, seq_len)
-                    else:
-                        from .triattention_kernels import cpp_sparse_compact
-
-                        for layer_slot, layer in enumerate(dense_layers):
-                            if self.eviction_mode == "per_head":
-                                source = per_head_workspace.keep[0]
-                            else:
-                                source = per_head_workspace.keep[0].view(
-                                    len(dense_layers),
-                                    int(first_pool.shape[2]),
-                                    -1,
-                                )[layer_slot]
-                            cpp_sparse_compact(
-                                dummy_pools[layer],
-                                [page_ids_by_layer[layer]],
-                                [source],
-                                [seq_len],
-                            )
-        except Exception:
-            states[key] = "failed"
-            if workspace is not None:
-                workspace.prewarm_failed = True
-            raise
-        states[key] = "ready"
-        if workspace is not None:
-            workspace.prewarmed = True
-            self._fixed_union_prewarmed_workspaces[key] = workspace
-        if self._fixed_score_metadata_enabled:
-            score_states = self._fixed_score_prewarm_states
-            score_states[key] = "running"
-            try:
-                _, swa_layers, _ = self._attention_layer_partition(num_layers)
-                representatives = [layers[0] for layers in storage_groups]
-                representatives.extend(
-                    layer for layer in swa_layers if layer not in representatives
-                )
-                global_layers = self._local_to_global_layers(num_layers)
-                score_workspace = _FixedScoreMetadataWorkspace(
-                    layer_pools,
-                    storage_groups,
+            score_kwargs = dict(
+                dense_groups=storage_groups,
+                page_representatives=representatives,
+                global_layers=global_layers,
+                max_requests=self._standalone_graph_request_chunk_size,
+                seq_len=seq_len,
+                num_q_heads=int(self._H),
+                num_freqs=int(self._F),
+                q_real=q_real,
+                q_imag=q_imag,
+                mlr_coef=mlr_coef,
+                freq_scale_sq=self._freq_scale_sq,
+                offsets=self._offsets,
+                omega=self.calibration["omega"],
+                page_table_keys=self._page_table_pool_keys(
                     representatives,
                     global_layers,
-                    self._standalone_graph_request_chunk_size,
-                    seq_len,
-                    int(self._H),
-                    int(self._F),
-                    q_real,
-                    q_imag,
-                    mlr_coef,
-                    self._freq_scale_sq,
-                    self._offsets,
-                    self.calibration["omega"],
-                    page_table_keys=self._page_table_pool_keys(
-                        representatives,
-                        global_layers,
-                    ),
-                    prompt_len=prompt_len,
-                    page_table_token_capacity=(
-                        seq_len + self._configured_protected_tail_capacity()
-                    ),
-                    staging_capacity=int(self.kv_cache_manager.max_batch_size),
+                ),
+                prompt_len=prompt_len,
+                page_table_token_capacity=page_table_token_capacity,
+                staging_capacity=int(self.kv_cache_manager.max_batch_size),
+            )
+            with nvtx_range("triattention.prewarm", color="green"):
+                dummy_score_workspace = _FixedScoreMetadataWorkspace(
+                    fixed_dummy_pools,
+                    **score_kwargs,
+                )
+                dummy_score_workspace.page_ids_device.zero_()
+                dummy_score_workspace.round_starts_device[0].fill_(float(seq_len))
+                dummy_score_workspace.valid_seq_lens_device[0].fill_(seq_len)
+                with nvtx_range("triattention.prewarm.score", color="blue"):
+                    dummy_score_workspace.prepare_phase(1)
+                    per_head, _ = dummy_score_workspace.fused_group.launch(
+                        1,
+                        dummy_score_workspace.round_starts_device,
+                        dummy_score_workspace.mean_cos,
+                        dummy_score_workspace.mean_sin,
+                        self.score_aggregation,
+                    )
+                    from .triattention_kernels import fixed_perhead_segment_views
+
+                    views = fixed_perhead_segment_views(
+                        per_head,
+                        1,
+                        len(dense_layers),
+                        seq_len,
+                    )
+                    scores_by_layer = {
+                        layer: views[:, 0, slot]
+                        for slot, layer in enumerate(dense_layers)
+                    }
+
+                score_workspace = _FixedScoreMetadataWorkspace(
+                    layer_pools,
+                    **score_kwargs,
                 )
                 score_workspace.prewarm_key = key
                 self._fixed_score_workspaces[key] = score_workspace
-            except Exception as exc:
-                score_states[key] = "failed"
-                self._fixed_score_workspaces.pop(key, None)
-                logger.warning(
-                    "TriAttention fixed score metadata prewarm failed; "
-                    "the mandatory CUDA Graph bucket will reject eviction: "
-                    f"{exc}"
-                )
-            else:
-                score_states[key] = "ready"
-                self._prewarm_fixed_shape_selection_bucket(
+                self._prewarm_cross_request_selection_bucket(
                     key,
-                    workspace,
                     score_workspace,
                     scores_by_layer,
                     dense_layers,
@@ -2869,11 +2234,61 @@ class TriAttention(BaseKVCacheCompressionManager):
                     prompt_len,
                     seq_len,
                 )
+                plan = self._cross_request_selection_plans[key]
+                selection_workspace = self._build_cross_request_selection_workspace(plan)
+                with nvtx_range("triattention.prewarm.select", color="yellow"):
+                    selection_workspace.stage_valid_widths_from_seq_lens(
+                        dummy_score_workspace.valid_seq_lens_device,
+                        1,
+                    )
+                    selection_workspace.select_requests(
+                        [
+                            [
+                                scores_by_layer[layer][:, prompt_len:seq_len]
+                                for layer in dense_layers
+                            ]
+                        ],
+                        normalize_scores=self.normalize_scores,
+                    )
 
-    def _prewarm_fixed_shape_selection_bucket(
+                from .cuda_graph import FixedBatchedCompactionWorkspace
+
+                layer_group_representative = {
+                    layer: layers[0] for layers in storage_groups for layer in layers
+                }
+                compaction_workspace = FixedBatchedCompactionWorkspace(
+                    eviction_mode=self.eviction_mode,
+                    layer_pools=fixed_dummy_pools,
+                    dense_layers=dense_layers,
+                    swa_layers=swa_layers,
+                    layer_group_representative=layer_group_representative,
+                    layer_pool_keys=layer_pool_keys,
+                    global_layers=global_layers,
+                    score_workspace=dummy_score_workspace,
+                    selection_workspace=selection_workspace,
+                    request_count=1,
+                    seq_len=seq_len,
+                    prompt_len=prompt_len,
+                    decode_keep_count=self.top_B,
+                    swa_window=swa_window,
+                    arena_generation=0,
+                    protected_tail_lengths=[0],
+                )
+                with nvtx_range("triattention.prewarm.compact", color="purple"):
+                    compaction_workspace.launch()
+        except Exception:
+            states[key] = "failed"
+            score_states[key] = "failed"
+            selection_states[key] = "failed"
+            self._fixed_score_workspaces.pop(key, None)
+            self._cross_request_selection_plans.pop(key, None)
+            raise
+        states[key] = "ready"
+        score_states[key] = "ready"
+
+    def _prewarm_cross_request_selection_bucket(
         self,
         key: tuple,
-        workspace: Optional[_FixedUnionWorkspace],
         score_workspace: _FixedScoreMetadataWorkspace,
         scores_by_layer: dict,
         dense_layers: List[int],
@@ -2881,94 +2296,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         prompt_len: int,
         seq_len: int,
     ) -> None:
-        """Record selection dimensions without allocating tensors."""
-        if not (self._fixed_shape_selection_enabled or self._cross_request_selection_enabled):
-            return
-        states = self._fixed_shape_selection_prewarm_states
-        if states.get(key) in ("running", "planned", "ready", "failed"):
-            return
-
-        states[key] = "running"
-        max_requests = None
-        bank_bytes = None
-        try:
-            max_requests = int(score_workspace.max_requests)
-            decode_width = seq_len - prompt_len
-            configured_budget = int(self.top_B)
-            decode_budget = (
-                configured_budget - prompt_len if self.count_prompt_tokens else configured_budget
-            )
-            if decode_budget <= 0 or decode_width <= decode_budget:
-                raise ValueError("fixed shape selection bucket has no eviction work")
-            selection_backend = self._selection_backend_for(decode_width, decode_budget)
-            rows = sum(int(scores_by_layer[layer].shape[0]) for layer in dense_layers)
-            first_scores = scores_by_layer[dense_layers[0]]
-            bank_bytes = _FixedUnionWorkspace.planned_selection_bank_nbytes(
-                rows,
-                decode_width,
-                decode_budget,
-                prompt_len,
-                first_scores.dtype,
-                selection_backend,
-                max_requests,
-            )
-            logger.info(
-                "TriAttention is recording a tensor-free fixed-shape selection plan: "
-                f"requests={max_requests}, backend={selection_backend}, "
-                f"estimated_bytes={bank_bytes}"
-            )
-            plan = _FixedShapeSelectionPlan(
-                rows=rows,
-                width=decode_width,
-                keep_count=decode_budget,
-                prompt_len=prompt_len,
-                dtype=first_scores.dtype,
-                device=first_scores.device,
-                selection_backend=selection_backend,
-                max_requests=max_requests,
-                materialized_nbytes=bank_bytes,
-            )
-        except Exception as exc:
-            states[key] = "failed"
-            self._fixed_shape_selection_plans.pop(key, None)
-            self._fixed_shape_selection_workspaces.pop(key, None)
-            self._fixed_shape_selection_bank_bytes.pop(key, None)
-            logger.warning(
-                "TriAttention fixed-shape selection prewarm failed; "
-                "the mandatory CUDA Graph bucket will reject eviction "
-                f"(requests={max_requests}, estimated_bytes={bank_bytes}): {exc}"
-            )
-            return
-
-        if self._fixed_shape_selection_enabled:
-            plans = self._fixed_shape_selection_plans
-            plans[key] = plan
-            self._fixed_shape_selection_materialization_state = "pending"
-            states[key] = "planned"
-        else:
-            states[key] = "disabled"
-        self._prewarm_cross_request_selection_bucket(
-            key,
-            plan,
-            tuple(dense_layers),
-            int(first_scores.shape[0]),
-            num_kv_heads,
-        )
-        logger.info(
-            "TriAttention fixed-shape selection plan is ready; persistent buffers "
-            f"are deferred until the first real generation prepare: requests={max_requests}, "
-            f"bytes={bank_bytes}"
-        )
-
-    def _prewarm_cross_request_selection_bucket(
-        self,
-        key: tuple,
-        stage3_plan: _FixedShapeSelectionPlan,
-        dense_layers: Tuple[int, ...],
-        num_query_heads: int,
-        num_kv_heads: int,
-    ) -> None:
-        """Record dimensions for one fixed request-batched selection shape."""
+        """Record one tensor-free request-batched selection plan."""
         if not self._cross_request_selection_enabled:
             return
         states = self._cross_request_selection_prewarm_states
@@ -2978,42 +2306,54 @@ class TriAttention(BaseKVCacheCompressionManager):
         states[key] = "running"
         bank_bytes = None
         try:
+            max_requests = int(score_workspace.max_requests)
+            decode_width = seq_len - prompt_len
+            decode_budget = int(self.top_B)
+            if self.count_prompt_tokens:
+                decode_budget -= prompt_len
+            if decode_budget <= 0 or decode_width <= decode_budget:
+                raise ValueError("request-batched selection bucket has no eviction work")
+            selection_backend = self._selection_backend_for(decode_width, decode_budget)
+            dense_layers_tuple = tuple(dense_layers)
+            rows = sum(int(scores_by_layer[layer].shape[0]) for layer in dense_layers)
+            first_scores = scores_by_layer[dense_layers[0]]
+            num_query_heads = int(first_scores.shape[0])
             if self.eviction_mode == "union":
                 bank_bytes = _BatchedFixedUnionWorkspace.planned_selection_bank_nbytes(
-                    stage3_plan.rows,
-                    stage3_plan.width,
-                    stage3_plan.keep_count,
-                    stage3_plan.prompt_len,
-                    stage3_plan.dtype,
-                    stage3_plan.selection_backend,
-                    stage3_plan.max_requests,
+                    rows,
+                    decode_width,
+                    decode_budget,
+                    prompt_len,
+                    first_scores.dtype,
+                    selection_backend,
+                    max_requests,
                 )
             else:
                 bank_bytes = _BatchedFixedPerHeadWorkspace.planned_selection_bank_nbytes(
                     eviction_mode=self.eviction_mode,
-                    dense_layers=dense_layers,
+                    dense_layers=dense_layers_tuple,
                     num_query_heads=num_query_heads,
                     num_kv_heads=num_kv_heads,
-                    width=stage3_plan.width,
-                    keep_count=stage3_plan.keep_count,
-                    prompt_len=stage3_plan.prompt_len,
-                    dtype=stage3_plan.dtype,
-                    selection_backend=stage3_plan.selection_backend,
-                    max_requests=stage3_plan.max_requests,
+                    width=decode_width,
+                    keep_count=decode_budget,
+                    prompt_len=prompt_len,
+                    dtype=first_scores.dtype,
+                    selection_backend=selection_backend,
+                    max_requests=max_requests,
                 )
             plan = _CrossRequestSelectionPlan(
                 eviction_mode=self.eviction_mode,
-                dense_layers=dense_layers,
+                dense_layers=dense_layers_tuple,
                 num_query_heads=num_query_heads,
                 num_kv_heads=num_kv_heads,
-                rows=stage3_plan.rows,
-                width=stage3_plan.width,
-                keep_count=stage3_plan.keep_count,
-                prompt_len=stage3_plan.prompt_len,
-                dtype=stage3_plan.dtype,
-                device=stage3_plan.device,
-                selection_backend=stage3_plan.selection_backend,
-                max_requests=stage3_plan.max_requests,
+                rows=rows,
+                width=decode_width,
+                keep_count=decode_budget,
+                prompt_len=prompt_len,
+                dtype=first_scores.dtype,
+                device=first_scores.device,
+                selection_backend=selection_backend,
+                max_requests=max_requests,
                 materialized_nbytes=bank_bytes,
             )
         except Exception as exc:
@@ -3035,84 +2375,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             f"requests={plan.max_requests}, backend={plan.selection_backend}, "
             f"bytes={plan.materialized_nbytes}"
         )
-
-    def _warm_fixed_shape_selection_workspace(self, workspace: _FixedUnionWorkspace) -> None:
-        """Warm the materialized exact backend without allocating an output."""
-        workspace.input_scores.zero_()
-        if self.normalize_scores:
-            torch.mean(workspace.input_scores, dim=1, keepdim=True, out=workspace.row_mean)
-            torch.std(
-                workspace.input_scores,
-                dim=1,
-                unbiased=False,
-                keepdim=True,
-                out=workspace.row_std,
-            )
-            workspace.row_std.clamp_min_(1e-6)
-            torch.sub(workspace.input_scores, workspace.row_mean, out=workspace.input_scores)
-            torch.div(workspace.input_scores, workspace.row_std, out=workspace.input_scores)
-        workspace.select(workspace.input_scores)
-
-    def _materialize_fixed_shape_selection_banks(self) -> None:
-        """Allocate fixed union-selection buffers before the first eviction."""
-        state = self._fixed_shape_selection_materialization_state
-        if state in ("disabled", "running", "done"):
-            return
-        self._fixed_shape_selection_materialization_state = "running"
-        plans = self._fixed_shape_selection_plans
-        states = self._fixed_shape_selection_prewarm_states
-        for key, plan in plans.items():
-            if states.get(key) != "planned":
-                continue
-            workspace = None
-            try:
-                candidate = self._fixed_union_prewarmed_workspaces.get(key)
-                if (
-                    candidate is not None
-                    and candidate.rows == plan.rows
-                    and candidate.width == plan.width
-                    and candidate.keep_count == plan.keep_count
-                    and candidate.prompt_len == plan.prompt_len
-                    and candidate.dtype == plan.dtype
-                    and candidate.device == plan.device
-                    and candidate.selection_backend == plan.selection_backend
-                ):
-                    workspace = candidate
-                else:
-                    workspace = _FixedUnionWorkspace(
-                        plan.rows,
-                        plan.width,
-                        plan.keep_count,
-                        plan.prompt_len,
-                        dtype=plan.dtype,
-                        device=plan.device,
-                        selection_backend=plan.selection_backend,
-                    )
-                    workspace.selection_only = True
-                workspaces = self._build_fixed_shape_selection_workspaces(
-                    workspace,
-                    plan.max_requests,
-                )
-                self._warm_fixed_shape_selection_workspace(workspace)
-            except Exception as exc:
-                states[key] = "failed"
-                self._fixed_shape_selection_workspaces.pop(key, None)
-                self._fixed_shape_selection_bank_bytes.pop(key, None)
-                if workspace is not None:
-                    workspace.release_segment_buffers()
-                logger.warning(
-                    "TriAttention deferred fixed-shape selection materialization failed; "
-                    f"the mandatory CUDA Graph bucket will reject eviction: {exc}"
-                )
-                continue
-
-            for item in workspaces:
-                item.prewarm_attempted = True
-                item.prewarmed = True
-            self._fixed_shape_selection_workspaces[key] = workspaces
-            self._fixed_shape_selection_bank_bytes[key] = plan.materialized_nbytes
-            states[key] = "ready"
-        self._fixed_shape_selection_materialization_state = "done"
 
     @staticmethod
     def _build_cross_request_selection_workspace(
@@ -3188,13 +2450,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._confirmed_kv_lengths.pop(request.py_request_id, None)
         self._prepared_generation_growth.pop(request.py_request_id, None)
         self._initialized_request_ids.discard(request.py_request_id)
-        self._clear_fixed_union_workspaces(request.py_request_id)
-
-    def _clear_fixed_union_workspaces(self, request_id: int) -> None:
-        """Release fixed buffers only after this request's compaction is ordered."""
-        for key in [key for key in self._fixed_union_workspaces if key[0] == request_id]:
-            del self._fixed_union_workspaces[key]
-        self._fixed_union_active.pop(request_id, None)
 
     # ------------------------------------------------------------------ #
     # Attention-metadata reconcile (compression-framework hook)          #
@@ -3265,315 +2520,6 @@ class TriAttention(BaseKVCacheCompressionManager):
     # holding a different token set still scores the correct relative distance
     # and no per-head position tracking is needed.
 
-    def _zscore_decode(self, head_scores: "torch.Tensor") -> "torch.Tensor":
-        """Z-normalize each head's scores over the token axis: ``(x - mean) /
-        std`` with ``std`` clamped to 1e-6 (upstream). Row-wise on ``[H, seq]``;
-        a no-op when ``normalize_scores`` is off."""
-        if not self.normalize_scores or head_scores.numel() == 0:
-            return head_scores
-        mean = head_scores.mean(dim=1, keepdim=True)
-        std = head_scores.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-6)
-        return (head_scores - mean) / std
-
-    def _group_heads_to_kv_max(
-        self, head_scores: "torch.Tensor", num_kv_heads: int
-    ) -> "torch.Tensor":
-        """Reduce per-query-head scores ``[H, seq]`` to per-KV-head ``[nkv, seq]``
-        by MAX over the query heads sharing each KV head (upstream within-group
-        aggregation). Query heads group contiguously: head ``q`` -> KV head
-        ``q // (H // nkv)`` (matches the ``q*nkv//H`` GQA map in scoring and
-        upstream's ``head // num_key_value_groups``)."""
-        num_q_heads, seq = head_scores.shape
-        group = max(1, num_q_heads // num_kv_heads)
-        return head_scores.view(num_kv_heads, group, seq).max(dim=1).values
-
-    def _decode_topk(
-        self, scores: "torch.Tensor", decode_start: int, decode_budget: int
-    ) -> "torch.Tensor":
-        """Pick each row's top-``decode_budget`` decode tokens by ``scores``
-        (``[rows, decode_count]``); return ABSOLUTE slot indices prefixed with the
-        pinned prompt slots, sorted ascending per row (``[rows, decode_start+k]``).
-        One IndexerTopK launch over all rows -- the SAME select primitive as the
-        union mode, so large-BS/seq decouples the cost from the row count. The
-        kept SET is what matters (the result is sorted by slot)."""
-        rows, decode_count = scores.shape
-        k = min(decode_budget, decode_count)
-        decode_idx = self._cute_dsl_topk_idx(scores, k) + decode_start  # [rows, k]
-        prefill_idx = torch.arange(decode_start, device=scores.device, dtype=torch.long).expand(
-            rows, decode_start
-        )
-        return torch.sort(torch.cat([prefill_idx, decode_idx], dim=1), dim=1).values
-
-    def _evict_modes(
-        self,
-        request: "LlmRequest",
-        num_layers: int,
-        seq_len: int,
-        precomputed: List["torch.Tensor"],
-        fixed_union_prewarm_key: Optional[tuple] = None,
-        fixed_union_workspace: Optional[_FixedUnionWorkspace] = None,
-    ) -> Optional[Union[int, "torch.Tensor"]]:
-        """Select and compact from precomputed dense-layer scores.
-
-        Returns either the uniform kept count or, for union mode, the sorted
-        shared keep tensor whose compaction is batched by the caller. Returns
-        ``None`` if no dense layer could be scored.
-
-        ``precomputed``: per-layer ``[H, seq_len]`` scores (from the fused
-        score kernel ``triton_tri_score_perhead``); used verbatim for the
-        selection and compaction. Kernel-masked SWA entries are ``None`` and are
-        excluded by the dense-layer partition.
-        """
-        budget = min(self.top_B, seq_len)
-        # Prompt pin: only decode tokens [decode_start, seq_len) compete; the
-        # first decode_start (prompt) tokens are always kept.
-        decode_start = 0
-        if self.pin_prefill:
-            decode_start = min(request.py_prompt_len, seq_len)
-        decode_count = seq_len - decode_start
-        decode_budget = (budget - decode_start) if self.count_prompt_tokens else budget
-        # Budget exhausted by the pinned prompt (or no decode tokens): keep the
-        # first `budget` contiguous slots everywhere; nothing per-head to do.
-        if decode_budget <= 0 or decode_count <= 0:
-            return budget
-
-        # Select from the precomputed per-layer K scores. For per_head /
-        # per_layer_perhead reduce to per-KV-head [nkv, decode_count] (group-max),
-        # z-normalized over the decode region. For union keep the raw per-head
-        # rows to stack.
-        dense_layers = self._dense_layers(num_layers)
-        if not dense_layers:
-            raise ValueError("TriAttention requires at least one full-attention layer")
-        # Number of KV heads from the first scored layer (HND dim 2).
-        get_buffers = self.kv_cache_manager.get_buffers
-        first_global_layer = self._global_layer_id(dense_layers[0], num_layers)
-        p0 = get_buffers(first_global_layer, kv_layout="HND")
-        if p0 is None:
-            return None
-        num_kv_heads = int(p0.shape[2])
-        per_layer_kv_scores: List[torch.Tensor] = []
-        union_rows: List[torch.Tensor] = []
-        dense_set = set(dense_layers)
-        for layer_idx in range(num_layers):
-            if layer_idx not in dense_set:
-                continue
-            head_scores = precomputed[layer_idx]
-            if head_scores is None:
-                return None
-            decode_scores = head_scores[:, decode_start:seq_len]
-            if self.eviction_mode == "union":
-                if fixed_union_workspace is None:
-                    decode_scores = self._zscore_decode(decode_scores)
-                union_rows.append(decode_scores)
-            else:
-                decode_scores = self._zscore_decode(decode_scores)
-                per_layer_kv_scores.append(self._group_heads_to_kv_max(decode_scores, num_kv_heads))
-
-        if self.eviction_mode == "union":
-            if fixed_union_workspace is not None:
-                return self._evict_union_fixed(
-                    request,
-                    decode_start,
-                    decode_budget,
-                    union_rows,
-                    fixed_union_workspace,
-                )
-            return self._evict_union(
-                request,
-                num_layers,
-                seq_len,
-                decode_start,
-                decode_budget,
-                torch.cat(union_rows, dim=0),
-                prewarm_key=fixed_union_prewarm_key,
-            )
-        if self.eviction_mode == "per_head":
-            return self._evict_per_head(
-                request, num_layers, seq_len, decode_start, decode_budget, per_layer_kv_scores
-            )
-        if self.eviction_mode == "per_layer_perhead":
-            return self._evict_per_layer_perhead(
-                request, num_layers, seq_len, decode_start, decode_budget, per_layer_kv_scores
-            )
-        raise ValueError(
-            f"Unknown eviction_mode {self.eviction_mode!r}; expected one of "
-            "'union', 'per_head', 'per_layer_perhead'"
-        )
-
-    def _evict_union_fixed(
-        self,
-        request: "LlmRequest",
-        decode_start: int,
-        decode_budget: int,
-        score_segments: List["torch.Tensor"],
-        workspace: _FixedUnionWorkspace,
-    ) -> "torch.Tensor":
-        """Select one exact-bucket request from caller-owned fixed buffers."""
-        if workspace.keep_count != decode_budget or workspace.prompt_len != decode_start:
-            raise ValueError("fixed union workspace no longer matches the request budget")
-        self._fixed_union_active[request.py_request_id] = workspace
-        return workspace.select_segments(
-            score_segments,
-            normalize_scores=self.normalize_scores,
-        )
-
-    def _evict_per_head(
-        self,
-        request: "LlmRequest",
-        num_layers: int,
-        seq_len: int,
-        decode_start: int,
-        decode_budget: int,
-        per_layer_kv_scores: List["torch.Tensor"],
-    ) -> int:
-        """per_head: each KV head's score = MEAN over layers of the per-layer MAX
-        (upstream ``_select_per_head_independent``). One keep set per KV head,
-        applied to EVERY layer."""
-        agg = torch.stack(per_layer_kv_scores, dim=0).mean(dim=0)  # [nkv, dc]
-        keep_2d = self._decode_topk(agg, decode_start, decode_budget)  # [nkv, keep_count]
-        # One keep set shared by every (dense) layer.
-        self._compact_perhead_layers(request, self._dense_layers(num_layers), keep_2d, seq_len)
-        return int(keep_2d.shape[1])
-
-    def _compact_perhead_layers(
-        self, request: "LlmRequest", layer_indices: List[int], keep_2d: "torch.Tensor", seq_len: int
-    ) -> None:
-        """Compact dense layers with per-head source sets through the C++ op."""
-        if int(keep_2d.shape[1]) >= seq_len:
-            return  # nothing to drop
-        mgr = self.kv_cache_manager
-        get_buffers = mgr.get_buffers
-        num_layers = self._num_layers_from_manager()
-        prepared_layers = []
-        for layer_idx in layer_indices:
-            global_layer = self._global_layer_id(layer_idx, num_layers)
-            pool = get_buffers(global_layer, kv_layout="HND")
-            if pool is None:
-                raise RuntimeError(f"Missing KV pool for attention layer {global_layer}")
-            tokens_per_block = int(pool.shape[3])
-            page_ids = self._resolve_page_ids(
-                request,
-                layer_idx,
-                (seq_len + tokens_per_block - 1) // tokens_per_block,
-            )
-            if not page_ids:
-                raise RuntimeError(
-                    f"Missing KV page ids for attention layer {global_layer} "
-                    f"of request {request.py_request_id}"
-                )
-            prepared_layers.append((layer_idx, pool, page_ids))
-        from .triattention_kernels import cpp_sparse_compact
-
-        for _, pool, page_ids in prepared_layers:
-            page_ids_t = torch.as_tensor(page_ids, device=pool.device, dtype=torch.long)
-            cpp_sparse_compact(
-                pool,
-                [page_ids_t],
-                [keep_2d.to(pool.device)],
-                [seq_len],
-            )
-
-    def _evict_per_layer_perhead(
-        self,
-        request: "LlmRequest",
-        num_layers: int,
-        seq_len: int,
-        decode_start: int,
-        decode_budget: int,
-        per_layer_kv_scores: List["torch.Tensor"],
-    ) -> Optional[int]:
-        """per_layer_perhead: each (layer, KV head) selects independently from
-        that layer's per-KV-head max (upstream
-        ``_select_per_layer_perhead_independent``). ``per_layer_kv_scores`` is
-        DENSE-ONLY (sliding-window layers skipped in ``_evict_modes``), so pair it
-        with the real dense layer indices rather than ``enumerate`` (whose 0..N-1
-        running index would no longer match the physical layer)."""
-        keep_count = None
-        for layer_idx, kv_scores in zip(self._dense_layers(num_layers), per_layer_kv_scores):
-            keep_2d = self._decode_topk(kv_scores, decode_start, decode_budget)
-            self._compact_perhead_layers(request, [layer_idx], keep_2d, seq_len)
-            keep_count = int(keep_2d.shape[1])
-        return keep_count
-
-    def _evict_union(
-        self,
-        request: "LlmRequest",
-        num_layers: int,
-        seq_len: int,
-        decode_start: int,
-        decode_budget: int,
-        head_matrix: "torch.Tensor",
-        prewarm_key: Optional[tuple] = None,
-    ) -> "torch.Tensor":
-        """union: union of every head's top-k, re-ranked by the per-token max
-        (upstream ``_select_union_based``). One 1-D keep set shared by every
-        layer; returns the sorted kept slot indices in ``[0, seq_len)`` so the
-        caller compacts all layers with the C++ V2 op."""
-        request_id = request.py_request_id
-        workspace = self._get_fixed_union_workspace(
-            request_id,
-            head_matrix,
-            decode_budget,
-            decode_start,
-            prewarm_key=prewarm_key,
-        )
-        if workspace is None:
-            raise RuntimeError("TriAttention union selection requires a fixed CUDA Graph workspace")
-        self._fixed_union_active[request_id] = workspace
-        return workspace.select(head_matrix)
-
-    @staticmethod
-    def _fixed_union_workspace_shape_key(
-        rows: int,
-        width: int,
-        keep_count: int,
-        prompt_len: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> tuple:
-        device = _FixedUnionWorkspace._canonical_device(device)
-        return (rows, width, keep_count, prompt_len, dtype, str(device))
-
-    @staticmethod
-    def _build_fixed_shape_selection_workspaces(
-        workspace: _FixedUnionWorkspace,
-        max_requests: int,
-    ) -> Tuple[_FixedUnionWorkspace, ...]:
-        """Share one exact-bucket scratch while keeping request outputs stable."""
-        if max_requests <= 0:
-            raise ValueError("fixed shape selection requires a positive request capacity")
-        workspace.prepare_segment_buffers()
-        workspaces = [workspace]
-        for _ in range(1, max_requests):
-            workspaces.append(workspace.shared_selection_slot())
-        return tuple(workspaces)
-
-    def _fixed_shape_selection_for(
-        self,
-        score_workspace: Optional[_FixedScoreMetadataWorkspace],
-        request_count: int,
-    ) -> Optional[Tuple[_FixedUnionWorkspace, ...]]:
-        """Return caller-owned slots only for a fully prewarmed exact bucket."""
-        if not self._fixed_shape_selection_enabled or score_workspace is None or request_count <= 0:
-            return None
-        key = score_workspace.prewarm_key
-        workspaces = self._fixed_shape_selection_workspaces.get(key)
-        states = self._fixed_shape_selection_prewarm_states
-        if (
-            states.get(key) != "ready"
-            or workspaces is None
-            or len(workspaces) < request_count
-            or not all(item.prewarmed for item in workspaces[:request_count])
-        ):
-            self._fixed_shape_selection_runtime_counts.setdefault(key, {"hit": 0, "fallback": 0})[
-                "fallback"
-            ] += 1
-            return None
-        self._fixed_shape_selection_runtime_counts.setdefault(key, {"hit": 0, "fallback": 0})[
-            "hit"
-        ] += 1
-        return workspaces[:request_count]
-
     def _cross_request_selection_for(
         self,
         score_workspace: Optional[_FixedScoreMetadataWorkspace],
@@ -3604,73 +2550,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         ] += 1
         return workspace
 
-    def _get_fixed_union_workspace(
-        self,
-        request_id: int,
-        scores: torch.Tensor,
-        keep_count: int,
-        prompt_len: int,
-        *,
-        prewarm_key: Optional[tuple] = None,
-    ) -> Optional[_FixedUnionWorkspace]:
-        """Get the fixed shape bucket used by every union selection."""
-        if not self._fixed_union_enabled or scores.ndim != 2:
-            return None
-        rows, width = (int(value) for value in scores.shape)
-        if rows <= 0 or keep_count <= 0 or width <= keep_count:
-            return None
-        shape_key = self._fixed_union_workspace_shape_key(
-            rows,
-            width,
-            keep_count,
-            prompt_len,
-            scores.dtype,
-            scores.device,
-        )
-        if self._fixed_union_prewarm_enabled and prewarm_key is not None:
-            states = self._fixed_union_prewarm_states
-            workspace = self._fixed_union_prewarmed_workspaces.get(prewarm_key)
-            if (
-                states.get(prewarm_key) == "ready"
-                and workspace is not None
-                and workspace.prewarmed
-                and workspace._matches_input(scores)
-                and workspace.keep_count == keep_count
-                and workspace.prompt_len == prompt_len
-            ):
-                return workspace
-
-        key = (request_id, *shape_key)
-        workspaces = self._fixed_union_workspaces
-        workspace = workspaces.get(key)
-        if workspace is None:
-            workspace = _FixedUnionWorkspace(
-                rows,
-                width,
-                keep_count,
-                prompt_len,
-                dtype=scores.dtype,
-                device=scores.device,
-            )
-            workspaces[key] = workspace
-        return workspace
-
-    def _cute_dsl_topk_idx(self, scores: "torch.Tensor", k: int) -> "torch.Tensor":
-        """Return unsorted per-row indices from the required CuTE-DSL top-k op."""
-        if scores.ndim != 2:
-            raise ValueError("TriAttention top-k scores must be two-dimensional")
-        rows, width = scores.shape
-        k = int(k)
-        if rows <= 0:
-            raise ValueError("TriAttention top-k requires at least one score row")
-        self._selection_backend_for(int(width), k)
-        if width == k:
-            return torch.arange(width, device=scores.device, dtype=torch.long).expand(rows, -1)
-        out = torch.empty((rows, k), dtype=torch.int32, device=scores.device)
-        seq_lens = torch.full((rows,), width, dtype=torch.int32, device=scores.device)
-        torch.ops.trtllm.cute_dsl_indexer_topk_decode(scores.contiguous(), seq_lens, out, k, 1)
-        return out.to(torch.long)
-
     def _local_to_global_layers(self, num_layers: int) -> List[int]:
         """Return V2's global layer id for every local TriAttention layer slot."""
         cached = self._local_to_global_layers_cache
@@ -3689,9 +2568,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
         self._local_to_global_layers_cache = global_layers
         return global_layers
-
-    def _global_layer_id(self, local_layer: int, num_layers: int) -> int:
-        return self._local_to_global_layers(num_layers)[local_layer]
 
     @staticmethod
     def _has_sliding_window_signal(config: Dict[str, object]) -> bool:
@@ -3788,10 +2664,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._attention_layer_partition_cache = result
         return result
 
-    def _dense_layers(self, num_layers: int) -> List[int]:
-        """Return full-attention layers used for TriAttention scoring."""
-        return self._attention_layer_partition(num_layers)[0]
-
     def _runtime_kv_layout(self, num_layers: int) -> _RuntimeKVLayout:
         """Return stable V2 pool views and layer groups for graph replay.
 
@@ -3842,7 +2714,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         if not dense_layers:
             raise ValueError("TriAttention requires at least one full-attention layer")
         storage_groups = self._dense_layer_pool_groups(dense_layers, global_layers)
-        dense_group_representatives = [layers[0] for layers in storage_groups.values()]
         layer_group_representative = {
             layer: layers[0] for layers in storage_groups.values() for layer in layers
         }
@@ -3860,9 +2731,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             dense_layers=dense_layers,
             swa_layers=swa_layers,
             swa_window=swa_window,
-            device=layer_pools[dense_layers[0]].device,
             storage_groups=storage_groups,
-            dense_group_representatives=dense_group_representatives,
             layer_group_representative=layer_group_representative,
             layer_pool_keys=layer_pool_keys,
             pool_representatives=pool_representatives,
@@ -3979,70 +2848,29 @@ class TriAttention(BaseKVCacheCompressionManager):
     def _attach_page_ids(
         self,
         prepared: List[dict],
-        dense_representatives: List[int],
-        swa_layers: List[int],
-        layer_pools: List[torch.Tensor],
-        global_layers: List[int],
-        workspace: Optional[_FixedScoreMetadataWorkspace],
+        workspace: _FixedScoreMetadataWorkspace,
         staging_request_ids: Optional[List[int]] = None,
         staging_offset: int = 0,
-    ) -> bool:
-        fixed = False
-        if workspace is not None:
-            try:
-                fixed = workspace.stage(
-                    self.kv_cache_manager,
-                    [item["request_id"] for item in prepared],
-                    [item["round_start"] for item in prepared],
-                    [item["seq_len"] for item in prepared],
-                    [item["seq_len"] + item["protected_tail"] for item in prepared],
-                    staging_request_ids=staging_request_ids,
-                    staging_offset=staging_offset,
-                )
-            except _FixedScoreStreamMismatch:
-                self._record_fixed_score_runtime(workspace.prewarm_key, "rejected")
-                raise
-            except Exception as exc:
-                if self._standalone_cuda_graph_enabled:
-                    raise RuntimeError("TriAttention fixed score staging failed") from exc
-                logger.warning(f"TriAttention fixed score staging failed: {exc}")
-        required_layers = [*dense_representatives, *swa_layers]
-        if fixed:
-            for request_index, item in enumerate(prepared):
-                item["page_ids"] = {
-                    layer: workspace.page_ids_device[
-                        workspace.representative_slots[layer], request_index
-                    ]
-                    for layer in required_layers
-                }
-            self._record_fixed_score_runtime(workspace.prewarm_key, "hit")
-            return True
-
-        if workspace is not None:
+    ) -> None:
+        try:
+            staged = workspace.stage(
+                self.kv_cache_manager,
+                [item["request_id"] for item in prepared],
+                [item["round_start"] for item in prepared],
+                [item["seq_len"] for item in prepared],
+                [item["seq_len"] + item["protected_tail"] for item in prepared],
+                staging_request_ids=staging_request_ids,
+                staging_offset=staging_offset,
+            )
+        except _FixedScoreStreamMismatch:
             self._record_fixed_score_runtime(workspace.prewarm_key, "rejected")
-        if self._standalone_cuda_graph_enabled:
+            raise
+        except Exception as exc:
+            raise RuntimeError("TriAttention fixed score staging failed") from exc
+        if not staged:
+            self._record_fixed_score_runtime(workspace.prewarm_key, "rejected")
             raise RuntimeError("TriAttention CUDA Graph requires fixed page-table staging")
-        for item in prepared:
-            request = item["request"]
-            request_id = item["request_id"]
-            item["page_ids"] = {}
-            for layer in required_layers:
-                tokens_per_block = int(layer_pools[layer].shape[3])
-                page_ids = self._resolve_page_ids(
-                    request,
-                    layer,
-                    (item["seq_len"] + item["protected_tail"] + tokens_per_block - 1)
-                    // tokens_per_block,
-                )
-                if not page_ids:
-                    raise RuntimeError(
-                        f"Missing KV page ids for attention layer {global_layers[layer]} "
-                        f"of request {request_id}"
-                    )
-                item["page_ids"][layer] = torch.as_tensor(
-                    page_ids, device=layer_pools[layer].device, dtype=torch.int64
-                )
-        return False
+        self._record_fixed_score_runtime(workspace.prewarm_key, "hit")
 
     def _standalone_graph_bucket_for(
         self,
@@ -4198,7 +3026,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         prepared: List[dict],
         layer_pools: List[torch.Tensor],
         dense_layers: List[int],
-        dense_groups: List[List[int]],
         swa_layers: List[int],
         swa_window: Optional[int],
         layer_group_representative: Dict[int, int],
@@ -4383,9 +3210,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             dense_layers = layout.dense_layers
             swa_layers = layout.swa_layers
             swa_window = layout.swa_window
-            device = layout.device
             storage_groups = layout.storage_groups
-            dense_group_representatives = layout.dense_group_representatives
             layer_group_representative = layout.layer_group_representative
             layer_pool_keys = layout.layer_pool_keys
 
@@ -4408,13 +3233,6 @@ class TriAttention(BaseKVCacheCompressionManager):
                         f"Request {rid} protected tail {protected_tail} exceeds "
                         f"configured capacity {protected_tail_capacity}"
                     )
-                swa_source = None
-                swa_destination = None
-                if swa_layers:
-                    assert swa_window is not None
-                    swa_source, swa_destination = _build_swa_rebase_copy(
-                        seq_len, expected_keep_count, swa_window, device=device
-                    )
                 prepared.append(
                     {
                         "request": request,
@@ -4423,8 +3241,6 @@ class TriAttention(BaseKVCacheCompressionManager):
                         "round_start": float(round_start),
                         "expected_keep_count": expected_keep_count,
                         "protected_tail": protected_tail,
-                        "swa_source": swa_source,
-                        "swa_destination": swa_destination,
                     }
                 )
         if not prepared:
@@ -4440,34 +3256,28 @@ class TriAttention(BaseKVCacheCompressionManager):
                 prepared,
             )
         with nvtx_range_debug("triattention.page_table_stage", color="orange"):
-            fixed_score_active = self._attach_page_ids(
+            self._attach_page_ids(
                 prepared,
-                dense_group_representatives,
-                swa_layers,
-                layer_pools,
-                global_layers,
                 fixed_score_workspace,
                 staging_request_ids,
                 staging_offset,
             )
         with nvtx_range_debug("triattention.selection_workspace_lookup", color="blue"):
-            cross_request_selection = (
-                self._cross_request_selection_for(fixed_score_workspace, len(prepared))
-                if fixed_score_active
-                else None
+            cross_request_selection = self._cross_request_selection_for(
+                fixed_score_workspace,
+                len(prepared),
             )
         with nvtx_range_debug("triattention.graph_admission", color="purple"):
             graph_capacity_targets = self._try_standalone_cuda_graph(
                 prepared=prepared,
                 layer_pools=layer_pools,
                 dense_layers=dense_layers,
-                dense_groups=dense_groups,
                 swa_layers=swa_layers,
                 swa_window=swa_window,
                 layer_group_representative=layer_group_representative,
                 layer_pool_keys=layer_pool_keys,
                 global_layers=global_layers,
-                score_workspace=fixed_score_workspace if fixed_score_active else None,
+                score_workspace=fixed_score_workspace,
                 selection_workspace=cross_request_selection,
                 fixed_perhead_segment_views=fixed_perhead_segment_views,
             )
@@ -4476,54 +3286,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         raise RuntimeError(
             f"TriAttention {self.eviction_mode} eviction must execute through CUDA Graph"
         )
-
-    # ------------------------------------------------------------------ #
-    # V2-manager cache access + physical eviction (HND physical layout)  #
-    # ------------------------------------------------------------------ #
-
-    def _resolve_page_ids(
-        self,
-        request: "LlmRequest",
-        layer_idx: int,
-        page_count: Optional[int] = None,
-    ) -> Optional[List[int]]:
-        """Return the page (block) ids that hold THIS request's KV for one layer.
-
-        The V2 KV cache is PAGED: a request's tokens live in several (possibly
-        non-contiguous) fixed-size pages inside one big shared pool. Before we
-        can read or compact a request's cache we must know WHICH pages are its
-        own. V2's ``get_batch_cache_indices([ids], layer_idx)`` returns one list
-        of block ids per requested id; we pass a single id and take ``[0]``.
-
-        These ids index the PAGE axis (dim 0) of the tensor ``get_buffers``
-        returns; the key/value split is a SEPARATE axis (kv_factor, dim 1) that
-        callers index on their own. We do NOT divide or rescale the ids here.
-
-        Returns ``None`` when V2 has no valid page metadata for the request.
-        Padded tail slots are excluded by V2's live/requested-block bound. A
-        negative id inside the required prefix is an invariant violation; it
-        must not be removed because that would shift every later block ordinal.
-        """
-        try:
-            num_layers = self._num_layers_from_manager()
-            global_layer = self._global_layer_id(layer_idx, num_layers)
-            kwargs = {"num_blocks_per_seq": [page_count]} if page_count is not None else {}
-            batch = self.kv_cache_manager.get_batch_cache_indices(
-                [request.py_request_id], global_layer, **kwargs
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to resolve KV pages for local layer {layer_idx} "
-                f"of request {request.py_request_id}"
-            ) from exc
-        if batch:
-            page_ids = batch[0]
-            if page_count is not None and len(page_ids) != page_count:
-                return None
-            if any(page < 0 for page in page_ids):
-                return None
-            return page_ids or None
-        return None
 
     def _num_layers_from_manager(self) -> int:
         return len(self.kv_cache_manager.pp_layers)

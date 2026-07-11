@@ -30,10 +30,8 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
     _BatchedFixedPerHeadWorkspace,
     _BatchedFixedUnionWorkspace,
     _FixedScoreMetadataWorkspace,
-    _FixedUnionWorkspace,
 )
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-    cpp_sparse_compact,
     fixed_perhead_segment_views,
 )
 
@@ -52,6 +50,73 @@ def _fake_cute_dsl_topk_decode(scores, seq_lens, output, top_k, next_n):
             sorted=False,
         ).indices
         output[row].copy_(indices.to(dtype=torch.int32))
+
+
+def _cpp_sparse_compact_reference(
+    pool,
+    page_ids_list,
+    source_list,
+    seq_len_list,
+    *,
+    dest_list=None,
+):
+    """Build the C++ compact-op inputs for eager graph test references."""
+    num_kv_heads = int(pool.shape[2])
+    tables = []
+    sources = []
+    destinations = []
+    per_head_source = None
+    per_head_destination = None
+    for request_index, (page_ids, source, seq_len) in enumerate(
+        zip(page_ids_list, source_list, seq_len_list)
+    ):
+        source = source.to(device=pool.device, dtype=torch.int32)
+        move_count = int(source.shape[-1])
+        if (dest_list is None and move_count >= int(seq_len)) or move_count == 0:
+            continue
+        current_per_head = source.ndim == 2
+        if per_head_source is None:
+            per_head_source = current_per_head
+        else:
+            assert per_head_source == current_per_head
+        if not current_per_head:
+            source = source.reshape(1, -1).expand(num_kv_heads, -1)
+        sources.append(source)
+        tables.append(page_ids.to(device=pool.device, dtype=torch.int32).reshape(-1))
+
+        if dest_list is not None:
+            destination = dest_list[request_index].to(device=pool.device, dtype=torch.int32)
+            current_per_head = destination.ndim == 2
+            if per_head_destination is None:
+                per_head_destination = current_per_head
+            else:
+                assert per_head_destination == current_per_head
+            destinations.append(destination)
+
+    if not sources:
+        return
+    max_pages = max(int(table.numel()) for table in tables)
+    page_table = torch.zeros(len(tables), max_pages, dtype=torch.int32, device=pool.device)
+    for request_index, table in enumerate(tables):
+        page_table[request_index, : table.numel()] = table
+    offsets_host = [0]
+    for source in sources:
+        offsets_host.append(offsets_host[-1] + int(source.shape[1]))
+    offsets = torch.tensor(offsets_host, dtype=torch.int32, device=pool.device)
+    indices = torch.cat(sources, dim=1).contiguous()
+    destination_indices = None
+    if destinations:
+        destination_indices = torch.cat(
+            destinations,
+            dim=1 if per_head_destination else 0,
+        ).contiguous()
+    torch.ops.trtllm.sparse_kv_cache_compact(
+        pool,
+        page_table,
+        indices,
+        offsets,
+        destination_indices,
+    )
 
 
 class _AlternatingBoundaryTieTopK:
@@ -688,54 +753,6 @@ class TestCuTEDSLGraphSelection:
             torch.cuda.synchronize(device)
             assert torch.equal(graph_result(), expected)
 
-    @pytest.mark.parametrize(
-        "keep_count,width",
-        [(4096, 4224), (8192, 9216)],
-        ids=("k4096", "k8192"),
-    )
-    def test_fixed_graph_workspace_has_no_legacy_topk_fallback(self, keep_count, width):
-        prompt_len = 13
-        scores = self._scores(width, seed=keep_count)
-        expected_decode = _union_keep_oracle(scores, keep_count)
-        expected = torch.cat(
-            (
-                torch.arange(prompt_len, dtype=torch.long),
-                expected_decode + prompt_len,
-            )
-        )
-        workspace = _FixedUnionWorkspace(
-            rows=2,
-            width=width,
-            keep_count=keep_count,
-            prompt_len=prompt_len,
-            dtype=torch.float32,
-            device=torch.device("cpu"),
-            selection_backend="cute_dsl_topk",
-        )
-
-        with (
-            mock.patch.object(
-                torch.ops.trtllm,
-                "cute_dsl_indexer_topk_decode",
-                side_effect=_fake_cute_dsl_topk_decode,
-                create=True,
-            ) as cute_topk,
-            mock.patch.object(
-                torch.ops.trtllm,
-                "indexer_topk_decode",
-                side_effect=AssertionError("legacy IndexerTopK fallback was called"),
-                create=True,
-            ),
-            mock.patch.object(
-                torch,
-                "topk",
-                side_effect=AssertionError("torch.topk fallback was called"),
-            ),
-        ):
-            actual = workspace.select(scores).clone()
-
-        assert cute_topk.call_count == 4
-        assert torch.equal(actual, expected)
 
     @pytest.mark.parametrize(
         "keep_count,width",
@@ -786,11 +803,11 @@ class TestCuTEDSLGraphSelection:
                 side_effect=AssertionError("torch.topk fallback was called"),
             ),
         ):
-            selected = workspace.select_requests(
+            workspace.select_requests(
                 [[scores] for scores in request_scores],
                 normalize_scores=False,
             )
-            actual = [request_workspace.keep.clone() for request_workspace in selected]
+            actual = workspace.keep[: len(request_scores)].clone()
 
         assert cute_topk.call_count == 4
         assert all(torch.equal(result, oracle) for result, oracle in zip(actual, expected))
@@ -1304,7 +1321,6 @@ class TestStandaloneGraphBuckets:
                 prepared=prepared,
                 layer_pools=[torch.empty(1)],
                 dense_layers=[0],
-                dense_groups=[[0]],
                 swa_layers=[],
                 swa_window=None,
                 layer_group_representative={0: 0},
@@ -1406,7 +1422,6 @@ class TestStandaloneGraphBuckets:
                 prepared=prepared,
                 layer_pools=[torch.empty(1)],
                 dense_layers=[0],
-                dense_groups=[[0]],
                 swa_layers=[],
                 swa_window=None,
                 layer_group_representative={0: 0},
@@ -1482,7 +1497,6 @@ class TestStandaloneGraphBuckets:
                     prepared=prepared,
                     layer_pools=[torch.empty(1)],
                     dense_layers=[0],
-                    dense_groups=[[0]],
                     swa_layers=[],
                     swa_window=None,
                     layer_group_representative={0: 0},
@@ -1542,7 +1556,6 @@ class TestStandaloneGraphBuckets:
             prepared=prepared,
             layer_pools=[torch.empty(1)],
             dense_layers=[0],
-            dense_groups=[[0]],
             swa_layers=[],
             swa_window=None,
             layer_group_representative={0: 0},
@@ -1917,7 +1930,7 @@ class TestFixedBatchedCompactionWorkspace:
         seq_lens = [9, 8]
         for layer, (pool, page_table, sources) in enumerate(zip(pools, page_tables, layer_sources)):
             before = self._logical_tokens(pool, page_table).clone()
-            cpp_sparse_compact(
+            _cpp_sparse_compact_reference(
                 pool,
                 [page_table[request] for request in range(request_count)],
                 sources,
@@ -1946,7 +1959,7 @@ class TestFixedBatchedCompactionWorkspace:
                 + (layer + 2) * 1_000_000
             )
             before = self._logical_tokens(pool, page_table).clone()
-            cpp_sparse_compact(
+            _cpp_sparse_compact_reference(
                 pool,
                 [page_table[request] for request in range(request_count)],
                 suffix_sources,
@@ -2208,7 +2221,7 @@ class TestStandaloneGraphCuda:
 
         def stage4_body():
             score_and_select()
-            cpp_sparse_compact(
+            _cpp_sparse_compact_reference(
                 pool,
                 [score.page_ids_device[0, request] for request in range(request_count)],
                 [selection.keep[request] for request in range(request_count)],
@@ -2691,13 +2704,13 @@ class TestStandaloneGraphCuda:
                 )
                 physical_seq_lens.append(seq_len + tail_length)
 
-            cpp_sparse_compact(
+            _cpp_sparse_compact_reference(
                 eager_pools[0],
                 [round_dense_tables[request] for request in range(request_count)],
                 dense_sources,
                 physical_seq_lens,
             )
-            cpp_sparse_compact(
+            _cpp_sparse_compact_reference(
                 eager_pools[1],
                 [round_swa_tables[request] for request in range(request_count)],
                 swa_sources,
