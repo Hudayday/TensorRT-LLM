@@ -484,6 +484,145 @@ class TestKVCacheFailuresGen:
         assert ids(out.paused_requests) == [99]
         mgr.suspend_request.assert_called_once_with(victim)
 
+    def test_pending_update_request_is_not_self_evicted(self):
+        """A request awaiting its previous update remains active for retry."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        req = make_gen_request(0)
+        req.is_generation_to_complete_state = False
+
+        out = sched.schedule_request([req], set(), {req.request_id})
+
+        assert out.generation_requests == []
+        assert out.paused_requests == []
+        mgr.suspend_request.assert_not_called()
+
+    def test_pending_update_request_does_not_evict_another_request(self):
+        """A pending requester stops before considering unrelated victims."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        current = make_gen_request(0)
+        victim = make_gen_request(1)
+        current.is_generation_to_complete_state = False
+        victim.is_generation_to_complete_state = False
+
+        out = sched.schedule_request(
+            [current, victim],
+            set(),
+            {current.request_id},
+        )
+
+        assert out.num_fitting_requests == 0
+        assert out.paused_requests == []
+        mgr.suspend_request.assert_not_called()
+
+    def test_inflight_victim_allows_transient_empty_iteration(self):
+        """An active in-flight victim can make allocation temporarily blocked."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        current = make_gen_request(0)
+        inflight_victim = make_gen_request(1)
+        current.is_generation_to_complete_state = False
+        inflight_victim.is_generation_to_complete_state = False
+        mgr.is_request_active.side_effect = (
+            lambda req_id: req_id == inflight_victim.request_id
+        )
+        sched = make_scheduler(mgr, max_num_tokens=100)
+
+        out = sched.schedule_request(
+            [current, inflight_victim],
+            {inflight_victim.request_id},
+            set(),
+        )
+
+        assert out.num_fitting_requests == 0
+        assert out.paused_requests == []
+        mgr.suspend_request.assert_not_called()
+
+    def test_completing_pending_victim_allows_transient_empty_iteration(self):
+        """A previous-batch completion can release pages after scheduling."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        current = make_gen_request(0)
+        completing_victim = make_gen_request(1)
+        current.is_generation_to_complete_state = False
+        completing_victim.is_generation_in_progress_state = False
+        completing_victim.is_generation_to_complete_state = True
+        mgr.is_request_active.side_effect = (
+            lambda req_id: req_id == completing_victim.request_id
+        )
+        sched = make_scheduler(mgr, max_num_tokens=100)
+
+        out = sched.schedule_request(
+            [current, completing_victim],
+            set(),
+            {completing_victim.request_id},
+        )
+
+        assert out.num_fitting_requests == 0
+        assert out.paused_requests == []
+        mgr.suspend_request.assert_not_called()
+
+    def test_pending_update_victim_is_not_evicted(self):
+        """A pending previous-batch update protects only its request."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        current = make_gen_request(0)
+        protected_victim = make_gen_request(1)
+        current.is_generation_to_complete_state = False
+        protected_victim.is_generation_to_complete_state = False
+
+        out = sched.schedule_request(
+            [current, protected_victim],
+            set(),
+            {protected_victim.request_id},
+        )
+
+        assert ids(out.paused_requests) == [current.request_id]
+        mgr.suspend_request.assert_called_once_with(current)
+
+    def test_pending_update_victim_can_defer_empty_iteration(self):
+        """A protected victim can be the only temporary source of progress."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        current = make_gen_request(0)
+        protected_victim = make_gen_request(1)
+        current.is_generation_to_complete_state = False
+        protected_victim.is_generation_to_complete_state = False
+        mgr.is_request_active.side_effect = lambda req_id: req_id == protected_victim.request_id
+        sched = make_scheduler(mgr, max_num_tokens=100)
+
+        out = sched.schedule_request(
+            [current, protected_victim],
+            set(),
+            {protected_victim.request_id},
+        )
+
+        assert out.num_fitting_requests == 0
+        assert out.paused_requests == []
+        mgr.suspend_request.assert_not_called()
+
+    def test_pending_update_allows_empty_iteration(self):
+        """An empty iteration lets overlap process the previous batch."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        mgr.is_request_active.side_effect = lambda req_id: False
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        req = make_gen_request(0)
+        req.is_generation_to_complete_state = False
+
+        out = sched.schedule_request([req], set(), {req.request_id})
+
+        assert out.num_fitting_requests == 0
+        assert out.paused_requests == []
+
+    def test_unprotected_allocation_failure_still_detects_deadlock(self):
+        """Pending-update handling must not hide an unrelated deadlock."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        mgr.is_request_active.side_effect = lambda req_id: False
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        req = make_gen_request(0)
+        req.is_generation_to_complete_state = False
+
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            sched.schedule_request([req], set())
+
     def test_gen_alloc_fails_evict_insufficient(self):
         """gen fails, evict victim, retry still fails → self-evict."""
         call_count = [0]

@@ -22,6 +22,7 @@ sparse-attention backend); the ``create_kv_cache_compression_manager`` factory
 lives in ``_util.py`` next to ``_create_kv_cache_manager``.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -297,6 +298,105 @@ class TestFactory:
         with patch.object(util_mod, "logger") as mock_logger:
             create_kv_cache_compression_manager(cfg, fake_kv_cache_manager)
             mock_logger.warning.assert_called_once()
+
+    @pytest.mark.parametrize(
+        (
+            "manager_key",
+            "algorithm",
+            "manager_max_seq_len",
+            "expected_reuse",
+            "expected_creator_max_seq_len",
+        ),
+        [
+            (ResourceManagerType.KV_CACHE_MANAGER, None, 9_280, False, 9_280),
+            (ResourceManagerType.KV_CACHE_MANAGER, "unknown", 9_280, False,
+             9_280),
+            (ResourceManagerType.KV_CACHE_MANAGER, "triattention", 32_768,
+             True, 32_768),
+            (ResourceManagerType.DRAFT_KV_CACHE_MANAGER, "triattention", 9_280,
+             False, 32_768),
+        ],
+    )
+    def test_creator_enables_generation_capacity_reuse_for_target_only(
+        self,
+        manager_key,
+        algorithm,
+        manager_max_seq_len,
+        expected_reuse,
+        expected_creator_max_seq_len,
+    ):
+        from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+
+        creator = KvCacheCreator.__new__(KvCacheCreator)
+        creator._mapping = MagicMock()
+        creator._kv_cache_config = MagicMock()
+        creator._tokens_per_block = 64
+        creator._max_seq_len = 32_768
+        creator._net_max_seq_len = 32_768
+        creator._max_batch_size = 1
+        creator._max_num_tokens = 4_096
+        creator._max_beam_width = 1
+        creator._speculative_config = None
+        creator._sparse_attention_config = None
+        creator._kv_connector_manager = None
+        creator._execution_stream = None
+        creator._is_disagg = False
+        creator._dummy_reqs = None
+        creator._skip_est = True
+        compression_config = (
+            None if algorithm is None else SimpleNamespace(algorithm=algorithm))
+        creator._llm_args = SimpleNamespace(
+            kv_cache_compression_config=compression_config)
+        creator._get_model_kv_cache_manager_cls = MagicMock(
+            return_value=KVCacheManagerV2)
+        creator._should_create_separate_draft_kv_cache = MagicMock(
+            return_value=False)
+        creator._enable_kv_cache_stats = MagicMock(return_value=False)
+
+        model_engine = MagicMock()
+        model_engine.model.model_config.is_generation = True
+        model_engine.kv_cache_manager_key = manager_key
+        created_manager = SimpleNamespace(max_seq_len=manager_max_seq_len)
+
+        with patch.object(util_mod,
+                          "_create_kv_cache_manager",
+                          return_value=created_manager) as create:
+            assert creator._create_kv_cache_manager(
+                model_engine) is created_manager
+
+        assert create.call_args.kwargs[
+            "reuse_generation_kv_capacity"] is expected_reuse
+        assert creator._max_seq_len == expected_creator_max_seq_len
+
+    def test_draft_manager_does_not_silently_limit_target_logical_length(self):
+        from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+
+        creator = KvCacheCreator.__new__(KvCacheCreator)
+        creator._skip_est = False
+        creator._max_seq_len = 32_768
+        creator._kv_cache_config = MagicMock()
+        creator._model_engine = MagicMock()
+        creator._draft_model_engine = MagicMock()
+        creator._kv_connector_manager = None
+        creator._is_kv_cache_manager_v2 = True
+        creator._llm_args = SimpleNamespace(
+            kv_cache_compression_config=SimpleNamespace(
+                algorithm="triattention"))
+        creator._is_encoder_decoder = MagicMock(return_value=False)
+        creator._should_create_separate_draft_kv_cache = MagicMock(
+            return_value=False)
+        target = SimpleNamespace(max_seq_len=32_768)
+        draft = SimpleNamespace(max_seq_len=9_280)
+        creator._create_kv_cache_manager = MagicMock(
+            side_effect=[target, draft])
+
+        resources = {}
+        creator.build_managers(resources, estimating_kv_cache=True)
+
+        assert creator._max_seq_len == 32_768
+        assert resources[ResourceManagerType.KV_CACHE_MANAGER] is target
+        assert resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER] is draft
 
 
 # ---------------------------------------------------------------------- #

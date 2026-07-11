@@ -61,6 +61,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import BaseKVCacheCompressionManager
 from tensorrt_llm._utils import nvtx_range, nvtx_range_debug, prefer_pinned
+from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
+    copy_batch_block_offsets_to_device,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
@@ -1383,6 +1386,9 @@ class _FixedScoreMetadataWorkspace:
         self.valid_seq_lens_host = torch.empty(
             max_requests, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
+        self._bulk_copy_idx_src = torch.empty(
+            max_requests, dtype=torch.int32, device="cpu", pin_memory=True
+        )
         self.page_ids_device = torch.empty(page_shape, dtype=torch.int64, device=self.device)
         self.round_starts_device = torch.empty(
             max_requests, dtype=torch.float32, device=self.device
@@ -1434,6 +1440,7 @@ class _FixedScoreMetadataWorkspace:
         self.bulk_copy_done = torch.cuda.Event()
         self.copy_pending = False
         self.stream = None
+        self._bulk_offsets_src: Optional[torch.Tensor] = None
         self._bulk_offsets_dst: Optional[torch.Tensor] = None
         self._bulk_stage_logged = False
         self.prewarm_key: Optional[tuple] = None
@@ -1585,10 +1592,13 @@ class _FixedScoreMetadataWorkspace:
     ) -> bool:
         """ONE bulk block-offset copy replaces 36 x R host round-trips.
 
-        Reuses the exact attention-backend path (copy_batch_block_offsets over
-        the manager's persistent pinned host table): dst[pool, r, 0(K), :] holds
-        base_page * index_scales; our HND page index is that value // kv_factor
-        (the same formula _get_batch_cache_indices_by_pool_id applies on host).
+        Uses the V2 block-offset kernel with immutable pinned snapshots of the
+        manager's host table and index map. The snapshots are required because
+        this method enqueues asynchronous host-memory reads; TriAttention later
+        resizes the same cache, which mutates the manager's table in place, and
+        the next metadata preparation reuses the manager's index-map buffer.
+        ``dst[pool, r, 0(K), :]`` holds ``base_page * index_scales``; our HND page
+        index is that value divided by ``kv_factor``.
         """
         host_table = manager.host_kv_cache_block_offsets
         kv_factor = int(manager.kv_factor)
@@ -1598,6 +1608,19 @@ class _FixedScoreMetadataWorkspace:
         if max_blocks < self.page_count:
             return False
         request_count = len(request_ids)
+        source = self._bulk_offsets_src
+        if (
+            source is None
+            or source.shape != host_table.shape
+            or source.dtype != host_table.dtype
+        ):
+            source = torch.empty_like(
+                host_table,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._bulk_offsets_src = source
+        source.copy_(host_table)
         bulk = self._bulk_offsets_dst
         allocated = False
         if bulk is None or bulk.shape[1] < self.max_requests:
@@ -1611,11 +1634,25 @@ class _FixedScoreMetadataWorkspace:
             )
             self._bulk_offsets_dst = bulk
             allocated = True
+        submitted = False
         try:
             if allocated:
                 self.bulk_allocation_done.record(current_stream)
                 manager._stream.wait_event(self.bulk_allocation_done)
-            manager.copy_batch_block_offsets(bulk, request_ids, 1, 0, request_count)
+            copy_idx = manager.index_mapper.get_copy_index(request_ids, 0, 1)
+            if copy_idx.shape[0] != request_count:
+                return False
+            copy_idx_source = self._bulk_copy_idx_src[:request_count]
+            copy_idx_source.copy_(copy_idx)
+            copy_batch_block_offsets_to_device(
+                source,
+                bulk,
+                copy_idx_source,
+                manager.index_scales,
+                manager.kv_offset,
+                manager._stream.cuda_stream,
+            )
+            submitted = True
             self.bulk_copy_done.record(manager._stream)
             current_stream.wait_event(self.bulk_copy_done)
             for slot, global_layer in enumerate(self.global_representatives):
@@ -1624,6 +1661,10 @@ class _FixedScoreMetadataWorkspace:
                     bulk[pool_id, :request_count, 0, : self.page_count] // kv_factor
                 )
         except (AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+            if submitted:
+                raise RuntimeError(
+                    "TriAttention bulk page-table copy failed after GPU submission"
+                ) from exc
             logger.warning(
                 f"TriAttention bulk page-table staging failed; using the host path: {exc}"
             )
@@ -1705,6 +1746,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         )
         self.top_B = top_B
         self.beta = beta
+        if self.top_B <= 0 or self.beta <= 0:
+            raise ValueError("TriAttention top_B and beta must both be positive")
         # Which token set each eviction round keeps (all reproduce the upstream
         # selection: z-normalize scores, pin the prompt tokens, no recency window):
         #   union              -- union of every KV head's top-B, re-ranked by the
@@ -1840,10 +1883,45 @@ class TriAttention(BaseKVCacheCompressionManager):
         request_id = request.py_request_id
         if request_id not in self._initialized_request_ids:
             self._validate_v2_compatibility()
+            self._validate_request_capacity(request)
             num_layers = self._num_layers_from_manager()
             self._attention_layer_partition(num_layers)
             self._initialized_request_ids.add(request_id)
         self._ensure_calibrated()
+
+    def _validate_request_capacity(self, request: "LlmRequest") -> None:
+        """Require enough target page-table capacity to reach first eviction."""
+        manager = self.kv_cache_manager
+        speculative_overshoot = (
+            0 if self.spec_config is None else int(self.spec_config.max_draft_len)
+        )
+        first_eviction_decode_length = (
+            (self.top_B // self.beta + 1) * self.beta
+            + speculative_overshoot
+        )
+        decode_capacity = min(int(request.py_max_new_tokens),
+                              first_eviction_decode_length)
+        confirmed_capacity = int(request.py_prompt_len) + decode_capacity
+        protected_tail_capacity = self._configured_protected_tail_capacity()
+        required_capacity = confirmed_capacity + protected_tail_capacity
+        pool_confirmed_capacity = manager.get_num_available_tokens(
+            token_num_upper_bound=confirmed_capacity,
+            max_num_draft_tokens=int(manager._kv_reserve_draft_tokens) + 1,
+        )
+        table_capacity = manager.max_blocks_per_seq * manager.tokens_per_block
+        if (confirmed_capacity > pool_confirmed_capacity
+                or required_capacity > table_capacity):
+            raise ValueError(
+                "TriAttention target KV capacity is too small to reach its first "
+                f"eviction: request requires {required_capacity} tokens "
+                f"(prompt={request.py_prompt_len}, budget={self.top_B}, "
+                f"beta={self.beta}, decode before eviction or completion="
+                f"{decode_capacity}, speculative overshoot="
+                f"{speculative_overshoot}, protected tail="
+                f"{protected_tail_capacity}), "
+                f"but the V2 pool covers {pool_confirmed_capacity + protected_tail_capacity} "
+                f"tokens and its page table covers {table_capacity} tokens"
+            )
 
     def _ensure_calibrated(self) -> None:
         """Resolve calibration once for startup prewarm or the first request."""
@@ -1883,6 +1961,11 @@ class TriAttention(BaseKVCacheCompressionManager):
         if manager.max_beam_width != 1:
             raise ValueError("TriAttention requires beam-width-one decoding")
         if self.spec_config is not None:
+            if self.spec_config.max_draft_len is None:
+                raise ValueError(
+                    "TriAttention speculative compatibility requires a resolved "
+                    "max_draft_len"
+                )
             if not self.spec_config.is_linear_tree:
                 raise ValueError("TriAttention speculative compatibility requires linear drafting")
             if self.spec_config.draft_len_schedule is not None:
@@ -1913,6 +1996,12 @@ class TriAttention(BaseKVCacheCompressionManager):
                     "TriAttention speculative compatibility requires the actual "
                     "separate draft KV cache manager"
                 )
+            if draft_manager.max_seq_len < manager.max_seq_len:
+                raise ValueError(
+                    "TriAttention compacts only the target KV cache, so the dense "
+                    "draft KV cache must cover the target logical max sequence "
+                    f"length ({draft_manager.max_seq_len} < {manager.max_seq_len})"
+                )
         if any(window is not None for window in manager.max_attention_window_vec) or any(
             not isinstance(layer, AttentionLayerConfig) or layer.sliding_window_size is not None
             for layer in manager.kv_cache_manager_py_config.layers
@@ -1939,8 +2028,9 @@ class TriAttention(BaseKVCacheCompressionManager):
         The compression manager is ordered after KVCacheManagerV2, so capacity
         already reflects the written token and any rewind. The overlap scheduler
         may already have enqueued the next forward; CUDA stream ordering keeps
-        compaction after that reader. Resize detaches the compacted tail without
-        blocking the host; V2's per-slot finish events prevent early page reuse.
+        compaction after that reader. The resize happens only after compaction;
+        it detaches the compacted tail without blocking the host, while V2's
+        per-slot finish events prevent early page reuse.
         """
         with nvtx_range_debug("triattention.generation_step_end", color="blue"):
             self._periodic_evict(scheduled_batch)

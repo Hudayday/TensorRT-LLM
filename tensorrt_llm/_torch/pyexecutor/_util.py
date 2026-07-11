@@ -958,6 +958,10 @@ class KvCacheCreator:
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
+        reuse_generation_kv_capacity = (
+            model_engine.kv_cache_manager_key ==
+            ResourceManagerType.KV_CACHE_MANAGER
+            and self._reuses_generation_kv_capacity())
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -977,6 +981,7 @@ class KvCacheCreator:
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
+            reuse_generation_kv_capacity=reuse_generation_kv_capacity,
         )
 
         if not self._skip_est:
@@ -999,10 +1004,16 @@ class KvCacheCreator:
                             max(1, kv_cache_manager.max_seq_len - 1))
                     self._max_seq_len = kv_cache_manager.max_seq_len
         else:
-            if kv_cache_manager is not None:
+            if (kv_cache_manager is not None and model_engine.kv_cache_manager_key
+                    == ResourceManagerType.KV_CACHE_MANAGER):
                 self._max_seq_len = kv_cache_manager.max_seq_len
 
         return kv_cache_manager
+
+    def _reuses_generation_kv_capacity(self) -> bool:
+        compression_config = self._llm_args.kv_cache_compression_config
+        return (compression_config is not None
+                and compression_config.algorithm == "triattention")
 
     def _should_create_separate_draft_kv_cache(self) -> bool:
         """
@@ -1686,7 +1697,8 @@ def _create_kv_cache_manager(
         num_kv_heads: Optional[Union[int, List[int]]] = None,
         head_dim: Optional[int] = None,
         kv_cache_type=None,
-        is_disagg: bool = False) -> KVCacheManager:
+        is_disagg: bool = False,
+        reuse_generation_kv_capacity: bool = False) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -1804,6 +1816,8 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+        manager_extra_kwargs[
+            "reuse_generation_kv_capacity"] = reuse_generation_kv_capacity
 
     if is_mla(config):
         kv_cache_manager = kv_cache_manager_cls(

@@ -16,8 +16,18 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+import torch
+
+import tensorrt_llm
+import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.mapping import Mapping
+
+DataType = tensorrt_llm.bindings.DataType
+CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
 
 
 def _manager(*, is_draft: bool = False) -> KVCacheManagerV2:
@@ -131,3 +141,45 @@ def test_suspended_cache_keeps_native_v2_behavior() -> None:
     manager.update_resources(SimpleNamespace(generation_requests=[request]))
 
     cache.resize.assert_not_called()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a real V2 CUDA pool")
+@pytest.mark.parametrize(
+    ("manager_kwargs", "is_draft", "expected_max_seq_len"),
+    [
+        ({}, False, 9_280),
+        ({"reuse_generation_kv_capacity": True}, False, 32_768),
+        ({"reuse_generation_kv_capacity": True}, True, 9_280),
+    ],
+)
+def test_real_v2_separates_logical_length_from_reused_physical_capacity(
+    manager_kwargs: dict,
+    is_draft: bool,
+    expected_max_seq_len: int,
+) -> None:
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_tokens=9_280,
+            enable_block_reuse=False,
+            max_util_for_resume=1.0,
+        ),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=16,
+        tokens_per_block=64,
+        max_seq_len=32_768,
+        max_batch_size=1,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=DataType.HALF,
+        vocab_size=128,
+        is_draft=is_draft,
+        **manager_kwargs,
+    )
+    try:
+        assert manager.max_seq_len == expected_max_seq_len
+        assert manager.max_blocks_per_seq == 148
+        assert manager.host_kv_cache_block_offsets.shape[-1] == 148
+        assert manager.get_num_available_tokens(token_num_upper_bound=32_768) == 9_280
+    finally:
+        manager.shutdown()

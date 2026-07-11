@@ -204,6 +204,10 @@ def _make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     fake_v2.max_total_draft_tokens = 0
     fake_v2._kv_reserve_draft_tokens = 0
     fake_v2.max_seq_len = 65536
+    fake_v2.tokens_per_block = 64
+    fake_v2.max_blocks_per_seq = 1028
+    fake_v2.get_num_available_tokens = (
+        lambda *, token_num_upper_bound, **_: token_num_upper_bound)
     fake_v2.max_attention_window_vec = []
     fake_v2.kv_cache_manager_py_config = SimpleNamespace(layers=[])
     fake_v2.impl = object()
@@ -227,6 +231,7 @@ def _make_request(request_id, **overrides):
     fields = {
         "py_request_id": request_id,
         "py_prompt_len": 0,
+        "py_max_new_tokens": 65536,
         "py_draft_tokens": [],
         "py_num_accepted_draft_tokens": 0,
         "is_dummy": False,
@@ -1186,6 +1191,90 @@ class TestStepEndHookRefactor:
 
         manager._validate_v2_compatibility()
 
+    def test_speculative_draft_must_cover_target_logical_length(self):
+        from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
+
+        target_manager = _make_fake_v2()
+        target_manager.max_seq_len = 32_768
+        draft_manager = _make_fake_v2(is_draft=True)
+        draft_manager.max_seq_len = 9_280
+        manager = TriAttention(
+            target_manager,
+            top_B=8,
+            skip_swa=False,
+            spec_config=DFlashDecodingConfig(max_draft_len=3),
+            draft_kv_cache_manager=draft_manager,
+        )
+
+        with pytest.raises(ValueError, match="dense draft KV cache must cover"):
+            manager._validate_v2_compatibility()
+
+    def test_request_capacity_must_reach_first_eviction(self):
+        manager = _make_triattention(top_B=4096, beta=4096)
+        manager.kv_cache_manager.tokens_per_block = 64
+        manager.kv_cache_manager.max_blocks_per_seq = 144
+        request = _make_request(7, py_prompt_len=1024)
+
+        with pytest.raises(ValueError, match="too small to reach its first eviction"):
+            manager._validate_request_capacity(request)
+
+    def test_request_capacity_checks_physical_pool_before_first_eviction(self):
+        manager = _make_triattention(top_B=4096, beta=128)
+        manager.kv_cache_manager.max_blocks_per_seq = 1028
+        manager.kv_cache_manager.get_num_available_tokens = (
+            lambda *, token_num_upper_bound, **_: token_num_upper_bound - 1)
+        request = _make_request(7, py_prompt_len=1024)
+
+        with pytest.raises(ValueError, match="too small to reach its first eviction"):
+            manager._validate_request_capacity(request)
+
+    @pytest.mark.parametrize(
+        ("top_B", "beta", "max_new_tokens", "expected_decode_capacity"),
+        [
+            (4096, 128, 16384, 4224),
+            (4100, 128, 16384, 4224),
+            (4096, 128, 2048, 2048),
+        ],
+    )
+    def test_request_capacity_uses_first_real_boundary_or_completion(
+        self,
+        top_B,
+        beta,
+        max_new_tokens,
+        expected_decode_capacity,
+    ):
+        manager = _make_triattention(top_B=top_B, beta=beta)
+        manager.kv_cache_manager.get_num_available_tokens = mock.MagicMock(
+            side_effect=lambda *, token_num_upper_bound, **_: token_num_upper_bound)
+        request = _make_request(
+            7,
+            py_prompt_len=1024,
+            py_max_new_tokens=max_new_tokens,
+        )
+
+        manager._validate_request_capacity(request)
+
+        assert manager.kv_cache_manager.get_num_available_tokens.call_args.kwargs[
+            "token_num_upper_bound"] == 1024 + expected_decode_capacity
+
+    def test_request_capacity_includes_speculative_boundary_overshoot(self):
+        from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
+
+        manager = _make_triattention(
+            top_B=4096,
+            beta=128,
+            spec_config=DFlashDecodingConfig(max_draft_len=4),
+            draft_kv_cache_manager=_make_fake_v2(is_draft=True),
+        )
+        manager.kv_cache_manager.get_num_available_tokens = mock.MagicMock(
+            side_effect=lambda *, token_num_upper_bound, **_: token_num_upper_bound)
+        request = _make_request(7, py_prompt_len=1024)
+
+        manager._validate_request_capacity(request)
+
+        assert manager.kv_cache_manager.get_num_available_tokens.call_args.kwargs[
+            "token_num_upper_bound"] == 1024 + 4224 + 4
+
     def test_dflash_requires_actual_separate_draft_manager(self):
         from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
 
@@ -1932,8 +2021,15 @@ class TestFixedScoreMetadata:
         workspace._bulk_stage_logged = True
         workspace.bulk_allocation_done = mock.Mock()
         workspace.bulk_copy_done = mock.Mock()
+        workspace._bulk_offsets_src = None
+        copy_idx_storage = mock.MagicMock()
+        copy_idx_source = mock.Mock(shape=(1,))
+        copy_idx_storage.__getitem__.return_value = copy_idx_source
+        workspace._bulk_copy_idx_src = copy_idx_storage
         bulk = mock.MagicMock()
         bulk.shape = (1, 2, 2, 4)
+        source = mock.Mock(shape=(1, 8, 2, 4), dtype=torch.int32)
+        host_table = mock.Mock(shape=(1, 8, 2, 4), dtype=torch.int32)
         converted = mock.Mock()
         bulk.__getitem__.return_value.__floordiv__.return_value = converted
         workspace._bulk_offsets_dst = None
@@ -1942,29 +2038,43 @@ class TestFixedScoreMetadata:
         workspace.page_ids_device.__getitem__.return_value = page_destination
 
         manager_stream = mock.Mock()
+        copy_idx = mock.Mock(shape=(1,))
         manager = SimpleNamespace(
-            host_kv_cache_block_offsets=SimpleNamespace(shape=(1, 8, 2, 4), dtype=torch.int32),
+            host_kv_cache_block_offsets=host_table,
             kv_factor=2,
             layer_offsets={10: 0},
             layer_to_pool_mapping_dict={0: 0},
-            copy_batch_block_offsets=mock.Mock(),
+            index_mapper=SimpleNamespace(get_copy_index=mock.Mock(return_value=copy_idx)),
+            index_scales=mock.Mock(),
+            kv_offset=mock.Mock(),
             _stream=manager_stream,
         )
         current_stream = mock.Mock()
         calls = mock.Mock()
+        source.copy_.side_effect = lambda *args: calls.snapshot()
+        copy_idx_source.copy_.side_effect = lambda *args: calls.index_snapshot()
         workspace.bulk_allocation_done.record.side_effect = lambda *args: calls.allocation_record()
         manager_stream.wait_event.side_effect = lambda *args: calls.manager_wait()
-        manager.copy_batch_block_offsets.side_effect = lambda *args: calls.copy()
         workspace.bulk_copy_done.record.side_effect = lambda *args: calls.record()
         current_stream.wait_event.side_effect = lambda *args: calls.wait()
         page_destination.copy_.side_effect = lambda *args: calls.read()
 
-        with mock.patch.object(torch, "empty", return_value=bulk):
+        with (
+            mock.patch.object(torch, "empty", return_value=bulk),
+            mock.patch.object(torch, "empty_like", return_value=source),
+            mock.patch(
+                "tensorrt_llm._torch.kv_cache_compression.triattention.triattention."
+                "copy_batch_block_offsets_to_device",
+                side_effect=lambda *args: calls.copy(),
+            ) as copy_offsets,
+        ):
             assert workspace._stage_page_tables_bulk(manager, [7], current_stream)
 
         assert calls.mock_calls == [
+            mock.call.snapshot(),
             mock.call.allocation_record(),
             mock.call.manager_wait(),
+            mock.call.index_snapshot(),
             mock.call.copy(),
             mock.call.record(),
             mock.call.wait(),
@@ -1974,6 +2084,107 @@ class TestFixedScoreMetadata:
         manager_stream.wait_event.assert_called_once_with(workspace.bulk_allocation_done)
         workspace.bulk_copy_done.record.assert_called_once_with(manager_stream)
         current_stream.wait_event.assert_called_once_with(workspace.bulk_copy_done)
+        source.copy_.assert_called_once_with(host_table)
+        copy_idx_source.copy_.assert_called_once_with(copy_idx)
+        copy_offsets.assert_called_once_with(
+            source,
+            bulk,
+            copy_idx_source,
+            manager.index_scales,
+            manager.kv_offset,
+            manager_stream.cuda_stream,
+        )
+
+        workspace.bulk_copy_done.record.side_effect = RuntimeError("event record failed")
+        with mock.patch(
+            "tensorrt_llm._torch.kv_cache_compression.triattention.triattention."
+            "copy_batch_block_offsets_to_device"
+        ):
+            with pytest.raises(RuntimeError, match="failed after GPU submission"):
+                workspace._stage_page_tables_bulk(manager, [7], current_stream)
+
+    @CUDA_REQUIRED
+    def test_bulk_page_table_copy_uses_immutable_host_snapshots(self):
+        from types import SimpleNamespace
+
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            _FixedScoreMetadataWorkspace,
+        )
+
+        device = torch.device("cuda")
+        current_stream = torch.cuda.current_stream(device)
+        manager_stream = torch.cuda.Stream(device=device)
+        host_table = torch.zeros(
+            1,
+            2,
+            2,
+            4,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+        host_table[0, 0, 0, :2] = torch.tensor([3, 4], dtype=torch.int32)
+        host_table[0, 1, 0, :2] = torch.tensor([7, 8], dtype=torch.int32)
+        persistent_copy_idx = torch.zeros(
+            1, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+
+        workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
+        workspace.device = device
+        workspace.max_requests = 1
+        workspace.page_count = 2
+        workspace.global_representatives = (10,)
+        workspace._bulk_stage_logged = True
+        workspace.bulk_allocation_done = torch.cuda.Event()
+        workspace.bulk_copy_done = torch.cuda.Event()
+        workspace._bulk_offsets_src = None
+        workspace._bulk_offsets_dst = None
+        workspace._bulk_copy_idx_src = torch.empty(
+            1, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        workspace.page_ids_device = torch.empty(
+            1, 1, 2, dtype=torch.int64, device=device
+        )
+
+        manager = SimpleNamespace(
+            host_kv_cache_block_offsets=host_table,
+            kv_factor=2,
+            layer_offsets={10: 0},
+            layer_to_pool_mapping_dict={0: 0},
+            index_mapper=SimpleNamespace(
+                get_copy_index=lambda request_ids, num_contexts, beam_width: persistent_copy_idx
+            ),
+            index_scales=torch.tensor(
+                [2], dtype=torch.int32, device="cpu", pin_memory=True
+            ),
+            kv_offset=torch.tensor(
+                [1], dtype=torch.int32, device="cpu", pin_memory=True
+            ),
+            _stream=manager_stream,
+        )
+
+        with torch.cuda.stream(manager_stream):
+            torch.cuda._sleep(50_000_000)
+        assert workspace._stage_page_tables_bulk(manager, [7], current_stream)
+
+        # Mutate both persistent V2 host inputs before the delayed kernel reads.
+        # The staged result must still reflect row 0 values [3, 4].
+        host_table[0, 0, 0, :2] = torch.tensor([9, 10], dtype=torch.int32)
+        persistent_copy_idx[0] = 1
+        current_stream.synchronize()
+
+        assert workspace.page_ids_device[0, 0].tolist() == [3, 4]
+
+        host_table[0, 0, 0, :2] = torch.tensor([11, 12], dtype=torch.int32)
+        persistent_copy_idx[0] = 0
+        with torch.cuda.stream(manager_stream):
+            torch.cuda._sleep(50_000_000)
+        assert workspace._stage_page_tables_bulk(manager, [7], current_stream)
+        host_table[0, 0, 0, :2] = torch.tensor([13, 14], dtype=torch.int32)
+        persistent_copy_idx[0] = 1
+        current_stream.synchronize()
+
+        assert workspace.page_ids_device[0, 0].tolist() == [11, 12]
 
     @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
     def test_config_enables_one_graph_pipeline_without_environment_gates(self, eviction_mode):
@@ -2934,27 +3145,40 @@ class TestFixedScoreMetadata:
         layer_to_pool = {0: 0, 1: 1, 2: 2}
         bulk_calls = []
 
-        def copy_batch_block_offsets(dst, request_ids, beam_width, num_contexts, num_seqs):
-            bulk_calls.append((tuple(request_ids), beam_width, num_contexts, num_seqs))
+        def copy_batch_block_offsets(
+            source, dst, copy_idx, index_scales, kv_offset, stream
+        ):
+            bulk_calls.append(tuple(copy_idx.tolist()))
             dst.zero_()
             for layer, pages in page_lists.items():
                 pool_id = layer_to_pool[layer_offsets[layer]]
                 page_offsets = torch.tensor(pages, dtype=dst.dtype, device=dst.device) * 2
-                dst[pool_id, :num_seqs, 0, : len(pages)] = page_offsets
+                dst[pool_id, :2, 0, : len(pages)] = page_offsets
 
         cache = SimpleNamespace(
             host_kv_cache_block_offsets=torch.empty(3, 8, 2, 2, dtype=torch.int32, pin_memory=True),
             kv_factor=2,
             layer_offsets=layer_offsets,
             layer_to_pool_mapping_dict=layer_to_pool,
-            copy_batch_block_offsets=copy_batch_block_offsets,
+            index_mapper=SimpleNamespace(
+                get_copy_index=lambda request_ids, num_contexts, beam_width: torch.tensor(
+                    [0, 1], dtype=torch.int32, device=device
+                )
+            ),
+            index_scales=torch.empty(0, dtype=torch.int32, device=device),
+            kv_offset=torch.empty(0, dtype=torch.int32, device=device),
             _stream=torch.cuda.current_stream(device),
             get_batch_cache_indices=mock.Mock(
                 side_effect=AssertionError("bulk V2 staging must not use the host path")
             ),
         )
 
-        assert workspace.stage(cache, [7, 8], [8.0, 9.0], [8, 7])
+        with mock.patch(
+            "tensorrt_llm._torch.kv_cache_compression.triattention.triattention."
+            "copy_batch_block_offsets_to_device",
+            side_effect=copy_batch_block_offsets,
+        ):
+            assert workspace.stage(cache, [7, 8], [8.0, 9.0], [8, 7])
         torch.cuda.current_stream(device).synchronize()
 
         expected = torch.tensor(
@@ -2969,7 +3193,7 @@ class TestFixedScoreMetadata:
         assert torch.equal(workspace.page_ids_device[:, :2], expected)
         assert workspace.round_starts_device[:2].tolist() == [8.0, 9.0]
         assert workspace.valid_seq_lens_device[:2].tolist() == [8, 7]
-        assert bulk_calls == [((7, 8), 1, 0, 2)]
+        assert bulk_calls == [(0, 1)]
         cache.get_batch_cache_indices.assert_not_called()
 
 

@@ -15,6 +15,7 @@
 
 import enum
 import os
+from collections.abc import Collection
 from typing import Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
@@ -36,6 +37,9 @@ class ScheduleAction(enum.Enum):
     SCHEDULED = "scheduled"  # success — payload contains tokens etc.
     SKIP = "skip"  # skip this request, continue the loop
     STOP = "stop"  # stop the scheduling loop
+
+
+_EMPTY_REQUEST_IDS: frozenset[int] = frozenset()
 
 
 class BudgetTracker:
@@ -217,8 +221,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
 
     def schedule_request(
-        self, active_requests: RequestList, inflight_request_ids: set[int]
+        self,
+        active_requests: RequestList,
+        inflight_request_ids: set[int],
+        pending_update_request_ids: Optional[Collection[int]] = None,
     ) -> SchedulerOutput:
+        if pending_update_request_ids is None:
+            pending_update_request_ids = _EMPTY_REQUEST_IDS
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
         # Main scheduling loop
         (
@@ -228,7 +237,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             evicted,
             disagg_candidates,
             has_chunking,
-        ) = self._schedule_loop(active_requests, inflight_request_ids)
+        ) = self._schedule_loop(
+            active_requests,
+            inflight_request_ids,
+            pending_update_request_ids,
+        )
 
         # Sort by LoRA task ID
         scheduled_encoder.sort(key=_get_lora_task_id)
@@ -245,7 +258,12 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # ---- Main scheduling loop ----
 
-    def _schedule_loop(self, active_requests, inflight_request_ids):
+    def _schedule_loop(
+        self,
+        active_requests,
+        inflight_request_ids,
+        pending_update_request_ids,
+    ):
         scheduled_ctx: RequestList = []
         scheduled_encoder: RequestList = []
         scheduled_gen: RequestList = []
@@ -253,6 +271,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         disagg_candidates: RequestList = []
         scheduled_beam_width = 0
         has_chunking = False
+        blocked_by_protected_request = False
 
         budget = BudgetTracker(
             self.max_num_tokens,
@@ -375,7 +394,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                 peft_pages = budget.peft_pages_needed(req)
                 if peft_pages is None:
                     break
-                action, tokens, scheduled_beam_width, req_it_end = self._try_schedule_generation(
+                (
+                    action,
+                    tokens,
+                    scheduled_beam_width,
+                    req_it_end,
+                    request_blocked_by_protected_request,
+                ) = self._try_schedule_generation(
                     req,
                     budget,
                     requests_list,
@@ -383,7 +408,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                     req_it_end,
                     evicted,
                     scheduled_beam_width,
+                    inflight_request_ids,
+                    pending_update_request_ids,
                 )
+                blocked_by_protected_request |= request_blocked_by_protected_request
                 if action is ScheduleAction.STOP:
                     break
                 if action is ScheduleAction.SKIP:
@@ -431,7 +459,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 and not r.is_generation_to_complete_state
                 and r.request_id not in inflight_request_ids
             )
-            if num_gen_candidates > 0 and not evicted:
+            if num_gen_candidates > 0 and not evicted and not blocked_by_protected_request:
                 raise RuntimeError(
                     f"V2 scheduler deadlock: {num_gen_candidates} generation "
                     f"request(s) active but none could be scheduled or "
@@ -912,32 +940,53 @@ class KVCacheV2Scheduler(RequestScheduler):
         req_it_end: int,
         evicted: RequestList,
         scheduled_beam_width: int,
-    ) -> tuple[ScheduleAction, int, int, int]:
+        inflight_request_ids: set[int],
+        pending_update_request_ids: Collection[int],
+    ) -> tuple[ScheduleAction, int, int, int, bool]:
         """Try to schedule a generation request.
 
-        Returns ``(action, tokens, scheduled_beam_width, req_it_end)``.
+        Returns ``(action, tokens, scheduled_beam_width, req_it_end,
+        blocked_by_protected_request)``.
         *tokens* is meaningful only when *action* is ``SCHEDULED``.
         """
         beam_width = req.get_beam_width_by_iter(for_next_iteration=False)
         req_tokens = beam_width + get_draft_token_length(req)
 
         if not budget.can_fit_tokens(req_tokens):
-            return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
+            return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end, False
 
         if scheduled_beam_width == 0:
             scheduled_beam_width = beam_width
         elif scheduled_beam_width != beam_width:
-            return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
+            return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end, False
 
         success = self.kv_cache_manager.try_allocate_generation(req)
+        if not success and req.request_id in pending_update_request_ids:
+            # The previous batch must publish this request's accepted-token
+            # update before any new allocation or suspension decision.
+            return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end, True
+
+        blocked_by_protected_victim = False
 
         if not success:
-            req_it_end, success = self._try_evict_for_gen(
-                req, requests_list, req_it, req_it_end, evicted
+            req_it_end, success, blocked_by_protected_victim = self._try_evict_for_gen(
+                req,
+                requests_list,
+                req_it,
+                req_it_end,
+                evicted,
+                inflight_request_ids,
+                pending_update_request_ids,
             )
 
         if success:
-            return ScheduleAction.SCHEDULED, req_tokens, scheduled_beam_width, req_it_end
+            return (
+                ScheduleAction.SCHEDULED,
+                req_tokens,
+                scheduled_beam_width,
+                req_it_end,
+                False,
+            )
 
         # Self-eviction: suspend this gen request to free its
         # GPU pages so other requests can resume().
@@ -951,7 +1000,13 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._suspend_request(req)
             evicted.append(req)
 
-        return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
+        return (
+            ScheduleAction.STOP,
+            0,
+            scheduled_beam_width,
+            req_it_end,
+            blocked_by_protected_victim,
+        )
 
     # ---- Eviction ----
 
@@ -991,7 +1046,16 @@ class KVCacheV2Scheduler(RequestScheduler):
             return False
         return self.kv_cache_manager.is_request_active(req.py_request_id)
 
-    def _try_evict_for_gen(self, req, requests_list, req_it, req_it_end, evicted):
+    def _try_evict_for_gen(
+        self,
+        req,
+        requests_list,
+        req_it,
+        req_it_end,
+        evicted,
+        inflight_request_ids,
+        pending_update_request_ids,
+    ):
         """Evict started requests from active_requests tail to make room.
 
         Search backwards from req_it_end
@@ -1002,14 +1066,22 @@ class KVCacheV2Scheduler(RequestScheduler):
         main loop), so they are never in scheduled_ctx/scheduled_gen and
         no token budget reclaim is needed.
 
-        Returns (new_req_it_end, success) tuple. new_req_it_end is always
-        updated to reflect evicted victims (even on failure) so the caller
-        can skip already-evicted requests.
+        Returns ``(new_req_it_end, success, blocked_by_protected_request)``.
+        ``new_req_it_end`` is always updated to reflect evicted victims (even
+        on failure) so the caller can skip already-evicted requests.
         """
+        blocked_by_protected_request = False
         while req_it_end > req_it:
             victim_idx = None
             for i in range(req_it_end - 1, req_it, -1):
-                if self._is_evictable(requests_list[i]):
+                victim = requests_list[i]
+                if victim.request_id in inflight_request_ids:
+                    blocked_by_protected_request = True
+                    continue
+                if victim.request_id in pending_update_request_ids:
+                    blocked_by_protected_request = True
+                    continue
+                if self._is_evictable(victim):
                     victim_idx = i
                     break
 
@@ -1026,9 +1098,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             req_it_end = victim_idx
 
             if self.kv_cache_manager.try_allocate_generation(req):
-                return req_it_end, True
+                return req_it_end, True, blocked_by_protected_request
 
-        return req_it_end, False
+        return req_it_end, False, blocked_by_protected_request
 
     # ---- Sorting ----
 

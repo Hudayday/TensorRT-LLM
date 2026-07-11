@@ -82,7 +82,7 @@ from .resource_manager import (ResourceManager, ResourceManagerType,
                                request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
-from .scheduler import (RequestScheduler, ScheduledRequests,
+from .scheduler import (KVCacheV2Scheduler, RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter
@@ -4901,8 +4901,21 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
-        scheduler_output = self.scheduler.schedule_request(
-            self.active_requests, self.inflight_req_ids)
+        if (isinstance(self.scheduler, KVCacheV2Scheduler)
+                and self.kv_cache_manager.generation_capacity_only
+                and self.previous_batch is not None):
+            pending_update_request_ids = {
+                request.request_id
+                for request in self.previous_batch.scheduled_requests.all_requests()
+            }
+            scheduler_output = self.scheduler.schedule_request(
+                self.active_requests,
+                self.inflight_req_ids,
+                pending_update_request_ids,
+            )
+        else:
+            scheduler_output = self.scheduler.schedule_request(
+                self.active_requests, self.inflight_req_ids)
 
         scheduled_context_requests = scheduler_output.context_requests
         if self.enable_attention_dp and self.attention_dp_enable_balance:
