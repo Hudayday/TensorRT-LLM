@@ -958,6 +958,11 @@ class KvCacheCreator:
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
+        reuse_generation_kv_capacity = (
+            model_engine.kv_cache_manager_key
+            == ResourceManagerType.KV_CACHE_MANAGER
+            and _kv_cache_compression_adjusts_generation_length(
+                self._llm_args.kv_cache_compression_config))
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -977,6 +982,7 @@ class KvCacheCreator:
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
+            reuse_generation_kv_capacity=reuse_generation_kv_capacity,
         )
 
         if not self._skip_est:
@@ -999,7 +1005,9 @@ class KvCacheCreator:
                             max(1, kv_cache_manager.max_seq_len - 1))
                     self._max_seq_len = kv_cache_manager.max_seq_len
         else:
-            if kv_cache_manager is not None:
+            if (kv_cache_manager is not None
+                    and model_engine.kv_cache_manager_key
+                    == ResourceManagerType.KV_CACHE_MANAGER):
                 self._max_seq_len = kv_cache_manager.max_seq_len
 
         return kv_cache_manager
@@ -1686,7 +1694,8 @@ def _create_kv_cache_manager(
         num_kv_heads: Optional[Union[int, List[int]]] = None,
         head_dim: Optional[int] = None,
         kv_cache_type=None,
-        is_disagg: bool = False) -> KVCacheManager:
+        is_disagg: bool = False,
+        reuse_generation_kv_capacity: bool = False) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -1804,6 +1813,8 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+        manager_extra_kwargs[
+            "reuse_generation_kv_capacity"] = reuse_generation_kv_capacity
 
     if is_mla(config):
         kv_cache_manager = kv_cache_manager_cls(
@@ -2035,6 +2046,8 @@ def _create_kv_cache_manager(
 def create_kv_cache_compression_manager(
     config: KvCacheCompressionConfig,
     kv_cache_manager: KVCacheManagerV2,
+    draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+    spec_config: Optional[SpeculativeConfig] = None,
 ) -> Optional[BaseKVCacheCompressionManager]:
     """Build the KV-cache compression manager for ``config.algorithm``, or return
     None if no algorithm matches.
@@ -2049,6 +2062,17 @@ def create_kv_cache_compression_manager(
         config.algorithm,
     )
     return None
+
+
+def _kv_cache_compression_adjusts_generation_length(
+        config: Optional[KvCacheCompressionConfig]) -> bool:
+    """Return a registered compression algorithm's target-length capability.
+
+    Concrete manager registration extends this dispatcher alongside
+    :func:`create_kv_cache_compression_manager`. Keeping the capability in the
+    runtime factory avoids adding a public LLM-argument field.
+    """
+    return False
 
 
 def create_py_executor_instance(
@@ -2256,7 +2280,12 @@ def create_py_executor_instance(
                                           "kv_cache_compression_config", None)
     if kv_cache_compression_config is not None:
         compression_manager = create_kv_cache_compression_manager(
-            kv_cache_compression_config, kv_cache_manager)
+            kv_cache_compression_config,
+            kv_cache_manager,
+            draft_kv_cache_manager=resources.get(
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER),
+            spec_config=spec_config,
+        )
         if compression_manager is not None:
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
                 compression_manager)
@@ -2269,16 +2298,15 @@ def create_py_executor_instance(
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
     # Compression manager runs after the cache manager: reconciles history once it's resized.
-    if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
-            in resource_manager.resource_managers):
-        resource_manager.resource_managers.move_to_end(
-            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER, last=True)
-
     cross_kv_cache_manager = resources.get(
         ResourceManagerType.CROSS_KV_CACHE_MANAGER)
     if cross_kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.CROSS_KV_CACHE_MANAGER, last=True)
+    if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
+            in resource_manager.resource_managers):
+        resource_manager.resource_managers.move_to_end(
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER, last=True)
 
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.

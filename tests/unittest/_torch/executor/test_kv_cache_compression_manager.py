@@ -22,6 +22,8 @@ sparse-attention backend); the ``create_kv_cache_compression_manager`` factory
 lives in ``_util.py`` next to ``_create_kv_cache_manager``.
 """
 
+from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -31,6 +33,8 @@ from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_man
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseKVCacheCompressionManager,
     BaseResourceManager,
+    ResourceManager,
+    ResourceManagerType,
 )
 
 # ---------------------------------------------------------------------- #
@@ -67,13 +71,25 @@ class _MockCompressionManager(_RecordingMixin, BaseKVCacheCompressionManager):
         self._record("on_request_finish")
 
 
+class _LengthAdjustingCompressionManager(BaseKVCacheCompressionManager):
+    adjusts_generation_kv_length: ClassVar[bool] = True
+
+
+def _v2_manager(*, is_draft: bool):
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+
+    manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    manager.enable_block_reuse = False
+    manager.generation_capacity_only = False
+    manager.is_draft = is_draft
+    return manager
+
+
 @pytest.fixture
 def fake_kv_cache_manager():
     """A stand-in KVCacheManagerV2. The framework reads enable_block_reuse off
     it in __init__; default it to False, like a normal run with reuse off."""
-    m = MagicMock(name="fake_KVCacheManagerV2")
-    m.enable_block_reuse = False
-    return m
+    return _v2_manager(is_draft=False)
 
 
 def _req(rid, first_chunk=True):
@@ -104,8 +120,11 @@ class TestBaseABC:
     def test_four_hooks_default_noop(self, fake_kv_cache_manager):
         m = BaseKVCacheCompressionManager(fake_kv_cache_manager)
         meta = MagicMock()
+        assert m.prewarm() is None
+        assert m.adjust_attention_metadata(meta) is None
         assert m.on_request_init(MagicMock()) is None
         assert m.on_context_step_end(MagicMock(), meta) is None
+        assert m.on_generation_step_begin(MagicMock(), meta) is None
         assert m.on_generation_step_end(MagicMock(), meta) is None
         assert m.on_request_finish(MagicMock()) is None
 
@@ -123,6 +142,38 @@ class TestBaseABC:
         assert m.get_max_resource_count() == 0
         assert m.get_needed_resource_to_completion(MagicMock()) == 0
 
+    def test_length_adjustment_is_scoped_to_target_v2(self):
+        target = _v2_manager(is_draft=False)
+        draft = _v2_manager(is_draft=True)
+
+        manager = _LengthAdjustingCompressionManager(target, draft)
+
+        assert manager.kv_cache_manager is target
+        assert manager.draft_kv_cache_manager is draft
+        assert manager.has_independent_draft_kv_cache
+        assert target.generation_capacity_only is True
+        assert draft.generation_capacity_only is False
+
+    def test_rejects_non_v2_ownership(self):
+        with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
+            BaseKVCacheCompressionManager(MagicMock())
+        with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
+            BaseKVCacheCompressionManager(_v2_manager(is_draft=False), MagicMock())
+
+    def test_publishes_draft_length_delta_through_protocol(self):
+        class Metadata:
+            def set_draft_kv_length_delta(self, delta):
+                self.delta = list(delta)
+
+        manager = BaseKVCacheCompressionManager(
+            _v2_manager(is_draft=False), _v2_manager(is_draft=True)
+        )
+        metadata = Metadata()
+
+        manager.publish_draft_kv_length_delta(metadata, [0, 37])
+
+        assert metadata.delta == [0, 37]
+
 
 # ---------------------------------------------------------------------- #
 # 2. Resource-manager API -> lifecycle-hook translation                   #
@@ -131,6 +182,46 @@ class TestBaseABC:
 
 
 class TestResourceManagerAPI:
+    def test_target_update_receives_metadata_before_final_compression(self):
+        calls = []
+        metadata = MagicMock(name="attention_metadata")
+        draft = MagicMock(name="draft_kv_cache_manager")
+        target = MagicMock(name="target_kv_cache_manager")
+        compression = MagicMock(name="compression_manager")
+        draft.update_resources.side_effect = lambda *args: calls.append(("draft", args))
+        target.update_resources.side_effect = lambda *args: calls.append(("target", args))
+        compression.update_resources.side_effect = lambda *args: calls.append(("compression", args))
+        manager = ResourceManager(
+            {
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft,
+                ResourceManagerType.KV_CACHE_MANAGER: target,
+                ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER: compression,
+            }
+        )
+        batch = _batch(generation=[_req(1)])
+
+        manager.update_resources(batch, metadata, 2.0)
+
+        assert calls == [
+            ("draft", (batch,)),
+            ("target", (batch, metadata, 2.0)),
+            ("compression", (batch,)),
+        ]
+
+    def test_real_v2_target_receives_relocation_metadata(self):
+        from tensorrt_llm._torch.pyexecutor import kv_cache_manager_v2 as kv_cache_v2_module
+
+        target = _v2_manager(is_draft=False)
+        target.kv_cache_map = {}
+        batch = _batch(generation=[_req(1)])
+        metadata = MagicMock(name="attention_metadata")
+        manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: target})
+
+        with patch.object(kv_cache_v2_module, "_update_kv_cache_draft_token_location") as relocate:
+            manager.update_resources(batch, metadata, 2.0)
+
+        relocate.assert_called_once_with(target, batch, metadata, 2.0)
+
     def test_prepare_fires_init_on_first_chunk_only(self, fake_kv_cache_manager):
         rec = []
         m = _MockCompressionManager(fake_kv_cache_manager, rec, "s")
@@ -185,6 +276,90 @@ class TestFactory:
             create_kv_cache_compression_manager(cfg, fake_kv_cache_manager)
             mock_logger.warning.assert_called_once()
 
+    def test_factory_accepts_independent_draft_manager(self):
+        cfg = MagicMock()
+        cfg.algorithm = "made_up_method"
+        target = _v2_manager(is_draft=False)
+        draft = _v2_manager(is_draft=True)
+
+        assert (
+            create_kv_cache_compression_manager(
+                cfg,
+                target,
+                draft_kv_cache_manager=draft,
+                spec_config=MagicMock(),
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        (
+            "manager_key",
+            "adjusts_generation_length",
+            "manager_max_seq_len",
+            "expected_reuse",
+            "expected_creator_max_seq_len",
+        ),
+        [
+            (ResourceManagerType.KV_CACHE_MANAGER, False, 9_280, False, 9_280),
+            (ResourceManagerType.KV_CACHE_MANAGER, True, 32_768, True, 32_768),
+            (ResourceManagerType.DRAFT_KV_CACHE_MANAGER, True, 9_280, False, 32_768),
+        ],
+    )
+    def test_creator_enables_generation_capacity_reuse_for_target_only(
+        self,
+        manager_key,
+        adjusts_generation_length,
+        manager_max_seq_len,
+        expected_reuse,
+        expected_creator_max_seq_len,
+    ):
+        from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+
+        creator = KvCacheCreator.__new__(KvCacheCreator)
+        creator._mapping = MagicMock()
+        creator._kv_cache_config = MagicMock()
+        creator._tokens_per_block = 64
+        creator._max_seq_len = 32_768
+        creator._net_max_seq_len = 32_768
+        creator._max_batch_size = 1
+        creator._max_num_tokens = 4_096
+        creator._max_beam_width = 1
+        creator._speculative_config = None
+        creator._sparse_attention_config = None
+        creator._kv_connector_manager = None
+        creator._execution_stream = None
+        creator._is_disagg = False
+        creator._dummy_reqs = None
+        creator._skip_est = True
+        creator._llm_args = SimpleNamespace(kv_cache_compression_config=MagicMock())
+        creator._get_model_kv_cache_manager_cls = MagicMock(return_value=KVCacheManagerV2)
+        creator._should_create_separate_draft_kv_cache = MagicMock(return_value=False)
+        creator._enable_kv_cache_stats = MagicMock(return_value=False)
+
+        model_engine = MagicMock()
+        model_engine.model.model_config.is_generation = True
+        model_engine.kv_cache_manager_key = manager_key
+        created_manager = SimpleNamespace(max_seq_len=manager_max_seq_len)
+
+        with (
+            patch.object(
+                util_mod,
+                "_kv_cache_compression_adjusts_generation_length",
+                return_value=adjusts_generation_length,
+            ),
+            patch.object(
+                util_mod,
+                "_create_kv_cache_manager",
+                return_value=created_manager,
+            ) as create,
+        ):
+            assert creator._create_kv_cache_manager(model_engine) is created_manager
+
+        assert create.call_args.kwargs["reuse_generation_kv_capacity"] is expected_reuse
+        assert creator._max_seq_len == expected_creator_max_seq_len
+
 
 # ---------------------------------------------------------------------- #
 # 4. Canonical names live in resource_manager, not in the sparse module   #
@@ -219,7 +394,7 @@ class TestBlockReuseGuard:
     and values, the same check RocketKVCacheManager makes."""
 
     def _mgr(self, enable_block_reuse):
-        m = MagicMock(name="KVCacheManagerV2")
+        m = _v2_manager(is_draft=False)
         m.enable_block_reuse = enable_block_reuse
         return m
 

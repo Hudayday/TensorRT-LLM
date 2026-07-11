@@ -201,6 +201,9 @@ class AttentionMetadata:
     def on_update_kv_lens(self):
         pass
 
+    def on_kv_cache_manager_changed(self) -> None:
+        """Refresh backend state after the active KV cache manager changes."""
+
     def on_update(self):
         if (self._seq_lens is not None
                 and self._seq_lens.shape[0] >= self.num_contexts

@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import DisaggTransferAdmissionCo
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
+    KVCacheV2Scheduler,
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
@@ -199,6 +200,41 @@ def _make_executor_with_kv_cache_manager(kv_cache_manager):
         ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager
     }
     return executor
+
+
+def test_schedule_passes_previous_batch_ids_as_pending_v2_updates():
+    scheduler_output = types.SimpleNamespace(
+        context_requests=[],
+        generation_requests=[],
+        encoder_requests=[],
+        paused_requests=[],
+        fitting_disagg_gen_init_requests=[],
+        num_fitting_requests=0,
+    )
+    scheduler = KVCacheV2Scheduler.__new__(KVCacheV2Scheduler)
+    scheduler.schedule_request = Mock(return_value=scheduler_output)
+    active_requests = [Mock(request_id=3)]
+    inflight_request_ids = {5}
+    previous_requests = [Mock(request_id=11), Mock(request_id=17)]
+    previous_scheduled = Mock()
+    previous_scheduled.all_requests.return_value = previous_requests
+
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.scheduler = scheduler
+    executor.kv_cache_manager = types.SimpleNamespace(generation_capacity_only=True)
+    executor.previous_batch = types.SimpleNamespace(scheduled_requests=previous_scheduled)
+    executor.active_requests = active_requests
+    executor.inflight_req_ids = inflight_request_ids
+    executor.enable_attention_dp = False
+    executor.enable_batch_waiting = False
+
+    executor._schedule()
+
+    scheduler.schedule_request.assert_called_once_with(
+        active_requests,
+        inflight_request_ids,
+        {11, 17},
+    )
 
 
 def test_get_kv_cache_capacity_without_manager():

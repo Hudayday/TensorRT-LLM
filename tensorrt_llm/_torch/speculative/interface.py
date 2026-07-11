@@ -143,6 +143,7 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
     attn_metadata.host_kv_cache_block_offsets = (
         draft_kv_cache_manager.host_kv_cache_block_offsets)
+    attn_metadata.on_kv_cache_manager_changed()
     if attn_metadata.enable_flash_mla:
         attn_metadata.prepare_flash_mla()
 
@@ -198,6 +199,7 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
         saved_state['target_kv_cache_block_offsets'])
     attn_metadata.host_kv_cache_block_offsets = (
         saved_state['target_host_kv_cache_block_offsets'])
+    attn_metadata.on_kv_cache_manager_changed()
     if attn_metadata.enable_flash_mla:
         attn_metadata.prepare_flash_mla()
     saved_dsa = saved_state.get('saved_dsa_state')
@@ -1643,6 +1645,7 @@ class SpecWorkerBase(nn.Module, ABC):
         attn_metadata.kv_cache_manager = draft_kv_cache_manager
         attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
         attn_metadata.host_kv_cache_block_offsets = draft_kv_cache_manager.host_kv_cache_block_offsets
+        attn_metadata.on_kv_cache_manager_changed()
         if attn_metadata.enable_flash_mla:
             attn_metadata.prepare_flash_mla()
 
@@ -1653,6 +1656,7 @@ class SpecWorkerBase(nn.Module, ABC):
             attn_metadata.kv_cache_manager = target_kv_cache_manager
             attn_metadata.kv_cache_block_offsets = target_kv_cache_block_offsets
             attn_metadata.host_kv_cache_block_offsets = target_host_kv_cache_block_offsets
+            attn_metadata.on_kv_cache_manager_changed()
             if attn_metadata.enable_flash_mla:
                 attn_metadata.prepare_flash_mla()
 

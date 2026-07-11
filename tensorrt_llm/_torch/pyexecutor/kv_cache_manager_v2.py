@@ -621,6 +621,7 @@ class KVCacheManagerV2(BaseResourceManager):
         model_config: Optional[ModelConfigCpp] = None,
         max_beam_width: int = 1,
         is_draft: bool = False,
+        reuse_generation_kv_capacity: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
         execution_stream: Optional[torch.cuda.Stream] = None,
         is_disagg: bool = False,
@@ -647,6 +648,9 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_mask=layer_mask,
         )
         self.is_draft = is_draft
+        # A compression manager can keep target physical KV shorter than the
+        # request's logical history. A separate draft manager remains dense.
+        self.generation_capacity_only: bool = False
         self.enable_swa_scratch_reuse = (
             kv_cache_config.enable_swa_scratch_reuse and not self.is_draft
         )
@@ -954,22 +958,32 @@ class KVCacheManagerV2(BaseResourceManager):
 
         max_num_tokens = self.get_num_available_tokens(token_num_upper_bound=max_seq_len)
 
+        physical_seq_len = max_seq_len
         if max_seq_len > max_num_tokens:
-            logger.warning(
-                f"max_seq_len {max_seq_len} is greater than max_num_tokens {max_num_tokens} "
-                "that can be allocated in kv cache manager, setting "
-                f"max_seq_len to {max_num_tokens}"
-            )
-            # max_num_tokens is a float from clamp_max_seq_len_for_mem; cast
-            # so downstream int-only consumers (torch.randint size, range)
-            # stay int.
-            self.max_seq_len = int(max_num_tokens)
+            physical_seq_len = int(max_num_tokens)
+            if reuse_generation_kv_capacity and not self.is_draft:
+                logger.info(
+                    "Keeping logical max_seq_len %d while sizing the live V2 "
+                    "block table for %d tokens because generation KV capacity "
+                    "will be reclaimed and reused.",
+                    max_seq_len,
+                    physical_seq_len,
+                )
+            else:
+                logger.warning(
+                    f"max_seq_len {max_seq_len} is greater than max_num_tokens {max_num_tokens} "
+                    "that can be allocated in kv cache manager, setting "
+                    f"max_seq_len to {max_num_tokens}"
+                )
+                # max_num_tokens is a float from clamp_max_seq_len_for_mem;
+                # cast so downstream int-only consumers stay int.
+                self.max_seq_len = physical_seq_len
 
         # Pad max_blocks_per_seq to next multiple of 4 (copy_block_offsets kernel).
         # Account for max single-sequence capacity = seq_len + extra KV tokens +
         # _kv_reserve_draft_tokens (see __init__) + 1 base decode token.
         max_seq_capacity = (
-            self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
+            physical_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
         )
         self.max_blocks_per_seq = (max_seq_capacity + tokens_per_block - 1) // tokens_per_block
         if self.max_blocks_per_seq % 4 != 0:
@@ -3061,12 +3075,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
                 else kv_cache.capacity - req.py_rewind_len
             )
-            success = kv_cache.resize(new_capacity, req.max_beam_num_tokens - 1)
+            history_length = None if self.generation_capacity_only else req.max_beam_num_tokens - 1
+            success = kv_cache.resize(new_capacity, history_length)
             if not success:
                 raise ValueError(
                     f"Failed to resize KV cache for request {req.py_request_id} "
                     f"to capacity {new_capacity} and history length "
-                    f"{req.max_beam_num_tokens - 1} tokens at generation update"
+                    f"{history_length} tokens at generation update"
                 )
 
     def copy_batch_block_offsets(
