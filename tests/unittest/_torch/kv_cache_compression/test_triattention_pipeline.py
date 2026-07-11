@@ -200,6 +200,7 @@ def _make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     fake_v2.mapping = SimpleNamespace(enable_attention_dp=False)
     fake_v2.is_disagg = False
     fake_v2.max_beam_width = 1
+    fake_v2.max_batch_size = 8
     fake_v2.num_extra_kv_tokens = 0
     fake_v2.max_total_draft_tokens = 0
     fake_v2._kv_reserve_draft_tokens = 0
@@ -720,6 +721,22 @@ class TestStepEndHookRefactor:
             mgr.on_generation_step_end("BATCH")
             pe.assert_called_once_with("BATCH")
 
+    @pytest.mark.parametrize(
+        ("manager_batch_size", "expected_chunk_size"),
+        [(1, 1), (8, 8), (32, 32), (128, 32)],
+    )
+    def test_graph_request_chunk_capacity_bounds_persistent_workspaces(
+        self,
+        manager_batch_size,
+        expected_chunk_size,
+    ):
+        kv_cache_manager = _make_fake_v2()
+        kv_cache_manager.max_batch_size = manager_batch_size
+
+        manager = TriAttention(kv_cache_manager, top_B=8, skip_swa=False)
+
+        assert manager._standalone_graph_request_chunk_size == expected_chunk_size
+
     def test_dummy_and_arbitrary_non_due_steps_do_not_materialize(self):
         from types import SimpleNamespace
         from unittest import mock
@@ -842,7 +859,7 @@ class TestStepEndHookRefactor:
         )
         cache = mgr.kv_cache_manager.kv_cache_map[7]
 
-        def compact(*args, protected_tail_lengths):
+        def compact(*args, protected_tail_lengths, **_kwargs):
             assert protected_tail_lengths == {7: 0}
             timeline.append("stage5_dispatch")
             return [(7, 1024 + 4096)]
@@ -869,7 +886,13 @@ class TestStepEndHookRefactor:
             mgr._periodic_evict(batch)
 
         ensure_buckets.assert_called_once_with([(request, 7)], 2)
-        evict.assert_called_once_with([(request, 7)], 2, protected_tail_lengths={7: 0})
+        evict.assert_called_once_with(
+            [(request, 7)],
+            2,
+            protected_tail_lengths={7: 0},
+            staging_request_ids=[7],
+            staging_offset=0,
+        )
         event.record.assert_called_once_with()
         event.synchronize.assert_not_called()
         mgr.kv_cache_manager._stream.wait_event.assert_called_once_with(event)
@@ -919,7 +942,7 @@ class TestStepEndHookRefactor:
         mgr._standalone_cuda_graph_enabled = True
         event = mock.Mock()
 
-        def compact(group, _num_layers, *, protected_tail_lengths):
+        def compact(group, _num_layers, *, protected_tail_lengths, **_kwargs):
             assert protected_tail_lengths == {7: 0, 8: 0, 9: 0}
             return [
                 (rid, mgr._minimum_evictable_length(request, mgr._confirmed_kv_lengths[rid]))
@@ -937,10 +960,123 @@ class TestStepEndHookRefactor:
             [(request_a, 7), (request_b, 8), (request_c, 9)],
             2,
             protected_tail_lengths={7: 0, 8: 0, 9: 0},
+            staging_request_ids=[7, 8, 9],
+            staging_offset=0,
         )
         mgr.kv_cache_manager.kv_cache_map[7].resize.assert_called_once_with(1024 + 4096, None)
         cache_b.resize.assert_called_once_with(1024 + 4096, None)
         cache_c.resize.assert_called_once_with(1024 + 4096, None)
+
+    def test_large_cohort_replays_bounded_graph_chunks(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        request_count = 35
+        seq_len = 1024 + 4096 + 1
+        mgr, first_request, _ = self._make_due_decode_request(seq_len=seq_len)
+        mgr.kv_cache_manager.max_batch_size = request_count
+        mgr._standalone_graph_request_chunk_size = 32
+        requests = [first_request]
+        for request_id in range(8, 8 + request_count - 1):
+            request = _make_request(
+                request_id,
+                py_prompt_len=1024,
+                max_beam_num_tokens=seq_len + 1,
+            )
+            requests.append(request)
+            mgr.kv_cache_manager.kv_cache_map[request_id] = SimpleNamespace(
+                capacity=seq_len,
+                history_length=1024,
+                is_active=True,
+                resize=mock.Mock(return_value=True),
+            )
+            mgr._initialized_request_ids.add(request_id)
+            mgr._gen_steps[request_id] = 127
+        batch = SimpleNamespace(generation_requests=requests)
+        event = mock.Mock()
+
+        def compact(chunk, _num_layers, *, protected_tail_lengths, **_kwargs):
+            assert protected_tail_lengths == {rid: 0 for _, rid in chunk}
+            return [(rid, 1024 + 4096) for _, rid in chunk]
+
+        with (
+            mock.patch.object(mgr, "_ensure_configured_graph_buckets"),
+            mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict,
+            mock.patch.object(torch.cuda, "Event", return_value=event),
+        ):
+            mgr._periodic_evict(batch)
+
+        assert [len(call.args[0]) for call in evict.call_args_list] == [32, 3]
+        assert [list(call.kwargs["protected_tail_lengths"]) for call in evict.call_args_list] == [
+            [request.py_request_id for request in requests[:32]],
+            [request.py_request_id for request in requests[32:]],
+        ]
+        assert [call.kwargs["staging_offset"] for call in evict.call_args_list] == [0, 32]
+        assert all(
+            call.kwargs["staging_request_ids"] == [request.py_request_id for request in requests]
+            for call in evict.call_args_list
+        )
+        for request in requests:
+            mgr.kv_cache_manager.kv_cache_map[request.py_request_id].resize.assert_called_once_with(
+                1024 + 4096, None
+            )
+
+    def test_completed_chunk_stays_committed_when_next_chunk_fails(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        request_count = 35
+        retained = 1024 + 4096
+        seq_len = retained + 1
+        mgr, first_request, _ = self._make_due_decode_request(seq_len=seq_len)
+        mgr._standalone_graph_request_chunk_size = 32
+        requests = [first_request]
+        for request_id in range(8, 8 + request_count - 1):
+            request = _make_request(
+                request_id,
+                py_prompt_len=1024,
+                max_beam_num_tokens=seq_len + 1,
+            )
+            requests.append(request)
+            mgr.kv_cache_manager.kv_cache_map[request_id] = SimpleNamespace(
+                capacity=seq_len,
+                history_length=1024,
+                is_active=True,
+                resize=mock.Mock(return_value=True),
+            )
+            mgr._initialized_request_ids.add(request_id)
+            mgr._gen_steps[request_id] = 127
+        batch = SimpleNamespace(generation_requests=requests)
+        calls = 0
+
+        def compact(chunk, _num_layers, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("second graph rejected")
+            for _, rid in chunk:
+                mgr._confirmed_kv_lengths[rid] = retained
+                mgr._evicted[rid] = 1
+            return [(rid, retained) for _, rid in chunk]
+
+        with (
+            mock.patch.object(mgr, "_ensure_configured_graph_buckets"),
+            mock.patch.object(mgr, "_evict_requests", side_effect=compact),
+            mock.patch.object(torch.cuda, "Event", return_value=mock.Mock()),
+        ):
+            with pytest.raises(RuntimeError, match="second graph rejected"):
+                mgr._periodic_evict(batch)
+
+        for request in requests[:32]:
+            rid = request.py_request_id
+            mgr.kv_cache_manager.kv_cache_map[rid].resize.assert_called_once_with(retained, None)
+            assert mgr._confirmed_kv_lengths[rid] == retained
+            assert mgr._evicted[rid] == 1
+        for request in requests[32:]:
+            rid = request.py_request_id
+            mgr.kv_cache_manager.kv_cache_map[rid].resize.assert_not_called()
+            assert mgr._confirmed_kv_lengths[rid] == seq_len
+            assert rid not in mgr._evicted
 
     def test_cross_request_selection_coalesces_legacy_backend_boundary(self):
         from types import SimpleNamespace
@@ -967,7 +1103,7 @@ class TestStepEndHookRefactor:
         mgr._cross_request_selection_enabled = True
         event = mock.Mock()
 
-        def compact(group, _num_layers, *, protected_tail_lengths):
+        def compact(group, _num_layers, *, protected_tail_lengths, **_kwargs):
             assert protected_tail_lengths == {7: 0, 8: 0}
             return [(rid, prompt_len + mgr.top_B) for _, rid in group]
 
@@ -982,6 +1118,8 @@ class TestStepEndHookRefactor:
             [(request_a, 7), (request_b, 8)],
             2,
             protected_tail_lengths={7: 0, 8: 0},
+            staging_request_ids=[7, 8],
+            staging_offset=0,
         )
 
     def test_resize_failure_is_reported(self):
@@ -1025,16 +1163,76 @@ class TestStepEndHookRefactor:
         mgr.draft_kv_cache_manager = _make_fake_v2(is_draft=True)
         event = mock.Mock()
 
+        def compact(*_args, **_kwargs):
+            mgr._confirmed_kv_lengths[7] = retained
+            return [(7, retained)]
+
         with (
             mock.patch.object(mgr, "_ensure_configured_graph_buckets"),
-            mock.patch.object(mgr, "_evict_requests", return_value=[(7, retained)]) as evict,
+            mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict,
             mock.patch.object(torch.cuda, "Event", return_value=event),
         ):
             mgr._periodic_evict(batch)
 
-        evict.assert_called_once_with([(request, 7)], 2, protected_tail_lengths={7: tail})
+        evict.assert_called_once_with(
+            [(request, 7)],
+            2,
+            protected_tail_lengths={7: tail},
+            staging_request_ids=[7],
+            staging_offset=0,
+        )
         assert mgr._confirmed_kv_lengths[7] == retained
         cache.resize.assert_called_once_with(retained + tail, None)
+
+    def test_mixed_protected_tails_share_one_selection_chunk(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        confirmed = 1024 + 4096 + 1
+        retained = 1024 + 4096
+        mgr, request_a, _ = self._make_due_decode_request(seq_len=confirmed)
+        request_b = _make_request(
+            8,
+            py_prompt_len=1024,
+            max_beam_num_tokens=confirmed + 1,
+        )
+        tails = {7: 2, 8: 5}
+        mgr.kv_cache_manager.kv_cache_map[7].capacity = confirmed + tails[7]
+        cache_b = SimpleNamespace(
+            capacity=confirmed + tails[8],
+            history_length=1024,
+            is_active=True,
+            resize=mock.Mock(return_value=True),
+        )
+        mgr.kv_cache_manager.kv_cache_map[8] = cache_b
+        mgr._initialized_request_ids.add(8)
+        mgr._gen_steps[8] = 127
+        mgr._prepared_generation_growth = tails
+        batch = SimpleNamespace(generation_requests=[request_a, request_b])
+
+        def compact(group, _num_layers, **_kwargs):
+            for _, rid in group:
+                mgr._confirmed_kv_lengths[rid] = retained
+            return [(rid, retained) for _, rid in group]
+
+        with (
+            mock.patch.object(mgr, "_ensure_configured_graph_buckets"),
+            mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict,
+            mock.patch.object(torch.cuda, "Event", return_value=mock.Mock()),
+        ):
+            mgr._periodic_evict(batch)
+
+        evict.assert_called_once_with(
+            [(request_a, 7), (request_b, 8)],
+            2,
+            protected_tail_lengths=tails,
+            staging_request_ids=[7, 8],
+            staging_offset=0,
+        )
+        mgr.kv_cache_manager.kv_cache_map[7].resize.assert_called_once_with(
+            retained + tails[7], None
+        )
+        cache_b.resize.assert_called_once_with(retained + tails[8], None)
 
     def test_confirmed_length_comes_from_capacity_ledger_not_logical_length(self):
         from unittest import mock
@@ -1950,6 +2148,7 @@ class TestFixedScoreMetadata:
         workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
         workspace.device = torch.device("cuda")
         workspace.max_requests = 1
+        workspace.staging_capacity = 1
         workspace.stream = None
         workspace.copy_pending = False
         workspace.copy_done = mock.Mock()
@@ -1981,6 +2180,7 @@ class TestFixedScoreMetadata:
         workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
         workspace.device = torch.device("cuda")
         workspace.max_requests = 2
+        workspace.staging_capacity = 2
         workspace.stream = None
         workspace.copy_pending = False
         workspace.copy_done = mock.Mock()
@@ -1992,9 +2192,9 @@ class TestFixedScoreMetadata:
         workspace.page_ids_host = torch.empty((1, 2, 3), dtype=torch.int64)
         workspace.round_starts_host = torch.empty(2, dtype=torch.float32)
         workspace.valid_seq_lens_host = torch.empty(2, dtype=torch.int32)
-        workspace.page_ids_device = mock.Mock()
-        workspace.round_starts_device = mock.Mock()
-        workspace.valid_seq_lens_device = mock.Mock()
+        workspace.page_ids_device = mock.MagicMock()
+        workspace.round_starts_device = mock.MagicMock()
+        workspace.valid_seq_lens_device = mock.MagicMock()
         group = mock.Mock()
         workspace.fused_group = group
         stream = object()
@@ -2026,12 +2226,18 @@ class TestFixedScoreMetadata:
         workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
         workspace.device = torch.device("cuda")
         workspace.max_requests = 2
+        workspace.staging_capacity = 2
         workspace.page_count = 2
         workspace.global_representatives = (10,)
         workspace._bulk_stage_logged = True
         workspace.bulk_allocation_done = mock.Mock()
         workspace.bulk_copy_done = mock.Mock()
+        workspace.bulk_consume_done = mock.Mock()
+        workspace.bulk_consume_pending = False
+        workspace.copy_pending = False
+        workspace.copy_done = mock.Mock()
         workspace._bulk_offsets_src = None
+        workspace._bulk_staged_request_ids = None
         copy_idx_storage = mock.MagicMock()
         copy_idx_source = mock.Mock(shape=(1,))
         copy_idx_storage.__getitem__.return_value = copy_idx_source
@@ -2066,6 +2272,7 @@ class TestFixedScoreMetadata:
         workspace.bulk_allocation_done.record.side_effect = lambda *args: calls.allocation_record()
         manager_stream.wait_event.side_effect = lambda *args: calls.manager_wait()
         workspace.bulk_copy_done.record.side_effect = lambda *args: calls.record()
+        workspace.bulk_consume_done.record.side_effect = lambda *args: calls.consume_record()
         current_stream.wait_event.side_effect = lambda *args: calls.wait()
         page_destination.copy_.side_effect = lambda *args: calls.read()
 
@@ -2082,13 +2289,14 @@ class TestFixedScoreMetadata:
 
         assert calls.mock_calls == [
             mock.call.snapshot(),
+            mock.call.index_snapshot(),
             mock.call.allocation_record(),
             mock.call.manager_wait(),
-            mock.call.index_snapshot(),
             mock.call.copy(),
             mock.call.record(),
             mock.call.wait(),
             mock.call.read(),
+            mock.call.consume_record(),
         ]
         workspace.bulk_allocation_done.record.assert_called_once_with(current_stream)
         manager_stream.wait_event.assert_called_once_with(workspace.bulk_allocation_done)
@@ -2112,6 +2320,79 @@ class TestFixedScoreMetadata:
         ):
             with pytest.raises(RuntimeError, match="failed after GPU submission"):
                 workspace._stage_page_tables_bulk(manager, [7], current_stream)
+
+    def test_bulk_page_table_chunks_reuse_one_snapshot_without_host_resync(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            _FixedScoreMetadataWorkspace,
+        )
+
+        workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
+        workspace.max_requests = 2
+        workspace.staging_capacity = 3
+        workspace.page_count = 2
+        workspace.global_representatives = (10,)
+        workspace._bulk_stage_logged = True
+        workspace.copy_pending = True
+        workspace.copy_done = mock.Mock()
+        workspace.copy_done.query.return_value = False
+        workspace.bulk_allocation_done = mock.Mock()
+        workspace.bulk_copy_done = mock.Mock()
+        workspace.bulk_consume_done = mock.Mock()
+        workspace.bulk_consume_pending = False
+        workspace._bulk_staged_request_ids = None
+        source = mock.Mock(shape=(1, 8, 2, 4), dtype=torch.int32)
+        workspace._bulk_offsets_src = source
+        bulk = mock.MagicMock()
+        bulk.shape = (1, 2, 2, 4)
+        workspace._bulk_offsets_dst = bulk
+        workspace._bulk_copy_idx_src = mock.MagicMock()
+        workspace.page_ids_device = mock.MagicMock()
+
+        copy_idx = mock.Mock(shape=(3,))
+        manager = SimpleNamespace(
+            host_kv_cache_block_offsets=mock.Mock(
+                shape=(1, 8, 2, 4),
+                dtype=torch.int32,
+            ),
+            kv_factor=2,
+            layer_offsets={10: 0},
+            layer_to_pool_mapping_dict={0: 0},
+            index_mapper=SimpleNamespace(get_copy_index=mock.Mock(return_value=copy_idx)),
+            index_scales=mock.Mock(),
+            kv_offset=mock.Mock(),
+            _stream=mock.Mock(),
+        )
+        current_stream = mock.Mock()
+
+        with mock.patch(
+            "tensorrt_llm._torch.kv_cache_compression.triattention.triattention."
+            "copy_batch_block_offsets_to_device"
+        ) as copy_offsets:
+            assert workspace._stage_page_tables_bulk(
+                manager,
+                [7, 8],
+                current_stream,
+                staging_request_ids=[7, 8, 9],
+                staging_offset=0,
+            )
+            assert workspace._stage_page_tables_bulk(
+                manager,
+                [9],
+                current_stream,
+                staging_request_ids=[7, 8, 9],
+                staging_offset=2,
+            )
+
+        workspace.copy_done.query.assert_called_once_with()
+        workspace.copy_done.synchronize.assert_called_once_with()
+        source.copy_.assert_called_once_with(manager.host_kv_cache_block_offsets)
+        manager.index_mapper.get_copy_index.assert_called_once_with([7, 8, 9], 0, 1)
+        assert copy_offsets.call_count == 2
+        assert workspace.bulk_consume_done.record.call_count == 2
+        manager._stream.wait_event.assert_called_once_with(workspace.bulk_consume_done)
 
     @CUDA_REQUIRED
     def test_bulk_page_table_copy_uses_immutable_host_snapshots(self):
@@ -2140,13 +2421,19 @@ class TestFixedScoreMetadata:
         workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
         workspace.device = device
         workspace.max_requests = 1
+        workspace.staging_capacity = 1
         workspace.page_count = 2
         workspace.global_representatives = (10,)
         workspace._bulk_stage_logged = True
         workspace.bulk_allocation_done = torch.cuda.Event()
         workspace.bulk_copy_done = torch.cuda.Event()
+        workspace.bulk_consume_done = torch.cuda.Event()
+        workspace.bulk_consume_pending = False
+        workspace.copy_done = torch.cuda.Event()
+        workspace.copy_pending = False
         workspace._bulk_offsets_src = None
         workspace._bulk_offsets_dst = None
+        workspace._bulk_staged_request_ids = None
         workspace._bulk_copy_idx_src = torch.empty(
             1, dtype=torch.int32, device="cpu", pin_memory=True
         )
@@ -2272,6 +2559,7 @@ class TestFixedScoreMetadata:
         workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
         workspace.device = torch.device("cuda")
         workspace.max_requests = 8
+        workspace.staging_capacity = 8
         stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=4)
         workspace.stream = stream
         workspace.copy_pending = True
@@ -2285,9 +2573,9 @@ class TestFixedScoreMetadata:
         workspace.page_ids_host = torch.empty((1, 8, 2), dtype=torch.int64)
         workspace.round_starts_host = torch.empty(8, dtype=torch.float32)
         workspace.valid_seq_lens_host = torch.empty(8, dtype=torch.int32)
-        workspace.page_ids_device = mock.Mock()
-        workspace.round_starts_device = mock.Mock()
-        workspace.valid_seq_lens_device = mock.Mock()
+        workspace.page_ids_device = mock.MagicMock()
+        workspace.round_starts_device = mock.MagicMock()
+        workspace.valid_seq_lens_device = mock.MagicMock()
         workspace.fused_group = mock.Mock()
         get_batch = mock.Mock(return_value=[[4, 5]])
 
@@ -2309,6 +2597,7 @@ class TestFixedScoreMetadata:
         workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
         workspace.device = torch.device("cuda")
         workspace.max_requests = 8
+        workspace.staging_capacity = 8
         workspace.stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=4)
         workspace.copy_pending = False
         workspace.copy_done = SimpleNamespace(query=mock.Mock(), synchronize=mock.Mock())
@@ -2362,7 +2651,15 @@ class TestFixedScoreMetadata:
                 global_layers=[0],
                 workspace=workspace,
             )
-        workspace.stage.assert_called_once_with(manager.kv_cache_manager, [7], [8.0], [8], [10])
+        workspace.stage.assert_called_once_with(
+            manager.kv_cache_manager,
+            [7],
+            [8.0],
+            [8],
+            [10],
+            staging_request_ids=None,
+            staging_offset=0,
+        )
         manager._resolve_page_ids.assert_not_called()
         assert manager._fixed_score_runtime_counts[("bucket",)]["rejected"] == 1
 
@@ -2376,6 +2673,7 @@ class TestFixedScoreMetadata:
         workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
         workspace.device = torch.device("cuda")
         workspace.max_requests = 1
+        workspace.staging_capacity = 1
         workspace.stream = None
         workspace.copy_pending = False
         workspace.copy_done = mock.Mock()
@@ -2482,6 +2780,8 @@ class TestFixedScoreMetadata:
             [8.0, 9.0],
             [8, 9],
             [10, 12],
+            staging_request_ids=None,
+            staging_offset=0,
         )
         manager._resolve_page_ids.assert_not_called()
         assert manager._fixed_score_runtime_counts[("bucket",)]["hit"] == 1
@@ -3094,12 +3394,9 @@ class TestFixedScoreMetadata:
                 workspace.round_starts_device[:request_count],
                 torch.tensor(round_starts, dtype=torch.float32, device=device),
             )
-            if request_count < max_requests:
-                assert torch.equal(
-                    workspace.page_ids_device[0, request_count:],
-                    torch.full_like(workspace.page_ids_device[0, request_count:], -1),
-                )
-                assert torch.isnan(workspace.round_starts_device[request_count:]).all()
+            # Exact-count graph kernels consume only the active prefix. Inactive
+            # rows intentionally retain prior values so staging does not add a
+            # full-workspace clear on every smaller cohort.
             assert tensor_pointers(workspace) == stable_workspace_pointers
             assert tensor_pointers(group) == stable_group_pointers
             assert [tensor_pointers(item) for item in selection_bank] == (stable_selection_pointers)

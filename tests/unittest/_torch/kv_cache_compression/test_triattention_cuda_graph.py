@@ -227,6 +227,7 @@ def _make_triattention(eviction_mode="union"):
     kv_cache_manager.mapping = SimpleNamespace(enable_attention_dp=False)
     kv_cache_manager.is_disagg = False
     kv_cache_manager.max_beam_width = 1
+    kv_cache_manager.max_batch_size = 32
     kv_cache_manager.num_extra_kv_tokens = 0
     kv_cache_manager.max_total_draft_tokens = 0
     kv_cache_manager._kv_reserve_draft_tokens = 0

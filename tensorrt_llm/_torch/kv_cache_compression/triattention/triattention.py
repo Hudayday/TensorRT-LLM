@@ -1358,6 +1358,7 @@ class _FixedScoreMetadataWorkspace:
         page_table_keys: Optional[List[object]] = None,
         prompt_len: int = 0,
         page_table_token_capacity: Optional[int] = None,
+        staging_capacity: Optional[int] = None,
     ) -> None:
         from .triattention_kernels import _FixedScoreGroup
 
@@ -1369,6 +1370,13 @@ class _FixedScoreMetadataWorkspace:
         if self.device.type != "cuda":
             raise ValueError("fixed score metadata is CUDA-only")
         self.max_requests = max_requests
+        if staging_capacity is None:
+            staging_capacity = max_requests
+        if staging_capacity < max_requests:
+            raise ValueError(
+                "fixed score staging capacity cannot be smaller than its graph capacity"
+            )
+        self.staging_capacity = int(staging_capacity)
         self.bucket_seq_len = seq_len
         if page_table_token_capacity is None:
             page_table_token_capacity = seq_len
@@ -1408,20 +1416,41 @@ class _FixedScoreMetadataWorkspace:
             for layer in page_representatives
         ):
             raise ValueError("fixed score metadata requires a uniform page count")
-        page_shape = (len(self.global_representatives), max_requests, self.page_count)
+        host_page_shape = (
+            len(self.global_representatives),
+            self.staging_capacity,
+            self.page_count,
+        )
+        device_page_shape = (len(self.global_representatives), max_requests, self.page_count)
         self.page_ids_host = torch.empty(
-            page_shape, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
+            host_page_shape,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=prefer_pinned(),
         )
         self.round_starts_host = torch.empty(
-            max_requests, dtype=torch.float32, device="cpu", pin_memory=prefer_pinned()
+            self.staging_capacity,
+            dtype=torch.float32,
+            device="cpu",
+            pin_memory=prefer_pinned(),
         )
         self.valid_seq_lens_host = torch.empty(
-            max_requests, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+            self.staging_capacity,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=prefer_pinned(),
         )
         self._bulk_copy_idx_src = torch.empty(
-            max_requests, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+            self.staging_capacity,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=prefer_pinned(),
         )
-        self.page_ids_device = torch.empty(page_shape, dtype=torch.int64, device=self.device)
+        self.page_ids_device = torch.empty(
+            device_page_shape,
+            dtype=torch.int64,
+            device=self.device,
+        )
         self.round_starts_device = torch.empty(
             max_requests, dtype=torch.float32, device=self.device
         )
@@ -1470,10 +1499,13 @@ class _FixedScoreMetadataWorkspace:
         self.copy_done = torch.cuda.Event()
         self.bulk_allocation_done = torch.cuda.Event()
         self.bulk_copy_done = torch.cuda.Event()
+        self.bulk_consume_done = torch.cuda.Event()
         self.copy_pending = False
+        self.bulk_consume_pending = False
         self.stream = None
         self._bulk_offsets_src: Optional[torch.Tensor] = None
         self._bulk_offsets_dst: Optional[torch.Tensor] = None
+        self._bulk_staged_request_ids: Optional[Tuple[int, ...]] = None
         self._bulk_stage_logged = False
         self.prewarm_key: Optional[tuple] = None
 
@@ -1525,13 +1557,22 @@ class _FixedScoreMetadataWorkspace:
         round_starts: List[float],
         seq_lens: Optional[List[int]] = None,
         page_table_seq_lens: Optional[List[int]] = None,
+        staging_request_ids: Optional[List[int]] = None,
+        staging_offset: int = 0,
     ) -> bool:
-        """Copy one request group's metadata into fixed buffers."""
+        """Copy one exact graph chunk into fixed device buffers.
+
+        A larger request group may stage all block offsets before its first
+        chunk mutates V2 state. Its chunks then use disjoint pinned host slices
+        while sharing the bounded graph workspace.
+        """
         request_count = len(request_ids)
         if (
             request_count == 0
             or request_count > self.max_requests
             or len(round_starts) != request_count
+            or staging_offset < 0
+            or staging_offset + request_count > self.staging_capacity
         ):
             return False
         stream = torch.cuda.current_stream(self.device)
@@ -1544,11 +1585,6 @@ class _FixedScoreMetadataWorkspace:
             raise _FixedScoreStreamMismatch(
                 "TriAttention fixed score metadata is bound to its first CUDA stream"
             )
-        if self.copy_pending and not self.copy_done.query():
-            # Reuse of the pinned host source must wait for its previous H2D
-            # copy, but the next device overwrite remains stream-ordered after
-            # the preceding graph consumer.
-            self.copy_done.synchronize()
         if seq_lens is None:
             seq_lens = [self.bucket_seq_len] * request_count
         if len(seq_lens) != request_count or any(
@@ -1574,7 +1610,17 @@ class _FixedScoreMetadataWorkspace:
             get_batch_cache_indices = manager.get_batch_cache_indices
         staged_bulk = False
         if manager is not None:
-            staged_bulk = self._stage_page_tables_bulk(manager, request_ids, stream)
+            staged_bulk = self._stage_page_tables_bulk(
+                manager,
+                request_ids,
+                stream,
+                staging_request_ids=staging_request_ids,
+                staging_offset=staging_offset,
+            )
+        elif staging_offset == 0 and self.copy_pending and not self.copy_done.query():
+            # Callable test sources do not pass through the bulk staging guard.
+            self.copy_done.synchronize()
+        host_slice = slice(staging_offset, staging_offset + request_count)
         if not staged_bulk:
             rows_by_group = []
             for global_layer in self.global_representatives:
@@ -1596,18 +1642,25 @@ class _FixedScoreMetadataWorkspace:
                         return False
                     padded_rows.append(pages + [pages[-1]] * (self.page_count - live_page_count))
                 rows_by_group.append(padded_rows)
-            self.page_ids_host[:, :request_count].copy_(
+            self.page_ids_host[:, host_slice].copy_(
                 torch.as_tensor(rows_by_group, dtype=torch.int64)
             )
-        self.round_starts_host[:request_count].copy_(
-            torch.as_tensor(round_starts, dtype=torch.float32)
-        )
-        self.valid_seq_lens_host[:request_count].copy_(torch.as_tensor(seq_lens, dtype=torch.int32))
+        self.round_starts_host[host_slice].copy_(torch.as_tensor(round_starts, dtype=torch.float32))
+        self.valid_seq_lens_host[host_slice].copy_(torch.as_tensor(seq_lens, dtype=torch.int32))
         try:
             if not staged_bulk:
-                self.page_ids_device.copy_(self.page_ids_host, non_blocking=True)
-            self.round_starts_device.copy_(self.round_starts_host, non_blocking=True)
-            self.valid_seq_lens_device.copy_(self.valid_seq_lens_host, non_blocking=True)
+                self.page_ids_device[:, :request_count].copy_(
+                    self.page_ids_host[:, host_slice],
+                    non_blocking=True,
+                )
+            self.round_starts_device[:request_count].copy_(
+                self.round_starts_host[host_slice],
+                non_blocking=True,
+            )
+            self.valid_seq_lens_device[:request_count].copy_(
+                self.valid_seq_lens_host[host_slice],
+                non_blocking=True,
+            )
             self.fused_group.stage_lengths(self.valid_seq_lens_device, request_count)
         finally:
             # The event guards pinned-source reuse. Requiring the same stream also
@@ -1621,8 +1674,11 @@ class _FixedScoreMetadataWorkspace:
         manager: KVCacheManagerV2,
         request_ids: List[int],
         current_stream: torch.cuda.Stream,
+        *,
+        staging_request_ids: Optional[List[int]] = None,
+        staging_offset: int = 0,
     ) -> bool:
-        """ONE bulk block-offset copy replaces 36 x R host round-trips.
+        """Copy one request group's V2 block offsets before live compaction.
 
         Uses the V2 block-offset kernel with immutable pinned snapshots of the
         manager's host table and index map. The snapshots are required because
@@ -1632,6 +1688,19 @@ class _FixedScoreMetadataWorkspace:
         ``dst[pool, r, 0(K), :]`` holds ``base_page * index_scales``; our HND page
         index is that value divided by ``kv_factor``.
         """
+        if staging_request_ids is None:
+            staging_request_ids = request_ids
+            staging_offset = 0
+        if (
+            not staging_request_ids
+            or len(staging_request_ids) > self.staging_capacity
+            or staging_offset < 0
+            or staging_offset + len(request_ids) > len(staging_request_ids)
+            or request_ids
+            != staging_request_ids[staging_offset : staging_offset + len(request_ids)]
+        ):
+            return False
+
         host_table = manager.host_kv_cache_block_offsets
         kv_factor = int(manager.kv_factor)
         layer_offsets = manager.layer_offsets
@@ -1640,6 +1709,7 @@ class _FixedScoreMetadataWorkspace:
         if max_blocks < self.page_count:
             return False
         request_count = len(request_ids)
+        staging_count = len(staging_request_ids)
         source = self._bulk_offsets_src
         if source is None or source.shape != host_table.shape or source.dtype != host_table.dtype:
             source = torch.empty_like(
@@ -1648,7 +1718,6 @@ class _FixedScoreMetadataWorkspace:
                 pin_memory=prefer_pinned(),
             )
             self._bulk_offsets_src = source
-        source.copy_(host_table)
         bulk = self._bulk_offsets_dst
         allocated = False
         if bulk is None or bulk.shape[1] < self.max_requests:
@@ -1664,14 +1733,25 @@ class _FixedScoreMetadataWorkspace:
             allocated = True
         submitted = False
         try:
+            if staging_offset == 0:
+                if self.copy_pending and not self.copy_done.query():
+                    self.copy_done.synchronize()
+                source.copy_(host_table)
+                copy_idx = manager.index_mapper.get_copy_index(staging_request_ids, 0, 1)
+                if copy_idx.shape[0] != staging_count:
+                    return False
+                self._bulk_copy_idx_src[:staging_count].copy_(copy_idx)
+                self._bulk_staged_request_ids = tuple(staging_request_ids)
+            elif self._bulk_staged_request_ids != tuple(staging_request_ids):
+                return False
             if allocated:
                 self.bulk_allocation_done.record(current_stream)
                 manager._stream.wait_event(self.bulk_allocation_done)
-            copy_idx = manager.index_mapper.get_copy_index(request_ids, 0, 1)
-            if copy_idx.shape[0] != request_count:
-                return False
-            copy_idx_source = self._bulk_copy_idx_src[:request_count]
-            copy_idx_source.copy_(copy_idx)
+            if self.bulk_consume_pending:
+                manager._stream.wait_event(self.bulk_consume_done)
+            copy_idx_source = self._bulk_copy_idx_src[
+                staging_offset : staging_offset + request_count
+            ]
             copy_batch_block_offsets_to_device(
                 source,
                 bulk,
@@ -1686,8 +1766,16 @@ class _FixedScoreMetadataWorkspace:
             for slot, global_layer in enumerate(self.global_representatives):
                 pool_id = pool_of[layer_offsets[global_layer]]
                 self.page_ids_device[slot, :request_count].copy_(
-                    bulk[pool_id, :request_count, 0, : self.page_count] // kv_factor
+                    bulk[
+                        pool_id,
+                        :request_count,
+                        0,
+                        : self.page_count,
+                    ]
+                    // kv_factor
                 )
+            self.bulk_consume_done.record(current_stream)
+            self.bulk_consume_pending = True
         except (AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError) as exc:
             if submitted:
                 raise RuntimeError(
@@ -1737,6 +1825,9 @@ class TriAttention(BaseKVCacheCompressionManager):
     """
 
     adjusts_generation_kv_length: ClassVar[bool] = True
+    # Bound persistent score/selection buffers. Larger cohorts use bounded,
+    # exact-request-count graph chunks; this is not a supported batch-size limit.
+    _MAX_STANDALONE_GRAPH_REQUESTS: ClassVar[int] = 32
 
     def _selection_backend_for(self, width: int, keep_count: int) -> str:
         """Require the Blackwell CuTE-DSL selector for every eviction mode."""
@@ -1776,6 +1867,12 @@ class TriAttention(BaseKVCacheCompressionManager):
         self.beta = beta
         if self.top_B <= 0 or self.beta <= 0:
             raise ValueError("TriAttention top_B and beta must both be positive")
+        self._standalone_graph_request_chunk_size = min(
+            self._MAX_STANDALONE_GRAPH_REQUESTS,
+            int(self.kv_cache_manager.max_batch_size),
+        )
+        if self._standalone_graph_request_chunk_size <= 0:
+            raise ValueError("TriAttention requires a positive KV-cache manager batch size")
         # Which token set each eviction round keeps (all reproduce the upstream
         # selection: z-normalize scores, pin the prompt tokens, no recency window):
         #   union              -- union of every KV head's top-B, re-ranked by the
@@ -2154,91 +2251,82 @@ class TriAttention(BaseKVCacheCompressionManager):
 
         # (2) Compact all affected dense and kernel-masked SWA layers, then release
         # the unreachable tail directly through V2's public resize primitive.
-        if evict_now:
-            self._ensure_configured_graph_buckets(evict_now, num_layers)
-            protected_tail_lengths = {rid: protected_tails[rid][2] for _, rid in evict_now}
-            evicted_before = self._evicted.copy()
-            confirmed_before = self._confirmed_kv_lengths.copy()
-            try:
-                if self._cross_request_selection_enabled:
-                    # Length is dynamic inside an upper-bound graph bucket. Prompt
-                    # and retained geometry remain exact because they define
-                    # selection and destination layout. Every bucket uses CuTE-DSL.
-                    graph_groups = {}
-                    for request, rid in evict_now:
-                        seq_len = self._confirmed_kv_lengths[rid]
-                        prompt_len = min(int(request.py_prompt_len), seq_len)
-                        keep_count = self._minimum_evictable_length(request, seq_len)
-                        selection_backend = self._selection_backend_for(
-                            seq_len - prompt_len,
-                            self.top_B,
+        if not evict_now:
+            return
+        self._ensure_configured_graph_buckets(evict_now, num_layers)
+        protected_tail_lengths = {rid: protected_tails[rid][2] for _, rid in evict_now}
+        if not self._cross_request_selection_enabled:
+            with nvtx_range_debug("triattention.evict_request_group", color="purple"):
+                capacity_targets = self._evict_requests(
+                    evict_now,
+                    num_layers,
+                    protected_tail_lengths=protected_tail_lengths,
+                )
+            self._resize_compacted_requests(capacity_targets, protected_tails)
+            return
+
+        # Length is dynamic inside an upper-bound graph bucket. Prompt and
+        # retained geometry define selection and destination layout; protected
+        # tails remain per-request graph inputs and do not split the cohort.
+        graph_groups = {}
+        for request, rid in evict_now:
+            seq_len = self._confirmed_kv_lengths[rid]
+            prompt_len = min(int(request.py_prompt_len), seq_len)
+            keep_count = self._minimum_evictable_length(request, seq_len)
+            selection_backend = self._selection_backend_for(
+                seq_len - prompt_len,
+                self.top_B,
+            )
+            key = (prompt_len, keep_count, selection_backend)
+            graph_groups.setdefault(key, []).append((request, rid))
+
+        chunk_size = self._standalone_graph_request_chunk_size
+        for group in graph_groups.values():
+            staging_request_ids = [rid for _, rid in group]
+            for start in range(0, len(group), chunk_size):
+                chunk = group[start : start + chunk_size]
+                chunk_tails = {rid: protected_tail_lengths[rid] for _, rid in chunk}
+                with nvtx_range_debug("triattention.evict_request_group", color="purple"):
+                    capacity_targets = self._evict_requests(
+                        chunk,
+                        num_layers,
+                        protected_tail_lengths=chunk_tails,
+                        staging_request_ids=staging_request_ids,
+                        staging_offset=start,
+                    )
+                # Commit each successful chunk before executing the next one.
+                # A later graph rejection therefore cannot leave earlier compacted
+                # requests under stale V2 capacity or bookkeeping.
+                self._resize_compacted_requests(capacity_targets, protected_tails)
+
+    def _resize_compacted_requests(self, capacity_targets, protected_tails) -> None:
+        if not capacity_targets:
+            return
+        mgr = self.kv_cache_manager
+        with nvtx_range("triattention.resize", color="red"):
+            with nvtx_range_debug("triattention.compaction_release_order", color="yellow"):
+                # V2 records a finish event when resize detaches tail pages.
+                # Reallocated pages wait on that event in their consumer stream.
+                compaction_event = torch.cuda.Event()
+                compaction_event.record()
+                mgr._stream.wait_event(compaction_event)
+            with nvtx_range_debug("triattention.v2_resize", color="red"):
+                for rid, target_capacity in capacity_targets:
+                    kv_cache = mgr.kv_cache_map.get(rid)
+                    if kv_cache is None or not kv_cache.is_active:
+                        continue
+                    if target_capacity > kv_cache.capacity:
+                        raise RuntimeError(
+                            f"Request {rid} compacted capacity {target_capacity} exceeds "
+                            f"current capacity {kv_cache.capacity}"
                         )
-                        key = (
-                            prompt_len,
-                            keep_count,
-                            selection_backend,
+                    protected_tail = protected_tails[rid][2]
+                    resized_capacity = target_capacity + protected_tail
+                    if not kv_cache.resize(resized_capacity, None):
+                        raise RuntimeError(
+                            f"Failed to resize compacted KV cache for request {rid} "
+                            f"to {resized_capacity} tokens"
                         )
-                        graph_groups.setdefault(key, []).append((request, rid))
-                    capacity_targets = []
-                    for group in graph_groups.values():
-                        with nvtx_range_debug("triattention.evict_request_group", color="purple"):
-                            capacity_targets.extend(
-                                self._evict_requests(
-                                    group,
-                                    num_layers,
-                                    protected_tail_lengths=protected_tail_lengths,
-                                )
-                            )
-                else:
-                    with nvtx_range_debug("triattention.evict_request_group", color="purple"):
-                        capacity_targets = self._evict_requests(
-                            evict_now,
-                            num_layers,
-                            protected_tail_lengths=protected_tail_lengths,
-                        )
-            finally:
-                # _evict_requests is also a directly testable execution primitive
-                # and publishes its result. The lifecycle hook keeps that result
-                # provisional until compaction synchronization and resize pass.
-                with nvtx_range_debug("triattention.restore_provisional_state", color="orange"):
-                    self._evicted.clear()
-                    self._evicted.update(evicted_before)
-                    self._confirmed_kv_lengths.clear()
-                    self._confirmed_kv_lengths.update(confirmed_before)
-        else:
-            capacity_targets = []
-        if capacity_targets:
-            with nvtx_range("triattention.resize", color="red"):
-                with nvtx_range_debug("triattention.compaction_release_order", color="yellow"):
-                    # V2 records a finish event when resize detaches tail pages.
-                    # Reallocated pages retain that event and wait on it in their
-                    # consumer stream, so only stream ordering is required here.
-                    # Avoid a host synchronize while ensuring the V2 release event
-                    # is recorded after compaction when the streams differ.
-                    compaction_event = torch.cuda.Event()
-                    compaction_event.record()
-                    mgr._stream.wait_event(compaction_event)
-                with nvtx_range_debug("triattention.v2_resize", color="red"):
-                    for rid, target_capacity in capacity_targets:
-                        kv_cache = mgr.kv_cache_map.get(rid)
-                        if kv_cache is None or not kv_cache.is_active:
-                            continue
-                        if target_capacity > kv_cache.capacity:
-                            raise RuntimeError(
-                                f"Request {rid} compacted capacity {target_capacity} exceeds "
-                                f"current capacity {kv_cache.capacity}"
-                            )
-                        protected_tail = protected_tails[rid][2]
-                        resized_capacity = target_capacity + protected_tail
-                        if not kv_cache.resize(resized_capacity, None):
-                            raise RuntimeError(
-                                f"Failed to resize compacted KV cache for request {rid} "
-                                f"to {resized_capacity} tokens"
-                            )
-                        source_capacity = protected_tails[rid][1]
-                        evicted = source_capacity - target_capacity
-                        self._evicted[rid] = self._evicted.get(rid, 0) + evicted
-                        self._confirmed_kv_lengths[rid] = target_capacity
 
     def _minimum_evictable_length(self, request: "LlmRequest", seq_len: int) -> int:
         """Return the largest cache length for which selection is an identity.
@@ -2739,7 +2827,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                     storage_groups,
                     representatives,
                     global_layers,
-                    int(self.kv_cache_manager.max_batch_size),
+                    self._standalone_graph_request_chunk_size,
                     seq_len,
                     int(self._H),
                     int(self._F),
@@ -2757,6 +2845,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                     page_table_token_capacity=(
                         seq_len + self._configured_protected_tail_capacity()
                     ),
+                    staging_capacity=int(self.kv_cache_manager.max_batch_size),
                 )
                 score_workspace.prewarm_key = key
                 self._fixed_score_workspaces[key] = score_workspace
@@ -3895,6 +3984,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         layer_pools: List[torch.Tensor],
         global_layers: List[int],
         workspace: Optional[_FixedScoreMetadataWorkspace],
+        staging_request_ids: Optional[List[int]] = None,
+        staging_offset: int = 0,
     ) -> bool:
         fixed = False
         if workspace is not None:
@@ -3905,6 +3996,8 @@ class TriAttention(BaseKVCacheCompressionManager):
                     [item["round_start"] for item in prepared],
                     [item["seq_len"] for item in prepared],
                     [item["seq_len"] + item["protected_tail"] for item in prepared],
+                    staging_request_ids=staging_request_ids,
+                    staging_offset=staging_offset,
                 )
             except _FixedScoreStreamMismatch:
                 self._record_fixed_score_runtime(workspace.prewarm_key, "rejected")
@@ -4269,6 +4362,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         evict_reqs,
         num_layers: int,
         protected_tail_lengths: Optional[Dict[int, int]] = None,
+        staging_request_ids: Optional[List[int]] = None,
+        staging_offset: int = 0,
     ) -> List[Tuple[int, int]]:
         """Score and compact requests, returning ``(request_id, capacity)`` targets.
 
@@ -4352,6 +4447,8 @@ class TriAttention(BaseKVCacheCompressionManager):
                 layer_pools,
                 global_layers,
                 fixed_score_workspace,
+                staging_request_ids,
+                staging_offset,
             )
         with nvtx_range_debug("triattention.selection_workspace_lookup", color="blue"):
             cross_request_selection = (
