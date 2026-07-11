@@ -50,7 +50,19 @@ The scoring math follows the same upstream reference (``methods/pruning_utils.py
 """
 
 import os
-from typing import TYPE_CHECKING, ClassVar, Dict, List, NamedTuple, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import (
+    TYPE_CHECKING,
+    ClassVar,
+    Dict,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 
@@ -461,6 +473,7 @@ class _BatchedFixedUnionWorkspace:
             self.prompt_len,
             out=self.keep[:request_count, self.prompt_len :],
         )
+
     def warm(self, *, normalize_scores: bool) -> None:
         """Warm both CuTe occupancy variants outside graph capture."""
         for request_count in dict.fromkeys((1, self.max_requests)):
@@ -836,9 +849,7 @@ class _FixedScoreMetadataWorkspace:
 
         if not dense_groups or not page_representatives or max_requests <= 0:
             raise ValueError("fixed score metadata requires non-empty positive geometry")
-        self.device = _canonical_device(
-            layer_pools[page_representatives[0]].device
-        )
+        self.device = _canonical_device(layer_pools[page_representatives[0]].device)
         if self.device.type != "cuda":
             raise ValueError("fixed score metadata is CUDA-only")
         self.max_requests = max_requests
@@ -1285,6 +1296,60 @@ class _FixedScoreMetadataWorkspace:
         torch.mean(sin_phase, dim=1, out=self.mean_sin[:request_count])
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _PreparedEviction:
+    """Request metadata validated before a fixed eviction graph is launched."""
+
+    request: "LlmRequest"
+    request_id: int
+    seq_len: int
+    round_start: float
+    expected_keep_count: int
+    protected_tail: int
+
+
+@dataclass(kw_only=True, slots=True)
+class _RequestCompressionState:
+    """Mutable compression state owned by one live request."""
+
+    generation_steps: int = 0
+    evicted_tokens: int = 0
+    confirmed_kv_length: Optional[int] = None
+
+
+@dataclass(kw_only=True, slots=True)
+class _PreparedGenerationBatch:
+    """Target growth reserved by the most recently prepared generation batch."""
+
+    batch: "ScheduledRequests"
+    growth_by_request: Dict[int, int]
+
+
+_BucketState = Literal["pending", "running", "planned", "ready", "failed"]
+
+
+@dataclass(kw_only=True, slots=True)
+class _EvictionBucketResources:
+    """Independent preparation states and resources for one graph bucket."""
+
+    prewarm_state: _BucketState = "pending"
+    score_state: _BucketState = "pending"
+    selection_state: _BucketState = "pending"
+    score_workspace: Optional[_FixedScoreMetadataWorkspace] = None
+    selection_plan: Optional[_CrossRequestSelectionPlan] = None
+    selection_workspace: Optional[
+        Union[_BatchedFixedUnionWorkspace, _BatchedFixedPerHeadWorkspace]
+    ] = None
+    selection_bank_bytes: Optional[int] = None
+
+    def states(self) -> Dict[str, _BucketState]:
+        return {
+            "bucket": self.prewarm_state,
+            "score": self.score_state,
+            "selection": self.selection_state,
+        }
+
+
 class TriAttention(BaseKVCacheCompressionManager):
     """Periodic physical KV eviction driven by trigonometric importance scoring.
 
@@ -1406,22 +1471,13 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._offset_max_length = offset_max_length
         self._offsets: Optional[torch.Tensor] = None
 
-        # Per-request confirmed-token counter; eviction fires when it crosses
-        # ``beta``. Cleared on request finish.
-        self._gen_steps: Dict[int, int] = {}
-        # Cumulative physically-evicted token count per request, consumed by the
-        # public introspection API.
-        self._evicted: Dict[int, int] = {}
-        # Authoritative confirmed physical prefix exposed to attention metadata.
-        self._confirmed_kv_lengths: Dict[int, int] = {}
+        # Request presence records successful initialization. The record also
+        # owns the counters and physical length cleared at request finish.
+        self._request_states: Dict[int, _RequestCompressionState] = {}
         # The overlap executor prepares B(n) before finalizing B(n-1). Keep the
         # exact fixed-linear generation width for that currently in-flight batch;
         # the final hook treats those slots as an opaque suffix.
-        self._prepared_batch = None
-        self._prepared_generation_growth: Dict[int, int] = {}
-        # Context requests initialize through the framework hook; generation-only
-        # requests initialize lazily in the final update hook.
-        self._initialized_request_ids: set[int] = set()
+        self._prepared_generation_batch: Optional[_PreparedGenerationBatch] = None
         # Every eviction mode uses one fixed-buffer CUDA Graph. Its shape comes
         # from top_B, beta, the prompt length, and the current request count.
         graph_enabled = self.eviction_mode in ("union", "per_head", "per_layer_perhead")
@@ -1429,14 +1485,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._fixed_score_metadata_enabled = graph_enabled
         self._cross_request_selection_enabled = graph_enabled
         self._standalone_cuda_graph_enabled = graph_enabled
-        self._fixed_union_prewarm_states = {}
-        self._fixed_score_workspaces = {}
-        self._fixed_score_prewarm_states = {}
+        self._eviction_buckets: Dict[tuple, _EvictionBucketResources] = {}
         self._fixed_score_runtime_counts = {}
-        self._cross_request_selection_workspaces = {}
-        self._cross_request_selection_prewarm_states = {}
-        self._cross_request_selection_plans = {}
-        self._cross_request_selection_bank_bytes = {}
         self._cross_request_selection_runtime_counts = {}
         self._cross_request_selection_materialization_state = (
             "pending" if self._cross_request_selection_enabled else "disabled"
@@ -1459,12 +1509,12 @@ class TriAttention(BaseKVCacheCompressionManager):
         runtime schema (see _resolve_calibration). TRT-LLM does not calibrate.
         """
         request_id = request.py_request_id
-        if request_id not in self._initialized_request_ids:
+        if request_id not in self._request_states:
             self._validate_v2_compatibility()
             self._validate_request_capacity(request)
             num_layers = self._num_layers_from_manager()
             self._attention_layer_partition(num_layers)
-            self._initialized_request_ids.add(request_id)
+            self._request_states[request_id] = _RequestCompressionState()
         self._ensure_calibrated()
 
     def _validate_request_capacity(self, request: "LlmRequest") -> None:
@@ -1618,16 +1668,19 @@ class TriAttention(BaseKVCacheCompressionManager):
                 self.kv_cache_manager._kv_reserve_draft_tokens,
             )
             generation_growth[request_id] = growth
-        self._prepared_batch = scheduled_batch
-        self._prepared_generation_growth = generation_growth
+        self._prepared_generation_batch = _PreparedGenerationBatch(
+            batch=scheduled_batch,
+            growth_by_request=generation_growth,
+        )
 
     def _inflight_generation_growth(
         self, scheduled_batch: "ScheduledRequests", request_id: int
     ) -> int:
         """Return exact newer target allocation width under overlap scheduling."""
-        if scheduled_batch is self._prepared_batch:
+        prepared = self._prepared_generation_batch
+        if prepared is None or scheduled_batch is prepared.batch:
             return 0
-        return self._prepared_generation_growth.get(request_id, 0)
+        return prepared.growth_by_request.get(request_id, 0)
 
     def _periodic_evict(
         self,
@@ -1654,14 +1707,14 @@ class TriAttention(BaseKVCacheCompressionManager):
                     f"request {request.py_request_id} must be resumed before "
                     "the final update hook"
                 )
-            if request.py_request_id not in self._initialized_request_ids:
+            if request.py_request_id not in self._request_states:
                 self.on_request_init(request)
             active_requests.append(request)
         if not active_requests or not self._calibrated:
             return
         mgr = self.kv_cache_manager
         num_layers = self._num_layers_from_manager()
-        protected_tails = {}
+        protected_tails: Dict[int, int] = {}
 
         # (1) bump per-request step counters; collect who evicts THIS step.
         evict_now = []
@@ -1690,12 +1743,13 @@ class TriAttention(BaseKVCacheCompressionManager):
                     f"Request {rid} KV length {seq_len} is below finalized "
                     f"history {kv_cache.history_length}"
                 )
-            self._confirmed_kv_lengths[rid] = seq_len
-            protected_tails[rid] = (request, seq_len, protected_tail)
-            previous_step = self._gen_steps.get(rid, 0)
+            request_state = self._request_states[rid]
+            request_state.confirmed_kv_length = seq_len
+            protected_tails[rid] = protected_tail
+            previous_step = request_state.generation_steps
             confirmed_delta = 1 + int(request.py_num_accepted_draft_tokens)
             step = previous_step + confirmed_delta
-            self._gen_steps[rid] = step
+            request_state.generation_steps = step
             if previous_step // self.beta < step // self.beta:
                 if seq_len > self._minimum_evictable_length(request, seq_len):
                     evict_now.append((request, rid))
@@ -1705,7 +1759,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         if not evict_now:
             return
         self._ensure_configured_graph_buckets(evict_now, num_layers)
-        protected_tail_lengths = {rid: protected_tails[rid][2] for _, rid in evict_now}
+        protected_tail_lengths = {rid: protected_tails[rid] for _, rid in evict_now}
         if not self._cross_request_selection_enabled:
             with nvtx_range_debug("triattention.evict_request_group", color="purple"):
                 capacity_targets = self._evict_requests(
@@ -1721,7 +1775,9 @@ class TriAttention(BaseKVCacheCompressionManager):
         # tails remain per-request graph inputs and do not split the cohort.
         graph_groups = {}
         for request, rid in evict_now:
-            seq_len = self._confirmed_kv_lengths[rid]
+            seq_len = self._request_states[rid].confirmed_kv_length
+            if seq_len is None:
+                raise RuntimeError(f"Missing confirmed KV length for request {rid}")
             prompt_len = min(int(request.py_prompt_len), seq_len)
             keep_count = self._minimum_evictable_length(request, seq_len)
             selection_backend = self._selection_backend_for(
@@ -1771,7 +1827,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                             f"Request {rid} compacted capacity {target_capacity} exceeds "
                             f"current capacity {kv_cache.capacity}"
                         )
-                    protected_tail = protected_tails[rid][2]
+                    protected_tail = protected_tails[rid]
                     resized_capacity = target_capacity + protected_tail
                     if not kv_cache.resize(resized_capacity, None):
                         raise RuntimeError(
@@ -1880,7 +1936,9 @@ class TriAttention(BaseKVCacheCompressionManager):
         configured_shapes = self._configured_upper_prewarm_shapes()
         required_shapes = set()
         for request, request_id in evict_now:
-            seq_len = self._confirmed_kv_lengths[request_id]
+            seq_len = self._request_states[request_id].confirmed_kv_length
+            if seq_len is None:
+                raise RuntimeError(f"Missing confirmed KV length for request {request_id}")
             prompt_len = min(int(request.py_prompt_len), seq_len)
             decode_width = seq_len - prompt_len
             required_shapes.add(
@@ -1904,11 +1962,12 @@ class TriAttention(BaseKVCacheCompressionManager):
                 prompt_len + decode_width,
                 prompt_len,
             )
-            states = {
-                "bucket": self._fixed_union_prewarm_states.get(key),
-                "score": self._fixed_score_prewarm_states.get(key),
-                "selection": self._cross_request_selection_prewarm_states.get(key),
-            }
+            resources = self._eviction_buckets.get(key)
+            states = (
+                {"bucket": None, "score": None, "selection": None}
+                if resources is None
+                else resources.states()
+            )
             if any(state != "ready" for state in states.values()):
                 self._prewarm_fixed_union_bucket(
                     layer_pools,
@@ -1922,11 +1981,12 @@ class TriAttention(BaseKVCacheCompressionManager):
 
         self._materialize_cross_request_selection_banks()
         for key in keys:
-            states = {
-                "bucket": self._fixed_union_prewarm_states.get(key),
-                "score": self._fixed_score_prewarm_states.get(key),
-                "selection": self._cross_request_selection_prewarm_states.get(key),
-            }
+            resources = self._eviction_buckets.get(key)
+            states = (
+                {"bucket": None, "score": None, "selection": None}
+                if resources is None
+                else resources.states()
+            )
             if any(state != "ready" for state in states.values()):
                 raise RuntimeError(
                     "TriAttention CUDA Graph bucket did not become ready: "
@@ -2123,14 +2183,15 @@ class TriAttention(BaseKVCacheCompressionManager):
             seq_len,
             prompt_len,
         )
-        states = self._fixed_union_prewarm_states
-        if states.get(key) in ("running", "ready", "failed"):
+        resources = self._eviction_buckets.setdefault(key, _EvictionBucketResources())
+        if resources.prewarm_state in ("running", "ready", "failed"):
             return
-        states[key] = "running"
-        score_states = self._fixed_score_prewarm_states
-        score_states[key] = "running"
-        selection_states = self._cross_request_selection_prewarm_states
-        selection_states.pop(key, None)
+        resources.prewarm_state = "running"
+        resources.score_state = "running"
+        resources.selection_state = "pending"
+        resources.selection_plan = None
+        resources.selection_workspace = None
+        resources.selection_bank_bytes = None
         try:
             first_pool = layer_pools[dense_layers[0]]
             device = first_pool.device
@@ -2157,9 +2218,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             for layers in all_groups.values():
                 live_pool = layer_pools[layers[0]]
                 tokens_per_block = int(live_pool.shape[3])
-                num_pages = (
-                    page_table_token_capacity + tokens_per_block - 1
-                ) // tokens_per_block
+                num_pages = (page_table_token_capacity + tokens_per_block - 1) // tokens_per_block
                 dummy_pool = self._dummy_pool_like(live_pool, num_pages, zero=True)
                 for layer in layers:
                     dummy_pools[layer] = dummy_pool
@@ -2215,8 +2274,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                         seq_len,
                     )
                     scores_by_layer = {
-                        layer: views[:, 0, slot]
-                        for slot, layer in enumerate(dense_layers)
+                        layer: views[:, 0, slot] for slot, layer in enumerate(dense_layers)
                     }
 
                 score_workspace = _FixedScoreMetadataWorkspace(
@@ -2224,7 +2282,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                     **score_kwargs,
                 )
                 score_workspace.prewarm_key = key
-                self._fixed_score_workspaces[key] = score_workspace
+                resources.score_workspace = score_workspace
                 self._prewarm_cross_request_selection_bucket(
                     key,
                     score_workspace,
@@ -2234,7 +2292,9 @@ class TriAttention(BaseKVCacheCompressionManager):
                     prompt_len,
                     seq_len,
                 )
-                plan = self._cross_request_selection_plans[key]
+                plan = resources.selection_plan
+                if plan is None:
+                    raise RuntimeError("TriAttention selection prewarm did not produce a plan")
                 selection_workspace = self._build_cross_request_selection_workspace(plan)
                 with nvtx_range("triattention.prewarm.select", color="yellow"):
                     selection_workspace.stage_valid_widths_from_seq_lens(
@@ -2242,12 +2302,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                         1,
                     )
                     selection_workspace.select_requests(
-                        [
-                            [
-                                scores_by_layer[layer][:, prompt_len:seq_len]
-                                for layer in dense_layers
-                            ]
-                        ],
+                        [[scores_by_layer[layer][:, prompt_len:seq_len] for layer in dense_layers]],
                         normalize_scores=self.normalize_scores,
                     )
 
@@ -2277,14 +2332,16 @@ class TriAttention(BaseKVCacheCompressionManager):
                 with nvtx_range("triattention.prewarm.compact", color="purple"):
                     compaction_workspace.launch()
         except Exception:
-            states[key] = "failed"
-            score_states[key] = "failed"
-            selection_states[key] = "failed"
-            self._fixed_score_workspaces.pop(key, None)
-            self._cross_request_selection_plans.pop(key, None)
+            resources.prewarm_state = "failed"
+            resources.score_state = "failed"
+            resources.selection_state = "failed"
+            resources.score_workspace = None
+            resources.selection_plan = None
+            resources.selection_workspace = None
+            resources.selection_bank_bytes = None
             raise
-        states[key] = "ready"
-        score_states[key] = "ready"
+        resources.prewarm_state = "ready"
+        resources.score_state = "ready"
 
     def _prewarm_cross_request_selection_bucket(
         self,
@@ -2299,11 +2356,11 @@ class TriAttention(BaseKVCacheCompressionManager):
         """Record one tensor-free request-batched selection plan."""
         if not self._cross_request_selection_enabled:
             return
-        states = self._cross_request_selection_prewarm_states
-        if states.get(key) in ("running", "planned", "ready", "failed"):
+        resources = self._eviction_buckets.setdefault(key, _EvictionBucketResources())
+        if resources.selection_state in ("running", "planned", "ready", "failed"):
             return
 
-        states[key] = "running"
+        resources.selection_state = "running"
         bank_bytes = None
         try:
             max_requests = int(score_workspace.max_requests)
@@ -2357,8 +2414,8 @@ class TriAttention(BaseKVCacheCompressionManager):
                 materialized_nbytes=bank_bytes,
             )
         except Exception as exc:
-            states[key] = "failed"
-            self._cross_request_selection_plans.pop(key, None)
+            resources.selection_state = "failed"
+            resources.selection_plan = None
             logger.warning(
                 "TriAttention cross-request selection planning failed; "
                 "the mandatory CUDA Graph bucket will reject eviction "
@@ -2366,9 +2423,9 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
             return
 
-        self._cross_request_selection_plans[key] = plan
+        resources.selection_plan = plan
         self._cross_request_selection_materialization_state = "pending"
-        states[key] = "planned"
+        resources.selection_state = "planned"
         logger.info(
             "TriAttention cross-request selection plan is ready; persistent buffers "
             "are deferred until the first real generation prepare: "
@@ -2415,10 +2472,9 @@ class TriAttention(BaseKVCacheCompressionManager):
         if state in ("disabled", "running", "done"):
             return
         self._cross_request_selection_materialization_state = "running"
-        plans = self._cross_request_selection_plans
-        states = self._cross_request_selection_prewarm_states
-        for key, plan in plans.items():
-            if states.get(key) != "planned":
+        for resources in self._eviction_buckets.values():
+            plan = resources.selection_plan
+            if resources.selection_state != "planned" or plan is None:
                 continue
             workspace = None
             try:
@@ -2429,27 +2485,27 @@ class TriAttention(BaseKVCacheCompressionManager):
                     )
                 workspace.warm(normalize_scores=self.normalize_scores)
             except Exception as exc:
-                states[key] = "failed"
-                self._cross_request_selection_workspaces.pop(key, None)
-                self._cross_request_selection_bank_bytes.pop(key, None)
+                resources.selection_state = "failed"
+                resources.selection_workspace = None
+                resources.selection_bank_bytes = None
                 logger.warning(
                     "TriAttention deferred cross-request selection materialization failed; "
                     f"the mandatory CUDA Graph bucket will reject eviction: {exc}"
                 )
                 continue
 
-            self._cross_request_selection_workspaces[key] = workspace
-            self._cross_request_selection_bank_bytes[key] = plan.materialized_nbytes
-            states[key] = "ready"
+            resources.selection_workspace = workspace
+            resources.selection_bank_bytes = plan.materialized_nbytes
+            resources.selection_state = "ready"
         self._cross_request_selection_materialization_state = "done"
 
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
         """Drop this request's per-request length and eviction state."""
-        self._gen_steps.pop(request.py_request_id, None)
-        self._evicted.pop(request.py_request_id, None)
-        self._confirmed_kv_lengths.pop(request.py_request_id, None)
-        self._prepared_generation_growth.pop(request.py_request_id, None)
-        self._initialized_request_ids.discard(request.py_request_id)
+        request_id = request.py_request_id
+        self._request_states.pop(request_id, None)
+        prepared = self._prepared_generation_batch
+        if prepared is not None:
+            prepared.growth_by_request.pop(request_id, None)
 
     # ------------------------------------------------------------------ #
     # Attention-metadata reconcile (compression-framework hook)          #
@@ -2457,7 +2513,8 @@ class TriAttention(BaseKVCacheCompressionManager):
 
     def evicted_count(self, request_id: int) -> int:
         """Cumulative tokens physically evicted for ``request_id``."""
-        return self._evicted.get(request_id, 0)
+        state = self._request_states.get(request_id)
+        return 0 if state is None else state.evicted_tokens
 
     def adjust_attention_metadata(self, attn_metadata) -> None:
         """Reconcile the attention metadata for this iteration's eviction.
@@ -2479,7 +2536,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         pl = list(prompt_lens) if prompt_lens is not None else None
         pl_changed = False
         for i in range(num_contexts, num_requests):
-            evicted = self._evicted.get(req_ids[i], 0)
+            evicted = self.evicted_count(req_ids[i])
             if evicted == 0:
                 continue
             native_cached = int(kvp.num_cached_tokens_per_seq[i])
@@ -2499,7 +2556,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             self.publish_draft_kv_length_delta(
                 attn_metadata,
                 [
-                    0 if i < num_contexts else self._evicted.get(req_ids[i], 0)
+                    0 if i < num_contexts else self.evicted_count(req_ids[i])
                     for i in range(num_requests)
                 ],
             )
@@ -2533,10 +2590,11 @@ class TriAttention(BaseKVCacheCompressionManager):
         ):
             return None
         key = score_workspace.prewarm_key
-        workspace = self._cross_request_selection_workspaces.get(key)
-        states = self._cross_request_selection_prewarm_states
+        resources = self._eviction_buckets.get(key)
+        workspace = None if resources is None else resources.selection_workspace
         if (
-            states.get(key) != "ready"
+            resources is None
+            or resources.selection_state != "ready"
             or workspace is None
             or workspace.eviction_mode != self.eviction_mode
             or request_count > workspace.max_requests
@@ -2769,12 +2827,12 @@ class TriAttention(BaseKVCacheCompressionManager):
         dense_groups: List[List[int]],
         swa_layers: List[int],
         num_layers: int,
-        prepared: List[dict],
+        prepared: Sequence[_PreparedEviction],
     ) -> Optional[_FixedScoreMetadataWorkspace]:
         if not self._fixed_score_metadata_enabled or not prepared:
             return None
-        seq_lens = [item["seq_len"] for item in prepared]
-        prompt_lens = {min(item["request"].py_prompt_len, item["seq_len"]) for item in prepared}
+        seq_lens = [item.seq_len for item in prepared]
+        prompt_lens = {min(item.request.py_prompt_len, item.seq_len) for item in prepared}
         if len(prompt_lens) != 1:
             return None
         prompt_len = next(iter(prompt_lens))
@@ -2788,14 +2846,16 @@ class TriAttention(BaseKVCacheCompressionManager):
         representatives = [group[0] for group in dense_groups]
         representatives.extend(layer for layer in swa_layers if layer not in representatives)
         candidates = []
-        for key, workspace in self._fixed_score_workspaces.items():
-            selection_plan = self._cross_request_selection_plans.get(key)
+        for key, resources in self._eviction_buckets.items():
+            workspace = resources.score_workspace
+            selection_plan = resources.selection_plan
             if (
-                self._fixed_score_prewarm_states.get(key) == "ready"
+                resources.score_state == "ready"
+                and workspace is not None
                 and workspace.prompt_len == prompt_len
                 and workspace.bucket_seq_len >= max_seq_len
                 and workspace.page_table_token_capacity
-                >= max(item["seq_len"] + item["protected_tail"] for item in prepared)
+                >= max(item.seq_len + item.protected_tail for item in prepared)
                 and len(prepared) <= workspace.max_requests
                 and (
                     not self._cross_request_selection_enabled
@@ -2847,7 +2907,7 @@ class TriAttention(BaseKVCacheCompressionManager):
 
     def _attach_page_ids(
         self,
-        prepared: List[dict],
+        prepared: Sequence[_PreparedEviction],
         workspace: _FixedScoreMetadataWorkspace,
         staging_request_ids: Optional[List[int]] = None,
         staging_offset: int = 0,
@@ -2855,10 +2915,10 @@ class TriAttention(BaseKVCacheCompressionManager):
         try:
             staged = workspace.stage(
                 self.kv_cache_manager,
-                [item["request_id"] for item in prepared],
-                [item["round_start"] for item in prepared],
-                [item["seq_len"] for item in prepared],
-                [item["seq_len"] + item["protected_tail"] for item in prepared],
+                [item.request_id for item in prepared],
+                [item.round_start for item in prepared],
+                [item.seq_len for item in prepared],
+                [item.seq_len + item.protected_tail for item in prepared],
                 staging_request_ids=staging_request_ids,
                 staging_offset=staging_offset,
             )
@@ -2874,7 +2934,7 @@ class TriAttention(BaseKVCacheCompressionManager):
 
     def _standalone_graph_bucket_for(
         self,
-        prepared: List[dict],
+        prepared: Sequence[_PreparedEviction],
         score_workspace: Optional[_FixedScoreMetadataWorkspace],
         selection_workspace: Optional[
             Union[_BatchedFixedUnionWorkspace, _BatchedFixedPerHeadWorkspace]
@@ -2890,22 +2950,24 @@ class TriAttention(BaseKVCacheCompressionManager):
         ):
             return None
         prewarm_key = score_workspace.prewarm_key
+        resources = self._eviction_buckets.get(prewarm_key)
         if (
             prewarm_key is None
-            or self._fixed_score_prewarm_states.get(prewarm_key) != "ready"
-            or self._cross_request_selection_prewarm_states.get(prewarm_key) != "ready"
-            or self._fixed_score_workspaces.get(prewarm_key) is not score_workspace
-            or self._cross_request_selection_workspaces.get(prewarm_key) is not selection_workspace
+            or resources is None
+            or resources.score_state != "ready"
+            or resources.selection_state != "ready"
+            or resources.score_workspace is not score_workspace
+            or resources.selection_workspace is not selection_workspace
         ):
             return None
-        seq_lens = [item["seq_len"] for item in prepared]
-        prompt_lens = {min(item["request"].py_prompt_len, item["seq_len"]) for item in prepared}
+        seq_lens = [item.seq_len for item in prepared]
+        prompt_lens = {min(item.request.py_prompt_len, item.seq_len) for item in prepared}
         if len(prompt_lens) != 1:
             return None
         prompt_len = next(iter(prompt_lens))
         bucket_seq_len = score_workspace.bucket_seq_len
         width = bucket_seq_len - prompt_len
-        protected_tail_lengths = tuple(int(item["protected_tail"]) for item in prepared)
+        protected_tail_lengths = tuple(item.protected_tail for item in prepared)
         actual_backends = {
             self._selection_backend_for(seq_len - prompt_len, self.top_B) for seq_len in seq_lens
         }
@@ -2926,7 +2988,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             or selection_workspace.prompt_len != prompt_len
             or selection_workspace.width != width
             or selection_workspace.keep_count != self.top_B
-            or any(item.get("expected_keep_count") != prompt_len + self.top_B for item in prepared)
+            or any(item.expected_keep_count != prompt_len + self.top_B for item in prepared)
         ):
             return None
         if min(score_workspace.max_requests, selection_workspace.max_requests) < request_count:
@@ -3023,7 +3085,7 @@ class TriAttention(BaseKVCacheCompressionManager):
     def _try_standalone_cuda_graph(
         self,
         *,
-        prepared: List[dict],
+        prepared: Sequence[_PreparedEviction],
         layer_pools: List[torch.Tensor],
         dense_layers: List[int],
         swa_layers: List[int],
@@ -3085,7 +3147,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                     seq_len=seq_len,
                     prompt_len=prompt_len,
                     swa_window=swa_window,
-                    protected_tail_lengths=[item["protected_tail"] for item in prepared],
+                    protected_tail_lengths=[item.protected_tail for item in prepared],
                 )
             with nvtx_range_debug("triattention.graph_pointer_fingerprint", color="blue"):
                 fingerprint = workspace.pointer_fingerprint(stream)
@@ -3159,14 +3221,15 @@ class TriAttention(BaseKVCacheCompressionManager):
             self._record_standalone_graph_runtime("success", request_count)
 
             capacity_targets = []
-            for request_index, item in enumerate(prepared):
-                keep_count = item["expected_keep_count"]
-                evicted = item["seq_len"] - keep_count
+            for item in prepared:
+                keep_count = item.expected_keep_count
+                evicted = item.seq_len - keep_count
                 if evicted <= 0:
                     raise RuntimeError("standalone eviction graph captured an identity compaction")
-                request_id = item["request_id"]
-                self._evicted[request_id] = self._evicted.get(request_id, 0) + evicted
-                self._confirmed_kv_lengths[request_id] = keep_count
+                request_id = item.request_id
+                request_state = self._request_states[request_id]
+                request_state.evicted_tokens += evicted
+                request_state.confirmed_kv_length = keep_count
                 capacity_targets.append((request_id, keep_count))
         return capacity_targets
 
@@ -3215,15 +3278,16 @@ class TriAttention(BaseKVCacheCompressionManager):
             layer_pool_keys = layout.layer_pool_keys
 
         # Resolve request length and page metadata before mutating any layer.
-        prepared = []
+        prepared: List[_PreparedEviction] = []
         with nvtx_range("triattention.metadata", color="cyan"):
             for request, rid in evict_reqs:
-                seq_len = self._confirmed_kv_lengths.get(rid)
+                request_state = self._request_states.get(rid)
+                seq_len = None if request_state is None else request_state.confirmed_kv_length
                 if seq_len is None:
                     raise RuntimeError(f"Missing confirmed KV length for request {rid}")
                 # Restore the uncompressed confirmed logical position from the
                 # physical prefix and cumulative eviction count.
-                round_start = seq_len + self._evicted.get(rid, 0)
+                round_start = seq_len + request_state.evicted_tokens
                 if seq_len <= self._minimum_evictable_length(request, seq_len):
                     continue
                 expected_keep_count = self._minimum_evictable_length(request, seq_len)
@@ -3234,14 +3298,14 @@ class TriAttention(BaseKVCacheCompressionManager):
                         f"configured capacity {protected_tail_capacity}"
                     )
                 prepared.append(
-                    {
-                        "request": request,
-                        "request_id": rid,
-                        "seq_len": int(seq_len),
-                        "round_start": float(round_start),
-                        "expected_keep_count": expected_keep_count,
-                        "protected_tail": protected_tail,
-                    }
+                    _PreparedEviction(
+                        request=request,
+                        request_id=rid,
+                        seq_len=int(seq_len),
+                        round_start=float(round_start),
+                        expected_keep_count=expected_keep_count,
+                        protected_tail=protected_tail,
+                    )
                 )
         if not prepared:
             return []

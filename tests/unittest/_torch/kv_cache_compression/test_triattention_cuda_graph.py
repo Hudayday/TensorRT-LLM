@@ -29,7 +29,10 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
     TriAttention,
     _BatchedFixedPerHeadWorkspace,
     _BatchedFixedUnionWorkspace,
+    _EvictionBucketResources,
     _FixedScoreMetadataWorkspace,
+    _PreparedEviction,
+    _RequestCompressionState,
 )
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
     fixed_perhead_segment_views,
@@ -307,6 +310,25 @@ def _make_triattention(eviction_mode="union"):
         top_B=8,
         eviction_mode=eviction_mode,
         skip_swa=False,
+    )
+
+
+def _prepared_eviction(
+    *,
+    seq_len,
+    prompt_len,
+    expected_keep_count,
+    protected_tail=0,
+    request_id=0,
+    round_start=0.0,
+):
+    return _PreparedEviction(
+        request=SimpleNamespace(py_prompt_len=prompt_len),
+        request_id=request_id,
+        seq_len=seq_len,
+        round_start=round_start,
+        expected_keep_count=expected_keep_count,
+        protected_tail=protected_tail,
     )
 
 
@@ -753,7 +775,6 @@ class TestCuTEDSLGraphSelection:
             torch.cuda.synchronize(device)
             assert torch.equal(graph_result(), expected)
 
-
     @pytest.mark.parametrize(
         "keep_count,width",
         [(4096, 4224), (8192, 9216)],
@@ -908,10 +929,12 @@ class TestStandaloneGraphBuckets:
             dtype=torch.int32,
         )
         selection.stage_valid_widths_from_seq_lens = mock.Mock()
-        manager._fixed_score_prewarm_states = {key: "ready"}
-        manager._fixed_score_workspaces = {key: score}
-        manager._cross_request_selection_prewarm_states = {key: "ready"}
-        manager._cross_request_selection_workspaces = {key: selection}
+        manager._eviction_buckets[key] = _EvictionBucketResources(
+            score_state="ready",
+            selection_state="ready",
+            score_workspace=score,
+            selection_workspace=selection,
+        )
 
     @pytest.mark.parametrize(
         "prompt_len,width,budget,backend,request_count",
@@ -935,12 +958,11 @@ class TestStandaloneGraphBuckets:
         manager.top_B = budget
         manager._standalone_cuda_graph_enabled = True
         prepared = [
-            {
-                "seq_len": prompt_len + width,
-                "request": SimpleNamespace(py_prompt_len=prompt_len),
-                "expected_keep_count": prompt_len + budget,
-                "protected_tail": 0,
-            }
+            _prepared_eviction(
+                seq_len=prompt_len + width,
+                prompt_len=prompt_len,
+                expected_keep_count=prompt_len + budget,
+            )
             for _ in range(request_count)
         ]
         score = SimpleNamespace(
@@ -991,17 +1013,18 @@ class TestStandaloneGraphBuckets:
             bucket_seq_len=14,
             page_table_token_capacity=15,
         )
-        manager._fixed_score_prewarm_states = {score.prewarm_key: "ready"}
-        manager._fixed_score_workspaces = {score.prewarm_key: score}
-        manager._cross_request_selection_prewarm_states = {score.prewarm_key: "ready"}
-        manager._cross_request_selection_workspaces = {score.prewarm_key: selection}
+        manager._eviction_buckets[score.prewarm_key] = _EvictionBucketResources(
+            score_state="ready",
+            selection_state="ready",
+            score_workspace=score,
+            selection_workspace=selection,
+        )
         prepared = [
-            {
-                "seq_len": 14,
-                "request": SimpleNamespace(py_prompt_len=2),
-                "expected_keep_count": 10,
-                "protected_tail": 0,
-            }
+            _prepared_eviction(
+                seq_len=14,
+                prompt_len=2,
+                expected_keep_count=10,
+            )
             for _ in range(2)
         ]
 
@@ -1016,12 +1039,11 @@ class TestStandaloneGraphBuckets:
         manager.top_B = 8
         manager._standalone_cuda_graph_enabled = True
         prepared = [
-            {
-                "seq_len": seq_len,
-                "request": SimpleNamespace(py_prompt_len=2),
-                "expected_keep_count": 10,
-                "protected_tail": 0,
-            }
+            _prepared_eviction(
+                seq_len=seq_len,
+                prompt_len=2,
+                expected_keep_count=10,
+            )
             for seq_len in (11, 13)
         ]
         score = SimpleNamespace(prewarm_key=("upper",), max_requests=8)
@@ -1056,12 +1078,12 @@ class TestStandaloneGraphBuckets:
 
         def prepared(tails):
             return [
-                {
-                    "seq_len": 14,
-                    "request": SimpleNamespace(py_prompt_len=2),
-                    "expected_keep_count": 10,
-                    "protected_tail": tail,
-                }
+                _prepared_eviction(
+                    seq_len=14,
+                    prompt_len=2,
+                    expected_keep_count=10,
+                    protected_tail=tail,
+                )
                 for tail in tails
             ]
 
@@ -1080,12 +1102,11 @@ class TestStandaloneGraphBuckets:
         manager.top_B = 2048
         manager._standalone_cuda_graph_enabled = True
         prepared = [
-            {
-                "seq_len": width,
-                "request": SimpleNamespace(py_prompt_len=0),
-                "expected_keep_count": 2048,
-                "protected_tail": 0,
-            }
+            _prepared_eviction(
+                seq_len=width,
+                prompt_len=0,
+                expected_keep_count=2048,
+            )
             for width in (4095, 4096)
         ]
         score = SimpleNamespace(prewarm_key=("cute-upper",), max_requests=8)
@@ -1134,12 +1155,11 @@ class TestStandaloneGraphBuckets:
 
         def prepared(widths):
             return [
-                {
-                    "seq_len": prompt_len + width,
-                    "request": SimpleNamespace(py_prompt_len=prompt_len),
-                    "expected_keep_count": prompt_len + budget,
-                    "protected_tail": 0,
-                }
+                _prepared_eviction(
+                    seq_len=prompt_len + width,
+                    prompt_len=prompt_len,
+                    expected_keep_count=prompt_len + budget,
+                )
                 for width in widths
             ]
 
@@ -1182,12 +1202,11 @@ class TestStandaloneGraphBuckets:
             )
             self._mark_ready(manager, score, selection)
             prepared = [
-                {
-                    "seq_len": prompt_len + width,
-                    "request": SimpleNamespace(py_prompt_len=prompt_len),
-                    "expected_keep_count": prompt_len + budget,
-                    "protected_tail": 0,
-                }
+                _prepared_eviction(
+                    seq_len=prompt_len + width,
+                    prompt_len=prompt_len,
+                    expected_keep_count=prompt_len + budget,
+                )
                 for width in valid_widths
             ]
             return manager._standalone_graph_bucket_for(prepared, score, selection)
@@ -1228,12 +1247,11 @@ class TestStandaloneGraphBuckets:
         manager.top_B = budget
         manager._standalone_cuda_graph_enabled = True
         prepared = [
-            {
-                "seq_len": prompt_len + width,
-                "request": SimpleNamespace(py_prompt_len=prompt_len),
-                "expected_keep_count": prompt_len + budget,
-                "protected_tail": 0,
-            }
+            _prepared_eviction(
+                seq_len=prompt_len + width,
+                prompt_len=prompt_len,
+                expected_keep_count=prompt_len + budget,
+            )
             for _ in range(request_count)
         ]
         score = SimpleNamespace(prewarm_key=(width, budget), max_requests=32)
@@ -1254,18 +1272,16 @@ class TestStandaloneGraphBuckets:
         manager.top_B = 2048
         manager._standalone_cuda_graph_enabled = True
         prepared = [
-            {
-                "seq_len": 5119,
-                "request": SimpleNamespace(py_prompt_len=1024),
-                "expected_keep_count": 3072,
-                "protected_tail": 0,
-            },
-            {
-                "seq_len": 5375,
-                "request": SimpleNamespace(py_prompt_len=1280),
-                "expected_keep_count": 3328,
-                "protected_tail": 0,
-            },
+            _prepared_eviction(
+                seq_len=5119,
+                prompt_len=1024,
+                expected_keep_count=3072,
+            ),
+            _prepared_eviction(
+                seq_len=5375,
+                prompt_len=1280,
+                expected_keep_count=3328,
+            ),
         ]
         score = SimpleNamespace(prewarm_key=("mixed",), max_requests=32)
         selection = SimpleNamespace(
@@ -1278,8 +1294,8 @@ class TestStandaloneGraphBuckets:
         self._mark_ready(manager, score, selection)
 
         assert manager._standalone_graph_bucket_for(prepared, score, selection) is None
-        manager._cross_request_selection_workspaces[score.prewarm_key] = SimpleNamespace()
-        prepared[1] = dict(prepared[0])
+        manager._eviction_buckets[score.prewarm_key].selection_workspace = SimpleNamespace()
+        prepared[1] = prepared[0]
         assert manager._standalone_graph_bucket_for(prepared, score, selection) is None
 
     def test_stats_are_zero_filled_before_first_eviction(self, monkeypatch):
@@ -1308,12 +1324,11 @@ class TestStandaloneGraphBuckets:
         manager._standalone_cuda_graph_enabled = True
         manager._standalone_graph_runtime_counts = {}
         prepared = [
-            {
-                "seq_len": 5119,
-                "request": SimpleNamespace(py_prompt_len=1024),
-                "expected_keep_count": 3072,
-                "protected_tail": 0,
-            }
+            _prepared_eviction(
+                seq_len=5119,
+                prompt_len=1024,
+                expected_keep_count=3072,
+            )
         ]
 
         with pytest.raises(RuntimeError, match="rejected its configured runtime bucket"):
@@ -1347,16 +1362,14 @@ class TestStandaloneGraphBuckets:
         manager.normalize_scores = True
         manager.score_aggregation = "mean"
         manager._standalone_cuda_graph_enabled = True
-        manager._evicted = {}
-        manager._confirmed_kv_lengths = {7: 3328}
+        manager._request_states = {7: _RequestCompressionState(confirmed_kv_length=3328)}
         prepared = [
-            {
-                "request": SimpleNamespace(py_prompt_len=256),
-                "request_id": 7,
-                "seq_len": 3328,
-                "expected_keep_count": 2304,
-                "protected_tail": 0,
-            }
+            _prepared_eviction(
+                request_id=7,
+                seq_len=3328,
+                prompt_len=256,
+                expected_keep_count=2304,
+            )
         ]
         score_output = torch.zeros(1, 3328)
         group = SimpleNamespace(launch=mock.Mock(return_value=(score_output, None)))
@@ -1442,8 +1455,8 @@ class TestStandaloneGraphBuckets:
         selected_segments = selection.select_requests.call_args.args[0]
         assert selected_segments[0][0].shape == (1, 3072)
         workspace.launch.assert_called_once_with()
-        assert manager._evicted == {7: 1024}
-        assert manager._confirmed_kv_lengths == {7: 2304}
+        assert manager._request_states[7].evicted_tokens == 1024
+        assert manager._request_states[7].confirmed_kv_length == 2304
         assert manager._standalone_graph_runtime_counts == {
             "attempt": 1,
             "attempt_requests": 1,
@@ -1455,16 +1468,14 @@ class TestStandaloneGraphBuckets:
         manager = _make_triattention()
         manager.top_B = 4096
         manager._standalone_cuda_graph_enabled = True
-        manager._evicted = {}
-        manager._confirmed_kv_lengths = {7: 9215}
+        manager._request_states = {7: _RequestCompressionState(confirmed_kv_length=9215)}
         prepared = [
-            {
-                "request": SimpleNamespace(py_prompt_len=1024),
-                "request_id": 7,
-                "seq_len": 9215,
-                "expected_keep_count": 5120,
-                "protected_tail": 0,
-            }
+            _prepared_eviction(
+                request_id=7,
+                seq_len=9215,
+                prompt_len=1024,
+                expected_keep_count=5120,
+            )
         ]
         score = SimpleNamespace(prewarm_key=("formal-a-first",), max_requests=8)
         selection = SimpleNamespace(
@@ -1506,8 +1517,8 @@ class TestStandaloneGraphBuckets:
                     selection_workspace=selection,
                     fixed_perhead_segment_views=mock.Mock(),
                 )
-        assert manager._evicted == {}
-        assert manager._confirmed_kv_lengths == {7: 9215}
+        assert manager._request_states[7].evicted_tokens == 0
+        assert manager._request_states[7].confirmed_kv_length == 9215
 
     def test_capture_failure_disables_semantic_bucket_before_new_arena(self):
         import contextlib
@@ -1517,16 +1528,14 @@ class TestStandaloneGraphBuckets:
         manager = _make_triattention()
         manager.top_B = 4096
         manager._standalone_cuda_graph_enabled = True
-        manager._evicted = {}
-        manager._confirmed_kv_lengths = {7: 9215}
+        manager._request_states = {7: _RequestCompressionState(confirmed_kv_length=9215)}
         prepared = [
-            {
-                "request": SimpleNamespace(py_prompt_len=1024),
-                "request_id": 7,
-                "seq_len": 9215,
-                "expected_keep_count": 5120,
-                "protected_tail": 0,
-            }
+            _prepared_eviction(
+                request_id=7,
+                seq_len=9215,
+                prompt_len=1024,
+                expected_keep_count=5120,
+            )
         ]
         stream = SimpleNamespace(device=torch.device("cpu"), cuda_stream=9)
         score = SimpleNamespace(
