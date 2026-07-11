@@ -54,6 +54,60 @@ def _fake_cute_dsl_topk_decode(scores, seq_lens, output, top_k, next_n):
         output[row].copy_(indices.to(dtype=torch.int32))
 
 
+class _AlternatingBoundaryTieTopK:
+    """Emulate a raw TopK op with unspecified exact-tie membership."""
+
+    def __init__(self):
+        self._tie_calls = {}
+
+    def __call__(self, scores, seq_lens, output, top_k, next_n):
+        assert next_n == 1
+        for row in range(scores.shape[0]):
+            width = int(seq_lens[row].item())
+            values = scores[row, :width]
+            threshold = torch.sort(values, descending=True).values[int(top_k) - 1]
+            higher = torch.nonzero(values > threshold, as_tuple=False).flatten()
+            tied = torch.nonzero(values == threshold, as_tuple=False).flatten()
+            remaining = int(top_k) - int(higher.numel())
+            if tied.numel() > remaining:
+                key = (scores.data_ptr(), row, width, int(top_k))
+                tie_call = self._tie_calls.get(key, 0)
+                self._tie_calls[key] = tie_call + 1
+                tied = tied if tie_call % 2 == 0 else tied.flip(0)
+            output[row].copy_(torch.cat((higher, tied[:remaining])).to(torch.int32))
+
+
+def _boundary_row_scores(*, exact_tie, device):
+    scores = torch.tensor(
+        [8.0, 7.0, 6.0, 5.0, 5.0, 4.0, 3.0, 2.0],
+        dtype=torch.float32,
+        device=device,
+    )
+    if not exact_tie:
+        scores[4] = torch.nextafter(
+            scores[3],
+            torch.tensor(float("inf"), dtype=torch.float32, device=device),
+        )
+    return scores
+
+
+def _boundary_union_scores(*, exact_tie, device):
+    scores = torch.tensor(
+        [
+            [12.0, -10.0, -11.0, 9.0, 8.0, -12.0, 7.0, -13.0],
+            [-10.0, 11.0, 10.0, -11.0, -12.0, 9.0, -13.0, 7.0],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    if not exact_tie:
+        scores[1, 5] = torch.nextafter(
+            scores[0, 3],
+            torch.tensor(float("inf"), dtype=torch.float32, device=device),
+        )
+    return scores
+
+
 def _union_keep_oracle(scores, keep_count):
     """Return the fixed-union contract without invoking a production selector."""
     combined = scores.max(dim=0).values
@@ -517,6 +571,122 @@ class TestCuTEDSLGraphSelection:
         generator = torch.Generator().manual_seed(seed)
         return torch.rand((2, width), generator=generator, dtype=torch.float32)
 
+    @staticmethod
+    def _boundary_selection(kind, *, exact_tie, device):
+        if kind == "row":
+            scores = _boundary_row_scores(exact_tie=exact_tie, device=device)
+            workspace = _BatchedFixedPerHeadWorkspace(
+                eviction_mode="per_head",
+                dense_layers=(0,),
+                num_query_heads=1,
+                num_kv_heads=1,
+                width=8,
+                keep_count=4,
+                prompt_len=0,
+                dtype=torch.float32,
+                device=device,
+                selection_backend="cute_dsl_topk",
+                max_requests=1,
+            )
+            segments = [[scores.view(1, -1)]]
+
+            def select():
+                workspace.select_requests(segments, normalize_scores=False)
+
+            expected = torch.tensor(
+                [0, 1, 2, 3 if exact_tie else 4],
+                dtype=torch.int32,
+                device=device,
+            )
+
+            def result():
+                return workspace.keep[0, 0]
+
+            return workspace, select, result, expected
+
+        if kind != "final_union":
+            raise ValueError(f"unsupported boundary selection kind: {kind}")
+        scores = _boundary_union_scores(exact_tie=exact_tie, device=device)
+        workspace = _BatchedFixedUnionWorkspace(
+            rows=2,
+            width=8,
+            keep_count=4,
+            prompt_len=0,
+            dtype=torch.float32,
+            device=device,
+            selection_backend="cute_dsl_topk",
+            max_requests=1,
+        )
+        segments = [[scores]]
+
+        def select():
+            workspace.select_requests(segments, normalize_scores=False)
+
+        expected = torch.tensor(
+            [0, 1, 2, 3 if exact_tie else 5],
+            dtype=torch.long,
+            device=device,
+        )
+
+        def result():
+            return workspace.keep[0]
+
+        return workspace, select, result, expected
+
+    @pytest.mark.parametrize("kind", ["row", "final_union"])
+    @pytest.mark.parametrize("exact_tie", [True, False], ids=("exact_tie", "one_ulp"))
+    def test_boundary_selection_has_stable_identity_with_adversarial_raw_topk(
+        self, kind, exact_tie
+    ):
+        _, select, result, expected = self._boundary_selection(
+            kind,
+            exact_tie=exact_tie,
+            device=torch.device("cpu"),
+        )
+        with mock.patch.object(
+            torch.ops.trtllm,
+            "cute_dsl_indexer_topk_decode",
+            side_effect=_AlternatingBoundaryTieTopK(),
+            create=True,
+        ):
+            for _ in range(6):
+                select()
+                assert torch.equal(result(), expected)
+
+    @pytest.mark.parametrize("kind", ["row", "final_union"])
+    @pytest.mark.parametrize("exact_tie", [True, False], ids=("exact_tie", "one_ulp"))
+    @CUDA_REQUIRED
+    def test_boundary_selection_is_stable_in_eager_and_cuda_graph(self, kind, exact_tie):
+        device = torch.device("cuda")
+        _, eager_select, eager_result, expected = self._boundary_selection(
+            kind,
+            exact_tie=exact_tie,
+            device=device,
+        )
+        _, graph_select, graph_result, _ = self._boundary_selection(
+            kind,
+            exact_tie=exact_tie,
+            device=device,
+        )
+
+        eager_select()
+        graph_select()
+        torch.cuda.synchronize(device)
+        for _ in range(6):
+            eager_select()
+            torch.cuda.synchronize(device)
+            assert torch.equal(eager_result(), expected)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_select()
+        torch.cuda.synchronize(device)
+        assert torch.equal(graph_result(), expected)
+        for _ in range(6):
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert torch.equal(graph_result(), expected)
+
     @pytest.mark.parametrize(
         "keep_count,width",
         [(4096, 4224), (8192, 9216)],
@@ -563,7 +733,7 @@ class TestCuTEDSLGraphSelection:
         ):
             actual = workspace.select(scores).clone()
 
-        assert cute_topk.call_count == 2
+        assert cute_topk.call_count == 4
         assert torch.equal(actual, expected)
 
     @pytest.mark.parametrize(
@@ -621,7 +791,7 @@ class TestCuTEDSLGraphSelection:
             )
             actual = [request_workspace.keep.clone() for request_workspace in selected]
 
-        assert cute_topk.call_count == 2
+        assert cute_topk.call_count == 4
         assert all(torch.equal(result, oracle) for result, oracle in zip(actual, expected))
 
     @pytest.mark.parametrize("eviction_mode", ["per_head", "per_layer_perhead"])

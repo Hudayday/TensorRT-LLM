@@ -141,15 +141,47 @@ def _topk_indices_into(
     torch.ops.trtllm.cute_dsl_indexer_topk_decode(scores, seq_lens, indices_i32, keep_count, 1)
 
 
+def _deterministic_topk_indices_into(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    indices_i32: torch.Tensor,
+    keep_count: int,
+) -> None:
+    """Write TopK indices with deterministic exact-boundary tie membership."""
+    _topk_indices_into(scores, seq_lens, indices_i32, keep_count)
+    if scores.is_cuda:
+        from .triattention_kernels import canonicalize_topk_scores
+
+        canonicalize_topk_scores(scores, seq_lens, indices_i32, keep_count)
+    else:
+        # CPU workspaces only exercise the selector contract in unit tests.
+        # Keep this reference path independent of any production TopK fallback.
+        selected_scores = torch.gather(scores, 1, indices_i32.to(torch.long))
+        threshold = torch.amin(selected_scores, dim=1, keepdim=True)
+        token_indices = torch.arange(
+            scores.shape[1], dtype=torch.float32, device=scores.device
+        ).view(1, -1)
+        valid = token_indices < seq_lens.view(-1, 1)
+        canonical_scores = torch.where(
+            scores > threshold,
+            1.0,
+            torch.where(scores == threshold, -token_indices, float("-inf")),
+        )
+        canonical_scores = torch.where(valid, canonical_scores, float("-inf"))
+        _topk_indices_into(canonical_scores, seq_lens, indices_i32, keep_count)
+        return
+    _topk_indices_into(scores, seq_lens, indices_i32, keep_count)
+
+
 class _FixedUnionWorkspace:
     """Persistent buffers for one request's fixed-shape union eviction.
 
     This workspace is intentionally internal and shape-specific. It removes the
     dynamic ``nonzero`` and temporary allocation chain from the capturable
-    CuTE-DSL route. The caller owns this object for the request lifetime. Finite ties are
-    repeatable for a fixed Torch runtime and preserve the selected-value
-    multiset; cross-backend token identity remains the existing unspecified
-    tie contract. Non-finite scores remain unsupported.
+    CuTE-DSL route. The caller owns this object for the request lifetime. Exact
+    TopK boundary ties are canonicalized by token index before both row and
+    final union selection, so repeated CUDA Graph replays keep the same token
+    set. Non-finite valid scores remain unsupported.
     """
 
     @staticmethod
@@ -411,7 +443,7 @@ class _FixedUnionWorkspace:
             dim=0,
             out=(self.combined, self.combined_argmax),
         )
-        _topk_indices_into(
+        _deterministic_topk_indices_into(
             per_head_scores,
             self.row_seq_lens,
             self.row_top_indices_i32,
@@ -447,7 +479,7 @@ class _FixedUnionWorkspace:
             dtype=torch.int32,
             out=self.union_count[0],
         )
-        _topk_indices_into(
+        _deterministic_topk_indices_into(
             self.candidates.view(1, self.width),
             self.union_count,
             self.final_indices_i32.view(1, self.keep_count),
@@ -902,7 +934,7 @@ class _BatchedFixedUnionWorkspace:
         self.row_seq_lens[:row_count].view(request_count, self.rows).copy_(
             valid_widths.view(request_count, 1).expand(-1, self.rows)
         )
-        _topk_indices_into(
+        _deterministic_topk_indices_into(
             input_scores.view(row_count, self.width),
             self.row_seq_lens[:row_count],
             row_indices_i32.view(row_count, self.keep_count),
@@ -936,7 +968,7 @@ class _BatchedFixedUnionWorkspace:
         )
         torch.gather(combined, 1, candidate_gather_indices, out=candidates)
         torch.sum(union_mask, dim=1, dtype=torch.int32, out=union_counts)
-        _topk_indices_into(
+        _deterministic_topk_indices_into(
             candidates,
             union_counts,
             final_indices_i32,
@@ -1227,7 +1259,7 @@ class _BatchedFixedPerHeadWorkspace:
         selection_scores = self.selection_scores[:request_count]
         row_seq_lens = self.row_seq_lens[:request_count]
         row_seq_lens.copy_(valid_widths.view(request_count, 1).expand(-1, self.selection_rows))
-        _topk_indices_into(
+        _deterministic_topk_indices_into(
             selection_scores.reshape(request_count * self.selection_rows, self.width),
             row_seq_lens.reshape(-1),
             self.top_indices_i32[:request_count].reshape(-1, self.keep_count),
@@ -1387,7 +1419,7 @@ class _FixedScoreMetadataWorkspace:
             max_requests, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         self._bulk_copy_idx_src = torch.empty(
-            max_requests, dtype=torch.int32, device="cpu", pin_memory=True
+            max_requests, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         self.page_ids_device = torch.empty(page_shape, dtype=torch.int64, device=self.device)
         self.round_starts_device = torch.empty(
@@ -1613,7 +1645,7 @@ class _FixedScoreMetadataWorkspace:
             source = torch.empty_like(
                 host_table,
                 device="cpu",
-                pin_memory=True,
+                pin_memory=prefer_pinned(),
             )
             self._bulk_offsets_src = source
         source.copy_(host_table)

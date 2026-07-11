@@ -32,6 +32,102 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _canonicalize_topk_scores_kernel(
+    scores,
+    seq_lens,
+    selected_indices,
+    WIDTH: tl.constexpr,
+    KEEP_COUNT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Rewrite one score row so a second TopK resolves boundary ties by index."""
+    row = tl.program_id(0)
+    row_scores = scores + row * WIDTH
+    row_selected = selected_indices + row * KEEP_COUNT
+
+    threshold = float("inf")
+    for start in tl.static_range(0, KEEP_COUNT, BLOCK):
+        selected_offset = start + tl.arange(0, BLOCK)
+        selected_mask = selected_offset < KEEP_COUNT
+        token_index = tl.load(
+            row_selected + selected_offset,
+            mask=selected_mask,
+            other=0,
+        )
+        selected_score = tl.load(
+            row_scores + token_index,
+            mask=selected_mask,
+            other=float("inf"),
+        ).to(tl.float32)
+        threshold = tl.minimum(threshold, tl.min(selected_score, axis=0))
+
+    seq_len = tl.load(seq_lens + row)
+    for start in tl.static_range(0, WIDTH, BLOCK):
+        token_index = start + tl.arange(0, BLOCK)
+        in_width = token_index < WIDTH
+        valid = in_width & (token_index < seq_len)
+        score = tl.load(
+            row_scores + token_index,
+            mask=valid,
+            other=float("-inf"),
+        ).to(tl.float32)
+        canonical_score = tl.where(
+            score > threshold,
+            1.0,
+            tl.where(score == threshold, -token_index.to(tl.float32), float("-inf")),
+        )
+        tl.store(row_scores + token_index, canonical_score, mask=in_width)
+
+
+def canonicalize_topk_scores(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    selected_indices: torch.Tensor,
+    keep_count: int,
+) -> None:
+    """Canonicalize exact TopK boundary ties without host synchronization.
+
+    ``selected_indices`` is a provisional CuTE-DSL TopK result. For each row,
+    scores above its selected minimum become ``1`` and scores equal to that
+    boundary become ``-token_index``. A second TopK therefore keeps every
+    strictly-better token and fills the remaining slots with the lowest token
+    indices from the exact tie. The caller must provide finite valid FP32
+    scores and ``keep_count <= seq_lens[row] <= scores.shape[1]``.
+    """
+    keep_count = int(keep_count)
+    if not scores.is_cuda:
+        raise ValueError("deterministic TopK canonicalization requires CUDA scores")
+    if scores.ndim != 2 or scores.dtype != torch.float32 or not scores.is_contiguous():
+        raise ValueError("TopK canonicalization requires contiguous two-dimensional FP32 scores")
+    rows, width = scores.shape
+    if rows <= 0 or not 1 <= keep_count <= width or width > 2**24:
+        raise ValueError("TopK canonicalization requires 1 <= keep_count <= width <= 2**24")
+    if (
+        seq_lens.shape != (rows,)
+        or seq_lens.dtype != torch.int32
+        or seq_lens.device != scores.device
+        or not seq_lens.is_contiguous()
+    ):
+        raise ValueError("TopK canonicalization sequence lengths do not match the score rows")
+    if (
+        selected_indices.shape != (rows, keep_count)
+        or selected_indices.dtype != torch.int32
+        or selected_indices.device != scores.device
+        or not selected_indices.is_contiguous()
+    ):
+        raise ValueError("TopK canonicalization indices do not match the requested selection")
+    _canonicalize_topk_scores_kernel[(rows,)](
+        scores,
+        seq_lens,
+        selected_indices,
+        WIDTH=width,
+        KEEP_COUNT=keep_count,
+        BLOCK=256,
+        num_warps=4,
+    )
+
+
 def cpp_sparse_compact_supported(pool: torch.Tensor) -> bool:
     """Return whether ``pool`` satisfies the C++ compact op layout contract."""
     return (

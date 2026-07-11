@@ -1642,7 +1642,7 @@ class TestTopKRouting:
         with _mock_cute_topk_without_fallbacks() as cute_topk:
             actual = workspace.select(scores)
 
-        assert cute_topk.call_count == 2
+        assert cute_topk.call_count == 4
         assert torch.equal(actual, expected)
 
     @pytest.mark.parametrize("keep_count", [4096, 8192])
@@ -1670,7 +1670,7 @@ class TestTopKRouting:
                 normalize_scores=False,
             )
 
-        assert cute_topk.call_count == 2
+        assert cute_topk.call_count == 4
         for actual, expected_keep in zip(selected, expected):
             assert torch.equal(actual.keep, expected_keep)
 
@@ -3769,7 +3769,7 @@ class TestFixedUnionWorkspace:
             "triattention.prewarm.select",
             "triattention.prewarm.compact",
         ]
-        assert cute_topk.call_count == 2
+        assert cute_topk.call_count == 4
         event.assert_not_called()
         synchronize.assert_not_called()
         assert seen_page_ids[0].tolist() == [0, 1]
@@ -3844,6 +3844,8 @@ class TestFixedUnionWorkspace:
 
         assert [tuple(call.args[0].shape) for call in cute_topk.call_args_list] == [
             (4, 4095),
+            (4, 4095),
+            (1, 4095),
             (1, 4095),
         ]
         assert all(call.args[3] == 2048 for call in cute_topk.call_args_list)
@@ -3896,6 +3898,8 @@ class TestFixedUnionWorkspace:
 
         assert [tuple(call.args[0].shape) for call in cute_topk.call_args_list] == [
             (4, 4096),
+            (4, 4096),
+            (1, 4096),
             (1, 4096),
         ]
         assert all(call.args[3] == 2048 for call in cute_topk.call_args_list)
@@ -4000,7 +4004,7 @@ class TestFixedUnionWorkspace:
             "triattention.prewarm.select",
             "triattention.prewarm.compact",
         ]
-        assert cute_topk.call_count == 2
+        assert cute_topk.call_count == 4
         compact.assert_called_once()
         assert compact.call_args.args[3] == 6
         workspace = next(iter(manager._fixed_union_prewarmed_workspaces.values()))
@@ -4193,7 +4197,13 @@ class TestFixedUnionWorkspace:
         assert torch.equal(first, second)
         assert torch.equal(first[:prompt_len], torch.arange(prompt_len, device=device))
         assert torch.equal(first[prompt_len:] - prompt_len, reference)
-        assert torch.equal(workspace.input_scores, normalized)
+        if torch.device(device).type == "cpu":
+            assert torch.equal(workspace.input_scores, normalized)
+        else:
+            # CUDA canonicalizes the reusable score scratch in place after the
+            # combined scores are materialized. The next selection restages
+            # every element before it is consumed again.
+            assert not torch.isnan(workspace.input_scores).any()
         assert cat.call_count == 2
         assert all(call.kwargs["out"] is workspace.input_scores for call in cat.call_args_list)
         assert pointers == {
@@ -4462,7 +4472,7 @@ class TestFixedUnionWorkspace:
 
         assert workspace_init.call_count == 1
         assert warm_bank.call_count == 1
-        assert cute_topk.call_count == 2
+        assert cute_topk.call_count == 4
         bank = manager._fixed_shape_selection_workspaces[key]
         assert manager._fixed_shape_selection_prewarm_states[key] == "ready"
         assert len(bank) == 3
@@ -4534,7 +4544,7 @@ class TestFixedUnionWorkspace:
         ):
             selected = workspace.select_segments(segments, normalize_scores=False).clone()
 
-        assert cute_topk.call_count == 2
+        assert cute_topk.call_count == 4
         combined = scores.max(dim=0).values
         row_top = _TORCH_TOPK_ORACLE(scores, keep_count, dim=1, sorted=False).indices
         union_mask = torch.zeros(width, dtype=torch.bool)
@@ -4689,7 +4699,9 @@ class TestFixedUnionWorkspace:
 
             for fixed_keep, expected_keep in pending_keeps:
                 assert torch.equal(fixed_keep, expected_keep)
-            assert torch.isfinite(base.input_scores).all()
+            # Selection may leave canonical -inf values in the shared scratch,
+            # but every slot must have replaced the NaN poison from this round.
+            assert not torch.isnan(base.input_scores).any()
 
             for workspace in bank[request_count:]:
                 assert torch.equal(
