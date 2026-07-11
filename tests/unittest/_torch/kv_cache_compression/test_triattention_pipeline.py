@@ -206,8 +206,7 @@ def _make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     fake_v2.max_seq_len = 65536
     fake_v2.tokens_per_block = 64
     fake_v2.max_blocks_per_seq = 1028
-    fake_v2.get_num_available_tokens = (
-        lambda *, token_num_upper_bound, **_: token_num_upper_bound)
+    fake_v2.get_num_available_tokens = lambda *, token_num_upper_bound, **_: token_num_upper_bound
     fake_v2.max_attention_window_vec = []
     fake_v2.kv_cache_manager_py_config = SimpleNamespace(layers=[])
     fake_v2.impl = object()
@@ -1222,7 +1221,8 @@ class TestStepEndHookRefactor:
         manager = _make_triattention(top_B=4096, beta=128)
         manager.kv_cache_manager.max_blocks_per_seq = 1028
         manager.kv_cache_manager.get_num_available_tokens = (
-            lambda *, token_num_upper_bound, **_: token_num_upper_bound - 1)
+            lambda *, token_num_upper_bound, **_: token_num_upper_bound - 1
+        )
         request = _make_request(7, py_prompt_len=1024)
 
         with pytest.raises(ValueError, match="too small to reach its first eviction"):
@@ -1245,7 +1245,8 @@ class TestStepEndHookRefactor:
     ):
         manager = _make_triattention(top_B=top_B, beta=beta)
         manager.kv_cache_manager.get_num_available_tokens = mock.MagicMock(
-            side_effect=lambda *, token_num_upper_bound, **_: token_num_upper_bound)
+            side_effect=lambda *, token_num_upper_bound, **_: token_num_upper_bound
+        )
         request = _make_request(
             7,
             py_prompt_len=1024,
@@ -1254,8 +1255,12 @@ class TestStepEndHookRefactor:
 
         manager._validate_request_capacity(request)
 
-        assert manager.kv_cache_manager.get_num_available_tokens.call_args.kwargs[
-            "token_num_upper_bound"] == 1024 + expected_decode_capacity
+        assert (
+            manager.kv_cache_manager.get_num_available_tokens.call_args.kwargs[
+                "token_num_upper_bound"
+            ]
+            == 1024 + expected_decode_capacity
+        )
 
     def test_request_capacity_includes_speculative_boundary_overshoot(self):
         from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
@@ -1267,13 +1272,18 @@ class TestStepEndHookRefactor:
             draft_kv_cache_manager=_make_fake_v2(is_draft=True),
         )
         manager.kv_cache_manager.get_num_available_tokens = mock.MagicMock(
-            side_effect=lambda *, token_num_upper_bound, **_: token_num_upper_bound)
+            side_effect=lambda *, token_num_upper_bound, **_: token_num_upper_bound
+        )
         request = _make_request(7, py_prompt_len=1024)
 
         manager._validate_request_capacity(request)
 
-        assert manager.kv_cache_manager.get_num_available_tokens.call_args.kwargs[
-            "token_num_upper_bound"] == 1024 + 4224 + 4
+        assert (
+            manager.kv_cache_manager.get_num_available_tokens.call_args.kwargs[
+                "token_num_upper_bound"
+            ]
+            == 1024 + 4224 + 4
+        )
 
     def test_dflash_requires_actual_separate_draft_manager(self):
         from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
@@ -2125,9 +2135,7 @@ class TestFixedScoreMetadata:
         )
         host_table[0, 0, 0, :2] = torch.tensor([3, 4], dtype=torch.int32)
         host_table[0, 1, 0, :2] = torch.tensor([7, 8], dtype=torch.int32)
-        persistent_copy_idx = torch.zeros(
-            1, dtype=torch.int32, device="cpu", pin_memory=True
-        )
+        persistent_copy_idx = torch.zeros(1, dtype=torch.int32, device="cpu", pin_memory=True)
 
         workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
         workspace.device = device
@@ -2142,9 +2150,7 @@ class TestFixedScoreMetadata:
         workspace._bulk_copy_idx_src = torch.empty(
             1, dtype=torch.int32, device="cpu", pin_memory=True
         )
-        workspace.page_ids_device = torch.empty(
-            1, 1, 2, dtype=torch.int64, device=device
-        )
+        workspace.page_ids_device = torch.empty(1, 1, 2, dtype=torch.int64, device=device)
 
         manager = SimpleNamespace(
             host_kv_cache_block_offsets=host_table,
@@ -2154,12 +2160,8 @@ class TestFixedScoreMetadata:
             index_mapper=SimpleNamespace(
                 get_copy_index=lambda request_ids, num_contexts, beam_width: persistent_copy_idx
             ),
-            index_scales=torch.tensor(
-                [2], dtype=torch.int32, device="cpu", pin_memory=True
-            ),
-            kv_offset=torch.tensor(
-                [1], dtype=torch.int32, device="cpu", pin_memory=True
-            ),
+            index_scales=torch.tensor([2], dtype=torch.int32, device="cpu", pin_memory=True),
+            kv_offset=torch.tensor([1], dtype=torch.int32, device="cpu", pin_memory=True),
             _stream=manager_stream,
         )
 
@@ -3145,9 +3147,7 @@ class TestFixedScoreMetadata:
         layer_to_pool = {0: 0, 1: 1, 2: 2}
         bulk_calls = []
 
-        def copy_batch_block_offsets(
-            source, dst, copy_idx, index_scales, kv_offset, stream
-        ):
+        def copy_batch_block_offsets(source, dst, copy_idx, index_scales, kv_offset, stream):
             bulk_calls.append(tuple(copy_idx.tolist()))
             dst.zero_()
             for layer, pages in page_lists.items():

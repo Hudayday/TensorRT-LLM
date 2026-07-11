@@ -966,8 +966,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 logger.info(
                     "Keeping logical max_seq_len %d while sizing the live V2 "
                     "block table for %d tokens because generation KV capacity "
-                    "will be reclaimed and reused.", max_seq_len,
-                    physical_seq_len)
+                    "will be reclaimed and reused.",
+                    max_seq_len,
+                    physical_seq_len,
+                )
             else:
                 logger.warning(
                     f"max_seq_len {max_seq_len} is greater than max_num_tokens {max_num_tokens} "
@@ -983,10 +985,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Account for max single-sequence capacity = seq_len + extra KV tokens +
         # _kv_reserve_draft_tokens (see __init__) + 1 base decode token.
         max_seq_capacity = (
-            physical_seq_len
-            + self.num_extra_kv_tokens
-            + self._kv_reserve_draft_tokens
-            + 1
+            physical_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
         )
         self.max_blocks_per_seq = (max_seq_capacity + tokens_per_block - 1) // tokens_per_block
         if self.max_blocks_per_seq % 4 != 0:

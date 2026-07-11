@@ -222,9 +222,7 @@ def test_schedule_passes_previous_batch_ids_as_pending_v2_updates():
     executor = PyExecutor.__new__(PyExecutor)
     executor.scheduler = scheduler
     executor.kv_cache_manager = types.SimpleNamespace(generation_capacity_only=True)
-    executor.previous_batch = types.SimpleNamespace(
-        scheduled_requests=previous_scheduled
-    )
+    executor.previous_batch = types.SimpleNamespace(scheduled_requests=previous_scheduled)
     executor.active_requests = active_requests
     executor.inflight_req_ids = inflight_request_ids
     executor.enable_attention_dp = False

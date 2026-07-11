@@ -309,12 +309,9 @@ class TestFactory:
         ),
         [
             (ResourceManagerType.KV_CACHE_MANAGER, None, 9_280, False, 9_280),
-            (ResourceManagerType.KV_CACHE_MANAGER, "unknown", 9_280, False,
-             9_280),
-            (ResourceManagerType.KV_CACHE_MANAGER, "triattention", 32_768,
-             True, 32_768),
-            (ResourceManagerType.DRAFT_KV_CACHE_MANAGER, "triattention", 9_280,
-             False, 32_768),
+            (ResourceManagerType.KV_CACHE_MANAGER, "unknown", 9_280, False, 9_280),
+            (ResourceManagerType.KV_CACHE_MANAGER, "triattention", 32_768, True, 32_768),
+            (ResourceManagerType.DRAFT_KV_CACHE_MANAGER, "triattention", 9_280, False, 32_768),
         ],
     )
     def test_creator_enables_generation_capacity_reuse_for_target_only(
@@ -344,14 +341,10 @@ class TestFactory:
         creator._is_disagg = False
         creator._dummy_reqs = None
         creator._skip_est = True
-        compression_config = (
-            None if algorithm is None else SimpleNamespace(algorithm=algorithm))
-        creator._llm_args = SimpleNamespace(
-            kv_cache_compression_config=compression_config)
-        creator._get_model_kv_cache_manager_cls = MagicMock(
-            return_value=KVCacheManagerV2)
-        creator._should_create_separate_draft_kv_cache = MagicMock(
-            return_value=False)
+        compression_config = None if algorithm is None else SimpleNamespace(algorithm=algorithm)
+        creator._llm_args = SimpleNamespace(kv_cache_compression_config=compression_config)
+        creator._get_model_kv_cache_manager_cls = MagicMock(return_value=KVCacheManagerV2)
+        creator._should_create_separate_draft_kv_cache = MagicMock(return_value=False)
         creator._enable_kv_cache_stats = MagicMock(return_value=False)
 
         model_engine = MagicMock()
@@ -359,14 +352,12 @@ class TestFactory:
         model_engine.kv_cache_manager_key = manager_key
         created_manager = SimpleNamespace(max_seq_len=manager_max_seq_len)
 
-        with patch.object(util_mod,
-                          "_create_kv_cache_manager",
-                          return_value=created_manager) as create:
-            assert creator._create_kv_cache_manager(
-                model_engine) is created_manager
+        with patch.object(
+            util_mod, "_create_kv_cache_manager", return_value=created_manager
+        ) as create:
+            assert creator._create_kv_cache_manager(model_engine) is created_manager
 
-        assert create.call_args.kwargs[
-            "reuse_generation_kv_capacity"] is expected_reuse
+        assert create.call_args.kwargs["reuse_generation_kv_capacity"] is expected_reuse
         assert creator._max_seq_len == expected_creator_max_seq_len
 
     def test_draft_manager_does_not_silently_limit_target_logical_length(self):
@@ -381,15 +372,13 @@ class TestFactory:
         creator._kv_connector_manager = None
         creator._is_kv_cache_manager_v2 = True
         creator._llm_args = SimpleNamespace(
-            kv_cache_compression_config=SimpleNamespace(
-                algorithm="triattention"))
+            kv_cache_compression_config=SimpleNamespace(algorithm="triattention")
+        )
         creator._is_encoder_decoder = MagicMock(return_value=False)
-        creator._should_create_separate_draft_kv_cache = MagicMock(
-            return_value=False)
+        creator._should_create_separate_draft_kv_cache = MagicMock(return_value=False)
         target = SimpleNamespace(max_seq_len=32_768)
         draft = SimpleNamespace(max_seq_len=9_280)
-        creator._create_kv_cache_manager = MagicMock(
-            side_effect=[target, draft])
+        creator._create_kv_cache_manager = MagicMock(side_effect=[target, draft])
 
         resources = {}
         creator.build_managers(resources, estimating_kv_cache=True)

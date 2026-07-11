@@ -1609,11 +1609,7 @@ class _FixedScoreMetadataWorkspace:
             return False
         request_count = len(request_ids)
         source = self._bulk_offsets_src
-        if (
-            source is None
-            or source.shape != host_table.shape
-            or source.dtype != host_table.dtype
-        ):
+        if source is None or source.shape != host_table.shape or source.dtype != host_table.dtype:
             source = torch.empty_like(
                 host_table,
                 device="cpu",
@@ -1896,11 +1892,9 @@ class TriAttention(BaseKVCacheCompressionManager):
             0 if self.spec_config is None else int(self.spec_config.max_draft_len)
         )
         first_eviction_decode_length = (
-            (self.top_B // self.beta + 1) * self.beta
-            + speculative_overshoot
-        )
-        decode_capacity = min(int(request.py_max_new_tokens),
-                              first_eviction_decode_length)
+            self.top_B // self.beta + 1
+        ) * self.beta + speculative_overshoot
+        decode_capacity = min(int(request.py_max_new_tokens), first_eviction_decode_length)
         confirmed_capacity = int(request.py_prompt_len) + decode_capacity
         protected_tail_capacity = self._configured_protected_tail_capacity()
         required_capacity = confirmed_capacity + protected_tail_capacity
@@ -1909,8 +1903,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             max_num_draft_tokens=int(manager._kv_reserve_draft_tokens) + 1,
         )
         table_capacity = manager.max_blocks_per_seq * manager.tokens_per_block
-        if (confirmed_capacity > pool_confirmed_capacity
-                or required_capacity > table_capacity):
+        if confirmed_capacity > pool_confirmed_capacity or required_capacity > table_capacity:
             raise ValueError(
                 "TriAttention target KV capacity is too small to reach its first "
                 f"eviction: request requires {required_capacity} tokens "
@@ -1963,8 +1956,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         if self.spec_config is not None:
             if self.spec_config.max_draft_len is None:
                 raise ValueError(
-                    "TriAttention speculative compatibility requires a resolved "
-                    "max_draft_len"
+                    "TriAttention speculative compatibility requires a resolved max_draft_len"
                 )
             if not self.spec_config.is_linear_tree:
                 raise ValueError("TriAttention speculative compatibility requires linear drafting")

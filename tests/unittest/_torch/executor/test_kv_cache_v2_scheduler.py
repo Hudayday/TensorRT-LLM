@@ -523,9 +523,7 @@ class TestKVCacheFailuresGen:
         inflight_victim = make_gen_request(1)
         current.is_generation_to_complete_state = False
         inflight_victim.is_generation_to_complete_state = False
-        mgr.is_request_active.side_effect = (
-            lambda req_id: req_id == inflight_victim.request_id
-        )
+        mgr.is_request_active.side_effect = lambda req_id: req_id == inflight_victim.request_id
         sched = make_scheduler(mgr, max_num_tokens=100)
 
         out = sched.schedule_request(
@@ -546,9 +544,7 @@ class TestKVCacheFailuresGen:
         current.is_generation_to_complete_state = False
         completing_victim.is_generation_in_progress_state = False
         completing_victim.is_generation_to_complete_state = True
-        mgr.is_request_active.side_effect = (
-            lambda req_id: req_id == completing_victim.request_id
-        )
+        mgr.is_request_active.side_effect = lambda req_id: req_id == completing_victim.request_id
         sched = make_scheduler(mgr, max_num_tokens=100)
 
         out = sched.schedule_request(
