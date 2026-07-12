@@ -2075,7 +2075,6 @@ def create_kv_cache_compression_manager(
             beta=triattention_config.beta,
             model_path=triattention_config.model_path,
             calibration_path=triattention_config.calibration_path,
-            window_size=triattention_config.window_size,
             eviction_mode=triattention_config.eviction_mode,
             normalize_scores=triattention_config.normalize_scores,
             pin_prefill=triattention_config.pin_prefill,

@@ -473,7 +473,6 @@ class TestTriAttentionClass:
 
         assert manager._local_to_global_layers_cache is None
         assert manager._attention_layer_partition_cache is None
-        assert manager._fixed_score_runtime_counts == {}
         assert manager._standalone_graph_cache is None
         assert manager._runtime_kv_layout_cache is None
 
@@ -2501,7 +2500,6 @@ class TestFixedScoreMetadata:
                 score_workspace=workspace,
             )
         }
-        manager._fixed_score_runtime_counts = {}
         pools = [torch.empty(1), torch.empty(1)]
         prepared = [
             _prepared_eviction(
@@ -2601,9 +2599,7 @@ class TestFixedScoreMetadata:
         manager = _make_triattention()
         get_batch = mock.Mock()
         manager.kv_cache_manager = SimpleNamespace(get_batch_cache_indices=get_batch)
-        manager._fixed_score_runtime_counts = {}
         workspace = SimpleNamespace(
-            prewarm_key=("bucket",),
             stage=mock.Mock(
                 side_effect=_FixedScoreStreamMismatch(
                     "TriAttention fixed score metadata is bound to its first CUDA stream"
@@ -2632,7 +2628,6 @@ class TestFixedScoreMetadata:
             staging_request_ids=None,
             staging_offset=0,
         )
-        assert manager._fixed_score_runtime_counts[("bucket",)]["rejected"] == 1
 
     def test_first_runtime_stream_is_retained_and_records_copy_event(self):
         from unittest import mock
@@ -2709,13 +2704,11 @@ class TestFixedScoreMetadata:
         manager = _make_triattention()
         get_batch = mock.Mock()
         manager.kv_cache_manager = SimpleNamespace(get_batch_cache_indices=get_batch)
-        manager._fixed_score_runtime_counts = {}
         page_ids = torch.tensor([[[10, 11], [12, 13]], [[20, 21], [22, 23]]])
         workspace = SimpleNamespace(
             stage=mock.Mock(return_value=True),
             page_ids_device=page_ids,
             representative_slots={0: 0, 1: 1},
-            prewarm_key=("bucket",),
         )
         prepared = [
             _prepared_eviction(
@@ -2747,7 +2740,6 @@ class TestFixedScoreMetadata:
             staging_request_ids=None,
             staging_offset=0,
         )
-        assert manager._fixed_score_runtime_counts[("bucket",)]["hit"] == 1
         assert all(not hasattr(item, "page_ids") for item in prepared)
 
     @pytest.mark.parametrize("request_count", [1, 7, 8])
@@ -3774,7 +3766,6 @@ class TestCrossRequestFixedUnionWorkspace:
         manager.normalize_scores = True
         manager._cross_request_selection_enabled = True
         manager._eviction_buckets = {}
-        manager._cross_request_selection_runtime_counts = {}
         manager._cross_request_selection_materialization_state = "pending"
         return manager
 
@@ -4094,15 +4085,6 @@ class TestCrossRequestFixedUnionWorkspace:
         manager._eviction_buckets[key].selection_state = "failed"
         assert manager._cross_request_selection_for(SimpleNamespace(prewarm_key=key), 1) is None
 
-        assert manager._cross_request_selection_runtime_counts[key] == {
-            "hit": 1,
-            "rejected": 2,
-        }
-        assert manager._cross_request_selection_runtime_counts[("other-bucket",)] == {
-            "hit": 0,
-            "rejected": 1,
-        }
-
     def test_selection_runs_once_inside_the_request_batched_graph(self):
         import contextlib
 
@@ -4388,7 +4370,6 @@ class TestFactory:
             beta=128,
             model_path=None,
             calibration_path=None,
-            window_size=128,
             eviction_mode="union",
             normalize_scores=True,
             pin_prefill=True,

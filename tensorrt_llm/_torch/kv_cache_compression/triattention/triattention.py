@@ -1388,7 +1388,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         calibration_path: Optional[str] = None,
         offset_max_length: int = 65536,
         score_aggregation: str = "mean",
-        window_size: int = 128,
         eviction_mode: str = "union",
         normalize_scores: bool = True,
         pin_prefill: bool = True,
@@ -1441,11 +1440,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         self.skip_swa = bool(skip_swa)
         # All physical moves use the graph-safe C++ V2 compaction operation.
         # No other compaction path exists.
-        # Recency-window knob, kept for API compatibility. The upstream
-        # calibration-based selection does not apply a recency window on the AIME
-        # protocol and none of the implemented modes read this value, so it is
-        # currently inert; the prompt is preserved via pin_prefill instead.
-        self.window_size = int(window_size)
         self.score_aggregation = score_aggregation
         # One fixed CUDA Graph scores, selects, and compacts every request that
         # reaches an eviction boundary in this step.
@@ -1488,8 +1482,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._cross_request_selection_enabled = graph_enabled
         self._standalone_cuda_graph_enabled = graph_enabled
         self._eviction_buckets: Dict[tuple, _EvictionBucketResources] = {}
-        self._fixed_score_runtime_counts = {}
-        self._cross_request_selection_runtime_counts = {}
         self._cross_request_selection_materialization_state = (
             "pending" if self._cross_request_selection_enabled else "disabled"
         )
@@ -2601,13 +2593,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             or workspace.eviction_mode != self.eviction_mode
             or request_count > workspace.max_requests
         ):
-            self._cross_request_selection_runtime_counts.setdefault(key, {"hit": 0, "rejected": 0})[
-                "rejected"
-            ] += 1
             return None
-        self._cross_request_selection_runtime_counts.setdefault(key, {"hit": 0, "rejected": 0})[
-            "hit"
-        ] += 1
         return workspace
 
     def _local_to_global_layers(self, num_layers: int) -> List[int]:
@@ -2816,12 +2802,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             for pool in pools
         )
 
-    def _record_fixed_score_runtime(self, key: Optional[tuple], outcome: str) -> None:
-        if key is None:
-            return
-        bucket = self._fixed_score_runtime_counts.setdefault(key, {"hit": 0, "rejected": 0})
-        bucket[outcome] += 1
-
     def _fixed_score_workspace_for(
         self,
         layer_pools: List[torch.Tensor],
@@ -2925,14 +2905,11 @@ class TriAttention(BaseKVCacheCompressionManager):
                 staging_offset=staging_offset,
             )
         except _FixedScoreStreamMismatch:
-            self._record_fixed_score_runtime(workspace.prewarm_key, "rejected")
             raise
         except Exception as exc:
             raise RuntimeError("TriAttention fixed score staging failed") from exc
         if not staged:
-            self._record_fixed_score_runtime(workspace.prewarm_key, "rejected")
             raise RuntimeError("TriAttention CUDA Graph requires fixed page-table staging")
-        self._record_fixed_score_runtime(workspace.prewarm_key, "hit")
 
     def _standalone_graph_bucket_for(
         self,
