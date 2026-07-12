@@ -3108,7 +3108,7 @@ class TestFixedScoreMetadata:
                 dst[pool_id, :2, 0, : len(pages)] = page_offsets
 
         cache = SimpleNamespace(
-            host_kv_cache_block_offsets=torch.empty(3, 8, 2, 2, dtype=torch.int32, pin_memory=True),
+            host_kv_cache_block_offsets=torch.empty(3, 8, 2, 4, dtype=torch.int32, pin_memory=True),
             kv_factor=2,
             layer_offsets=layer_offsets,
             layer_to_pool_mapping_dict=layer_to_pool,
