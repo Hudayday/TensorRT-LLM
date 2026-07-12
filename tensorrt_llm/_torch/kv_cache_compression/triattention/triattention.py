@@ -1188,27 +1188,29 @@ class _FixedScoreMetadataWorkspace:
         kv_factor = int(manager.kv_factor)
         layer_offsets = manager.layer_offsets
         pool_of = manager.layer_to_pool_mapping_dict
-        num_pools, _, _, max_blocks = host_table.shape
-        if max_blocks < self.page_count:
+        num_pools, _, kv_planes, max_blocks = host_table.shape
+        # The native copy reads four int32 block offsets per access.
+        copy_blocks = (self.page_count + 3) // 4 * 4
+        if kv_planes != 2 or copy_blocks > max_blocks:
             return False
         request_count = len(request_ids)
         staging_count = len(staging_request_ids)
+        source_shape = (num_pools, host_table.shape[1], 2, copy_blocks)
         source = self._bulk_offsets_src
-        if source is None or source.shape != host_table.shape or source.dtype != host_table.dtype:
+        if source is None or source.shape != source_shape or source.dtype != host_table.dtype:
             source = torch.empty_like(
-                host_table,
+                host_table[..., :copy_blocks],
                 device="cpu",
                 pin_memory=prefer_pinned(),
+                memory_format=torch.contiguous_format,
             )
             self._bulk_offsets_src = source
         bulk = self._bulk_offsets_dst
         allocated = False
-        if bulk is None or bulk.shape[1] < self.max_requests:
+        bulk_shape = (num_pools, self.max_requests, 2, copy_blocks)
+        if bulk is None or bulk.shape != bulk_shape or bulk.dtype != host_table.dtype:
             bulk = torch.empty(
-                num_pools,
-                self.max_requests,
-                2,
-                max_blocks,
+                bulk_shape,
                 dtype=host_table.dtype,
                 device=self.device,
             )
@@ -1219,7 +1221,7 @@ class _FixedScoreMetadataWorkspace:
             if staging_offset == 0:
                 if self.copy_pending and not self.copy_done.query():
                     self.copy_done.synchronize()
-                source.copy_(host_table)
+                source.copy_(host_table[..., :copy_blocks])
                 copy_idx = manager.index_mapper.get_copy_index(staging_request_ids, 0, 1)
                 if copy_idx.shape[0] != staging_count:
                     return False

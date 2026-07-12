@@ -2189,7 +2189,7 @@ class TestFixedScoreMetadata:
         workspace.device = torch.device("cuda")
         workspace.max_requests = 2
         workspace.staging_capacity = 2
-        workspace.page_count = 2
+        workspace.page_count = 5
         workspace.global_representatives = (10,)
         workspace._bulk_stage_logged = True
         workspace.bulk_allocation_done = mock.Mock()
@@ -2205,9 +2205,12 @@ class TestFixedScoreMetadata:
         copy_idx_storage.__getitem__.return_value = copy_idx_source
         workspace._bulk_copy_idx_src = copy_idx_storage
         bulk = mock.MagicMock()
-        bulk.shape = (1, 2, 2, 4)
-        source = mock.Mock(shape=(1, 8, 2, 4), dtype=torch.int32)
-        host_table = mock.Mock(shape=(1, 8, 2, 4), dtype=torch.int32)
+        bulk.shape = (1, 2, 2, 8)
+        bulk.dtype = torch.int32
+        source = mock.Mock(shape=(1, 8, 2, 8), dtype=torch.int32)
+        host_table = mock.MagicMock(shape=(1, 8, 2, 12), dtype=torch.int32)
+        host_table_prefix = mock.Mock()
+        host_table.__getitem__.return_value = host_table_prefix
         converted = mock.Mock()
         bulk.__getitem__.return_value.__floordiv__.return_value = converted
         workspace._bulk_offsets_dst = None
@@ -2264,7 +2267,10 @@ class TestFixedScoreMetadata:
         manager_stream.wait_event.assert_called_once_with(workspace.bulk_allocation_done)
         workspace.bulk_copy_done.record.assert_called_once_with(manager_stream)
         current_stream.wait_event.assert_called_once_with(workspace.bulk_copy_done)
-        source.copy_.assert_called_once_with(host_table)
+        host_table.__getitem__.assert_has_calls(
+            [mock.call((Ellipsis, slice(None, 8, None)))] * 2
+        )
+        source.copy_.assert_called_once_with(host_table_prefix)
         copy_idx_source.copy_.assert_called_once_with(copy_idx)
         copy_offsets.assert_called_once_with(
             source,
@@ -2273,6 +2279,9 @@ class TestFixedScoreMetadata:
             manager.index_scales,
             manager.kv_offset,
             manager_stream.cuda_stream,
+        )
+        bulk.__getitem__.assert_called_once_with(
+            (0, slice(None, 1, None), 0, slice(None, 5, None))
         )
 
         workspace.bulk_copy_done.record.side_effect = RuntimeError("event record failed")
@@ -2294,7 +2303,7 @@ class TestFixedScoreMetadata:
         workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
         workspace.max_requests = 2
         workspace.staging_capacity = 3
-        workspace.page_count = 2
+        workspace.page_count = 5
         workspace.global_representatives = (10,)
         workspace._bulk_stage_logged = True
         workspace.copy_pending = True
@@ -2305,18 +2314,19 @@ class TestFixedScoreMetadata:
         workspace.bulk_consume_done = mock.Mock()
         workspace.bulk_consume_pending = False
         workspace._bulk_staged_request_ids = None
-        source = mock.Mock(shape=(1, 8, 2, 4), dtype=torch.int32)
+        source = mock.Mock(shape=(1, 8, 2, 8), dtype=torch.int32)
         workspace._bulk_offsets_src = source
         bulk = mock.MagicMock()
-        bulk.shape = (1, 2, 2, 4)
+        bulk.shape = (1, 2, 2, 8)
+        bulk.dtype = torch.int32
         workspace._bulk_offsets_dst = bulk
         workspace._bulk_copy_idx_src = mock.MagicMock()
         workspace.page_ids_device = mock.MagicMock()
 
         copy_idx = mock.Mock(shape=(3,))
         manager = SimpleNamespace(
-            host_kv_cache_block_offsets=mock.Mock(
-                shape=(1, 8, 2, 4),
+            host_kv_cache_block_offsets=mock.MagicMock(
+                shape=(1, 8, 2, 12),
                 dtype=torch.int32,
             ),
             kv_factor=2,
@@ -2350,7 +2360,9 @@ class TestFixedScoreMetadata:
 
         workspace.copy_done.query.assert_called_once_with()
         workspace.copy_done.synchronize.assert_called_once_with()
-        source.copy_.assert_called_once_with(manager.host_kv_cache_block_offsets)
+        source.copy_.assert_called_once_with(
+            manager.host_kv_cache_block_offsets[..., :8]
+        )
         manager.index_mapper.get_copy_index.assert_called_once_with([7, 8, 9], 0, 1)
         assert copy_offsets.call_count == 2
         assert workspace.bulk_consume_done.record.call_count == 2
@@ -2371,20 +2383,20 @@ class TestFixedScoreMetadata:
             1,
             2,
             2,
-            4,
+            12,
             dtype=torch.int32,
             device="cpu",
             pin_memory=True,
         )
-        host_table[0, 0, 0, :2] = torch.tensor([3, 4], dtype=torch.int32)
-        host_table[0, 1, 0, :2] = torch.tensor([7, 8], dtype=torch.int32)
+        host_table[0, 0, 0, :5] = torch.tensor([3, 4, 5, 6, 7], dtype=torch.int32)
+        host_table[0, 1, 0, :5] = torch.tensor([8, 9, 10, 11, 12], dtype=torch.int32)
         persistent_copy_idx = torch.zeros(1, dtype=torch.int32, device="cpu", pin_memory=True)
 
         workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
         workspace.device = device
         workspace.max_requests = 1
         workspace.staging_capacity = 1
-        workspace.page_count = 2
+        workspace.page_count = 5
         workspace.global_representatives = (10,)
         workspace._bulk_stage_logged = True
         workspace.bulk_allocation_done = torch.cuda.Event()
@@ -2399,7 +2411,7 @@ class TestFixedScoreMetadata:
         workspace._bulk_copy_idx_src = torch.empty(
             1, dtype=torch.int32, device="cpu", pin_memory=True
         )
-        workspace.page_ids_device = torch.empty(1, 1, 2, dtype=torch.int64, device=device)
+        workspace.page_ids_device = torch.empty(1, 1, 5, dtype=torch.int64, device=device)
 
         manager = SimpleNamespace(
             host_kv_cache_block_offsets=host_table,
@@ -2417,25 +2429,27 @@ class TestFixedScoreMetadata:
         with torch.cuda.stream(manager_stream):
             torch.cuda._sleep(50_000_000)
         assert workspace._stage_page_tables_bulk(manager, [7], current_stream)
+        assert workspace._bulk_offsets_src.shape[-1] == 8
+        assert workspace._bulk_offsets_dst.shape[-1] == 8
 
         # Mutate both persistent V2 host inputs before the delayed kernel reads.
-        # The staged result must still reflect row 0 values [3, 4].
-        host_table[0, 0, 0, :2] = torch.tensor([9, 10], dtype=torch.int32)
+        # The staged result must still reflect row 0 values [3, 4, 5, 6, 7].
+        host_table[0, 0, 0, :5] = torch.tensor([13, 14, 15, 16, 17], dtype=torch.int32)
         persistent_copy_idx[0] = 1
         current_stream.synchronize()
 
-        assert workspace.page_ids_device[0, 0].tolist() == [3, 4]
+        assert workspace.page_ids_device[0, 0].tolist() == [3, 4, 5, 6, 7]
 
-        host_table[0, 0, 0, :2] = torch.tensor([11, 12], dtype=torch.int32)
+        host_table[0, 0, 0, :5] = torch.tensor([18, 19, 20, 21, 22], dtype=torch.int32)
         persistent_copy_idx[0] = 0
         with torch.cuda.stream(manager_stream):
             torch.cuda._sleep(50_000_000)
         assert workspace._stage_page_tables_bulk(manager, [7], current_stream)
-        host_table[0, 0, 0, :2] = torch.tensor([13, 14], dtype=torch.int32)
+        host_table[0, 0, 0, :5] = torch.tensor([23, 24, 25, 26, 27], dtype=torch.int32)
         persistent_copy_idx[0] = 1
         current_stream.synchronize()
 
-        assert workspace.page_ids_device[0, 0].tolist() == [11, 12]
+        assert workspace.page_ids_device[0, 0].tolist() == [18, 19, 20, 21, 22]
 
     @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
     def test_config_enables_one_graph_pipeline_without_environment_gates(self, eviction_mode):
