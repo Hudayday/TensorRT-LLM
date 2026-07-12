@@ -1874,7 +1874,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         selection_backend = (
             f"fixed_{self.eviction_mode}.{self._selection_backend_for(decode_width, self.top_B)}"
         )
-        compaction_backend = "cpp_sparse_kv_cache_compact"
+        compaction_backend = "cpp_sparse_kv_cache_compact_layers"
         protected_tail_capacity = self._configured_protected_tail_capacity()
         pool_geometry = []
         for lids in storage_groups:

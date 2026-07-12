@@ -55,7 +55,7 @@ def _fake_cute_dsl_topk_decode(scores, seq_lens, output, top_k, next_n):
         output[row].copy_(indices.to(dtype=torch.int32))
 
 
-def _cpp_sparse_compact_reference(
+def _cpp_multilayer_compact_reference(
     pool,
     page_ids_list,
     source_list,
@@ -63,7 +63,7 @@ def _cpp_sparse_compact_reference(
     *,
     dest_list=None,
 ):
-    """Build the C++ compact-op inputs for eager graph test references."""
+    """Run the multi-layer compact operation eagerly for graph references."""
     num_kv_heads = int(pool.shape[2])
     tables = []
     sources = []
@@ -113,11 +113,14 @@ def _cpp_sparse_compact_reference(
             destinations,
             dim=1 if per_head_destination else 0,
         ).contiguous()
-    torch.ops.trtllm.sparse_kv_cache_compact(
-        pool,
-        page_table,
+    torch.ops.trtllm.sparse_kv_cache_compact_layers(
+        [pool],
+        torch.tensor([pool.data_ptr()], dtype=torch.int64, device=pool.device),
+        [page_table],
+        torch.tensor([page_table.data_ptr()], dtype=torch.int64, device=pool.device),
         indices,
         offsets,
+        None,
         destination_indices,
     )
 
@@ -1975,7 +1978,7 @@ class TestFixedBatchedCompactionWorkspace:
         seq_lens = [9, 8]
         for layer, (pool, page_table, sources) in enumerate(zip(pools, page_tables, layer_sources)):
             before = self._logical_tokens(pool, page_table).clone()
-            _cpp_sparse_compact_reference(
+            _cpp_multilayer_compact_reference(
                 pool,
                 [page_table[request] for request in range(request_count)],
                 sources,
@@ -2004,7 +2007,7 @@ class TestFixedBatchedCompactionWorkspace:
                 + (layer + 2) * 1_000_000
             )
             before = self._logical_tokens(pool, page_table).clone()
-            _cpp_sparse_compact_reference(
+            _cpp_multilayer_compact_reference(
                 pool,
                 [page_table[request] for request in range(request_count)],
                 suffix_sources,
@@ -2266,7 +2269,7 @@ class TestStandaloneGraphCuda:
 
         def stage4_body():
             score_and_select()
-            _cpp_sparse_compact_reference(
+            _cpp_multilayer_compact_reference(
                 pool,
                 [score.page_ids_device[0, request] for request in range(request_count)],
                 [selection.keep[request] for request in range(request_count)],
@@ -2758,14 +2761,14 @@ class TestStandaloneGraphCuda:
                 )
                 physical_seq_lens.append(seq_len + tail_length)
 
-            _cpp_sparse_compact_reference(
+            _cpp_multilayer_compact_reference(
                 eager_pools[0],
                 [round_dense_tables[request] for request in range(request_count)],
                 dense_sources,
                 physical_seq_lens,
                 dest_list=dense_destinations,
             )
-            _cpp_sparse_compact_reference(
+            _cpp_multilayer_compact_reference(
                 eager_pools[1],
                 [round_swa_tables[request] for request in range(request_count)],
                 swa_sources,

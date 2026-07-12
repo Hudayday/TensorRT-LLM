@@ -317,28 +317,3 @@ def test_sparse_kv_cache_compact_layers_cuda_graph_replay():
 
     for actual, reference in zip(pools, replay_expected):
         assert torch.equal(actual.cpu(), reference)
-
-
-def test_sparse_kv_cache_compact_single_layer_abi():
-    pools_cpu, pools, page_tables = _make_pools(1, torch.float16, head_dim=32)
-    page_tables_cpu = [page_table.cpu() for page_table in page_tables]
-    source_offsets = torch.tensor([0, 4, 8], dtype=torch.int32)
-    source_row = torch.tensor([0, 2, 5, 9, 1, 3, 6, 10], dtype=torch.int32)
-    source_indices = source_row.view(1, -1).expand(_NUM_KV_HEADS, -1).contiguous()
-    expected = _reference_compact(
-        pools_cpu,
-        page_tables_cpu,
-        source_indices,
-        source_offsets,
-    )[0]
-
-    torch.ops.trtllm.sparse_kv_cache_compact(
-        pools[0],
-        page_tables[0],
-        source_indices.cuda(),
-        source_offsets.cuda(),
-        None,
-    )
-    torch.cuda.synchronize()
-
-    assert torch.equal(pools[0].cpu(), expected)
