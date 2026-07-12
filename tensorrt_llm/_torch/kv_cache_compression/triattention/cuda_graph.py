@@ -83,9 +83,9 @@ def _run_cpp_compact_layers(
 class FixedBatchedCompactionWorkspace:
     """Fixed-shape buffers for graph-captured compaction.
 
-    Dense layers compact the selected prefix and append any target KV reserved
-    for the next overlapped forward. Kernel-masked SWA layers use their own page
-    table and compact the latest window plus the same protected target tail.
+    Dense layers leave the prompt in place and compact selected decode tokens
+    plus any target KV reserved for the next overlapped forward. Kernel-masked
+    SWA layers compact the latest window plus the same protected target tail.
     """
 
     def __init__(
@@ -182,7 +182,9 @@ class FixedBatchedCompactionWorkspace:
         self.cpp_num_kv_heads = cpp_num_kv_heads
         if selection_workspace.num_kv_heads != cpp_num_kv_heads:
             raise ValueError("fixed graph selection KV-head count does not match the pool")
-        move_counts = [self.keep_count + length for length in self.protected_tail_lengths]
+        move_counts = [
+            self.decode_keep_count + length for length in self.protected_tail_lengths
+        ]
         move_offsets = [0]
         for count in move_counts:
             move_offsets.append(move_offsets[-1] + count)
@@ -201,6 +203,17 @@ class FixedBatchedCompactionWorkspace:
             move_offsets,
             dtype=torch.int32,
             device=self.device,
+        )
+        self.cpp_destination = torch.cat(
+            [
+                torch.arange(
+                    self.prompt_len,
+                    self.prompt_len + count,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                for count in move_counts
+            ]
         )
         max_protected_tail = max(self.protected_tail_lengths, default=0)
         self.protected_tail_offsets = torch.arange(
@@ -351,6 +364,7 @@ class FixedBatchedCompactionWorkspace:
         owned_tensors = [
             self.cpp_indices,
             self.cpp_offsets,
+            self.cpp_destination,
             self.protected_tail_offsets,
             self.protected_tail_source,
         ]
@@ -409,7 +423,7 @@ class FixedBatchedCompactionWorkspace:
                 group,
                 self.cpp_indices,
                 self.cpp_offsets,
-                None,
+                self.cpp_destination,
             )
         if self.swa_indices is not None:
             assert self.swa_offsets is not None
@@ -423,19 +437,20 @@ class FixedBatchedCompactionWorkspace:
                 )
 
     def _stage_dense_indices(self) -> None:
-        """Pack selected prefix and opaque protected tail into one operation."""
+        """Pack selected decode tokens and opaque protected tail."""
         keep = self.selection_workspace.keep[: self.request_count]
+        decode_keep = keep[..., self.prompt_len :]
         per_layer = None
         if self.eviction_mode == "per_layer_perhead":
-            per_layer = keep.view(
+            per_layer = decode_keep.view(
                 self.request_count,
                 len(self.dense_layers),
                 self.cpp_num_kv_heads,
-                self.keep_count,
+                self.decode_keep_count,
             )
         uniform_tail = self._uniform_protected_tail_length
         if uniform_tail is not None:
-            move_count = self.keep_count + uniform_tail
+            move_count = self.decode_keep_count + uniform_tail
             if self.eviction_mode == "per_layer_perhead":
                 assert per_layer is not None
                 target = self.cpp_indices.view(
@@ -444,7 +459,7 @@ class FixedBatchedCompactionWorkspace:
                     self.request_count,
                     move_count,
                 )
-                target_keep = target[:, :, :, : self.keep_count]
+                target_keep = target[:, :, :, : self.decode_keep_count]
                 target_keep.copy_(per_layer.permute(1, 2, 0, 3))
             else:
                 target = self.cpp_indices.view(
@@ -452,11 +467,17 @@ class FixedBatchedCompactionWorkspace:
                     self.request_count,
                     move_count,
                 )
-                target_keep = target[:, :, : self.keep_count]
+                target_keep = target[:, :, : self.decode_keep_count]
                 if self.eviction_mode == "union":
-                    target_keep.copy_(keep.view(1, self.request_count, self.keep_count))
+                    target_keep.copy_(
+                        decode_keep.view(
+                            1,
+                            self.request_count,
+                            self.decode_keep_count,
+                        )
+                    )
                 else:
-                    target_keep.copy_(keep.permute(1, 0, 2))
+                    target_keep.copy_(decode_keep.permute(1, 0, 2))
             if uniform_tail:
                 torch.add(
                     self.score_workspace.valid_seq_lens_device[: self.request_count].view(
@@ -467,7 +488,7 @@ class FixedBatchedCompactionWorkspace:
                 )
                 tail_source = self.protected_tail_source[:, :uniform_tail]
                 if self.eviction_mode == "per_layer_perhead":
-                    target[:, :, :, self.keep_count :].copy_(
+                    target[:, :, :, self.decode_keep_count :].copy_(
                         tail_source.view(1, 1, self.request_count, uniform_tail).expand(
                             len(self.dense_layers),
                             self.cpp_num_kv_heads,
@@ -476,7 +497,7 @@ class FixedBatchedCompactionWorkspace:
                         )
                     )
                 else:
-                    target[:, :, self.keep_count :].copy_(
+                    target[:, :, self.decode_keep_count :].copy_(
                         tail_source.view(1, self.request_count, uniform_tail).expand(
                             self.cpp_num_kv_heads,
                             self.request_count,
@@ -486,7 +507,7 @@ class FixedBatchedCompactionWorkspace:
             return
         for request_index, tail_length in enumerate(self.protected_tail_lengths):
             begin = self._move_offsets[request_index]
-            keep_end = begin + self.keep_count
+            keep_end = begin + self.decode_keep_count
             if self.eviction_mode == "per_layer_perhead":
                 assert per_layer is not None
                 target_keep = self.cpp_indices[:, :, begin:keep_end]
@@ -495,10 +516,12 @@ class FixedBatchedCompactionWorkspace:
                 target_keep = self.cpp_indices[:, begin:keep_end]
                 if self.eviction_mode == "union":
                     target_keep.copy_(
-                        keep[request_index].view(1, self.keep_count).expand_as(target_keep)
+                        decode_keep[request_index]
+                        .view(1, self.decode_keep_count)
+                        .expand_as(target_keep)
                     )
                 else:
-                    target_keep.copy_(keep[request_index])
+                    target_keep.copy_(decode_keep[request_index])
             if tail_length:
                 torch.add(
                     self.score_workspace.valid_seq_lens_device[request_index],

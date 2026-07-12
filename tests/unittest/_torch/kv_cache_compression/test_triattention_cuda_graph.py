@@ -1649,14 +1649,16 @@ class TestFixedBatchedCompactionWorkspace:
             workspace.launch()
 
         assert run.call_count == 2
-        assert workspace.cpp_indices.tolist() == [[0, 1, 2, 4, 5, 7, 8, 9]]
-        assert workspace.cpp_offsets.tolist() == [0, 8]
+        assert selection.keep.tolist() == [[0, 1, 2, 4, 5, 7]]
+        assert workspace.cpp_indices.tolist() == [[2, 4, 5, 7, 8, 9]]
+        assert workspace.cpp_offsets.tolist() == [0, 6]
+        assert workspace.cpp_destination.tolist() == [2, 3, 4, 5, 6, 7]
         assert workspace.cpp_page_tables[0][1].tolist() == [[3, 1, 0]]
         assert workspace.cpp_page_tables[1][1].tolist() == [[2, 0, 1]]
         assert workspace.swa_source.tolist() == [6, 7, 8, 9]
         assert workspace.swa_indices.tolist() == [[6, 7, 8, 9]]
         assert workspace.swa_destination.tolist() == [4, 5, 6, 7]
-        assert run.call_args_list[0].args[-1] is None
+        assert run.call_args_list[0].args[-1] is workspace.cpp_destination
 
     @pytest.mark.parametrize("eviction_mode", ["per_head", "per_layer_perhead"])
     def test_mode_specific_keep_sets_are_packed_per_layer_and_head(self, eviction_mode):
@@ -1736,16 +1738,18 @@ class TestFixedBatchedCompactionWorkspace:
         assert len(launched_sources) == len(dense_layers)
         for layer_slot, actual in enumerate(launched_sources):
             if eviction_mode == "per_head":
-                expected = keep.permute(1, 0, 2).reshape(num_kv_heads, -1)
+                expected = keep[..., prompt_len:].permute(1, 0, 2).reshape(num_kv_heads, -1)
             else:
                 expected = (
                     keep.view(request_count, len(dense_layers), num_kv_heads, keep_count)[
-                        :, layer_slot
+                        :, layer_slot, :, prompt_len:
                     ]
                     .permute(1, 0, 2)
                     .reshape(num_kv_heads, -1)
                 )
             assert torch.equal(actual, expected)
+        assert workspace.cpp_offsets.tolist() == [0, 2, 4]
+        assert workspace.cpp_destination.tolist() == [1, 2, 1, 2]
 
     def test_ragged_protected_tails_are_appended_to_each_request_segment(self):
         request_count = 2
@@ -1789,12 +1793,14 @@ class TestFixedBatchedCompactionWorkspace:
             workspace.launch()
 
         assert run.call_count == 1
-        assert workspace.cpp_offsets.tolist() == [0, 4, 10]
-        assert workspace.cpp_indices.tolist() == [[0, 2, 7, 8, 0, 3, 8, 9, 10, 11]]
-        assert run.call_args.args[-1] is None
+        assert workspace.cpp_offsets.tolist() == [0, 3, 8]
+        assert workspace.cpp_indices.tolist() == [[2, 7, 8, 3, 8, 9, 10, 11]]
+        assert workspace.cpp_destination.tolist() == [1, 2, 3, 1, 2, 3, 4, 5]
+        assert run.call_args.args[-1] is workspace.cpp_destination
 
+    @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
     @CUDA_REQUIRED
-    def test_graph_compaction_preserves_ragged_protected_tail_bytes(self):
+    def test_graph_compaction_preserves_ragged_protected_tail_bytes(self, eviction_mode):
         device = torch.device("cuda")
         request_count = 2
         num_heads = 2
@@ -1814,18 +1820,33 @@ class TestFixedBatchedCompactionWorkspace:
         before = self._logical_tokens(pool.clone(), page_table)
         seq_lens = [10, 11]
         tail_lengths = [2, 3]
-        keep = torch.tensor(
+        union_keep = torch.tensor(
             [[0, 1, 3, 6, 9], [0, 1, 4, 8, 10]],
             dtype=torch.int32,
             device=device,
         )
+        if eviction_mode == "union":
+            keep = union_keep
+        else:
+            keep = torch.stack(
+                (
+                    union_keep,
+                    torch.tensor(
+                        [[0, 1, 4, 7, 9], [0, 1, 5, 7, 10]],
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                ),
+                dim=1,
+            )
+        original_keep = keep.clone()
         score = SimpleNamespace(
             representative_slots={0: 0},
             page_ids_device=page_table.view(1, request_count, -1),
             valid_seq_lens_device=torch.tensor(seq_lens, dtype=torch.int32, device=device),
         )
         selection = SimpleNamespace(
-            eviction_mode="union",
+            eviction_mode=eviction_mode,
             dense_layers=(0,),
             num_kv_heads=num_heads,
             max_requests=request_count,
@@ -1835,7 +1856,7 @@ class TestFixedBatchedCompactionWorkspace:
             keep=keep,
         )
         workspace = FixedBatchedCompactionWorkspace(
-            eviction_mode="union",
+            eviction_mode=eviction_mode,
             layer_pools=[pool],
             dense_layers=[0],
             swa_layers=[],
@@ -1857,24 +1878,39 @@ class TestFixedBatchedCompactionWorkspace:
         after = self._logical_tokens(pool, page_table)
 
         for request_index, (seq_len, tail_length) in enumerate(zip(seq_lens, tail_lengths)):
-            source = torch.cat(
-                (
-                    keep[request_index].to(torch.long),
-                    torch.arange(
-                        seq_len,
-                        seq_len + tail_length,
-                        dtype=torch.long,
-                        device=device,
-                    ),
+            tail = torch.arange(
+                seq_len,
+                seq_len + tail_length,
+                dtype=torch.long,
+                device=device,
+            )
+            destination = torch.arange(
+                2,
+                2 + 3 + tail_length,
+                dtype=torch.long,
+                device=device,
+            )
+            for head in range(num_heads):
+                selected = (
+                    keep[request_index]
+                    if eviction_mode == "union"
+                    else keep[request_index, head]
                 )
-            )
-            expected = before[request_index].index_select(2, source)
-            torch.testing.assert_close(
-                after[request_index, :, :, : source.numel()],
-                expected,
-                rtol=0,
-                atol=0,
-            )
+                source = torch.cat((selected[2:].to(torch.long), tail))
+                assert torch.all(destination <= source)
+                torch.testing.assert_close(
+                    after[request_index, :, head].index_select(1, destination),
+                    before[request_index, :, head].index_select(1, source),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    after[request_index, :, head, :2],
+                    before[request_index, :, head, :2],
+                    rtol=0,
+                    atol=0,
+                )
+        assert torch.equal(keep, original_keep)
 
     @staticmethod
     def _logical_tokens(pool, page_table):
@@ -2682,6 +2718,7 @@ class TestStandaloneGraphCuda:
             valid_seq_lens.copy_(torch.tensor(round_seq_lens, dtype=torch.int32, device=device))
 
             dense_sources = []
+            dense_destinations = []
             swa_sources = []
             swa_destinations = []
             physical_seq_lens = []
@@ -2694,7 +2731,15 @@ class TestStandaloneGraphCuda:
                     dtype=torch.int64,
                     device=device,
                 )
-                dense_sources.append(torch.cat((keep[request], protected_tail)))
+                dense_sources.append(torch.cat((keep[request, 2:], protected_tail)))
+                dense_destinations.append(
+                    torch.arange(
+                        2,
+                        6 + tail_length,
+                        dtype=torch.int64,
+                        device=device,
+                    )
+                )
                 swa_sources.append(
                     torch.arange(
                         seq_len - 2,
@@ -2718,6 +2763,7 @@ class TestStandaloneGraphCuda:
                 [round_dense_tables[request] for request in range(request_count)],
                 dense_sources,
                 physical_seq_lens,
+                dest_list=dense_destinations,
             )
             _cpp_sparse_compact_reference(
                 eager_pools[1],
@@ -2747,7 +2793,7 @@ class TestStandaloneGraphCuda:
                 assert torch.equal(dense_after[:, :, :2], dense_before[:, :, :2])
                 assert torch.equal(swa_after[:, :, :2], swa_before[:, :, :2])
                 assert torch.equal(
-                    dense_after[:, :, : dense_sources[request].numel()],
+                    dense_after.index_select(2, dense_destinations[request]),
                     dense_before.index_select(2, dense_sources[request]),
                 )
                 assert torch.equal(
