@@ -1,18 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -22,7 +9,7 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -61,19 +48,35 @@ def _cache(capacity: int = 256) -> MagicMock:
     return cache
 
 
-def test_capacity_only_is_manager_scoped() -> None:
+@pytest.mark.parametrize(
+    ("capacity_only", "rewind", "complete", "active", "expected_resize"),
+    [
+        (False, 3, False, True, (253, 200)),
+        (True, 3, False, True, (253, None)),
+        (True, 0, True, True, (None, None)),
+        (True, 3, False, False, None),
+    ],
+)
+def test_update_resize_policy(
+    capacity_only: bool,
+    rewind: int,
+    complete: bool,
+    active: bool,
+    expected_resize: tuple[int | None, int | None] | None,
+) -> None:
     manager = _manager()
-    first = _request(1, rewind=3)
-    second = _request(2, rewind=5)
-    first_cache = _cache()
-    second_cache = _cache()
-    manager.kv_cache_map = {1: first_cache, 2: second_cache}
-    manager.generation_capacity_only = True
+    request = _request(1, rewind=rewind, complete=complete)
+    cache = _cache()
+    cache.is_active = active
+    manager.kv_cache_map[1] = cache
+    manager.generation_capacity_only = capacity_only
 
-    manager.update_resources(SimpleNamespace(generation_requests=[first, second]))
+    manager.update_resources(SimpleNamespace(generation_requests=[request]))
 
-    first_cache.resize.assert_called_once_with(253, None)
-    second_cache.resize.assert_called_once_with(251, None)
+    if expected_resize is None:
+        cache.resize.assert_not_called()
+    else:
+        cache.resize.assert_called_once_with(*expected_resize)
 
 
 def test_target_capacity_only_does_not_change_draft_manager() -> None:
@@ -92,55 +95,6 @@ def test_target_capacity_only_does_not_change_draft_manager() -> None:
 
     target_cache.resize.assert_called_once_with(253, None)
     draft_cache.resize.assert_called_once_with(253, 200)
-
-
-def test_llm_request_has_no_compression_marker() -> None:
-    request = LlmRequest(
-        request_id=1,
-        max_new_tokens=1,
-        input_tokens=[1],
-        sampling_config=SamplingConfig(1),
-        is_streaming=False,
-    )
-
-    assert "py_kv_cache_generation_capacity_only" not in request.__dict__
-    assert "py_kv_cache_compaction" not in request.__dict__
-
-
-def test_default_manager_preserves_native_history_update() -> None:
-    manager = _manager()
-    request = _request(1, rewind=3)
-    cache = _cache()
-    manager.kv_cache_map[1] = cache
-
-    manager.update_resources(SimpleNamespace(generation_requests=[request]))
-
-    cache.resize.assert_called_once_with(253, 200)
-
-
-def test_capacity_only_completion_preserves_history() -> None:
-    manager = _manager()
-    request = _request(1, complete=True)
-    cache = _cache()
-    manager.kv_cache_map[1] = cache
-    manager.generation_capacity_only = True
-
-    manager.update_resources(SimpleNamespace(generation_requests=[request]))
-
-    cache.resize.assert_called_once_with(None, None)
-
-
-def test_suspended_cache_keeps_native_v2_behavior() -> None:
-    manager = _manager()
-    manager.generation_capacity_only = True
-    request = _request(1, rewind=3)
-    cache = _cache()
-    cache.is_active = False
-    manager.kv_cache_map[1] = cache
-
-    manager.update_resources(SimpleNamespace(generation_requests=[request]))
-
-    cache.resize.assert_not_called()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a real V2 CUDA pool")

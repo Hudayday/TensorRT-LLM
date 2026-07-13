@@ -161,7 +161,8 @@ def test_target_and_draft_cpu_length_domains_are_independent() -> None:
     assert metadata.host_total_kv_lens is metadata.target_host_total_kv_lens
 
 
-def test_native_draft_cache_context_selects_and_restores_length_domain() -> None:
+@pytest.mark.parametrize("context_kind", ["native", "eager"])
+def test_draft_cache_context_selects_and_restores_length_domain(context_kind: str) -> None:
     metadata, target_manager, draft_manager = _metadata_with_separate_draft_cache()
     target_offsets = torch.tensor([100], dtype=torch.int32)
     draft_offsets = torch.tensor([200], dtype=torch.int32)
@@ -172,35 +173,17 @@ def test_native_draft_cache_context_selects_and_restores_length_domain() -> None
     metadata._materialize_draft_device_kv_lengths()
     metadata._materialize_draft_host_kv_lengths()
 
-    saved = prepare_attn_metadata_for_draft_replay(metadata, draft_manager)
-    assert metadata.kv_cache_manager is draft_manager
-    assert metadata.kv_cache_block_offsets is draft_offsets
-    assert metadata.kv_lens_cuda_runtime.tolist() == [41, 129]
-
-    restore_attn_metadata_after_draft_replay(metadata, saved)
-
-    assert metadata.kv_cache_manager is target_manager
-    assert metadata.kv_cache_block_offsets is target_offsets
-    assert metadata.host_kv_cache_block_offsets is target_host_offsets
-    assert metadata.kv_lens_cuda_runtime.tolist() == [41, 92]
-
-
-def test_eager_draft_cache_context_selects_and_restores_length_domain() -> None:
-    metadata, target_manager, draft_manager = _metadata_with_separate_draft_cache()
-    target_offsets = torch.tensor([100], dtype=torch.int32)
-    draft_offsets = torch.tensor([200], dtype=torch.int32)
-    target_host_offsets = torch.tensor([250], dtype=torch.int32)
-    metadata.kv_cache_block_offsets = target_offsets
-    metadata.draft_kv_cache_block_offsets = draft_offsets
-    metadata.host_kv_cache_block_offsets = target_host_offsets
-    metadata._materialize_draft_device_kv_lengths()
-    metadata._materialize_draft_host_kv_lengths()
-
-    worker = object()
-    with SpecWorkerBase.draft_kv_cache_context(worker, metadata, draft_manager):
+    if context_kind == "native":
+        saved = prepare_attn_metadata_for_draft_replay(metadata, draft_manager)
         assert metadata.kv_cache_manager is draft_manager
         assert metadata.kv_cache_block_offsets is draft_offsets
         assert metadata.kv_lens_cuda_runtime.tolist() == [41, 129]
+        restore_attn_metadata_after_draft_replay(metadata, saved)
+    else:
+        with SpecWorkerBase.draft_kv_cache_context(object(), metadata, draft_manager):
+            assert metadata.kv_cache_manager is draft_manager
+            assert metadata.kv_cache_block_offsets is draft_offsets
+            assert metadata.kv_lens_cuda_runtime.tolist() == [41, 129]
 
     assert metadata.kv_cache_manager is target_manager
     assert metadata.kv_cache_block_offsets is target_offsets
