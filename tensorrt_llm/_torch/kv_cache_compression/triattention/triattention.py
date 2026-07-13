@@ -1392,7 +1392,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         normalize_scores: bool = True,
         pin_prefill: bool = True,
         count_prompt_tokens: bool = False,
-        skip_swa: bool = True,
         spec_config: Optional["SpeculativeConfig"] = None,
     ):
         super().__init__(kv_cache_manager, draft_kv_cache_manager)
@@ -1437,7 +1436,6 @@ class TriAttention(BaseKVCacheCompressionManager):
                 "TriAttention physical KV reclaim requires pin_prefill=True and "
                 "count_prompt_tokens=False so finalized prompt KV is preserved"
             )
-        self.skip_swa = bool(skip_swa)
         # All physical moves use the graph-safe C++ V2 compaction operation.
         # No other compaction path exists.
         self.score_aggregation = score_aggregation
@@ -1449,9 +1447,9 @@ class TriAttention(BaseKVCacheCompressionManager):
         # (on_request_init). TRT-LLM does NOT compute calibration; model_path is
         # used for RoPE tables and local layer_types/sliding_window metadata.
         self.model_path = model_path
-        if self.skip_swa and self.model_path is None:
+        if self.model_path is None:
             raise ValueError(
-                "TriAttention skip_swa=True requires model_path so kernel-masked "
+                "TriAttention requires model_path so kernel-masked "
                 "sliding-attention layers can be classified safely"
             )
         self.calibration_path = calibration_path
@@ -2647,15 +2645,13 @@ class TriAttention(BaseKVCacheCompressionManager):
         lifecycles. A sliding layer found here is therefore stored at full length
         and applies its window only in the attention kernel.
         """
-        if not self.skip_swa:
-            return list(range(num_layers)), [], None
         cached = self._attention_layer_partition_cache
         if cached is not None:
             return cached
 
         model_path = self.model_path
         if model_path is None:
-            raise ValueError("TriAttention skip_swa=True requires model_path")
+            raise ValueError("TriAttention requires model_path")
 
         try:
             from transformers import AutoConfig

@@ -3315,9 +3315,8 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
     model_path: Optional[str] = Field(
         default=None,
         description="Checkpoint path used to derive RoPE tables when converting "
-        "the official calibration and, when `skip_swa=True`, to classify "
-        "kernel-masked sliding-attention layers. Required when `skip_swa=True`."
-    )
+        "the official calibration and to classify kernel-masked sliding-attention "
+        "layers. Required by TriAttention.")
     calibration_path: Optional[str] = Field(
         default=None,
         description="Path to the official TriAttention calibration `.pt` "
@@ -3329,13 +3328,6 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         description="Compatibility field retained for existing configs. The "
         "implemented calibration-based selection does not use a separate "
         "recency window.")
-    skip_swa: bool = Field(
-        default=True,
-        description=
-        "For models such as GPT-OSS whose V2 cache is full-length for every "
-        "layer but whose attention kernel masks selected layers, exclude those "
-        "layers from TriAttention scoring and rebase their latest window before "
-        "capacity reclaim. True V2 SWA/VSWA lifecycles and SSM are rejected.")
     count_prompt_tokens: bool = Field(
         default=False,
         description="If False (default), the KV budget counts only DECODE tokens "

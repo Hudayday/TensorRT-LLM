@@ -2078,7 +2078,6 @@ def create_kv_cache_compression_manager(
             eviction_mode=triattention_config.eviction_mode,
             normalize_scores=triattention_config.normalize_scores,
             pin_prefill=triattention_config.pin_prefill,
-            skip_swa=triattention_config.skip_swa,
             count_prompt_tokens=triattention_config.count_prompt_tokens,
         )
     logger.warning(

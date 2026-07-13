@@ -240,7 +240,7 @@ def _make_fake_v2(enable_block_reuse=False, *, is_draft=False):
 
 def _make_triattention(**overrides):
     """Construct a fully initialized manager for method-level unit tests."""
-    options = {"top_B": 8, "skip_swa": False}
+    options = {"top_B": 8, "model_path": "/models/test"}
     options.update(overrides)
     return TriAttention(_make_fake_v2(), **options)
 
@@ -420,7 +420,8 @@ class TestKvCacheCompressionConfig:
 class TestTriAttentionClass:
     def test_triattention_enables_capacity_only_on_target_manager(self):
         manager = _make_fake_v2()
-        triattention = TriAttention(manager, top_B=8, skip_swa=False)
+        triattention = TriAttention(manager, top_B=8, model_path="/models/test")
+        triattention._attention_layer_partition_cache = ([], [], None)
         triattention._calibrated = True
         first = _make_request(11)
         second = _make_request(12)
@@ -437,7 +438,8 @@ class TestTriAttentionClass:
         manager.num_extra_kv_tokens = 4
         manager.max_total_draft_tokens = 4
         manager._kv_reserve_draft_tokens = 4
-        triattention = TriAttention(manager, top_B=8, skip_swa=False)
+        triattention = TriAttention(manager, top_B=8, model_path="/models/test")
+        triattention._attention_layer_partition_cache = ([], [], None)
         triattention._calibrated = True
         request = _make_request(11)
 
@@ -513,7 +515,7 @@ class TestStepEndHookRefactor:
         kv_cache_manager = _make_fake_v2()
         kv_cache_manager.max_batch_size = manager_batch_size
 
-        manager = TriAttention(kv_cache_manager, top_B=8, skip_swa=False)
+        manager = TriAttention(kv_cache_manager, top_B=8, model_path="/models/test")
 
         assert manager._standalone_graph_request_chunk_size == expected_chunk_size
 
@@ -761,7 +763,7 @@ class TestStepEndHookRefactor:
         manager = TriAttention(
             _make_fake_v2(),
             top_B=8,
-            skip_swa=False,
+            model_path="/models/test",
             spec_config=spec_config,
             draft_kv_cache_manager=draft_manager,
         )
@@ -777,7 +779,7 @@ class TestStepEndHookRefactor:
         manager = TriAttention(
             _make_fake_v2(),
             top_B=8,
-            skip_swa=False,
+            model_path="/models/test",
             spec_config=spec_config,
             draft_kv_cache_manager=_make_fake_v2(is_draft=True),
         )
@@ -798,7 +800,7 @@ class TestStepEndHookRefactor:
         manager = TriAttention(
             _make_fake_v2(),
             top_B=8,
-            skip_swa=False,
+            model_path="/models/test",
             spec_config=spec_config,
             draft_kv_cache_manager=_make_fake_v2(is_draft=True),
         )
@@ -813,7 +815,7 @@ class TestStepEndHookRefactor:
         manager = TriAttention(
             _make_fake_v2(),
             top_B=8,
-            skip_swa=False,
+            model_path="/models/test",
             spec_config=spec_config,
             draft_kv_cache_manager=_make_fake_v2(is_draft=True),
         )
@@ -826,7 +828,7 @@ class TestStepEndHookRefactor:
         manager = TriAttention(
             _make_fake_v2(),
             top_B=8,
-            skip_swa=False,
+            model_path="/models/test",
             spec_config=DFlashDecodingConfig(max_draft_len=3),
         )
 
@@ -841,7 +843,7 @@ class TestStepEndHookRefactor:
         manager = TriAttention(
             _make_fake_v2(),
             top_B=8,
-            skip_swa=False,
+            model_path="/models/test",
             spec_config=spec_config,
         )
 
@@ -854,7 +856,7 @@ class TestStepEndHookRefactor:
         manager.kv_cache_map = {
             7: SimpleNamespace(capacity=106, is_active=True),
         }
-        triattention = TriAttention(manager, top_B=8, skip_swa=False)
+        triattention = TriAttention(manager, top_B=8, model_path="/models/test")
         batch = SimpleNamespace(
             context_requests=[],
             generation_requests=[_make_request(7, py_draft_tokens=[1, 2, 3])],
@@ -871,7 +873,7 @@ class TestStepEndHookRefactor:
         manager.kv_cache_map = {
             7: SimpleNamespace(capacity=106, is_active=True),
         }
-        triattention = TriAttention(manager, top_B=8, skip_swa=False)
+        triattention = TriAttention(manager, top_B=8, model_path="/models/test")
         batch = SimpleNamespace(
             context_requests=[],
             generation_requests=[_make_request(7, py_draft_tokens=[1, 2])],
@@ -1557,7 +1559,6 @@ class TestGraphPrewarm:
 
         manager, pools = self._make_mocked_prewarm_manager()
         manager.eviction_mode = eviction_mode
-        manager.skip_swa = True
         manager.kv_cache_manager.layer_to_pool_mapping_dict = {0: 0, 1: 1}
         manager._attention_layer_partition_cache = ([0], [1], 2)
         before = [pool.clone() for pool in pools]
@@ -1744,7 +1745,6 @@ class TestGraphPrewarm:
         manager.score_aggregation = "mean"
         manager.normalize_scores = True
         manager.eviction_mode = "union"
-        manager.skip_swa = False
         manager._fixed_union_prewarm_enabled = True
         manager._eviction_buckets = {}
         manager._request_states = {}
@@ -1758,7 +1758,6 @@ class TestKernelMaskedSwa:
         from unittest import mock
 
         mgr = _make_triattention()
-        mgr.skip_swa = True
         mgr.model_path = "/models/gpt-oss"
         mgr.top_B = 128
         mgr.kv_cache_manager = SimpleNamespace(pp_layers=[0, 1, 2, 3])
@@ -1786,7 +1785,6 @@ class TestKernelMaskedSwa:
         from unittest import mock
 
         mgr = _make_triattention()
-        mgr.skip_swa = True
         mgr.model_path = "/models/gpt-oss"
         mgr.top_B = 127
         mgr.kv_cache_manager = SimpleNamespace(pp_layers=[0, 1])
@@ -1808,7 +1806,7 @@ class TestFactory:
         # Calibration is deferred to the first request, so construction needs
         # no calibration file or CUDA.
         fake_v2 = _make_fake_v2(enable_block_reuse=False)
-        cfg = TriAttentionKvCacheCompressionConfig(top_B=32, beta=16, skip_swa=False)
+        cfg = TriAttentionKvCacheCompressionConfig(top_B=32, beta=16, model_path="/models/test")
         mgr = create_kv_cache_compression_manager(cfg, kv_cache_manager=fake_v2)
         assert isinstance(mgr, TriAttention)
         assert mgr.top_B == 32
@@ -1820,7 +1818,7 @@ class TestFactory:
             top_B=64,
             beta=8,
             eviction_mode="per_head",
-            skip_swa=False,
+            model_path="/models/test",
         )
         mgr = create_kv_cache_compression_manager(
             cfg, kv_cache_manager=_make_fake_v2(enable_block_reuse=False)
