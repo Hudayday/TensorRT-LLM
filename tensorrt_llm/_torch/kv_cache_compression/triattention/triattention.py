@@ -2211,9 +2211,13 @@ class TriAttention(BaseKVCacheCompressionManager):
                 live_pool = layer_pools[layers[0]]
                 tokens_per_block = int(live_pool.shape[3])
                 num_pages = (page_table_token_capacity + tokens_per_block - 1) // tokens_per_block
-                dummy_pool = self._dummy_pool_like(live_pool, num_pages, zero=True)
-                for layer in layers:
-                    dummy_pools[layer] = dummy_pool
+                dummy_group = self._dummy_pool_like(
+                    live_pool, num_pages * len(layers), zero=True
+                )
+                for slot, layer in enumerate(layers):
+                    dummy_pools[layer] = dummy_group.narrow(
+                        0, slot * num_pages, num_pages
+                    )
             if any(pool is None for pool in dummy_pools):
                 raise RuntimeError("TriAttention could not build every dummy prewarm pool")
             fixed_dummy_pools = [pool for pool in dummy_pools if pool is not None]

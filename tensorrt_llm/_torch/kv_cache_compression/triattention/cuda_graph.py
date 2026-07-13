@@ -51,7 +51,7 @@ def _unique_tensor_nbytes(tensors: Iterable[torch.Tensor]) -> int:
 
 
 class _CppCompactGroup(NamedTuple):
-    """Stable tensors for one multi-layer compact launch."""
+    """Stable tensors for one layered sparse-KV updater launch."""
 
     layers: Tuple[int, ...]
     pools: Tuple[torch.Tensor, ...]
@@ -65,9 +65,9 @@ def _run_cpp_compact_layers(
     group: _CppCompactGroup,
     source: torch.Tensor,
     offsets: torch.Tensor,
-    destination: Optional[torch.Tensor],
+    destination_base: int,
 ) -> None:
-    """Compact one uniform layer group with one CUDA kernel launch."""
+    """Compact one uniform V2 layer group with the sparse-KV updater."""
     torch.ops.trtllm.sparse_kv_cache_compact_layers(
         list(group.pools),
         group.pool_pointers,
@@ -76,7 +76,7 @@ def _run_cpp_compact_layers(
         source,
         offsets,
         group.source_layer_indices,
-        destination,
+        destination_base,
     )
 
 
@@ -161,8 +161,8 @@ class FixedBatchedCompactionWorkspace:
         self.score_workspace = score_workspace
         self.layer_pools = tuple(layer_pools)
 
-        # Fixed-shape buffers let each uniform V2 pool group compact all of its
-        # layers with one graph-safe C++ operation.
+        # Fixed-shape buffers let every uniform V2 group use one layered
+        # sparse-KV updater launch without replay-time host metadata.
         first_dense_pool = layer_pools[self.dense_layers[0]]
         cpp_num_kv_heads = int(first_dense_pool.shape[2]) if first_dense_pool.ndim == 5 else -1
         supported_pools = all(
@@ -182,9 +182,7 @@ class FixedBatchedCompactionWorkspace:
         self.cpp_num_kv_heads = cpp_num_kv_heads
         if selection_workspace.num_kv_heads != cpp_num_kv_heads:
             raise ValueError("fixed graph selection KV-head count does not match the pool")
-        move_counts = [
-            self.decode_keep_count + length for length in self.protected_tail_lengths
-        ]
+        move_counts = [self.decode_keep_count + length for length in self.protected_tail_lengths]
         move_offsets = [0]
         for count in move_counts:
             move_offsets.append(move_offsets[-1] + count)
@@ -204,17 +202,7 @@ class FixedBatchedCompactionWorkspace:
             dtype=torch.int32,
             device=self.device,
         )
-        self.cpp_destination = torch.cat(
-            [
-                torch.arange(
-                    self.prompt_len,
-                    self.prompt_len + count,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-                for count in move_counts
-            ]
-        )
+        self.dense_destination_base = self.prompt_len
         max_protected_tail = max(self.protected_tail_lengths, default=0)
         self.protected_tail_offsets = torch.arange(
             max_protected_tail,
@@ -263,7 +251,7 @@ class FixedBatchedCompactionWorkspace:
 
         self.swa_source = None
         self.swa_indices = None
-        self.swa_destination = None
+        self.swa_destination_base = None
         self.swa_offsets = None
         self.swa_source_offsets = None
         swa_entries = []
@@ -292,17 +280,7 @@ class FixedBatchedCompactionWorkspace:
                 dtype=torch.int32,
                 device=self.device,
             )
-            self.swa_destination = torch.cat(
-                [
-                    torch.arange(
-                        self.keep_count - int(swa_window),
-                        self.keep_count + length,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    for length in self.protected_tail_lengths
-                ]
-            )
+            self.swa_destination_base = self.keep_count - int(swa_window)
             self.swa_offsets = torch.tensor(
                 swa_move_offsets,
                 dtype=torch.int32,
@@ -331,6 +309,10 @@ class FixedBatchedCompactionWorkspace:
                 layers = tuple(entry[0] for entry in group_entries)
                 pools = tuple(entry[1] for entry in group_entries)
                 page_tables = tuple(entry[2] for entry in group_entries)
+                if len({int(pool.data_ptr()) for pool in pools}) != len(pools):
+                    raise ValueError(
+                        "layered compaction requires a distinct pool view for every layer"
+                    )
                 source_layer_indices = None
                 if mode == "dense" and self.eviction_mode == "per_layer_perhead":
                     source_layer_indices = torch.tensor(
@@ -364,7 +346,6 @@ class FixedBatchedCompactionWorkspace:
         owned_tensors = [
             self.cpp_indices,
             self.cpp_offsets,
-            self.cpp_destination,
             self.protected_tail_offsets,
             self.protected_tail_source,
         ]
@@ -378,7 +359,6 @@ class FixedBatchedCompactionWorkspace:
                     *self.swa_source_offsets,
                     self.swa_source,
                     self.swa_indices,
-                    self.swa_destination,
                     self.swa_offsets,
                 )
             )
@@ -423,17 +403,17 @@ class FixedBatchedCompactionWorkspace:
                 group,
                 self.cpp_indices,
                 self.cpp_offsets,
-                self.cpp_destination,
+                self.dense_destination_base,
             )
         if self.swa_indices is not None:
             assert self.swa_offsets is not None
-            assert self.swa_destination is not None
+            assert self.swa_destination_base is not None
             for group in self.cpp_swa_groups:
                 _run_cpp_compact_layers(
                     group,
                     self.swa_indices,
                     self.swa_offsets,
-                    self.swa_destination,
+                    self.swa_destination_base,
                 )
 
     def _stage_dense_indices(self) -> None:

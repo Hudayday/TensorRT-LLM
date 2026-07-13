@@ -464,6 +464,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def on_kv_cache_manager_changed(self) -> None:
         """Refresh views that depend on the active target or draft KV cache."""
+        if self.enable_flash_mla:
+            self._flash_mla_metadata_valid = False
 
     def update_for_spec_dec(self) -> None:
         # MTP updates kv_lens_cuda in-place between sub-steps, which changes

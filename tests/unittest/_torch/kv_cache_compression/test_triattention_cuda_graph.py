@@ -35,6 +35,7 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels 
 
 CUDA_REQUIRED = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 _TORCH_TOPK_ORACLE = torch.topk
+_COMPACTION_HEAD_SIZE = 16
 
 
 def _fake_cute_dsl_topk_decode(scores, seq_lens, output, top_k, next_n):
@@ -50,27 +51,23 @@ def _fake_cute_dsl_topk_decode(scores, seq_lens, output, top_k, next_n):
         output[row].copy_(indices.to(dtype=torch.int32))
 
 
-def _cpp_multilayer_compact_reference(
+def _cpp_compact_reference(
     pool,
     page_ids_list,
     source_list,
     seq_len_list,
     *,
-    dest_list=None,
+    destination_base=0,
 ):
-    """Run the multi-layer compact operation eagerly for graph references."""
+    """Run the layered updater adapter eagerly for graph references."""
     num_kv_heads = int(pool.shape[2])
     tables = []
     sources = []
-    destinations = []
     per_head_source = None
-    per_head_destination = None
-    for request_index, (page_ids, source, seq_len) in enumerate(
-        zip(page_ids_list, source_list, seq_len_list)
-    ):
+    for page_ids, source, seq_len in zip(page_ids_list, source_list, seq_len_list):
         source = source.to(device=pool.device, dtype=torch.int32)
         move_count = int(source.shape[-1])
-        if (dest_list is None and move_count >= int(seq_len)) or move_count == 0:
+        if (destination_base == 0 and move_count >= int(seq_len)) or move_count == 0:
             continue
         current_per_head = source.ndim == 2
         if per_head_source is None:
@@ -81,15 +78,6 @@ def _cpp_multilayer_compact_reference(
             source = source.reshape(1, -1).expand(num_kv_heads, -1)
         sources.append(source)
         tables.append(page_ids.to(device=pool.device, dtype=torch.int32).reshape(-1))
-
-        if dest_list is not None:
-            destination = dest_list[request_index].to(device=pool.device, dtype=torch.int32)
-            current_per_head = destination.ndim == 2
-            if per_head_destination is None:
-                per_head_destination = current_per_head
-            else:
-                assert per_head_destination == current_per_head
-            destinations.append(destination)
 
     if not sources:
         return
@@ -102,12 +90,6 @@ def _cpp_multilayer_compact_reference(
         offsets_host.append(offsets_host[-1] + int(source.shape[1]))
     offsets = torch.tensor(offsets_host, dtype=torch.int32, device=pool.device)
     indices = torch.cat(sources, dim=1).contiguous()
-    destination_indices = None
-    if destinations:
-        destination_indices = torch.cat(
-            destinations,
-            dim=1 if per_head_destination else 0,
-        ).contiguous()
     torch.ops.trtllm.sparse_kv_cache_compact_layers(
         [pool],
         torch.tensor([pool.data_ptr()], dtype=torch.int64, device=pool.device),
@@ -116,7 +98,7 @@ def _cpp_multilayer_compact_reference(
         indices,
         offsets,
         None,
-        destination_indices,
+        destination_base,
     )
 
 
@@ -604,11 +586,13 @@ class TestStandaloneGraphCuda:
         tokens_per_block = int(initial_pool.shape[3])
         page_count = (seq_len + tokens_per_block - 1) // tokens_per_block
         pool = initial_pool.clone()
-        q_real = torch.tensor([[[0.75]]], dtype=torch.float32, device=device)
-        q_imag = torch.tensor([[[0.25]]], dtype=torch.float32, device=device)
-        mlr = torch.tensor([[[0.125]]], dtype=torch.float32, device=device)
-        freq = torch.tensor([1.0], dtype=torch.float32, device=device)
-        omega = torch.tensor([0.013], dtype=torch.float32, device=device)
+        num_freqs = _COMPACTION_HEAD_SIZE // 2
+        frequencies = torch.arange(1, num_freqs + 1, dtype=torch.float32, device=device)
+        q_real = (frequencies * 0.75).view(1, 1, num_freqs)
+        q_imag = (frequencies.flip(0) * 0.25).view(1, 1, num_freqs)
+        mlr = (frequencies * 0.125).view(1, 1, num_freqs)
+        freq = frequencies.reciprocal()
+        omega = frequencies * 0.013
         offsets = torch.tensor([1.0, 2.0, 4.0], dtype=torch.float32, device=device)
         score = _FixedScoreMetadataWorkspace(
             [pool],
@@ -618,7 +602,7 @@ class TestStandaloneGraphCuda:
             request_count,
             seq_len,
             1,
-            1,
+            num_freqs,
             q_real,
             q_imag,
             mlr,
@@ -708,7 +692,7 @@ class TestStandaloneGraphCuda:
 
         def stage4_body():
             score_and_select()
-            _cpp_multilayer_compact_reference(
+            _cpp_compact_reference(
                 pool,
                 [score.page_ids_device[0, request] for request in range(request_count)],
                 [selection.keep[request] for request in range(request_count)],
@@ -742,10 +726,10 @@ class TestStandaloneGraphCuda:
         page_count = (seq_len + tokens_per_block - 1) // tokens_per_block
         total_pages = request_count * page_count
         initial = torch.arange(
-            total_pages * 2 * tokens_per_block * 2,
+            total_pages * 2 * tokens_per_block * _COMPACTION_HEAD_SIZE,
             dtype=torch.float32,
             device=device,
-        ).view(total_pages, 2, 1, tokens_per_block, 2)
+        ).view(total_pages, 2, 1, tokens_per_block, _COMPACTION_HEAD_SIZE)
         eager = self._build_formal_path(
             width,
             budget,
@@ -815,8 +799,12 @@ class TestStandaloneGraphCuda:
         )
         assert torch.equal(eager_pool.view(torch.uint8), graph_pool.view(torch.uint8))
         for request, page_ids in enumerate(tables):
-            initial_tokens = initial[page_ids].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
-            graph_tokens = graph_pool[page_ids].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
+            initial_tokens = initial[page_ids].permute(1, 2, 0, 3, 4).reshape(
+                2, 1, -1, _COMPACTION_HEAD_SIZE
+            )
+            graph_tokens = graph_pool[page_ids].permute(1, 2, 0, 3, 4).reshape(
+                2, 1, -1, _COMPACTION_HEAD_SIZE
+            )
             assert torch.equal(
                 graph_tokens[:, :, :prompt_len],
                 initial_tokens[:, :, :prompt_len],
@@ -845,10 +833,10 @@ class TestStandaloneGraphCuda:
         initial_pools = [
             (
                 torch.arange(
-                    total_pages * 2 * 2 * tokens_per_block * 2,
+                    total_pages * 2 * 2 * tokens_per_block * _COMPACTION_HEAD_SIZE,
                     dtype=torch.float32,
                     device=device,
-                ).view(total_pages, 2, 2, tokens_per_block, 2)
+                ).view(total_pages, 2, 2, tokens_per_block, _COMPACTION_HEAD_SIZE)
                 + layer * 10000.0
             )
             for layer in range(2)
@@ -856,7 +844,15 @@ class TestStandaloneGraphCuda:
 
         def build():
             pools = [pool.clone() for pool in initial_pools]
-            q_real = (torch.arange(8, dtype=torch.float32, device=device).view(2, 4, 1) + 1.0) / 8.0
+            num_freqs = _COMPACTION_HEAD_SIZE // 2
+            q_real = (
+                torch.arange(
+                    2 * 4 * num_freqs,
+                    dtype=torch.float32,
+                    device=device,
+                ).view(2, 4, num_freqs)
+                + 1.0
+            ) / (2 * 4 * num_freqs)
             q_imag = q_real.flip(1) * 0.25
             mlr = torch.full_like(q_real, 0.125)
             score = _FixedScoreMetadataWorkspace(
@@ -867,13 +863,25 @@ class TestStandaloneGraphCuda:
                 request_count,
                 seq_len,
                 4,
-                1,
+                num_freqs,
                 q_real,
                 q_imag,
                 mlr,
-                torch.ones(1, dtype=torch.float32, device=device),
+                torch.linspace(
+                    1.0,
+                    0.5,
+                    num_freqs,
+                    dtype=torch.float32,
+                    device=device,
+                ),
                 torch.tensor([1.0, 2.0, 4.0], dtype=torch.float32, device=device),
-                torch.tensor([0.013], dtype=torch.float32, device=device),
+                torch.arange(
+                    1,
+                    num_freqs + 1,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                * 0.013,
                 page_table_keys=[("pool", 0), ("pool", 1)],
                 prompt_len=prompt_len,
             )
@@ -1021,10 +1029,16 @@ class TestStandaloneGraphCuda:
         seq_len = prompt_len + width
         page_count = (seq_len + tokens_per_block - 1) // tokens_per_block
         initial = torch.arange(
-            request_count * page_count * 2 * tokens_per_block * 2,
+            request_count * page_count * 2 * tokens_per_block * _COMPACTION_HEAD_SIZE,
             dtype=torch.float32,
             device=device,
-        ).view(request_count * page_count, 2, 1, tokens_per_block, 2)
+        ).view(
+            request_count * page_count,
+            2,
+            1,
+            tokens_per_block,
+            _COMPACTION_HEAD_SIZE,
+        )
         eager = self._build_formal_path(
             width,
             budget,
@@ -1094,8 +1108,16 @@ class TestStandaloneGraphCuda:
         dense_tables = torch.tensor([[2, 0, 1], [5, 3, 4]], device=device)
         swa_tables = torch.tensor([[1, 2, 0], [4, 5, 3]], device=device)
         base_pools = [
-            torch.arange(6 * 2 * 1 * 4 * 2, dtype=torch.float32, device=device).view(6, 2, 1, 4, 2),
-            torch.arange(6 * 2 * 1 * 4 * 2, dtype=torch.float32, device=device).view(6, 2, 1, 4, 2)
+            torch.arange(
+                6 * 2 * 1 * 4 * _COMPACTION_HEAD_SIZE,
+                dtype=torch.float32,
+                device=device,
+            ).view(6, 2, 1, 4, _COMPACTION_HEAD_SIZE),
+            torch.arange(
+                6 * 2 * 1 * 4 * _COMPACTION_HEAD_SIZE,
+                dtype=torch.float32,
+                device=device,
+            ).view(6, 2, 1, 4, _COMPACTION_HEAD_SIZE)
             + 1000.0,
         ]
         keep = torch.tensor(
@@ -1200,19 +1222,19 @@ class TestStandaloneGraphCuda:
                 )
                 physical_seq_lens.append(seq_len + tail_length)
 
-            _cpp_multilayer_compact_reference(
+            _cpp_compact_reference(
                 eager_pools[0],
                 [round_dense_tables[request] for request in range(request_count)],
                 dense_sources,
                 physical_seq_lens,
-                dest_list=dense_destinations,
+                destination_base=2,
             )
-            _cpp_multilayer_compact_reference(
+            _cpp_compact_reference(
                 eager_pools[1],
                 [round_swa_tables[request] for request in range(request_count)],
                 swa_sources,
                 physical_seq_lens,
-                dest_list=swa_destinations,
+                destination_base=4,
             )
             assert cache.execute(
                 key=("swa-with-protected-tail",),
@@ -1228,10 +1250,18 @@ class TestStandaloneGraphCuda:
             for request in range(request_count):
                 dense_ids = round_dense_tables[request]
                 swa_ids = round_swa_tables[request]
-                dense_before = round_pools[0][dense_ids].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
-                dense_after = graph_pools[0][dense_ids].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
-                swa_before = round_pools[1][swa_ids].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
-                swa_after = graph_pools[1][swa_ids].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 2)
+                dense_before = round_pools[0][dense_ids].permute(1, 2, 0, 3, 4).reshape(
+                    2, 1, -1, _COMPACTION_HEAD_SIZE
+                )
+                dense_after = graph_pools[0][dense_ids].permute(1, 2, 0, 3, 4).reshape(
+                    2, 1, -1, _COMPACTION_HEAD_SIZE
+                )
+                swa_before = round_pools[1][swa_ids].permute(1, 2, 0, 3, 4).reshape(
+                    2, 1, -1, _COMPACTION_HEAD_SIZE
+                )
+                swa_after = graph_pools[1][swa_ids].permute(1, 2, 0, 3, 4).reshape(
+                    2, 1, -1, _COMPACTION_HEAD_SIZE
+                )
                 assert torch.equal(dense_after[:, :, :2], dense_before[:, :, :2])
                 assert torch.equal(swa_after[:, :, :2], swa_before[:, :, :2])
                 assert torch.equal(
