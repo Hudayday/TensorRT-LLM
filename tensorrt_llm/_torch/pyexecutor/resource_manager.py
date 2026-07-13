@@ -2382,6 +2382,10 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
                 f"run with KV-cache block reuse. Set "
                 f"KvCacheConfig.enable_block_reuse to False.")
         kv_cache_manager.generation_capacity_only = self.adjusts_generation_kv_length
+        # Rebuilt every step by prepare_resources: maps this step's scheduled
+        # request ids to their LlmRequest objects so adjust_attention_metadata
+        # can read each row's py_num_compressed_tokens.
+        self._scheduled_requests_by_id: Dict[int, "LlmRequest"] = {}
 
     @property
     def has_independent_draft_kv_cache(self) -> bool:
@@ -2400,9 +2404,6 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
                 "separate draft KV cache compression requires compatible "
                 "attention metadata")
         attn_metadata.set_draft_kv_length_delta(delta)
-
-    def prewarm(self) -> None:
-        """Prepare private fixed-shape state before model graph capture."""
 
     # ================================================================== #
     # KV-cache lifecycle hooks (5, in temporal order).                   #
@@ -2454,7 +2455,46 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
 
     def adjust_attention_metadata(self,
                                   attn_metadata: "AttentionMetadata") -> None:
-        """Publish compressed lengths before attention metadata is prepared."""
+        """Reconcile attention-metadata KV lengths with physical eviction.
+
+        The model engine derives ``num_cached_tokens_per_seq`` from each
+        request's logical token count and invokes this hook right before
+        ``attn_metadata.prepare()``. Subtract every scheduled request's
+        cumulative physically-evicted count
+        (``LlmRequest.py_num_compressed_tokens``) so the kernel reads the
+        compacted cache. Position ids and every other logical-token consumer
+        are untouched, and the draft engine never runs this hook, so a
+        separate draft KV cache stays dense. When one-model speculative
+        decoding shares this metadata between the compressed target cache and
+        the dense draft cache, additionally publish the per-row evicted
+        counts as the draft KV length delta.
+        """
+        kv_cache_params = getattr(attn_metadata, "kv_cache_params", None)
+        num_cached = getattr(kv_cache_params, "num_cached_tokens_per_seq", None)
+        request_ids = getattr(attn_metadata, "request_ids", None)
+        if num_cached is None or request_ids is None:
+            return
+        requests_by_id = self._scheduled_requests_by_id
+        num_rows = min(len(num_cached), len(request_ids))
+        draft_kv_length_delta = [0] * len(num_cached)
+        for row in range(num_rows):
+            request = requests_by_id.get(request_ids[row])
+            if request is None:
+                # Warmup / CUDA-graph padding dummies are never compressed.
+                continue
+            compressed = request.py_num_compressed_tokens
+            if compressed == 0:
+                continue
+            if compressed > num_cached[row]:
+                raise RuntimeError(
+                    f"Request {request_ids[row]} has {compressed} compressed "
+                    f"KV tokens but only {num_cached[row]} cached tokens")
+            num_cached[row] -= compressed
+            draft_kv_length_delta[row] = compressed
+        if (self.has_independent_draft_kv_cache
+                and hasattr(attn_metadata, "set_draft_kv_length_delta")):
+            self.publish_draft_kv_length_delta(attn_metadata,
+                                               draft_kv_length_delta)
 
     # ================================================================== #
     # BaseResourceManager interface — PyExecutor auto-invokes these each  #
@@ -2475,6 +2515,14 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
 
     def prepare_resources(self, scheduled_batch: "ScheduledRequests") -> None:
         """Fire request initialization and the pre-forward generation hook."""
+        # Snapshot this step's requests so adjust_attention_metadata can map
+        # attention-metadata rows back to LlmRequest objects. Runs before the
+        # engine builds this step's inputs, so the map is never stale.
+        self._scheduled_requests_by_id = {
+            req.py_request_id: req
+            for req in (list(scheduled_batch.context_requests) +
+                        list(scheduled_batch.generation_requests))
+        }
         for req in scheduled_batch.context_requests:
             if req.is_first_context_chunk:
                 self.on_request_init(req)

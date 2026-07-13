@@ -1082,13 +1082,6 @@ class PyTorchModelEngine(ModelEngine):
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
-        kv_compression_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER)
-        if kv_compression_manager is not None:
-            assert isinstance(kv_compression_manager,
-                              BaseKVCacheCompressionManager)
-            # Compression graphs need stable workspaces before model capture.
-            kv_compression_manager.prewarm()
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")

@@ -120,7 +120,6 @@ class TestBaseABC:
     def test_four_hooks_default_noop(self, fake_kv_cache_manager):
         m = BaseKVCacheCompressionManager(fake_kv_cache_manager)
         meta = MagicMock()
-        assert m.prewarm() is None
         assert m.adjust_attention_metadata(meta) is None
         assert m.on_request_init(MagicMock()) is None
         assert m.on_context_step_end(MagicMock(), meta) is None
@@ -173,6 +172,91 @@ class TestBaseABC:
         manager.publish_draft_kv_length_delta(metadata, [0, 37])
 
         assert metadata.delta == [0, 37]
+
+    def test_request_field_defaults_to_zero(self):
+        """LlmRequest carries the compression count; a fresh request must
+        default to 0 so runs without a compression manager are unchanged."""
+        from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+        from tensorrt_llm.bindings import SamplingConfig
+
+        request = LlmRequest(
+            request_id=1,
+            max_new_tokens=8,
+            input_tokens=[1, 2, 3],
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        assert request.py_num_compressed_tokens == 0
+
+
+def _length_request(rid, compressed):
+    return SimpleNamespace(
+        py_request_id=rid,
+        is_first_context_chunk=False,
+        py_num_compressed_tokens=compressed,
+    )
+
+
+def _length_metadata(num_cached, request_ids):
+    return SimpleNamespace(
+        kv_cache_params=SimpleNamespace(num_cached_tokens_per_seq=num_cached),
+        request_ids=request_ids,
+    )
+
+
+class TestAdjustFromRequestField:
+    """The base manager subtracts LlmRequest.py_num_compressed_tokens from
+    the engine-derived KV lengths — the request carries the length truth,
+    the framework applies it, the model engine stays untouched."""
+
+    def test_subtracts_compressed_tokens_per_row(self, fake_kv_cache_manager):
+        m = BaseKVCacheCompressionManager(fake_kv_cache_manager)
+        m.prepare_resources(_batch(generation=[_length_request(1, 30), _length_request(2, 0)]))
+        metadata = _length_metadata([100, 50], [1, 2])
+
+        m.adjust_attention_metadata(metadata)
+
+        assert metadata.kv_cache_params.num_cached_tokens_per_seq == [70, 50]
+
+    def test_unknown_rows_are_untouched(self, fake_kv_cache_manager):
+        """Warmup / CUDA-graph padding dummies never appear in the scheduled
+        batch; their rows must pass through unchanged."""
+        m = BaseKVCacheCompressionManager(fake_kv_cache_manager)
+        m.prepare_resources(_batch(generation=[_length_request(1, 30)]))
+        metadata = _length_metadata([100, 64], [1, (1 << 64) - 1])
+
+        m.adjust_attention_metadata(metadata)
+
+        assert metadata.kv_cache_params.num_cached_tokens_per_seq == [70, 64]
+
+    def test_rejects_overcompressed_request(self, fake_kv_cache_manager):
+        m = BaseKVCacheCompressionManager(fake_kv_cache_manager)
+        m.prepare_resources(_batch(generation=[_length_request(1, 101)]))
+        metadata = _length_metadata([100], [1])
+
+        with pytest.raises(RuntimeError, match="compressed"):
+            m.adjust_attention_metadata(metadata)
+
+    def test_publishes_draft_delta_from_request_field(self):
+        """With an independent dense draft cache, the same per-row counts
+        become the draft KV length delta (draft = compressed target + delta),
+        so speculative decoding keeps its dense draft domain."""
+
+        class ShimMetadata(SimpleNamespace):
+            def set_draft_kv_length_delta(self, delta):
+                self.delta = list(delta)
+
+        m = BaseKVCacheCompressionManager(_v2_manager(is_draft=False), _v2_manager(is_draft=True))
+        m.prepare_resources(_batch(generation=[_length_request(1, 30), _length_request(2, 0)]))
+        metadata = ShimMetadata(
+            kv_cache_params=SimpleNamespace(num_cached_tokens_per_seq=[100, 50]),
+            request_ids=[1, 2],
+        )
+
+        m.adjust_attention_metadata(metadata)
+
+        assert metadata.kv_cache_params.num_cached_tokens_per_seq == [70, 50]
+        assert metadata.delta == [30, 0]
 
 
 # ---------------------------------------------------------------------- #
