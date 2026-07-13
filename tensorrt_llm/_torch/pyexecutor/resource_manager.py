@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, ClassVar, Dict, Iterable, List, Optional,
-                    Protocol, Sequence, Set, Tuple, Union, runtime_checkable)
+                    Sequence, Set, Tuple, Union)
 
 import torch
 from mpi4py import MPI
@@ -2332,14 +2332,6 @@ class BlockManager:
 # --------------------------------------------------------------------- #
 
 
-@runtime_checkable
-class KVCacheCompressionMetadata(Protocol):
-    """Attention-metadata contract used by cache-compression managers."""
-
-    def set_draft_kv_length_delta(self, delta: Sequence[int]) -> None:
-        """Publish ``dense draft length - compressed target length`` per row."""
-
-
 class BaseKVCacheCompressionManager(BaseResourceManager):
     """Framework-level base class for all KV-cache compression managers.
 
@@ -2349,11 +2341,17 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
     base implementations below translate those callbacks into the lifecycle
     hooks.
 
-    Concrete compression methods subclass this directly. The startup callback,
-    request-lifecycle hooks, and metadata adjustment below all default to no-op;
-    subclasses override what they need. The manager never inherits from any
-    cache manager because this layer decides *how* the physical KV is used, not
-    *what* physical KV exists. Subclasses hold ``KVCacheManagerV2`` as a tool.
+    Concrete compression methods subclass this directly. The request-lifecycle
+    hooks below all default to no-op; subclasses override what they need. The
+    manager never inherits from any cache manager because this layer decides
+    *how* the physical KV is used, not *what* physical KV exists. Subclasses
+    hold ``KVCacheManagerV2`` as a tool.
+
+    A manager that physically evicts KV publishes the per-request cumulative
+    evicted count through ``LlmRequest.py_num_compressed_tokens`` in the same
+    ``update_resources`` call that compacts the cache. The model engine
+    subtracts that count when it derives attention-metadata KV lengths on the
+    next step, so no attention-metadata plumbing is required here.
     """
 
     adjusts_generation_kv_length: ClassVar[bool] = False
@@ -2386,23 +2384,6 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
     @property
     def has_independent_draft_kv_cache(self) -> bool:
         return self.draft_kv_cache_manager is not None
-
-    def publish_draft_kv_length_delta(
-        self,
-        attn_metadata: "AttentionMetadata",
-        delta: Sequence[int],
-    ) -> None:
-        """Publish the dense-draft length domain through the framework contract."""
-        if not self.has_independent_draft_kv_cache:
-            return
-        if not isinstance(attn_metadata, KVCacheCompressionMetadata):
-            raise TypeError(
-                "separate draft KV cache compression requires compatible "
-                "attention metadata")
-        attn_metadata.set_draft_kv_length_delta(delta)
-
-    def prewarm(self) -> None:
-        """Prepare private fixed-shape state before model graph capture."""
 
     # ================================================================== #
     # KV-cache lifecycle hooks (5, in temporal order).                   #
@@ -2452,10 +2433,6 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         ``KVCacheManagerV2``; subclasses must not free them here.
         """
 
-    def adjust_attention_metadata(self,
-                                  attn_metadata: "AttentionMetadata") -> None:
-        """Publish compressed lengths before attention metadata is prepared."""
-
     # ================================================================== #
     # BaseResourceManager interface — PyExecutor auto-invokes these each  #
     # iteration; they translate into the semantic lifecycle hooks above.  #
@@ -2494,9 +2471,10 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         request-state transitions: it is iteration-exact and immune to a
         short-output request going straight to ``GENERATION_TO_COMPLETE``
         (which, under the overlap scheduler, never passes through
-        ``GENERATION_IN_PROGRESS``). Compression methods that need attention
-        metadata publish it through :meth:`adjust_attention_metadata` at the
-        model-engine boundary.
+        ``GENERATION_IN_PROGRESS``). Compression methods that evict here
+        publish the new cumulative count through
+        ``LlmRequest.py_num_compressed_tokens`` so the model engine derives
+        matching KV lengths on the next step.
         """
         for req in scheduled_batch.context_requests_last_chunk:
             self.on_context_step_end(req, attn_metadata)

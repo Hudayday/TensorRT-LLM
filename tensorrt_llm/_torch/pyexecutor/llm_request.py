@@ -730,6 +730,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_batch_idx = None
         self.py_draft_pages_allocated = 0
         self.py_rewind_len = 0
+        # Cumulative count of this request's KV tokens physically evicted by a
+        # KV-cache compression manager (the manager is the only writer; it
+        # updates the count in the same step that compacts the cache). The
+        # model engine subtracts it when deriving attention-metadata KV
+        # lengths, while logical token accounting (position ids, stop
+        # criteria, statistics) keeps using max_beam_num_tokens. Draft KV
+        # caches are never compressed, so the draft engine ignores it.
+        self.py_num_compressed_tokens = 0
         self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens
         self.py_last_context_chunk = (None, None)
         self.py_draft_logits = None

@@ -120,8 +120,6 @@ class TestBaseABC:
     def test_four_hooks_default_noop(self, fake_kv_cache_manager):
         m = BaseKVCacheCompressionManager(fake_kv_cache_manager)
         meta = MagicMock()
-        assert m.prewarm() is None
-        assert m.adjust_attention_metadata(meta) is None
         assert m.on_request_init(MagicMock()) is None
         assert m.on_context_step_end(MagicMock(), meta) is None
         assert m.on_generation_step_begin(MagicMock(), meta) is None
@@ -160,19 +158,21 @@ class TestBaseABC:
         with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
             BaseKVCacheCompressionManager(_v2_manager(is_draft=False), MagicMock())
 
-    def test_publishes_draft_length_delta_through_protocol(self):
-        class Metadata:
-            def set_draft_kv_length_delta(self, delta):
-                self.delta = list(delta)
+    def test_compressed_token_count_defaults_to_zero_on_requests(self):
+        """The request field is the manager->engine channel: it must exist
+        with a 0 default on every freshly built request so runs without a
+        compression manager are bit-identical to before."""
+        from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+        from tensorrt_llm.bindings import SamplingConfig
 
-        manager = BaseKVCacheCompressionManager(
-            _v2_manager(is_draft=False), _v2_manager(is_draft=True)
+        request = LlmRequest(
+            request_id=1,
+            max_new_tokens=8,
+            input_tokens=[1, 2, 3],
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
         )
-        metadata = Metadata()
-
-        manager.publish_draft_kv_length_delta(metadata, [0, 37])
-
-        assert metadata.delta == [0, 37]
+        assert request.py_num_compressed_tokens == 0
 
 
 # ---------------------------------------------------------------------- #

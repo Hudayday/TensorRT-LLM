@@ -80,8 +80,7 @@ from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
                           get_multimodal_embedding_lengths)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
-from .resource_manager import (BaseKVCacheCompressionManager,
-                               BaseResourceManager, KVCacheManager,
+from .resource_manager import (BaseResourceManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
@@ -1082,13 +1081,6 @@ class PyTorchModelEngine(ModelEngine):
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
-        kv_compression_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER)
-        if kv_compression_manager is not None:
-            assert isinstance(kv_compression_manager,
-                              BaseKVCacheCompressionManager)
-            # Compression graphs need stable workspaces before model capture.
-            kv_compression_manager.prewarm()
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
@@ -2786,19 +2778,15 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata, new_tensors_device, num_accepted_tokens_device,
                 resource_manager)
 
-    def _prepare_self_attention_metadata(
-            self, attn_metadata: AttentionMetadata,
-            resource_manager: Optional[ResourceManager]) -> None:
-        kv_compression_manager = None
-        if resource_manager is not None and not self.is_draft_model:
-            kv_compression_manager = resource_manager.get_resource_manager(
-                ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER)
-        if kv_compression_manager is not None:
-            assert isinstance(kv_compression_manager,
-                              BaseKVCacheCompressionManager)
-            # Reconcile physical KV lengths before prepare binds kernel views.
-            kv_compression_manager.adjust_attention_metadata(attn_metadata)
-        attn_metadata.prepare()
+    def _compressed_kv_token_count(self, request: LlmRequest) -> int:
+        """Tokens a KV-cache compression manager physically evicted for this
+        request. Subtracted only from attention-metadata KV lengths: position
+        ids and every other consumer keep the logical token count. Draft KV
+        caches are never compressed, so the draft engine always returns 0.
+        """
+        if self.is_draft_model:
+            return 0
+        return request.py_num_compressed_tokens
 
     @nvtx_range("_prepare_incremental_update_metadata")
     def _prepare_incremental_update_metadata(
@@ -2812,8 +2800,7 @@ class PyTorchModelEngine(ModelEngine):
             total_num_tokens: int,
             num_generation_tokens: int,
             request_accepted_path: Optional[Dict[int, Any]] = None,
-            num_extend_ctx_requests: int = 0,
-            resource_manager: Optional[ResourceManager] = None):
+            num_extend_ctx_requests: int = 0):
         """
         Common metadata preparation logic for incremental updates.
         """
@@ -2836,7 +2823,7 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
             num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
         attn_metadata.kv_cache_manager = kv_cache_manager
-        self._prepare_self_attention_metadata(attn_metadata, resource_manager)
+        attn_metadata.prepare()
 
         # Get LoRA parameters
         lora_params = self._get_lora_params_from_requests(
@@ -3108,11 +3095,14 @@ class PyTorchModelEngine(ModelEngine):
                           and spec_config.spec_dec_mode.extend_ctx(
                               self.attn_backend) and spec_config.is_linear_tree)
 
+        kv_compressed_tokens_per_seq = []
         for idx, request in enumerate(extend_requests):
             request_accepted_path[request.py_request_id] = \
                 request.py_num_accepted_draft_tokens_indices
 
             base_past_seen = request.max_beam_num_tokens - 1
+            compressed_kv_tokens = self._compressed_kv_token_count(request)
+            kv_compressed_tokens_per_seq.append(compressed_kv_tokens)
 
             if use_extend_ctx:
                 # We're treating the prompt lengths as context requests here, so
@@ -3122,7 +3112,8 @@ class PyTorchModelEngine(ModelEngine):
                 prompt_lengths[idx] = request.py_prompt_len
 
             if request.is_dummy:
-                num_cached_tokens_per_seq[idx] = base_past_seen
+                num_cached_tokens_per_seq[
+                    idx] = base_past_seen - compressed_kv_tokens
                 request.cached_tokens = base_past_seen
                 num_extend_dummy_requests += 1
             else:
@@ -3131,9 +3122,11 @@ class PyTorchModelEngine(ModelEngine):
                     num_previous_batch] = request.py_batch_idx
                 num_previous_batch += 1
 
-                num_cached_tokens_per_seq[
-                    idx] = base_past_seen + num_tokens_per_extend_request
-                request.cached_tokens = num_cached_tokens_per_seq[idx].item()
+                num_cached_tokens_per_seq[idx] = (
+                    base_past_seen + num_tokens_per_extend_request -
+                    compressed_kv_tokens)
+                request.cached_tokens = (base_past_seen +
+                                         num_tokens_per_extend_request)
 
             request.py_batch_idx = request.py_seq_slot
 
@@ -3178,6 +3171,15 @@ class PyTorchModelEngine(ModelEngine):
             num_extend_ctx_requests = num_extend_requests
 
         virtual_num_tokens = num_generation_tokens
+        publish_draft_kv_length_delta = getattr(attn_metadata,
+                                                "set_draft_kv_length_delta",
+                                                None)
+        if publish_draft_kv_length_delta is not None and not self.is_draft_model:
+            # One-model speculative decoding keeps the separate draft cache
+            # dense while compression shortens only the target cache. Publish
+            # the per-row dense-minus-compressed gap so the metadata can serve
+            # both KV length domains within one forward.
+            publish_draft_kv_length_delta(kv_compressed_tokens_per_seq)
         lora_params = self._prepare_incremental_update_metadata(
             scheduled_requests=scheduled_requests,
             kv_cache_manager=kv_cache_manager,
@@ -3188,8 +3190,7 @@ class PyTorchModelEngine(ModelEngine):
             total_num_tokens=virtual_num_tokens,
             num_generation_tokens=num_generation_tokens,
             request_accepted_path=request_accepted_path,
-            num_extend_ctx_requests=num_extend_ctx_requests,
-            resource_manager=resource_manager)
+            num_extend_ctx_requests=num_extend_ctx_requests)
 
         # No padding because there are only generation requests.
         attn_metadata.padded_num_tokens = None
@@ -3276,6 +3277,12 @@ class PyTorchModelEngine(ModelEngine):
         gather_ids = []
         position_ids = []  # per sequence
         num_cached_tokens_per_seq = []  # per sequence
+        # Per sequence, aligned with num_cached_tokens_per_seq: tokens a
+        # KV-cache compression manager evicted from the target cache (0 for
+        # context rows and whenever no compression manager runs). Already
+        # subtracted from num_cached_tokens_per_seq; kept as a separate list so
+        # speculative metadata can reconstruct the dense draft KV lengths.
+        kv_compressed_tokens_per_seq = []
         draft_tokens = []
         draft_lens = []
         gen_request_seq_slots = []  # per generation request
@@ -3377,6 +3384,7 @@ class PyTorchModelEngine(ModelEngine):
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            kv_compressed_tokens_per_seq.append(0)
             request.cached_tokens = num_cached_tokens_per_seq[-1]
             append_cross_attention_state(
                 request,
@@ -3562,8 +3570,11 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(past_seen_token_num,
                               past_seen_token_num + 1 + num_draft_tokens)))
-                num_cached_tokens_per_seq.append(past_seen_token_num)
-                request.cached_tokens = num_cached_tokens_per_seq[-1]
+                compressed_kv_tokens = self._compressed_kv_token_count(request)
+                num_cached_tokens_per_seq.append(past_seen_token_num -
+                                                 compressed_kv_tokens)
+                kv_compressed_tokens_per_seq.append(compressed_kv_tokens)
+                request.cached_tokens = past_seen_token_num
                 # update batch index
                 request.py_batch_idx = request.py_seq_slot
             else:
@@ -3590,9 +3601,13 @@ class PyTorchModelEngine(ModelEngine):
                 previous_pos_indices.extend([previous_batch_idx] *
                                             runtime_tokens_per_gen_step)
 
+                compressed_kv_tokens = self._compressed_kv_token_count(request)
                 num_cached_tokens_per_seq.append(past_seen_token_num +
-                                                 runtime_tokens_per_gen_step)
-                request.cached_tokens = num_cached_tokens_per_seq[-1]
+                                                 runtime_tokens_per_gen_step -
+                                                 compressed_kv_tokens)
+                kv_compressed_tokens_per_seq.append(compressed_kv_tokens)
+                request.cached_tokens = (past_seen_token_num +
+                                         runtime_tokens_per_gen_step)
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
                     prompt_lengths.append(runtime_tokens_per_gen_step)
@@ -3649,7 +3664,10 @@ class PyTorchModelEngine(ModelEngine):
                 py_request_id] = request.py_num_accepted_draft_tokens_indices
             prompt_lengths.append(request.py_prompt_len)
             past_seen_token_num = begin_compute
-            num_cached_tokens_per_seq.append(past_seen_token_num)
+            compressed_kv_tokens = self._compressed_kv_token_count(request)
+            num_cached_tokens_per_seq.append(past_seen_token_num -
+                                             compressed_kv_tokens)
+            kv_compressed_tokens_per_seq.append(compressed_kv_tokens)
             append_cross_attention_state(request, project_encoder_output=False)
 
             # update batch index
@@ -3724,9 +3742,12 @@ class PyTorchModelEngine(ModelEngine):
                         helix_position_offsets.append(position_id)
 
                 request.cached_tokens = past_seen_token_num
+                compressed_kv_tokens = self._compressed_kv_token_count(request)
                 for beam in range(beam_width):
                     position_ids.append(position_id)
-                    num_cached_tokens_per_seq.append(past_seen_token_num)
+                    num_cached_tokens_per_seq.append(past_seen_token_num -
+                                                     compressed_kv_tokens)
+                    kv_compressed_tokens_per_seq.append(compressed_kv_tokens)
                     prompt_lengths.append(request.py_prompt_len)
                     gather_ids.append(len(position_ids) - 1)
 
@@ -4165,7 +4186,16 @@ class PyTorchModelEngine(ModelEngine):
 
         if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
             attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
-        self._prepare_self_attention_metadata(attn_metadata, resource_manager)
+        publish_draft_kv_length_delta = getattr(attn_metadata,
+                                                "set_draft_kv_length_delta",
+                                                None)
+        if publish_draft_kv_length_delta is not None and not self.is_draft_model:
+            # One-model speculative decoding keeps the separate draft cache
+            # dense while compression shortens only the target cache. Publish
+            # the per-row dense-minus-compressed gap so the metadata can serve
+            # both KV length domains within one forward.
+            publish_draft_kv_length_delta(kv_compressed_tokens_per_seq)
+        attn_metadata.prepare()
         cross_attention_inputs = (self._prepare_enc_dec_cross_attn_inputs(
             cross_encoder_hidden_states,
             cross_encoder_seq_lens,

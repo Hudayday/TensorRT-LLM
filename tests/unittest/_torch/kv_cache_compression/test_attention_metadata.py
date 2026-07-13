@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
-from unittest import mock
 
 import pytest
 import torch
@@ -16,11 +15,6 @@ from tensorrt_llm._torch.kv_cache_compression.attention_metadata import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
-from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseKVCacheCompressionManager,
-    ResourceManager,
-    ResourceManagerType,
-)
 from tensorrt_llm._torch.speculative.interface import (
     SpecWorkerBase,
     prepare_attn_metadata_for_draft_replay,
@@ -223,49 +217,37 @@ def test_draft_length_refresh_reuses_graph_stable_buffers() -> None:
     assert metadata.kv_lens_cuda_runtime.cpu().tolist() == [44, 137]
 
 
-def test_model_engine_adjusts_before_prepare() -> None:
-    calls = []
+def test_target_engine_subtracts_request_compressed_tokens() -> None:
+    """The model engine derives compressed KV lengths from the request field
+    (``LlmRequest.py_num_compressed_tokens``) when building
+    ``num_cached_tokens_per_seq``; position ids keep the logical count."""
     engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
     engine.is_draft_model = False
-    compression_manager = mock.Mock(spec=BaseKVCacheCompressionManager)
-    resource_manager = ResourceManager(
-        {
-            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER: compression_manager,
-        }
-    )
-    metadata = mock.Mock()
-    compression_manager.adjust_attention_metadata.side_effect = lambda value: calls.append(
-        ("adjust", value)
-    )
-    metadata.prepare.side_effect = lambda: calls.append(("prepare", metadata))
+    request = SimpleNamespace(py_num_compressed_tokens=37)
 
-    engine._prepare_self_attention_metadata(metadata, resource_manager)
-
-    assert calls == [("adjust", metadata), ("prepare", metadata)]
+    assert engine._compressed_kv_token_count(request) == 37
 
 
-def test_model_engine_prepares_without_compression_manager() -> None:
-    engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
-    engine.is_draft_model = False
-    metadata = mock.Mock()
-
-    engine._prepare_self_attention_metadata(metadata, ResourceManager({}))
-
-    metadata.prepare.assert_called_once_with()
-
-
-def test_draft_model_does_not_adjust_compression_metadata() -> None:
+def test_draft_engine_ignores_request_compressed_tokens() -> None:
+    """Draft KV caches are never compressed: the draft engine must keep dense
+    lengths even though it reads the same request objects."""
     engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
     engine.is_draft_model = True
-    compression_manager = mock.Mock(spec=BaseKVCacheCompressionManager)
-    resource_manager = ResourceManager(
-        {
-            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER: compression_manager,
-        }
+    request = SimpleNamespace(py_num_compressed_tokens=37)
+
+    assert engine._compressed_kv_token_count(request) == 0
+
+
+def test_base_metadata_has_no_draft_delta_channel() -> None:
+    """The engine publishes the draft length delta only when the metadata
+    class provides ``set_draft_kv_length_delta`` (duck-typed); the plain
+    TRTLLM metadata must not, so dense runs skip the publish entirely."""
+    assert getattr(TrtllmAttentionMetadata, "set_draft_kv_length_delta", None) is None
+    assert (
+        getattr(
+            KVCacheCompressionAwareTrtllmAttentionMetadata,
+            "set_draft_kv_length_delta",
+            None,
+        )
+        is not None
     )
-    metadata = mock.Mock()
-
-    engine._prepare_self_attention_metadata(metadata, resource_manager)
-
-    compression_manager.adjust_attention_metadata.assert_not_called()
-    metadata.prepare.assert_called_once_with()
