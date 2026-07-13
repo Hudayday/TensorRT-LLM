@@ -338,10 +338,8 @@ class _FixedScoreGroup:
         if len(page_table_slots) != len(layer_indices):
             raise ValueError("page_table_slots must align with layer_indices")
         self.max_requests = max_requests
-        self.seq_len = seq_len
         self.prompt_len = prompt_len
         self.output_width = seq_len - prompt_len
-        self.num_q_heads = num_q_heads
         self.num_layers = len(layer_indices)
         p0 = layer_pools[layer_indices[0]]
         if p0.ndim != 5:

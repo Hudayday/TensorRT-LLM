@@ -140,14 +140,6 @@ def _mock_cute_topk_without_fallbacks():
         yield cute_topk
 
 
-def _topk_oracle(scores: torch.Tensor, keep_count: int) -> torch.Tensor:
-    """Return sorted per-row indices for an independent expected result."""
-    return torch.sort(
-        _TORCH_TOPK_ORACLE(scores, keep_count, dim=1, sorted=False).indices,
-        dim=1,
-    ).values
-
-
 def _union_oracle(scores: torch.Tensor, keep_count: int) -> torch.Tensor:
     """Independent expected-result implementation of union selection."""
     combined = scores.max(dim=0).values
@@ -357,40 +349,6 @@ def _torch_tri_score_oracle(
     return scores
 
 
-def _logical_kv(pool, page_ids, seq_len):
-    return (
-        pool.index_select(0, page_ids)
-        .permute(1, 2, 0, 3, 4)
-        .reshape(pool.shape[1], pool.shape[2], -1, pool.shape[4])[:, :, :seq_len]
-    )
-
-
-def _torch_union_keep(head_scores, prompt_len, budget):
-    # Callers provide decode-only scores. Prompt tokens are pinned separately
-    # and are prepended to the selected decode ordinals below.
-    decode = head_scores
-    decode = (decode - decode.mean(dim=1, keepdim=True)) / decode.std(
-        dim=1, unbiased=False, keepdim=True
-    ).clamp_min(1e-6)
-    combined = decode.max(dim=0).values
-    row_top = torch.topk(decode, budget, dim=1, sorted=False).indices
-    union = torch.unique(row_top, sorted=True)
-    assert union.numel() >= budget
-    selected = union.index_select(
-        0,
-        torch.topk(combined.index_select(0, union), budget, sorted=False).indices,
-    )
-    prompt = torch.arange(prompt_len, dtype=torch.long, device=head_scores.device)
-    return torch.sort(torch.cat([prompt, selected + prompt_len])).values
-
-
-def _workspace_pointer_snapshot(workspace):
-    return {
-        name: (tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()))
-        for name, tensor in workspace.named_tensors()
-    }
-
-
 class TestKvCacheCompressionConfig:
     def test_llm_args_dispatches_concrete_and_unknown_algorithms(self):
         from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -436,7 +394,6 @@ class TestTriAttentionClass:
     def test_request_init_accepts_speculative_capacity(self):
         manager = _make_fake_v2()
         manager.num_extra_kv_tokens = 4
-        manager.max_total_draft_tokens = 4
         manager._kv_reserve_draft_tokens = 4
         triattention = TriAttention(manager, top_B=8, model_path="/models/test")
         triattention._attention_layer_partition_cache = ([], [], None)
@@ -522,9 +479,6 @@ class TestStepEndHookRefactor:
 
     @staticmethod
     def _make_due_decode_request(seq_len):
-        from types import SimpleNamespace
-        from unittest import mock
-
         request = _make_request(
             7,
             py_prompt_len=1024,
@@ -557,7 +511,6 @@ class TestStepEndHookRefactor:
 
     def test_identity_gate_preserves_real_eviction_round(self):
         import contextlib
-        from unittest import mock
 
         import tensorrt_llm._torch.kv_cache_compression.triattention.triattention as tri_module
 
@@ -572,7 +525,7 @@ class TestStepEndHookRefactor:
 
         def compact(*args, protected_tail_lengths, **_kwargs):
             assert protected_tail_lengths == {7: 0}
-            timeline.append("stage5_dispatch")
+            timeline.append("compact_dispatch")
             return [(7, 1024 + 4096)]
 
         @contextlib.contextmanager
@@ -598,7 +551,7 @@ class TestStepEndHookRefactor:
         mgr.kv_cache_manager._stream.wait_event.assert_called_once_with(event)
         cache.resize.assert_called_once_with(1024 + 4096, None)
         assert timeline == [
-            "stage5_dispatch",
+            "compact_dispatch",
             "enter:triattention.resize",
             "event",
             "stream_wait",
@@ -644,8 +597,6 @@ class TestStepEndHookRefactor:
 
     @pytest.mark.parametrize("accepted", [0, 1, 2, 3])
     def test_overlap_tail_is_excluded_from_selection_and_compacted(self, accepted):
-        from unittest import mock
-
         from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
         confirmed = 1024 + 4096 + 1 + accepted
@@ -685,8 +636,6 @@ class TestStepEndHookRefactor:
         cache.resize.assert_called_once_with(retained + tail, None)
 
     def test_confirmed_length_comes_from_capacity_ledger_not_logical_length(self):
-        from unittest import mock
-
         physical_confirmed = 6100
         manager = _make_triattention(beta=128)
         manager._calibrated = True
@@ -799,21 +748,6 @@ class TestStepEndHookRefactor:
         with pytest.raises(ValueError, match="requires a separate draft KV cache"):
             manager._validate_v2_compatibility()
 
-    def test_dflash_shared_target_draft_cache_is_rejected(self):
-        from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
-
-        spec_config = DFlashDecodingConfig(max_draft_len=3)
-        spec_config._allow_separate_draft_kv_cache = False
-        manager = TriAttention(
-            _make_fake_v2(),
-            top_B=8,
-            model_path="/models/test",
-            spec_config=spec_config,
-        )
-
-        with pytest.raises(ValueError, match="requires a separate draft KV cache"):
-            manager._validate_v2_compatibility()
-
     def test_prepare_snapshots_fixed_linear_generation_growth(self):
         manager = _make_fake_v2()
         manager.num_extra_kv_tokens = 2
@@ -848,8 +782,6 @@ class TestStepEndHookRefactor:
         assert triattention._prepared_generation_batch.growth_by_request == {7: 7}
 
     def test_request_finish_clears_compression_state(self):
-        from types import SimpleNamespace
-
         request = SimpleNamespace(py_request_id=7)
         mgr = _make_triattention()
         _set_request_state(
@@ -886,7 +818,6 @@ class TestTopKRouting:
             0,
             dtype=request_scores[0].dtype,
             device=request_scores[0].device,
-            selection_backend="cute_dsl_topk",
             max_requests=len(request_scores),
         )
 
@@ -902,114 +833,9 @@ class TestTopKRouting:
             assert torch.equal(actual, expected_keep)
 
 
-def _torch_tri_score_oracle(
-    layer_pools,
-    page_ids,
-    seq_lens,
-    round_starts,
-    q_real,
-    q_imag,
-    mlr_coef,
-    freq_scale_sq,
-    omega,
-    offsets,
-    layer_indices,
-    aggregation,
-):
-    """Independent Torch implementation of the paged TriAttention score."""
-    scores = []
-    num_q_heads = int(q_real.shape[1])
-    for request, seq_len in enumerate(seq_lens):
-        phase = (round_starts[request] + offsets[:, None]) * omega[None, :]
-        mean_cos = torch.cos(phase).mean(dim=0)
-        mean_sin = torch.sin(phase).mean(dim=0)
-        for layer in layer_indices:
-            pool = layer_pools[layer]
-            request_page_ids = (
-                page_ids[layer][request] if isinstance(page_ids, dict) else page_ids[request]
-            )
-            keys = (
-                pool.index_select(0, request_page_ids)[:, 0]
-                .permute(1, 0, 2, 3)
-                .reshape(pool.shape[2], -1, pool.shape[4])[:, :seq_len]
-                .float()
-            )
-            num_kv_heads = int(keys.shape[0])
-            group_size = num_q_heads // num_kv_heads
-            head_scores = []
-            for head in range(num_q_heads):
-                key = keys[head // group_size]
-                num_freqs = int(key.shape[-1]) // 2
-                key_real = key[:, :num_freqs]
-                key_imag = key[:, num_freqs:]
-                product_real = q_real[layer, head] * key_real + q_imag[layer, head] * key_imag
-                product_imag = q_imag[layer, head] * key_real - q_real[layer, head] * key_imag
-                if aggregation == "mean":
-                    position = (
-                        freq_scale_sq * (product_real * mean_cos - product_imag * mean_sin)
-                    ).sum(dim=-1)
-                else:
-                    position = (
-                        (
-                            freq_scale_sq[None, None, :]
-                            * (
-                                product_real[None] * torch.cos(phase)[:, None, :]
-                                - product_imag[None] * torch.sin(phase)[:, None, :]
-                            )
-                        )
-                        .sum(dim=-1)
-                        .max(dim=0)
-                        .values
-                    )
-                mlr = (
-                    torch.sqrt(key_real.square() + key_imag.square())
-                    * mlr_coef[layer, head]
-                    * freq_scale_sq
-                ).sum(dim=-1)
-                head_scores.append(position + mlr)
-            scores.append(torch.stack(head_scores))
-    return scores
-
-
-def _logical_kv(pool, page_ids, seq_len):
-    return (
-        pool.index_select(0, page_ids)
-        .permute(1, 2, 0, 3, 4)
-        .reshape(pool.shape[1], pool.shape[2], -1, pool.shape[4])[:, :, :seq_len]
-    )
-
-
-def _torch_union_keep(head_scores, prompt_len, budget):
-    # Callers provide decode-only scores. Prompt tokens are pinned separately
-    # and are prepended to the selected decode ordinals below.
-    decode = head_scores
-    decode = (decode - decode.mean(dim=1, keepdim=True)) / decode.std(
-        dim=1, unbiased=False, keepdim=True
-    ).clamp_min(1e-6)
-    combined = decode.max(dim=0).values
-    row_top = torch.topk(decode, budget, dim=1, sorted=False).indices
-    union = torch.unique(row_top, sorted=True)
-    assert union.numel() >= budget
-    selected = union.index_select(
-        0,
-        torch.topk(combined.index_select(0, union), budget, sorted=False).indices,
-    )
-    prompt = torch.arange(prompt_len, dtype=torch.long, device=head_scores.device)
-    return torch.sort(torch.cat([prompt, selected + prompt_len])).values
-
-
-def _workspace_pointer_snapshot(workspace):
-    return {
-        name: (tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()))
-        for name, tensor in workspace.named_tensors()
-    }
-
-
 class TestFixedScoreMetadata:
     @CUDA_REQUIRED
     def test_bulk_page_table_copy_uses_immutable_host_snapshots(self):
-        from types import SimpleNamespace
-
         from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
             _FixedScoreMetadataWorkspace,
         )
@@ -1090,9 +916,6 @@ class TestFixedScoreMetadata:
         assert workspace.page_ids_device[0, 0].tolist() == [18, 19, 20, 21, 22]
 
     def test_cross_stream_staging_is_rejected_before_page_table_query(self):
-        from types import SimpleNamespace
-        from unittest import mock
-
         from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
             _FixedScoreMetadataWorkspace,
             _FixedScoreStreamMismatch,
@@ -1116,9 +939,6 @@ class TestFixedScoreMetadata:
         get_batch.assert_not_called()
 
     def test_staged_page_tables_bypass_per_request_cuda_materialization(self):
-        from types import SimpleNamespace
-        from unittest import mock
-
         manager = _make_triattention()
         get_batch = mock.Mock()
         manager.kv_cache_manager = SimpleNamespace(get_batch_cache_indices=get_batch)
@@ -1160,11 +980,7 @@ class TestFixedScoreMetadata:
 
     @pytest.mark.parametrize("request_count", [1, 7, 8])
     @CUDA_REQUIRED
-    def test_workspace_stages_dense_and_swa_tables_and_rejects_lifetime_changes(
-        self, request_count
-    ):
-        from unittest import mock
-
+    def test_workspace_stages_dense_and_swa_tables_and_rejects_stream_changes(self, request_count):
         from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
             _FixedScoreMetadataWorkspace,
             _FixedScoreStreamMismatch,
@@ -1255,24 +1071,6 @@ class TestFixedScoreMetadata:
         for slot, global_layer in enumerate((10, 12, 13)):
             expected = torch.tensor(tables[global_layer], dtype=torch.int64, device=device)
             assert torch.equal(workspace.page_ids_device[slot, :request_count], expected)
-        assert workspace.matches(pools, dense_groups, representatives)
-        changed_dense = list(pools)
-        changed_dense[1] = pools[1].clone()
-        assert not workspace.matches(changed_dense, dense_groups, representatives)
-        changed_shape = list(pools)
-        changed_shape[1] = pools[1].view(max_requests * page_count, 2, 1, 2, 8)
-        assert not workspace.matches(changed_shape, dense_groups, representatives)
-        changed_stride = list(pools)
-        changed_stride[1] = pools[1].as_strided(pools[1].shape, (32, 16, 16, 1, 4))
-        assert not workspace.matches(changed_stride, dense_groups, representatives)
-        changed_dtype = list(pools)
-        changed_dtype[1] = pools[1].view(torch.int32)
-        assert not workspace.matches(changed_dtype, dense_groups, representatives)
-        changed_swa = list(pools)
-        changed_swa[3] = pools[3].clone()
-        assert not workspace.matches(changed_swa, dense_groups, representatives)
-        assert not workspace.matches(pools, [[0], [1], [2]], [0, 1, 2, 3])
-
         calls = get_batch.call_count
         other_stream = torch.cuda.Stream(device=device)
         with torch.cuda.stream(other_stream):
@@ -1489,8 +1287,6 @@ class TestFixedScoreMetadata:
 
 class TestKernelMaskedSwa:
     def test_layer_partition_uses_local_model_config(self):
-        from unittest import mock
-
         mgr = _make_triattention()
         mgr.model_path = "/models/gpt-oss"
         mgr.top_B = 128
@@ -1516,8 +1312,6 @@ class TestKernelMaskedSwa:
         assert window == 128
 
     def test_layer_partition_rejects_decode_budget_smaller_than_window(self):
-        from unittest import mock
-
         mgr = _make_triattention()
         mgr.model_path = "/models/gpt-oss"
         mgr.top_B = 127

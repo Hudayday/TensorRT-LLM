@@ -24,7 +24,6 @@ import torch
 class _CppCompactGroup(NamedTuple):
     """Tensors for one layered sparse-KV updater launch."""
 
-    layers: Tuple[int, ...]
     pools: Tuple[torch.Tensor, ...]
     page_tables: Tuple[torch.Tensor, ...]
     pool_pointers: torch.Tensor
@@ -100,7 +99,6 @@ class BatchedCompactionWorkspace:
         self.eviction_mode = eviction_mode
         self.device = layer_pools[dense_layers[0]].device
         self.request_count = int(request_count)
-        self.seq_len = int(seq_len)
         self.prompt_len = int(prompt_len)
         self.decode_keep_count = int(decode_keep_count)
         self.keep_count = self.prompt_len + self.decode_keep_count
@@ -282,7 +280,6 @@ class BatchedCompactionWorkspace:
                     )
                 result.append(
                     _CppCompactGroup(
-                        layers=layers,
                         pools=pools,
                         page_tables=page_tables,
                         pool_pointers=torch.tensor(

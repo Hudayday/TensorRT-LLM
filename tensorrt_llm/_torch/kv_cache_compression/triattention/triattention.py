@@ -77,8 +77,8 @@ if TYPE_CHECKING:
 # Required keys for the calibration ``.pt`` consumed by TriAttention.
 _REQUIRED_CALIBRATION_KEYS = frozenset({"E_q", "E_q_norm", "omega", "freq_scale_sq"})
 
-# Bound eager workspace memory independently of CUDA Graph support. A large
-# due cohort is processed as consecutive request chunks with identical results.
+# Bound eager workspace memory. A large due cohort is processed as consecutive
+# request chunks with identical results.
 _EAGER_REQUEST_CHUNK_SIZE = 32
 _EAGER_RESOURCE_CACHE_LIMIT = 3
 _EAGER_COMPACTION_CACHE_LIMIT = 6
@@ -158,7 +158,6 @@ class _CrossRequestSelectionPlan(NamedTuple):
     prompt_len: int
     dtype: torch.dtype
     device: torch.device
-    selection_backend: str
     max_requests: int
 
 
@@ -191,7 +190,6 @@ class _BatchedFixedUnionWorkspace:
         *,
         dtype: torch.dtype,
         device: torch.device,
-        selection_backend: str,
         max_requests: int,
         dense_layers: Tuple[int, ...] = (),
         num_query_heads: int = 0,
@@ -201,14 +199,11 @@ class _BatchedFixedUnionWorkspace:
             raise ValueError("cross-request selection requires rows > 0 and width > keep_count > 0")
         if max_requests <= 0:
             raise ValueError("cross-request selection requires a positive request capacity")
-        if selection_backend != "cute_dsl_topk":
-            raise ValueError(f"unsupported cross-request selection backend: {selection_backend}")
         self.max_requests = max_requests
         self.eviction_mode = "union"
         self.dense_layers = tuple(dense_layers)
         self.num_query_heads = int(num_query_heads)
         self.num_kv_heads = int(num_kv_heads)
-        self.selection_backend = selection_backend
         self.rows = rows
         self.width = width
         self.keep_count = keep_count
@@ -241,23 +236,6 @@ class _BatchedFixedUnionWorkspace:
         if prompt_len:
             prompt = torch.arange(prompt_len, dtype=torch.int32, device=self.device)
             self.keep[:, :prompt_len].copy_(prompt.expand(max_requests, -1))
-
-    def named_tensors(self) -> Tuple[Tuple[str, torch.Tensor], ...]:
-        """Return the fixed tensor inventory owned by this selection bucket."""
-        tensors = (
-            ("row_mean", self.row_mean),
-            ("row_std", self.row_std),
-            ("combined", self.combined),
-            ("final_indices", self.final_indices),
-            ("sorted_indices", self.sorted_indices),
-            ("sort_order", self.sort_order),
-            ("keep", self.keep),
-            ("valid_widths", self.valid_widths),
-            ("valid_scale", self.valid_scale),
-            ("token_indices", self.token_indices),
-            ("invalid_mask", self.invalid_mask),
-        )
-        return tensors
 
     def stage_valid_widths_from_seq_lens(
         self,
@@ -374,7 +352,6 @@ class _BatchedFixedPerHeadWorkspace:
         prompt_len: int,
         dtype: torch.dtype,
         device: torch.device,
-        selection_backend: str,
         max_requests: int,
     ) -> None:
         if eviction_mode not in ("per_head", "per_layer_perhead"):
@@ -385,9 +362,6 @@ class _BatchedFixedPerHeadWorkspace:
             raise ValueError("query heads must be divisible by KV heads")
         if width <= keep_count or keep_count <= 0:
             raise ValueError("per-head selection requires width > keep_count > 0")
-        if selection_backend != "cute_dsl_topk":
-            raise ValueError(f"unsupported per-head selection backend: {selection_backend}")
-
         self.eviction_mode = eviction_mode
         self.dense_layers = tuple(int(layer) for layer in dense_layers)
         self.num_layers = len(self.dense_layers)
@@ -406,7 +380,6 @@ class _BatchedFixedPerHeadWorkspace:
         self.total_keep = self.prompt_len + self.keep_count
         self.dtype = dtype
         self.device = _canonical_device(device)
-        self.selection_backend = selection_backend
         self.max_requests = int(max_requests)
 
         score_shape = (self.max_requests, self.num_layers, self.num_query_heads, self.width)
@@ -454,23 +427,6 @@ class _BatchedFixedPerHeadWorkspace:
             self.keep[:, :, : self.prompt_len].copy_(
                 prompt.view(1, 1, -1).expand(self.max_requests, self.selection_rows, -1)
             )
-
-    def named_tensors(self) -> Tuple[Tuple[str, torch.Tensor], ...]:
-        return (
-            ("row_mean", self.row_mean),
-            ("row_std", self.row_std),
-            ("valid_widths", self.valid_widths),
-            ("valid_scale", self.valid_scale),
-            ("token_indices", self.token_indices),
-            ("invalid_mask", self.invalid_mask),
-            ("grouped_scores", self.grouped_scores),
-            ("selection_scores", self.selection_scores),
-            ("row_seq_lens", self.row_seq_lens),
-            ("top_indices_i32", self.top_indices_i32),
-            ("sorted_indices_i32", self.sorted_indices_i32),
-            ("sort_order", self.sort_order),
-            ("keep", self.keep),
-        )
 
     def stage_valid_widths_from_seq_lens(
         self, valid_seq_lens: torch.Tensor, request_count: int
@@ -664,11 +620,6 @@ class _FixedScoreMetadataWorkspace:
             global_layers,
             page_table_keys,
         )
-        self.page_table_keys = tuple(page_table_keys)
-        self.signature = (
-            self.page_table_keys,
-            self._signature(layer_pools, dense_groups, page_representatives),
-        )
         tokens_per_block = int(layer_pools[page_representatives[0]].shape[3])
         self.tokens_per_block = tokens_per_block
         self.page_count = (
@@ -772,47 +723,6 @@ class _FixedScoreMetadataWorkspace:
         self._bulk_offsets_src: Optional[torch.Tensor] = None
         self._bulk_offsets_dst: Optional[torch.Tensor] = None
         self._bulk_stage_logged = False
-
-    def _signature(
-        self,
-        layer_pools: List[torch.Tensor],
-        dense_groups: List[List[int]],
-        representatives: List[int],
-    ) -> tuple:
-        layers = dict.fromkeys(
-            [layer for group in dense_groups for layer in group] + list(representatives)
-        )
-        tensors = tuple(
-            (
-                layer,
-                int(layer_pools[layer].untyped_storage().data_ptr()),
-                int(layer_pools[layer].data_ptr()),
-                tuple(layer_pools[layer].shape),
-                tuple(layer_pools[layer].stride()),
-                str(layer_pools[layer].device),
-                str(layer_pools[layer].dtype),
-            )
-            for layer in layers
-        )
-        return (
-            tuple(tuple(group) for group in dense_groups),
-            tuple(representatives),
-            tensors,
-        )
-
-    def matches(
-        self,
-        layer_pools: List[torch.Tensor],
-        dense_groups: List[List[int]],
-        representatives: List[int],
-    ) -> bool:
-        try:
-            return self.signature == (
-                self.page_table_keys,
-                self._signature(layer_pools, dense_groups, representatives),
-            )
-        except (AttributeError, IndexError, KeyError):
-            return False
 
     def stage(
         self,
@@ -1098,16 +1008,6 @@ class TriAttention(BaseKVCacheCompressionManager):
     """
 
     adjusts_generation_kv_length = True
-
-    def _selection_backend_for(self, width: int, keep_count: int) -> str:
-        """Require the Blackwell CuTE-DSL selector for every eviction mode."""
-        if keep_count <= 0:
-            raise RuntimeError("TriAttention top-k keep_count must be positive")
-        if width < keep_count:
-            raise RuntimeError(
-                f"TriAttention top-k width={width} is smaller than keep_count={keep_count}"
-            )
-        return "cute_dsl_topk"
 
     def __init__(
         self,
@@ -1462,7 +1362,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         protected_tail_lengths = {rid: protected_tails[rid] for _, rid in evict_now}
         # Prompt and retained geometry define selection and destination layout.
         # Requests with the same geometry execute eagerly in bounded chunks.
-        # Chunking limits workspace memory; it is not a CUDA Graph constraint.
+        # Chunking limits workspace memory.
         eviction_groups = {}
         for request, rid in evict_now:
             seq_len = self._request_states[rid].confirmed_kv_length
@@ -1470,11 +1370,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 raise RuntimeError(f"Missing confirmed KV length for request {rid}")
             prompt_len = min(int(request.py_prompt_len), seq_len)
             keep_count = self._minimum_evictable_length(request, seq_len)
-            selection_backend = self._selection_backend_for(
-                seq_len - prompt_len,
-                self.top_B,
-            )
-            key = (prompt_len, keep_count, selection_backend)
+            key = (prompt_len, keep_count)
             eviction_groups.setdefault(key, []).append((request, rid))
 
         for group in eviction_groups.values():
@@ -1583,7 +1479,6 @@ class TriAttention(BaseKVCacheCompressionManager):
                 plan.prompt_len,
                 dtype=plan.dtype,
                 device=plan.device,
-                selection_backend=plan.selection_backend,
                 max_requests=plan.max_requests,
                 dense_layers=plan.dense_layers,
                 num_query_heads=plan.num_query_heads,
@@ -1599,7 +1494,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             prompt_len=plan.prompt_len,
             dtype=plan.dtype,
             device=plan.device,
-            selection_backend=plan.selection_backend,
             max_requests=plan.max_requests,
         )
 
@@ -1902,7 +1796,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         seq_len = max(item.seq_len for item in prepared)
         page_table_token_capacity = max(item.seq_len + item.protected_tail for item in prepared)
         request_count = len(prepared)
-        selection_backend = self._selection_backend_for(seq_len - prompt_len, self.top_B)
         dense_groups = list(layout.storage_groups.values())
         representatives = [group[0] for group in dense_groups]
         representatives.extend(layer for layer in layout.swa_layers if layer not in representatives)
@@ -1914,7 +1807,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             prompt_len,
             page_table_token_capacity,
             self.top_B,
-            selection_backend,
             tuple(layout.dense_layers),
             layout.pool_view_fingerprint,
         )
@@ -1961,7 +1853,6 @@ class TriAttention(BaseKVCacheCompressionManager):
                 prompt_len=prompt_len,
                 dtype=torch.float32,
                 device=first_pool.device,
-                selection_backend=selection_backend,
                 max_requests=request_count,
             )
         )

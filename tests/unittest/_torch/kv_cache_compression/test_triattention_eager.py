@@ -99,7 +99,6 @@ def test_union_eager_uses_one_deterministic_cute_selection(keep_count, width):
         prompt_len=prompt_len,
         dtype=torch.float32,
         device=torch.device("cpu"),
-        selection_backend="cute_dsl_topk",
         max_requests=1,
     )
     raw_topk = _AlternatingTieTopK()
@@ -141,7 +140,6 @@ def test_per_head_eager_keeps_stable_indices(eviction_mode):
         prompt_len=3,
         dtype=torch.float32,
         device=torch.device("cpu"),
-        selection_backend="cute_dsl_topk",
         max_requests=1,
     )
     scores = torch.arange(2 * 4 * 16, dtype=torch.float32).reshape(2, 4, 16)
@@ -172,7 +170,6 @@ def test_union_eager_runs_the_registered_cute_op():
         prompt_len=0,
         dtype=torch.float32,
         device=device,
-        selection_backend="cute_dsl_topk",
         max_requests=2,
     )
     scores = torch.randn(2, 4, 96, dtype=torch.float32, device=device)
