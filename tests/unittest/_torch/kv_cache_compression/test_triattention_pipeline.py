@@ -875,7 +875,7 @@ class TestTopKRouting:
 
         with _mock_cute_topk_without_fallbacks() as cute_topk:
             workspace.select_requests(
-                [[scores] for scores in request_scores],
+                torch.stack(request_scores),
                 normalize_scores=False,
             )
             selected = workspace.keep[: len(request_scores)].clone()
@@ -1276,6 +1276,7 @@ class TestFixedScoreMetadata:
         max_requests = 8
         page_count = 2
         seq_len = 7
+        prompt_len = 2
         page_ids = torch.arange(max_requests * page_count, dtype=torch.int64, device=device).view(
             max_requests, page_count
         )
@@ -1301,7 +1302,7 @@ class TestFixedScoreMetadata:
         assert not offsets.is_contiguous()
         round_device = torch.arange(max_requests, dtype=torch.float32, device=device) + 9.0
         round_starts = round_device[:request_count].tolist()
-        seq_lens = [seq_len] * request_count
+        seq_lens = [seq_len - request % 2 for request in range(request_count)]
         phase = (round_device[:, None, None] + offsets[None, :, None]) * omega[None, None]
         oracle = _torch_tri_score_oracle(
             pools,
@@ -1333,28 +1334,30 @@ class TestFixedScoreMetadata:
                 freq,
                 omega,
                 offsets,
+                prompt_len=prompt_len,
             )
-            fixed, fixed_offsets = group.launch(
+            group.stage_lengths(
+                torch.tensor(seq_lens, dtype=torch.int32, device=device),
+                request_count,
+            )
+            fixed = group.launch(
                 request_count,
                 round_device,
                 torch.cos(phase).mean(dim=1),
                 torch.sin(phase).mean(dim=1),
                 aggregation,
             )
-            assert torch.equal(
-                fixed_offsets,
-                torch.arange(
-                    request_count * len(layers) + 1,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                * seq_len,
+            assert fixed.shape == (
+                request_count,
+                len(layers),
+                2,
+                seq_len - prompt_len,
             )
             for request in range(request_count):
                 for layer_slot, layer in enumerate(layers):
-                    segment_index = request * len(layers) + layer_slot
-                    segment = fixed[:, segment_index * seq_len : (segment_index + 1) * seq_len]
-                    expected = oracle[request * len(pools) + layer]
+                    valid_width = seq_lens[request] - prompt_len
+                    segment = fixed[request, layer_slot, :, :valid_width]
+                    expected = oracle[request * len(pools) + layer][:, prompt_len:]
                     torch.testing.assert_close(segment, expected, rtol=5e-3, atol=5e-3)
                     selected = torch.topk(segment.max(dim=0).values, 3).indices.sort().values
                     expected_selected = (
@@ -1382,6 +1385,7 @@ class TestFixedScoreMetadata:
         max_requests = 8
         page_count = 2
         seq_len = 7
+        prompt_len = 1
         num_layers = 3
         # Three SEPARATE allocations (distinct storages, like V2 TensorWrapper).
         pools = [
@@ -1409,7 +1413,7 @@ class TestFixedScoreMetadata:
         offsets = torch.tensor([1.0, 2.0, 4.0], device=device)
         round_device = torch.arange(max_requests, dtype=torch.float32, device=device) + 9.0
         round_starts = round_device[:request_count].tolist()
-        seq_lens = [seq_len] * request_count
+        seq_lens = [seq_len - request % 2 for request in range(request_count)]
         phase = (round_device[:, None, None] + offsets[None, :, None]) * omega[None, None]
 
         layer_order = list(range(num_layers))
@@ -1428,8 +1432,13 @@ class TestFixedScoreMetadata:
             freq,
             omega,
             offsets,
+            prompt_len=prompt_len,
         )
-        fixed, _ = group.launch(
+        group.stage_lengths(
+            torch.tensor(seq_lens, dtype=torch.int32, device=device),
+            request_count,
+        )
+        fixed = group.launch(
             request_count,
             round_device,
             torch.cos(phase).mean(dim=1),
@@ -1455,9 +1464,9 @@ class TestFixedScoreMetadata:
         )
         for request in range(request_count):
             for layer_slot, layer in enumerate(layer_order):
-                segment_index = request * num_layers + layer_slot
-                segment = fixed[:, segment_index * seq_len : (segment_index + 1) * seq_len]
-                expected = oracle[request * num_layers + layer]
+                valid_width = seq_lens[request] - prompt_len
+                segment = fixed[request, layer_slot, :, :valid_width]
+                expected = oracle[request * num_layers + layer][:, prompt_len:]
                 torch.testing.assert_close(segment, expected, rtol=5e-3, atol=5e-3)
 
 

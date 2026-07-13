@@ -117,9 +117,9 @@ def test_union_eager_uses_one_deterministic_cute_selection(keep_count, width):
             create=True,
         ),
     ):
-        workspace.select_requests([[scores]], normalize_scores=False)
+        workspace.select_requests(scores.unsqueeze(0), normalize_scores=False)
 
-    expected = _stable_topk(scores.max(dim=0).values, width, keep_count).to(torch.long)
+    expected = _stable_topk(scores.max(dim=0).values, width, keep_count)
     assert torch.equal(
         workspace.keep[0, prompt_len:],
         torch.sort(expected + prompt_len).values,
@@ -145,14 +145,13 @@ def test_per_head_eager_keeps_stable_indices(eviction_mode):
         max_requests=1,
     )
     scores = torch.arange(2 * 4 * 16, dtype=torch.float32).reshape(2, 4, 16)
-    segments = [[scores[0], scores[1]]]
     with mock.patch.object(
         torch.ops.trtllm,
         "cute_dsl_indexer_topk_decode",
         side_effect=_fake_cute_topk,
         create=True,
     ):
-        workspace.select_requests(segments, normalize_scores=False)
+        workspace.select_requests(scores.unsqueeze(0), normalize_scores=False)
     assert tuple(workspace.keep.shape) == (
         1,
         workspace.selection_rows,
@@ -177,10 +176,7 @@ def test_union_eager_runs_the_registered_cute_op():
         max_requests=2,
     )
     scores = torch.randn(2, 4, 96, dtype=torch.float32, device=device)
-    workspace.select_requests(
-        [[scores[request_index]] for request_index in range(2)],
-        normalize_scores=True,
-    )
+    workspace.select_requests(scores, normalize_scores=True)
     torch.cuda.synchronize(device)
     assert torch.all(workspace.keep[:, 1:] >= workspace.keep[:, :-1])
 

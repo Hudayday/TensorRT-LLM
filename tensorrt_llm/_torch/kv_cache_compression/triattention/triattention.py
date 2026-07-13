@@ -217,45 +217,37 @@ class _BatchedFixedUnionWorkspace:
         self.dtype = dtype
         self.device = _canonical_device(device)
 
-        shape = (max_requests, rows, width)
-        self.input_scores = torch.empty(shape, dtype=dtype, device=self.device)
         self.row_mean = torch.empty((max_requests, rows, 1), dtype=dtype, device=self.device)
         self.row_std = torch.empty_like(self.row_mean)
         self.combined = torch.empty((max_requests, width), dtype=dtype, device=self.device)
-        self.combined_argmax = torch.empty(
-            (max_requests, width), dtype=torch.long, device=self.device
-        )
         self.final_indices = torch.empty(
-            (max_requests, keep_count), dtype=torch.long, device=self.device
+            (max_requests, keep_count), dtype=torch.int32, device=self.device
         )
         self.sorted_indices = torch.empty_like(self.final_indices)
-        self.sort_order = torch.empty_like(self.final_indices)
+        self.sort_order = torch.empty(
+            (max_requests, keep_count), dtype=torch.long, device=self.device
+        )
         self.keep = torch.empty(
-            (max_requests, self.total_keep), dtype=torch.long, device=self.device
+            (max_requests, self.total_keep), dtype=torch.int32, device=self.device
         )
         self.valid_widths = torch.full(
             (max_requests,), width, dtype=torch.int32, device=self.device
         )
         self.valid_scale = torch.empty((max_requests, 1, 1), dtype=dtype, device=self.device)
-        self.token_indices = torch.arange(width, dtype=torch.long, device=self.device)
+        self.token_indices = torch.arange(width, dtype=torch.int32, device=self.device)
         self.invalid_mask = torch.empty(
             (max_requests, 1, width), dtype=torch.bool, device=self.device
         )
         if prompt_len:
-            prompt = torch.arange(prompt_len, dtype=torch.long, device=self.device)
+            prompt = torch.arange(prompt_len, dtype=torch.int32, device=self.device)
             self.keep[:, :prompt_len].copy_(prompt.expand(max_requests, -1))
-        self.final_indices_i32 = torch.empty(
-            (max_requests, keep_count), dtype=torch.int32, device=self.device
-        )
 
     def named_tensors(self) -> Tuple[Tuple[str, torch.Tensor], ...]:
         """Return the fixed tensor inventory owned by this selection bucket."""
         tensors = (
-            ("input_scores", self.input_scores),
             ("row_mean", self.row_mean),
             ("row_std", self.row_std),
             ("combined", self.combined),
-            ("combined_argmax", self.combined_argmax),
             ("final_indices", self.final_indices),
             ("sorted_indices", self.sorted_indices),
             ("sort_order", self.sort_order),
@@ -265,7 +257,7 @@ class _BatchedFixedUnionWorkspace:
             ("token_indices", self.token_indices),
             ("invalid_mask", self.invalid_mask),
         )
-        return tensors + (("final_indices_i32", self.final_indices_i32),)
+        return tensors
 
     def stage_valid_widths_from_seq_lens(
         self,
@@ -288,8 +280,13 @@ class _BatchedFixedUnionWorkspace:
             out=self.valid_widths[:request_count],
         )
 
-    def _select_input_scores(self, request_count: int, *, normalize_scores: bool) -> None:
-        input_scores = self.input_scores[:request_count]
+    def _select_input_scores(
+        self,
+        input_scores: torch.Tensor,
+        request_count: int,
+        *,
+        normalize_scores: bool,
+    ) -> None:
         valid_widths = self.valid_widths[:request_count]
         invalid_mask = self.invalid_mask[:request_count]
         torch.ge(
@@ -319,20 +316,17 @@ class _BatchedFixedUnionWorkspace:
         input_scores.masked_fill_(invalid_mask, float("-inf"))
 
         combined = self.combined[:request_count]
-        combined_argmax = self.combined_argmax[:request_count]
         final_indices = self.final_indices[:request_count]
         sorted_indices = self.sorted_indices[:request_count]
         sort_order = self.sort_order[:request_count]
 
-        torch.max(input_scores, dim=1, out=(combined, combined_argmax))
-        final_indices_i32 = self.final_indices_i32[:request_count]
+        torch.amax(input_scores, dim=1, out=combined)
         _deterministic_topk_indices_into(
             combined,
             valid_widths,
-            final_indices_i32,
+            final_indices,
             self.keep_count,
         )
-        final_indices.copy_(final_indices_i32)
         torch.sort(final_indices, dim=1, out=(sorted_indices, sort_order))
         torch.add(
             sorted_indices,
@@ -342,35 +336,27 @@ class _BatchedFixedUnionWorkspace:
 
     def select_requests(
         self,
-        segments_by_request: List[List[torch.Tensor]],
+        scores: torch.Tensor,
         *,
         normalize_scores: bool,
     ) -> None:
-        """Pack and select every request with one fixed-shape operation sequence."""
-        request_count = len(segments_by_request)
+        """Select from request-major score output without repacking it."""
+        request_count = int(scores.shape[0]) if scores.ndim >= 1 else 0
         if request_count <= 0 or request_count > self.max_requests:
             raise ValueError("request count exceeds the cross-request selection capacity")
-
-        flat_segments = []
-        for segments in segments_by_request:
-            if not segments or sum(int(segment.shape[0]) for segment in segments) != self.rows:
-                raise ValueError("cross-request segments do not match the workspace row count")
-            if any(
-                segment.ndim != 2
-                or int(segment.shape[1]) != self.width
-                or segment.dtype != self.dtype
-                or segment.device != self.device
-                for segment in segments
-            ):
-                raise ValueError("cross-request segment geometry no longer matches its bucket")
-            flat_segments.extend(segments)
-
-        torch.cat(
-            flat_segments,
-            dim=0,
-            out=self.input_scores[:request_count].view(request_count * self.rows, self.width),
+        if (
+            scores.numel() != request_count * self.rows * self.width
+            or int(scores.shape[-1]) != self.width
+            or scores.dtype != self.dtype
+            or scores.device != self.device
+            or not scores.is_contiguous()
+        ):
+            raise ValueError("cross-request scores do not match the workspace geometry")
+        self._select_input_scores(
+            scores.view(request_count, self.rows, self.width),
+            request_count,
+            normalize_scores=normalize_scores,
         )
-        self._select_input_scores(request_count, normalize_scores=normalize_scores)
 
 
 class _BatchedFixedPerHeadWorkspace:
@@ -425,7 +411,6 @@ class _BatchedFixedPerHeadWorkspace:
 
         score_shape = (self.max_requests, self.num_layers, self.num_query_heads, self.width)
         grouped_shape = (self.max_requests, self.num_layers, self.num_kv_heads, self.width)
-        self.input_scores = torch.empty(score_shape, dtype=dtype, device=self.device)
         self.row_mean = torch.empty(score_shape[:-1] + (1,), dtype=dtype, device=self.device)
         self.row_std = torch.empty_like(self.row_mean)
         self.valid_widths = torch.full(
@@ -439,7 +424,6 @@ class _BatchedFixedPerHeadWorkspace:
             (self.max_requests, 1, 1, self.width), dtype=torch.bool, device=self.device
         )
         self.grouped_scores = torch.empty(grouped_shape, dtype=dtype, device=self.device)
-        self.grouped_argmax = torch.empty(grouped_shape, dtype=torch.long, device=self.device)
         if self.eviction_mode == "per_head":
             self.selection_scores = torch.empty(
                 (self.max_requests, self.num_kv_heads, self.width),
@@ -473,7 +457,6 @@ class _BatchedFixedPerHeadWorkspace:
 
     def named_tensors(self) -> Tuple[Tuple[str, torch.Tensor], ...]:
         return (
-            ("input_scores", self.input_scores),
             ("row_mean", self.row_mean),
             ("row_std", self.row_std),
             ("valid_widths", self.valid_widths),
@@ -481,7 +464,6 @@ class _BatchedFixedPerHeadWorkspace:
             ("token_indices", self.token_indices),
             ("invalid_mask", self.invalid_mask),
             ("grouped_scores", self.grouped_scores),
-            ("grouped_argmax", self.grouped_argmax),
             ("selection_scores", self.selection_scores),
             ("row_seq_lens", self.row_seq_lens),
             ("top_indices_i32", self.top_indices_i32),
@@ -508,8 +490,13 @@ class _BatchedFixedPerHeadWorkspace:
             out=self.valid_widths[:request_count],
         )
 
-    def _select_input_scores(self, request_count: int, *, normalize_scores: bool) -> None:
-        input_scores = self.input_scores[:request_count]
+    def _select_input_scores(
+        self,
+        input_scores: torch.Tensor,
+        request_count: int,
+        *,
+        normalize_scores: bool,
+    ) -> None:
         valid_widths = self.valid_widths[:request_count]
         invalid_mask = self.invalid_mask[:request_count]
         torch.ge(
@@ -534,8 +521,7 @@ class _BatchedFixedPerHeadWorkspace:
         input_scores.masked_fill_(invalid_mask, float("-inf"))
 
         grouped_scores = self.grouped_scores[:request_count]
-        grouped_argmax = self.grouped_argmax[:request_count]
-        torch.max(
+        torch.amax(
             input_scores.view(
                 request_count,
                 self.num_layers,
@@ -544,7 +530,7 @@ class _BatchedFixedPerHeadWorkspace:
                 self.width,
             ),
             dim=3,
-            out=(grouped_scores, grouped_argmax),
+            out=grouped_scores,
         )
         if self.eviction_mode == "per_head":
             torch.mean(grouped_scores, dim=1, out=self.selection_scores[:request_count])
@@ -570,31 +556,27 @@ class _BatchedFixedPerHeadWorkspace:
 
     def select_requests(
         self,
-        segments_by_request: List[List[torch.Tensor]],
+        scores: torch.Tensor,
         *,
         normalize_scores: bool,
     ) -> None:
-        request_count = len(segments_by_request)
+        request_count = int(scores.shape[0]) if scores.ndim >= 1 else 0
         if request_count <= 0 or request_count > self.max_requests:
             raise ValueError("request count exceeds the per-head selection capacity")
-        flat_segments = []
-        for segments in segments_by_request:
-            if len(segments) != self.num_layers:
-                raise ValueError("per-head segments do not match the dense-layer count")
-            if any(
-                segment.shape != (self.num_query_heads, self.width)
-                or segment.dtype != self.dtype
-                or segment.device != self.device
-                for segment in segments
-            ):
-                raise ValueError("per-head segment geometry no longer matches its bucket")
-            flat_segments.extend(segments)
-        torch.cat(
-            flat_segments,
-            dim=0,
-            out=self.input_scores[:request_count].view(request_count * self.rows, self.width),
+        expected_shape = (
+            request_count,
+            self.num_layers,
+            self.num_query_heads,
+            self.width,
         )
-        self._select_input_scores(request_count, normalize_scores=normalize_scores)
+        if (
+            tuple(scores.shape) != expected_shape
+            or scores.dtype != self.dtype
+            or scores.device != self.device
+            or not scores.is_contiguous()
+        ):
+            raise ValueError("per-head scores do not match the workspace geometry")
+        self._select_input_scores(scores, request_count, normalize_scores=normalize_scores)
 
 
 class _FixedScoreStreamMismatch(RuntimeError):
@@ -778,6 +760,7 @@ class _FixedScoreMetadataWorkspace:
             freq_scale_sq,
             omega,
             offsets,
+            prompt_len=prompt_len,
         )
         self.copy_done = torch.cuda.Event()
         self.bulk_allocation_done = torch.cuda.Event()
@@ -2100,8 +2083,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         layers, the latest model window is rebased to the tail of the common
         compacted prefix before the request-wide capacity is reduced.
         """
-        from .triattention_kernels import fixed_perhead_segment_views
-
         if protected_tail_lengths is None:
             protected_tail_lengths = {}
         protected_tail_capacity = self._configured_protected_tail_capacity()
@@ -2154,23 +2135,14 @@ class TriAttention(BaseKVCacheCompressionManager):
             self._attach_page_ids(prepared, score_workspace)
 
         request_count = len(prepared)
-        seq_len = score_workspace.bucket_seq_len
-        prompt_len = selection_workspace.prompt_len
         with nvtx_range("triattention.score", color="blue"):
             score_workspace.prepare_phase(request_count)
-            per_head, _ = score_workspace.fused_group.launch(
+            per_head = score_workspace.fused_group.launch(
                 request_count,
                 score_workspace.round_starts_device,
                 score_workspace.mean_cos,
                 score_workspace.mean_sin,
                 self.score_aggregation,
-            )
-            layer_order = score_workspace.dense_layer_order
-            views = fixed_perhead_segment_views(
-                per_head,
-                request_count,
-                len(layer_order),
-                seq_len,
             )
         with nvtx_range("triattention.select", color="yellow"):
             selection_workspace.stage_valid_widths_from_seq_lens(
@@ -2178,13 +2150,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 request_count,
             )
             selection_workspace.select_requests(
-                [
-                    [
-                        views[:, request_index, layer_slot, prompt_len:seq_len]
-                        for layer_slot in range(len(layer_order))
-                    ]
-                    for request_index in range(request_count)
-                ],
+                per_head,
                 normalize_scores=self.normalize_scores,
             )
         with nvtx_range("triattention.compact", color="purple"):

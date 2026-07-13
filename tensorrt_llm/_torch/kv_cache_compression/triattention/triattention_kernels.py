@@ -16,7 +16,7 @@ House rules honored throughout:
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List
 
 import torch
 import triton
@@ -137,7 +137,6 @@ def _tri_score_perhead_kernel(
     seg_layer_id,  # [nseg] int32: ABSOLUTE layer id (indexes layer_base_addrs + calib)
     seg_seq_len,  # [nseg] int32
     req_round_start,  # [num_requests] fp32
-    seg_out_offset,  # [nseg] int64: write base (column) into each [H, sum_seq] row
     seg_n_tblk,  # [nseg] int32: cdiv(seq_len, T_BLOCK)
     # per-LAYER calibration, [L,H,F] flattened layer-major:
     q_real_ptr,  # [L*H*F] fp32
@@ -150,8 +149,8 @@ def _tri_score_perhead_kernel(
     freq_scale_sq_ptr,  # [F] fp32
     omega_ptr,  # [F] fp32 ('max' path only)
     offsets_ptr,  # [O] fp32 ('max' path only)
-    out_ptr,  # [num_q_heads * sum_seq] fp32 (logically [H, sum_seq])
-    sum_seq,  # int: total tokens across all segments == row stride of out.
+    out_ptr,  # [request, layer, query_head, decode_token] fp32
+    output_width,
     # scalars uniform across the batch:
     num_q_heads,
     num_kv_heads,
@@ -167,6 +166,7 @@ def _tri_score_perhead_kernel(
     s_slot,
     s_dim,
     USE_MAX: tl.constexpr,
+    TOKEN_START: tl.constexpr,
     T_BLOCK: tl.constexpr,
     F_BLOCK: tl.constexpr,
 ):
@@ -188,7 +188,6 @@ def _tri_score_perhead_kernel(
     layer_id = tl.load(seg_layer_id + seg)
     req_id = tl.load(seg_req_id + seg)
     rstart = tl.load(req_round_start + req_id)
-    out_base = tl.load(seg_out_offset + seg)
     # This segment's layer base: an absolute address cast back to a pool-typed
     # pointer. TRT-LLM V2 exposes every layer as its own TensorWrapper storage,
     # so "element offset relative to one shared storage" does not exist; the
@@ -205,9 +204,10 @@ def _tri_score_perhead_kernel(
 
     # ---- token tile of THIS segment ----
     t = t_blk * T_BLOCK + tl.arange(0, T_BLOCK)
-    t_mask = t < seq_len
-    blk_in_seq = t // tokens_per_block
-    slot = (t % tokens_per_block).to(tl.int64)
+    absolute_t = t + TOKEN_START
+    t_mask = absolute_t < seq_len
+    blk_in_seq = absolute_t // tokens_per_block
+    slot = (absolute_t % tokens_per_block).to(tl.int64)
     # page_off + blk_in_seq stays within this segment's page table for in-range
     # tokens (t_mask). For masked tail tokens the load is masked (other=0) so the
     # possibly-out-of-this-segment index is never dereferenced.
@@ -274,8 +274,10 @@ def _tri_score_perhead_kernel(
         mlr_f = kmag * mlrc[None, :] * fss[None, :]
         mlr = tl.sum(tl.where(f_mask[None, :], mlr_f, 0.0), axis=1)
 
-        # write this head's score at row h, column (out_base + t). No mean.
-        tl.store(out_ptr + h.to(tl.int64) * sum_seq + out_base + t, score + mlr, mask=t_mask)
+        # Segments are request-major then layer-major. Write the decode-only
+        # score directly in the selector's [request, layer, head, token] layout.
+        out_offset = (seg.to(tl.int64) * num_q_heads + h) * output_width + t
+        tl.store(out_ptr + out_offset, score + mlr, mask=t_mask)
         qg += 1
 
 
@@ -285,6 +287,7 @@ def _launch_tri_score_perhead(
     geometry_args: tuple,
     *,
     score_aggregation: str,
+    token_start: int,
     token_block: int,
     num_freqs: int,
 ) -> None:
@@ -295,6 +298,7 @@ def _launch_tri_score_perhead(
         *pointer_args,
         *geometry_args,
         USE_MAX=(score_aggregation == "max"),
+        TOKEN_START=token_start,
         T_BLOCK=token_block,
         F_BLOCK=triton.next_power_of_2(num_freqs),
     )
@@ -325,13 +329,18 @@ class _FixedScoreGroup:
         freq_scale_sq: torch.Tensor,
         omega: torch.Tensor,
         offsets: torch.Tensor,
+        prompt_len: int = 0,
     ) -> None:
         if not layer_indices or min(max_requests, page_count, seq_len) <= 0:
             raise ValueError("fixed score group requires non-empty positive geometry")
+        if prompt_len < 0 or prompt_len >= seq_len:
+            raise ValueError("fixed score prompt length must leave a non-empty decode region")
         if len(page_table_slots) != len(layer_indices):
             raise ValueError("page_table_slots must align with layer_indices")
         self.max_requests = max_requests
         self.seq_len = seq_len
+        self.prompt_len = prompt_len
+        self.output_width = seq_len - prompt_len
         self.num_q_heads = num_q_heads
         self.num_layers = len(layer_indices)
         p0 = layer_pools[layer_indices[0]]
@@ -381,7 +390,6 @@ class _FixedScoreGroup:
         self.anchor_pool = p0
 
         num_segments = max_requests * self.num_layers
-        segment = torch.arange(num_segments, device=device)
         seg_req = torch.arange(max_requests, dtype=torch.int32, device=device).repeat_interleave(
             self.num_layers
         )
@@ -389,7 +397,6 @@ class _FixedScoreGroup:
             max_requests
         )
         seg_seq = torch.full((num_segments,), seq_len, dtype=torch.int32, device=device)
-        seg_out_off = segment.to(torch.int64) * seq_len
         # Per-segment page-table offsets into page_ids.view(-1): segment
         # (r, layer_slot) reads table [page_table_slots[layer_slot], r].
         if page_ids.ndim != 3 or tuple(page_ids.shape[1:]) != (max_requests, page_count):
@@ -405,16 +412,18 @@ class _FixedScoreGroup:
         slot_idx = slots_t.repeat(max_requests)
         seg_page_off = (slot_idx * max_requests + req_idx) * page_count
         self.token_block = 64
-        self.max_ntblk = (seq_len + self.token_block - 1) // self.token_block
+        self.max_ntblk = (self.output_width + self.token_block - 1) // self.token_block
         seg_ntblk = torch.full((num_segments,), self.max_ntblk, dtype=torch.int32, device=device)
         self.seg_req = seg_req
         self.seg_seq = seg_seq
         self.seg_ntblk = seg_ntblk
-        self.seg_offsets = (
-            torch.arange(num_segments + 1, dtype=torch.int32, device=device) * seq_len
-        )
         self.output = torch.empty(
-            num_q_heads * num_segments * seq_len, dtype=torch.float32, device=device
+            max_requests,
+            self.num_layers,
+            num_q_heads,
+            self.output_width,
+            dtype=torch.float32,
+            device=device,
         )
         self.pointer_prefix = (
             self.anchor_pool,
@@ -426,7 +435,6 @@ class _FixedScoreGroup:
             seg_seq,
         )
         self.pointer_middle = (
-            seg_out_off,
             seg_ntblk,
             q_real_LHF.view(-1),
             q_imag_LHF.view(-1),
@@ -449,7 +457,7 @@ class _FixedScoreGroup:
         )
         torch.add(
             self.seg_seq[:num_segments],
-            self.token_block - 1,
+            self.token_block - 1 - self.prompt_len,
             out=self.seg_ntblk[:num_segments],
         )
         torch.div(
@@ -466,13 +474,12 @@ class _FixedScoreGroup:
         mean_cos: torch.Tensor,
         mean_sin: torch.Tensor,
         score_aggregation: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Launch the fused score kernel using the persistent metadata."""
+    ) -> torch.Tensor:
+        """Return decode-only scores as ``[request, layer, head, token]``."""
         if request_count <= 0 or request_count > self.max_requests:
             raise ValueError("request count exceeds fixed score capacity")
         num_segments = request_count * self.num_layers
-        sum_seq = num_segments * self.seq_len
-        output = self.output[: self.num_q_heads * sum_seq]
+        output = self.output[:request_count]
         _launch_tri_score_perhead(
             (num_segments, self.max_ntblk, self.num_kv_heads),
             (
@@ -484,29 +491,10 @@ class _FixedScoreGroup:
                 *self.pointer_tail,
                 output,
             ),
-            (sum_seq, *self.geometry_args),
+            (self.output_width, *self.geometry_args),
             score_aggregation=score_aggregation,
+            token_start=self.prompt_len,
             token_block=self.token_block,
             num_freqs=self.num_freqs,
         )
-        return output.view(self.num_q_heads, sum_seq), self.seg_offsets[: num_segments + 1]
-
-
-def fixed_perhead_segment_views(
-    perhead_scores: torch.Tensor,
-    request_count: int,
-    layer_count: int,
-    seq_len: int,
-) -> torch.Tensor:
-    """View fixed score output as ``[H, R, L, S]`` without reading offsets.
-
-    The fixed score launcher writes request-major, then layer-major segments of
-    one exact sequence length.  Its geometry is already known by the caller, so
-    materializing ``seg_offsets`` on the host would add a needless CUDA sync.
-    """
-    if min(request_count, layer_count, seq_len) <= 0:
-        raise ValueError("fixed score segment geometry must be positive")
-    expected_width = request_count * layer_count * seq_len
-    if perhead_scores.ndim != 2 or int(perhead_scores.shape[1]) != expected_width:
-        raise ValueError("fixed score output width does not match request/layer/sequence geometry")
-    return perhead_scores.view(int(perhead_scores.shape[0]), request_count, layer_count, seq_len)
+        return output
