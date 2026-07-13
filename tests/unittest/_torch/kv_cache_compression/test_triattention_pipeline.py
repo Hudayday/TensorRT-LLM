@@ -498,6 +498,23 @@ class TestStepEndHookRefactor:
         assert "update_resources" not in TriAttention.__dict__
         assert "on_generation_step_end" in TriAttention.__dict__
 
+    def test_prepare_does_not_evict_and_update_runs_final_hook_once(self):
+        manager = _make_triattention()
+        request = _make_request(7)
+        batch = SimpleNamespace(
+            context_requests=[],
+            context_requests_last_chunk=[],
+            generation_requests=[request],
+        )
+
+        with mock.patch.object(manager, "_periodic_evict") as periodic_evict:
+            manager.prepare_resources(batch)
+            periodic_evict.assert_not_called()
+
+            manager.update_resources(batch)
+
+        periodic_evict.assert_called_once_with(batch)
+
     @pytest.mark.parametrize("top_B", [511, 512])
     def test_non_v2_manager_is_always_rejected(self, top_B):
         with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
