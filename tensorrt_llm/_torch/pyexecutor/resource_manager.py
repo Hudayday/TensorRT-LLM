@@ -2402,18 +2402,6 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         attn_metadata.set_draft_kv_length_delta(delta)
 
     # ================================================================== #
-    # Optional startup callback. This is not a request-lifecycle hook.    #
-    # ================================================================== #
-
-    def prewarm(self) -> None:
-        """Optional startup warmup after autotuning and before graph capture.
-
-        Compression methods may override this to compile or allocate private
-        fixed-shape workspaces. Implementations must not create requests or
-        mutate live KV-cache state.
-        """
-
-    # ================================================================== #
     # KV-cache request-lifecycle hooks (5, in temporal order).           #
     # Subclasses override what they need; all default to no-op.          #
     # ================================================================== #

@@ -104,7 +104,7 @@ l0_b200:
   - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
   - test_e2e.py::test_openai_chat_guided_decoding[openai/gpt-oss-120b]
   - unittest/_torch/attention
-  - unittest/_torch/kv_cache_compression/test_triattention_cuda_graph.py TIMEOUT (120)
+  - unittest/_torch/kv_cache_compression/test_triattention_eager.py TIMEOUT (120)
   - unittest/_torch/kv_cache_compression/test_triattention_pipeline.py TIMEOUT (120)
   - unittest/_torch/compilation
   - unittest/_torch/debugger
