@@ -1687,91 +1687,81 @@ class TriAttention(BaseKVCacheCompressionManager):
         gen_requests = scheduled_batch.generation_requests
         if not gen_requests:
             return
-        active_requests = []
+        mgr = self.kv_cache_manager
+        resolved_requests = []
         for request in gen_requests:
             if request.is_dummy or request.state in (
                 LlmRequestState.GENERATION_COMPLETE,
                 LlmRequestState.CONTEXT_INIT,
             ):
                 continue
-            kv_cache = self.kv_cache_manager.kv_cache_map.get(request.py_request_id)
+            request_id = request.py_request_id
+            kv_cache = mgr.kv_cache_map.get(request_id)
             if kv_cache is None:
                 continue
             if not kv_cache.is_active:
                 raise RuntimeError(
                     "TriAttention cannot finalize a suspended target KV cache; "
-                    f"request {request.py_request_id} must be resumed before "
+                    f"request {request_id} must be resumed before "
                     "the final update hook"
                 )
-            if request.py_request_id not in self._request_states:
+            if request_id not in self._request_states:
                 self.on_request_init(request)
-            active_requests.append(request)
-        if not active_requests or not self._calibrated:
+            resolved_requests.append((request, request_id, kv_cache))
+        if not resolved_requests or not self._calibrated:
             return
-        mgr = self.kv_cache_manager
-        num_layers = self._num_layers_from_manager()
         protected_tails: Dict[int, int] = {}
+        eviction_groups = {}
 
-        # (1) bump per-request step counters; collect who evicts THIS step.
-        evict_now = []
-        for request in active_requests:
-            rid = request.py_request_id
-            kv_cache = mgr.kv_cache_map.get(rid)
-            if kv_cache is None or not kv_cache.is_active:
-                continue
+        # Resolve every active target cache before changing cadence state. The
+        # captured cache objects also avoid repeating the V2 map lookup here.
+        for request, request_id, kv_cache in resolved_requests:
             raw_capacity = int(kv_cache.capacity)
             # One-engine speculative decoding keeps a fixed reserve E. Under
             # overlap, B(n) is allocated/enqueued before finalizing B(n-1), so
             # its exact scheduler growth Q is also opaque. Both spans are
             # contiguous after the stable target prefix and move byte-for-byte.
             protected_tail = int(mgr.num_extra_kv_tokens) + self._inflight_generation_growth(
-                scheduled_batch, rid
+                scheduled_batch, request_id
             )
             seq_len = raw_capacity - protected_tail
             if seq_len < 0 or protected_tail < 0:
                 raise RuntimeError(
-                    f"Request {rid} has an inconsistent protected target tail: "
+                    f"Request {request_id} has an inconsistent protected target tail: "
                     f"confirmed={seq_len}, capacity={raw_capacity}, "
                     f"protected_tail={protected_tail}"
                 )
             if seq_len < kv_cache.history_length:
                 raise RuntimeError(
-                    f"Request {rid} KV length {seq_len} is below finalized "
+                    f"Request {request_id} KV length {seq_len} is below finalized "
                     f"history {kv_cache.history_length}"
                 )
-            request_state = self._request_states[rid]
+            request_state = self._request_states[request_id]
             request_state.confirmed_kv_length = seq_len
-            protected_tails[rid] = protected_tail
             previous_step = request_state.generation_steps
             confirmed_delta = 1 + int(request.py_num_accepted_draft_tokens)
             step = previous_step + confirmed_delta
             request_state.generation_steps = step
-            if previous_step // self.beta < step // self.beta:
-                if seq_len > self._minimum_evictable_length(request, seq_len):
-                    evict_now.append((request, rid))
+            if previous_step // self.beta >= step // self.beta:
+                continue
+            keep_count = self._minimum_evictable_length(request, seq_len)
+            if seq_len <= keep_count:
+                continue
+            protected_tails[request_id] = protected_tail
+            prompt_len = min(int(request.py_prompt_len), seq_len)
+            key = (prompt_len, keep_count)
+            eviction_groups.setdefault(key, []).append((request, request_id))
 
         # (2) Compact all affected dense and kernel-masked SWA layers, then release
         # the unreachable tail directly through V2's public resize primitive.
-        if not evict_now:
+        if not eviction_groups:
             return
-        protected_tail_lengths = {rid: protected_tails[rid] for _, rid in evict_now}
-        # Prompt and retained geometry define selection and destination layout.
-        # Requests with the same geometry execute eagerly in bounded chunks.
-        # Chunking limits workspace memory.
-        eviction_groups = {}
-        for request, rid in evict_now:
-            seq_len = self._request_states[rid].confirmed_kv_length
-            if seq_len is None:
-                raise RuntimeError(f"Missing confirmed KV length for request {rid}")
-            prompt_len = min(int(request.py_prompt_len), seq_len)
-            keep_count = self._minimum_evictable_length(request, seq_len)
-            key = (prompt_len, keep_count)
-            eviction_groups.setdefault(key, []).append((request, rid))
+        num_layers = self._num_layers_from_manager()
 
         for group in eviction_groups.values():
             for begin in range(0, len(group), _EAGER_REQUEST_CHUNK_SIZE):
                 chunk = group[begin : begin + _EAGER_REQUEST_CHUNK_SIZE]
-                chunk_tails = {rid: protected_tail_lengths[rid] for _, rid in chunk}
+                chunk_tails = {rid: protected_tails[rid] for _, rid in chunk}
                 with nvtx_range_debug("triattention.evict_request_group", color="purple"):
                     capacity_targets = self._evict_requests(
                         chunk,

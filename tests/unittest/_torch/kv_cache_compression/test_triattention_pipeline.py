@@ -612,6 +612,38 @@ class TestStepEndHookRefactor:
             "exit:triattention.resize",
         ]
 
+    def test_suspended_cache_rejects_batch_before_cadence_mutation(self):
+        manager, first_request, _ = self._make_due_decode_request(
+            seq_len=1024 + 4096 + 1
+        )
+        second_request = _make_request(8, py_prompt_len=1024)
+        manager.kv_cache_manager.kv_cache_map[8] = SimpleNamespace(is_active=False)
+        first_state = manager._request_states[7]
+        second_state = _set_request_state(manager, 8, generation_steps=127)
+        batch = SimpleNamespace(generation_requests=[first_request, second_request])
+
+        with pytest.raises(RuntimeError, match="request 8 must be resumed"):
+            manager._periodic_evict(batch)
+
+        assert first_state.generation_steps == 127
+        assert first_state.confirmed_kv_length is None
+        assert second_state.generation_steps == 127
+        assert second_state.confirmed_kv_length is None
+
+    def test_non_boundary_step_skips_eviction_geometry(self):
+        manager, _, batch = self._make_due_decode_request(
+            seq_len=1024 + 4096 + 1
+        )
+        state = manager._request_states[7]
+        state.generation_steps = 126
+
+        with mock.patch.object(manager, "_minimum_evictable_length") as keep_count:
+            manager._periodic_evict(batch)
+
+        keep_count.assert_not_called()
+        assert state.generation_steps == 127
+        assert state.confirmed_kv_length == 1024 + 4096 + 1
+
     def test_eager_eviction_chunks_large_due_cohort(self):
         manager, _, _ = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
         requests = []
