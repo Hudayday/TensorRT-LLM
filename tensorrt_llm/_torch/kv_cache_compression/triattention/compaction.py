@@ -25,9 +25,8 @@ class _CppCompactGroup(NamedTuple):
     """Tensors for one layered sparse-KV updater launch."""
 
     pools: Tuple[torch.Tensor, ...]
-    page_tables: Tuple[torch.Tensor, ...]
+    page_table: torch.Tensor
     pool_pointers: torch.Tensor
-    page_table_pointers: torch.Tensor
     source_layer_indices: Optional[torch.Tensor]
 
 
@@ -41,13 +40,163 @@ def _run_cpp_compact_layers(
     torch.ops.trtllm.sparse_kv_cache_compact_layers(
         list(group.pools),
         group.pool_pointers,
-        list(group.page_tables),
-        group.page_table_pointers,
+        group.page_table,
         source,
         offsets,
         group.source_layer_indices,
         destination_base,
     )
+
+
+class _PreparedPackCompactionSources:
+    """Replay one fixed compaction-source packing launch."""
+
+    def __init__(
+        self,
+        selected_indices: torch.Tensor,
+        valid_seq_lens: torch.Tensor,
+        dense_offsets: torch.Tensor,
+        dense_indices: torch.Tensor,
+        *,
+        eviction_mode: str,
+        prompt_len: int,
+        keep_count: int,
+        num_dense_layers: int,
+        num_kv_heads: int,
+        max_protected_tail: int,
+        swa_window: int,
+        swa_offsets: Optional[torch.Tensor],
+        swa_indices: Optional[torch.Tensor],
+    ) -> None:
+        if eviction_mode not in ("union", "per_head", "per_layer_perhead"):
+            raise ValueError(f"unsupported compaction mode: {eviction_mode}")
+        request_count = int(selected_indices.shape[0]) if selected_indices.ndim else 0
+        per_layer = eviction_mode == "per_layer_perhead"
+        union = eviction_mode == "union"
+        if union:
+            selection_rows = 1
+        elif per_layer:
+            selection_rows = num_dense_layers * num_kv_heads
+        else:
+            selection_rows = num_kv_heads
+        selection_prefix = (request_count,) if union else (request_count, selection_rows)
+        dense_prefix = (num_dense_layers, num_kv_heads) if per_layer else (num_kv_heads,)
+        if (
+            request_count <= 0
+            or min(keep_count, num_dense_layers, num_kv_heads) <= 0
+            or min(prompt_len, max_protected_tail, swa_window) < 0
+            or tuple(selected_indices.shape) != (*selection_prefix, prompt_len + keep_count)
+            or valid_seq_lens.shape != (request_count,)
+            or dense_offsets.shape != (request_count + 1,)
+            or dense_indices.ndim != len(dense_prefix) + 1
+            or tuple(dense_indices.shape[:-1]) != dense_prefix
+        ):
+            raise ValueError("prepared compaction packing requires one valid fixed geometry")
+
+        device = selected_indices.device
+        fixed_tensors = (selected_indices, valid_seq_lens, dense_offsets, dense_indices)
+        if any(
+            not tensor.is_cuda
+            or tensor.dtype != torch.int32
+            or tensor.device != device
+            or not tensor.is_contiguous()
+            for tensor in fixed_tensors
+        ):
+            raise ValueError("prepared compaction packing requires contiguous CUDA int32 tensors")
+
+        has_swa = swa_offsets is not None or swa_indices is not None
+        if has_swa:
+            if (
+                swa_offsets is None
+                or swa_indices is None
+                or swa_window <= 0
+                or swa_offsets.shape != (request_count + 1,)
+                or swa_indices.ndim != 2
+                or tuple(swa_indices.shape[:-1]) != (num_kv_heads,)
+                or any(
+                    not tensor.is_cuda
+                    or tensor.dtype != torch.int32
+                    or tensor.device != device
+                    or not tensor.is_contiguous()
+                    for tensor in (swa_offsets, swa_indices)
+                )
+            ):
+                raise ValueError("prepared SWA packing buffers do not match the fixed geometry")
+            swa_offsets_arg = swa_offsets
+            swa_indices_arg = swa_indices
+            swa_total = int(swa_indices.shape[-1])
+        else:
+            if swa_window != 0:
+                raise ValueError("prepared SWA packing requires source buffers")
+            # HAS_SWA specializes all corresponding loads and stores away.
+            swa_offsets_arg = dense_offsets
+            swa_indices_arg = dense_indices
+            swa_total = 0
+
+        from .triattention_kernels import _pack_compaction_sources_kernel
+
+        block = 256
+        max_move = keep_count + max_protected_tail
+        if has_swa:
+            max_move = max(max_move, swa_window + max_protected_tail)
+        domain_count = num_dense_layers * num_kv_heads if per_layer else num_kv_heads
+        grid = (request_count, domain_count, (max_move + block - 1) // block)
+        self.device = device
+        self.tensors = (
+            selected_indices,
+            valid_seq_lens,
+            dense_offsets,
+            dense_indices,
+            swa_offsets_arg,
+            swa_indices_arg,
+        )
+        self.constants = (
+            int(dense_indices.shape[-1]),
+            swa_total,
+            selection_rows,
+            prompt_len + keep_count,
+            keep_count,
+            prompt_len,
+            num_kv_heads,
+            swa_window,
+            union,
+            per_layer,
+            has_swa,
+            block,
+        )
+        with torch.cuda.device(device):
+            self.stream = torch.cuda.current_stream(device)
+            compiled = _pack_compaction_sources_kernel.warmup(
+                *self.tensors,
+                DENSE_TOTAL=self.constants[0],
+                SWA_TOTAL=self.constants[1],
+                SELECTION_ROWS=self.constants[2],
+                SELECTION_STRIDE=self.constants[3],
+                KEEP_COUNT=self.constants[4],
+                PROMPT_LEN=self.constants[5],
+                NUM_KV_HEADS=self.constants[6],
+                SWA_WINDOW=self.constants[7],
+                UNION=self.constants[8],
+                PER_LAYER=self.constants[9],
+                HAS_SWA=self.constants[10],
+                BLOCK=self.constants[11],
+                num_warps=4,
+                grid=grid,
+            )
+            self.runner = compiled[grid]
+
+    def __call__(self) -> None:
+        current_stream = torch.cuda.current_stream(self.device)
+        if (current_stream.device, current_stream.cuda_stream) != (
+            self.stream.device,
+            self.stream.cuda_stream,
+        ):
+            raise RuntimeError("prepared compaction packing must run on its workspace stream")
+        self.runner(
+            *self.tensors,
+            *self.constants,
+            stream=self.stream.cuda_stream,
+        )
 
 
 class BatchedCompactionWorkspace:
@@ -109,9 +258,7 @@ class BatchedCompactionWorkspace:
         ):
             raise ValueError("protected-tail lengths must match the request count")
         self.protected_tail_lengths = tuple(int(length) for length in protected_tail_lengths)
-        self._uniform_protected_tail_length = (
-            self.protected_tail_lengths[0] if len(set(self.protected_tail_lengths)) == 1 else None
-        )
+        self.max_protected_tail = max(self.protected_tail_lengths, default=0)
         self.dense_layers = tuple(int(layer) for layer in dense_layers)
         self.swa_layers = tuple(int(layer) for layer in swa_layers)
         if layer_pool_keys is None:
@@ -146,7 +293,6 @@ class BatchedCompactionWorkspace:
         move_offsets = [0]
         for count in move_counts:
             move_offsets.append(move_offsets[-1] + count)
-        self._move_offsets = tuple(move_offsets)
         cpp_index_shape = (
             (len(self.dense_layers), cpp_num_kv_heads, move_offsets[-1])
             if self.eviction_mode == "per_layer_perhead"
@@ -163,40 +309,18 @@ class BatchedCompactionWorkspace:
             device=self.device,
         )
         self.dense_destination_base = self.prompt_len
-        max_protected_tail = max(self.protected_tail_lengths, default=0)
-        self.protected_tail_offsets = torch.arange(
-            max_protected_tail,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.protected_tail_source = torch.empty(
-            self.request_count,
-            max_protected_tail,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.cpp_page_tables = {}
+        cpp_page_tables = {}
 
         def page_table_for(representative: int) -> torch.Tensor:
-            if representative not in self.cpp_page_tables:
-                source_pages = score_workspace.page_ids_device[
-                    score_workspace.representative_slots[representative],
-                    : self.request_count,
-                ]
-                if source_pages.device != self.device or source_pages.dtype not in (
-                    torch.int32,
-                    torch.int64,
-                ):
-                    raise ValueError("page tables must be integer tensors on the pool device")
-                self.cpp_page_tables[representative] = (
-                    source_pages,
-                    torch.empty(
-                        source_pages.shape,
-                        dtype=torch.int32,
-                        device=self.device,
-                    ).contiguous(),
-                )
-            return self.cpp_page_tables[representative][1]
+            slot = score_workspace.representative_slots[representative]
+            if slot not in cpp_page_tables:
+                block_offsets = score_workspace.block_offsets_device[slot, : self.request_count, 0]
+                if block_offsets.device != self.device or block_offsets.dtype != torch.int32:
+                    raise ValueError("block offsets must be int32 tensors on the pool device")
+                if block_offsets.ndim != 2 or block_offsets.stride(1) != 1:
+                    raise ValueError("K block offsets must have a contiguous block dimension")
+                cpp_page_tables[slot] = block_offsets
+            return cpp_page_tables[slot]
 
         dense_entries = [
             (
@@ -207,31 +331,20 @@ class BatchedCompactionWorkspace:
             for layer in self.dense_layers
         ]
 
-        self.swa_source = None
         self.swa_indices = None
         self.swa_destination_base = None
         self.swa_offsets = None
-        self.swa_source_offsets = None
+        self.swa_window = 0
         swa_entries = []
         if self.swa_layers:
             if swa_window is None or swa_window <= 0 or self.keep_count < swa_window:
                 raise ValueError("SWA compaction requires a valid retained window")
+            self.swa_window = int(swa_window)
             swa_move_counts = [int(swa_window) + length for length in self.protected_tail_lengths]
             swa_move_offsets = [0]
             for count in swa_move_counts:
                 swa_move_offsets.append(swa_move_offsets[-1] + count)
-            self._swa_move_offsets = tuple(swa_move_offsets)
             total_swa = swa_move_offsets[-1]
-            self.swa_source_offsets = tuple(
-                torch.arange(
-                    -int(swa_window),
-                    length,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-                for length in self.protected_tail_lengths
-            )
-            self.swa_source = torch.empty(total_swa, dtype=torch.int32, device=self.device)
             self.swa_indices = torch.empty(
                 cpp_num_kv_heads,
                 total_swa,
@@ -271,6 +384,8 @@ class BatchedCompactionWorkspace:
                     raise ValueError(
                         "layered compaction requires a distinct pool view for every layer"
                     )
+                if len({int(page_table.data_ptr()) for page_table in page_tables}) != 1:
+                    raise ValueError("layers in one V2 pool must share one block-offset table")
                 source_layer_indices = None
                 if mode == "dense" and self.eviction_mode == "per_layer_perhead":
                     source_layer_indices = torch.tensor(
@@ -281,14 +396,9 @@ class BatchedCompactionWorkspace:
                 result.append(
                     _CppCompactGroup(
                         pools=pools,
-                        page_tables=page_tables,
+                        page_table=page_tables[0],
                         pool_pointers=torch.tensor(
                             [pool.data_ptr() for pool in pools],
-                            dtype=torch.int64,
-                            device=self.device,
-                        ),
-                        page_table_pointers=torch.tensor(
-                            [page_table.data_ptr() for page_table in page_tables],
                             dtype=torch.int64,
                             device=self.device,
                         ),
@@ -299,35 +409,25 @@ class BatchedCompactionWorkspace:
 
         self.cpp_dense_groups = compact_groups(dense_entries, "dense")
         self.cpp_swa_groups = compact_groups(swa_entries, "swa")
+        self._pack_compaction_sources = _PreparedPackCompactionSources(
+            self.selection_workspace.keep[: self.request_count],
+            self.score_workspace.valid_seq_lens_device[: self.request_count],
+            self.cpp_offsets,
+            self.cpp_indices,
+            eviction_mode=self.eviction_mode,
+            prompt_len=self.prompt_len,
+            keep_count=self.decode_keep_count,
+            num_dense_layers=len(self.dense_layers),
+            num_kv_heads=self.cpp_num_kv_heads,
+            max_protected_tail=self.max_protected_tail,
+            swa_window=self.swa_window,
+            swa_offsets=self.swa_offsets,
+            swa_indices=self.swa_indices,
+        )
 
     def launch(self) -> None:
         """Stage dynamic metadata and run C++ dense/SWA compact launches."""
-        if self.swa_source is not None:
-            assert self.swa_source_offsets is not None
-            assert self.swa_indices is not None
-            uniform_tail = self._uniform_protected_tail_length
-            if uniform_tail is not None:
-                source_offsets = self.swa_source_offsets[0]
-                torch.add(
-                    self.score_workspace.valid_seq_lens_device[: self.request_count].view(
-                        self.request_count, 1
-                    ),
-                    source_offsets.view(1, -1),
-                    out=self.swa_source.view(self.request_count, -1),
-                )
-            else:
-                for request_index, source_offsets in enumerate(self.swa_source_offsets):
-                    begin = self._swa_move_offsets[request_index]
-                    end = self._swa_move_offsets[request_index + 1]
-                    torch.add(
-                        self.score_workspace.valid_seq_lens_device[request_index],
-                        source_offsets,
-                        out=self.swa_source[begin:end],
-                    )
-            self.swa_indices.copy_(self.swa_source.reshape(1, -1).expand(self.cpp_num_kv_heads, -1))
-        for source_pages, staged_i32 in self.cpp_page_tables.values():
-            staged_i32.copy_(source_pages)
-        self._stage_dense_indices()
+        self._pack_compaction_sources()
         for group in self.cpp_dense_groups:
             _run_cpp_compact_layers(
                 group,
@@ -345,107 +445,3 @@ class BatchedCompactionWorkspace:
                     self.swa_offsets,
                     self.swa_destination_base,
                 )
-
-    def _stage_dense_indices(self) -> None:
-        """Pack selected decode tokens and opaque protected tail."""
-        keep = self.selection_workspace.keep[: self.request_count]
-        decode_keep = keep[..., self.prompt_len :]
-        per_layer = None
-        if self.eviction_mode == "per_layer_perhead":
-            per_layer = decode_keep.view(
-                self.request_count,
-                len(self.dense_layers),
-                self.cpp_num_kv_heads,
-                self.decode_keep_count,
-            )
-        uniform_tail = self._uniform_protected_tail_length
-        if uniform_tail is not None:
-            move_count = self.decode_keep_count + uniform_tail
-            if self.eviction_mode == "per_layer_perhead":
-                assert per_layer is not None
-                target = self.cpp_indices.view(
-                    len(self.dense_layers),
-                    self.cpp_num_kv_heads,
-                    self.request_count,
-                    move_count,
-                )
-                target_keep = target[:, :, :, : self.decode_keep_count]
-                target_keep.copy_(per_layer.permute(1, 2, 0, 3))
-            else:
-                target = self.cpp_indices.view(
-                    self.cpp_num_kv_heads,
-                    self.request_count,
-                    move_count,
-                )
-                target_keep = target[:, :, : self.decode_keep_count]
-                if self.eviction_mode == "union":
-                    target_keep.copy_(
-                        decode_keep.view(
-                            1,
-                            self.request_count,
-                            self.decode_keep_count,
-                        )
-                    )
-                else:
-                    target_keep.copy_(decode_keep.permute(1, 0, 2))
-            if uniform_tail:
-                torch.add(
-                    self.score_workspace.valid_seq_lens_device[: self.request_count].view(
-                        self.request_count, 1
-                    ),
-                    self.protected_tail_offsets[:uniform_tail].view(1, uniform_tail),
-                    out=self.protected_tail_source[:, :uniform_tail],
-                )
-                tail_source = self.protected_tail_source[:, :uniform_tail]
-                if self.eviction_mode == "per_layer_perhead":
-                    target[:, :, :, self.decode_keep_count :].copy_(
-                        tail_source.view(1, 1, self.request_count, uniform_tail).expand(
-                            len(self.dense_layers),
-                            self.cpp_num_kv_heads,
-                            self.request_count,
-                            uniform_tail,
-                        )
-                    )
-                else:
-                    target[:, :, self.decode_keep_count :].copy_(
-                        tail_source.view(1, self.request_count, uniform_tail).expand(
-                            self.cpp_num_kv_heads,
-                            self.request_count,
-                            uniform_tail,
-                        )
-                    )
-            return
-        for request_index, tail_length in enumerate(self.protected_tail_lengths):
-            begin = self._move_offsets[request_index]
-            keep_end = begin + self.decode_keep_count
-            if self.eviction_mode == "per_layer_perhead":
-                assert per_layer is not None
-                target_keep = self.cpp_indices[:, :, begin:keep_end]
-                target_keep.copy_(per_layer[request_index])
-            else:
-                target_keep = self.cpp_indices[:, begin:keep_end]
-                if self.eviction_mode == "union":
-                    target_keep.copy_(
-                        decode_keep[request_index]
-                        .view(1, self.decode_keep_count)
-                        .expand_as(target_keep)
-                    )
-                else:
-                    target_keep.copy_(decode_keep[request_index])
-            if tail_length:
-                torch.add(
-                    self.score_workspace.valid_seq_lens_device[request_index],
-                    self.protected_tail_offsets[:tail_length],
-                    out=self.protected_tail_source[request_index, :tail_length],
-                )
-                tail_source = self.protected_tail_source[request_index, :tail_length]
-                if self.eviction_mode == "per_layer_perhead":
-                    self.cpp_indices[:, :, keep_end : keep_end + tail_length].copy_(
-                        tail_source.view(1, 1, tail_length).expand(
-                            len(self.dense_layers), self.cpp_num_kv_heads, tail_length
-                        )
-                    )
-                else:
-                    self.cpp_indices[:, keep_end : keep_end + tail_length].copy_(
-                        tail_source.view(1, tail_length).expand(self.cpp_num_kv_heads, tail_length)
-                    )

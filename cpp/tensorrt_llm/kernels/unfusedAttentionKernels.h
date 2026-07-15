@@ -418,8 +418,8 @@ void invokeUpdateSparseKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
 //! each request and head, source ordinals must increase strictly and satisfy
 //! destinationBase + move <= source[move].
 template <typename T>
-void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int64_t const* pageTablePointers,
-    int32_t numLayers, int32_t maxPagesPerSeq, int32_t const* sparseKvIndices, int32_t const* sourceLayerIndices,
+void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int32_t const* pageTable, int32_t numLayers,
+    int64_t pageTableRequestStride, int32_t const* sparseKvIndices, int32_t const* sourceLayerIndices,
     int64_t sourceLayerStride, int32_t const* sparseKvOffsets, int32_t destinationBase, int32_t batchSize,
     int32_t numKvHeads, int32_t tokensPerBlock, int32_t headDim, cudaStream_t stream);
 

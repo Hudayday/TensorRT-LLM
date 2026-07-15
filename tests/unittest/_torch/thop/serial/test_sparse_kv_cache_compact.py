@@ -17,11 +17,26 @@ _NUM_KV_HEADS = 2
 _BATCH_SIZE = 2
 _MAX_PAGES_PER_SEQUENCE = 3
 _NUM_PAGES = _BATCH_SIZE * _MAX_PAGES_PER_SEQUENCE
+_PAGE_INDEX_DIVISOR = 2
+
+
+def _encode_k_block_offsets(
+    page_table: torch.Tensor, page_index_scale: int = _PAGE_INDEX_DIVISOR
+) -> torch.Tensor:
+    encoded = torch.empty(
+        page_table.shape[0],
+        2,
+        page_table.shape[1],
+        dtype=torch.int32,
+        device=page_table.device,
+    )
+    encoded[:, 0] = page_table * page_index_scale
+    encoded[:, 1] = encoded[:, 0] + 1
+    return encoded[:, 0]
 
 
 class _DeviceArguments(NamedTuple):
     pool_pointers: torch.Tensor
-    page_table_pointers: torch.Tensor
     source_indices: torch.Tensor
     source_offsets: torch.Tensor
     source_layer_indices: Optional[torch.Tensor]
@@ -31,9 +46,11 @@ def _make_pools(
     num_layers: int,
     dtype: torch.dtype,
     head_dim: int,
+    page_index_scale: int = _PAGE_INDEX_DIVISOR,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    num_pages = _NUM_PAGES * page_index_scale // _PAGE_INDEX_DIVISOR
     shape = (
-        _NUM_PAGES,
+        num_pages,
         2,
         _NUM_KV_HEADS,
         _TOKENS_PER_BLOCK,
@@ -45,14 +62,17 @@ def _make_pools(
         for layer in range(num_layers)
     ]
     pools = [pool.cuda() for pool in pools_cpu]
-    page_table = torch.tensor([[4, 1, 5], [2, 0, 3]], dtype=torch.int32, device="cuda")
-    page_tables = [page_table.clone() for _ in range(num_layers)]
+    raw_pages = [[4, 1, 5], [2, 0, 3]]
+    assert set(raw_pages[0]).isdisjoint(raw_pages[1])
+    raw_page_table = torch.tensor(raw_pages, dtype=torch.int32, device="cuda")
+    page_table = _encode_k_block_offsets(raw_page_table, page_index_scale)
+    page_tables = [page_table] * num_layers
+    assert page_tables[0].stride(0) == 2 * page_tables[0].shape[1]
     return pools_cpu, pools, page_tables
 
 
 def _device_arguments(
     pools: list[torch.Tensor],
-    page_tables: list[torch.Tensor],
     source_indices: torch.Tensor,
     source_offsets: torch.Tensor,
     source_layer_indices: Optional[torch.Tensor] = None,
@@ -61,11 +81,6 @@ def _device_arguments(
     return _DeviceArguments(
         pool_pointers=torch.tensor(
             [pool.data_ptr() for pool in pools], dtype=torch.int64, device=device
-        ),
-        page_table_pointers=torch.tensor(
-            [page_table.data_ptr() for page_table in page_tables],
-            dtype=torch.int64,
-            device=device,
         ),
         source_indices=source_indices.to(device),
         source_offsets=source_offsets.to(device),
@@ -88,6 +103,7 @@ def _reference_compact(
     for group_layer, (source_pool, destination_pool, page_table) in enumerate(
         zip(original, expected, page_tables)
     ):
+        raw_page_table = page_table // _PAGE_INDEX_DIVISOR
         if source_indices.ndim == 2:
             layer_sources = source_indices
         else:
@@ -100,9 +116,9 @@ def _reference_compact(
                 for request_move, global_move in enumerate(range(begin, end)):
                     source_token = int(layer_sources[head, global_move])
                     destination_token = destination_base + request_move
-                    source_page = int(page_table[request, source_token // _TOKENS_PER_BLOCK])
+                    source_page = int(raw_page_table[request, source_token // _TOKENS_PER_BLOCK])
                     destination_page = int(
-                        page_table[request, destination_token // _TOKENS_PER_BLOCK]
+                        raw_page_table[request, destination_token // _TOKENS_PER_BLOCK]
                     )
                     destination_pool[
                         destination_page,
@@ -129,8 +145,7 @@ def _compact(
     torch.ops.trtllm.sparse_kv_cache_compact_layers(
         pools,
         arguments.pool_pointers,
-        page_tables,
-        arguments.page_table_pointers,
+        page_tables[0],
         arguments.source_indices,
         arguments.source_offsets,
         arguments.source_layer_indices,
@@ -149,9 +164,12 @@ def _compact(
         (torch.float32, 256),
     ],
 )
-@pytest.mark.parametrize("destination_base", [0, 2])
-def test_sparse_kv_cache_compact_layers(dtype, head_dim, destination_base):
-    pools_cpu, pools, page_tables = _make_pools(3, dtype, head_dim)
+@pytest.mark.parametrize(
+    "destination_base,page_index_scale",
+    [(0, 2), (2, 2), (2, 4)],
+)
+def test_sparse_kv_cache_compact_layers(dtype, head_dim, destination_base, page_index_scale):
+    pools_cpu, pools, page_tables = _make_pools(3, dtype, head_dim, page_index_scale)
     page_tables_cpu = [page_table.cpu() for page_table in page_tables]
     source_offsets = torch.tensor([0, 3, 6], dtype=torch.int32)
     source_row = torch.tensor([2, 5, 8, 3, 7, 10], dtype=torch.int32)
@@ -163,7 +181,7 @@ def test_sparse_kv_cache_compact_layers(dtype, head_dim, destination_base):
         source_offsets,
         destination_base,
     )
-    arguments = _device_arguments(pools, page_tables, source_indices, source_offsets)
+    arguments = _device_arguments(pools, source_indices, source_offsets)
 
     _compact(pools, page_tables, arguments, destination_base)
     torch.cuda.synchronize()
@@ -196,7 +214,6 @@ def test_sparse_kv_cache_compact_layers_per_layer_source():
     )
     arguments = _device_arguments(
         pools,
-        page_tables,
         source_indices,
         source_offsets,
         source_layer_indices,
@@ -222,10 +239,12 @@ def test_sparse_kv_cache_compact_layers_multiple_tiles():
         for layer in range(num_layers)
     ]
     pools = [pool.cuda() for pool in pools_cpu]
-    page_table = torch.arange(num_pages, dtype=torch.int32, device="cuda").reshape(
+    raw_page_table = torch.arange(num_pages, dtype=torch.int32, device="cuda").reshape(
         _BATCH_SIZE, max_pages_per_sequence
     )
-    page_tables = [page_table.clone() for _ in range(num_layers)]
+    page_table = _encode_k_block_offsets(raw_page_table)
+    page_tables = [page_table] * num_layers
+    assert page_tables[0].stride(0) == 2 * max_pages_per_sequence
     page_tables_cpu = [table.cpu() for table in page_tables]
     source_offsets = torch.tensor([0, 40, 75], dtype=torch.int32)
     source_row = torch.cat((torch.arange(40, 80), torch.arange(36, 71))).to(torch.int32)
@@ -238,7 +257,7 @@ def test_sparse_kv_cache_compact_layers_multiple_tiles():
         source_offsets,
         destination_base,
     )
-    arguments = _device_arguments(pools, page_tables, source_indices, source_offsets)
+    arguments = _device_arguments(pools, source_indices, source_offsets)
 
     _compact(pools, page_tables, arguments, destination_base)
     torch.cuda.synchronize()
@@ -263,7 +282,7 @@ def test_sparse_kv_cache_compact_layers_cuda_graph_replay():
         source_offsets,
         destination_base,
     )
-    arguments = _device_arguments(pools, page_tables, source_indices, source_offsets)
+    arguments = _device_arguments(pools, source_indices, source_offsets)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

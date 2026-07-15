@@ -41,11 +41,13 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
     _PreparedEviction,
     _PreparedGenerationBatch,
     _RequestCompressionState,
+    _RuntimeKVLayout,
 )
 
 # Framework base class lives in pyexecutor.resource_manager; the factory lives
 # in pyexecutor._util (next to _create_kv_cache_manager), matching #15106.
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheCompressionConfig,
@@ -58,6 +60,23 @@ CUDA_REQUIRED = pytest.mark.skipif(
 )
 
 _TORCH_TOPK_ORACLE = torch.topk
+
+
+def _encode_block_offsets(page_ids: torch.Tensor) -> torch.Tensor:
+    """Build the native V2 [pool, request, K/V, block] layout."""
+    if page_ids.ndim == 2:
+        page_ids = page_ids.unsqueeze(0)
+    encoded = torch.empty(
+        page_ids.shape[0],
+        page_ids.shape[1],
+        2,
+        page_ids.shape[2],
+        dtype=torch.int32,
+        device=page_ids.device,
+    )
+    encoded[:, :, 0] = page_ids.to(torch.int32) * 2
+    encoded[:, :, 1] = encoded[:, :, 0] + 1
+    return encoded
 
 
 def _set_request_state(
@@ -90,7 +109,7 @@ def _prepared_eviction(
         request=request,
         request_id=request_id,
         seq_len=seq_len,
-        round_start=float(seq_len if round_start is None else round_start),
+        round_start=int(seq_len if round_start is None else round_start),
         expected_keep_count=expected_keep_count,
         protected_tail=protected_tail,
     )
@@ -376,6 +395,51 @@ class TestKvCacheCompressionConfig:
 
 
 class TestTriAttentionClass:
+    def test_cached_layout_checks_page_counts_without_rebuilding_pool_views(self):
+        page_count_query = mock.Mock(side_effect=[8, 16, 8, 18])
+        manager = SimpleNamespace(
+            get_buffers=mock.Mock(side_effect=AssertionError("pool view was rebuilt")),
+            impl=SimpleNamespace(get_page_index_upper_bound=page_count_query),
+            kv_factor=2,
+            layer_offsets={10: 100, 11: 101, 12: 102},
+        )
+        triattention = _make_triattention()
+        triattention.kv_cache_manager = manager
+        cached = _RuntimeKVLayout(
+            manager=manager,
+            num_layers=3,
+            global_layers=[10, 11, 12],
+            layer_pools=[torch.empty(4), torch.empty(8), torch.empty(4)],
+            dense_layers=[0, 1, 2],
+            swa_layers=[],
+            swa_window=None,
+            storage_groups={0: [0, 2], 1: [1]},
+            layer_group_representative={0: 0, 1: 1, 2: 0},
+            layer_pool_keys=(0, 1, 0),
+            # These are local layer slots. Layer 2 shares layer 0's pool.
+            pool_representatives=(0, 1),
+            pool_page_counts=(4, 8),
+            pool_view_fingerprint=(),
+        )
+        triattention._runtime_kv_layout_cache = cached
+
+        assert triattention._runtime_kv_layout(3) is cached
+        manager.get_buffers.assert_not_called()
+        assert page_count_query.call_args_list == [
+            mock.call(100, Role.KEY),
+            mock.call(101, Role.KEY),
+        ]
+
+        with pytest.raises(RuntimeError, match="pool layout changed"):
+            triattention._runtime_kv_layout(3)
+        manager.get_buffers.assert_not_called()
+        assert page_count_query.call_args_list == [
+            mock.call(100, Role.KEY),
+            mock.call(101, Role.KEY),
+            mock.call(100, Role.KEY),
+            mock.call(101, Role.KEY),
+        ]
+
     def test_triattention_enables_capacity_only_on_target_manager(self):
         manager = _make_fake_v2()
         triattention = TriAttention(manager, top_B=8, model_path="/models/test")
@@ -516,11 +580,6 @@ class TestStepEndHookRefactor:
 
         mgr, request, batch = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
         timeline = []
-        event = mock.Mock()
-        event.record.side_effect = lambda: timeline.append("event")
-        mgr.kv_cache_manager._stream.wait_event.side_effect = lambda _: timeline.append(
-            "stream_wait"
-        )
         cache = mgr.kv_cache_manager.kv_cache_map[7]
 
         def compact(*args, protected_tail_lengths, **_kwargs):
@@ -536,7 +595,6 @@ class TestStepEndHookRefactor:
 
         with (
             mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict,
-            mock.patch.object(torch.cuda, "Event", return_value=event),
             mock.patch.object(tri_module, "nvtx_range", side_effect=track_range),
         ):
             mgr._periodic_evict(batch)
@@ -546,15 +604,11 @@ class TestStepEndHookRefactor:
             2,
             protected_tail_lengths={7: 0},
         )
-        event.record.assert_called_once_with()
-        event.synchronize.assert_not_called()
-        mgr.kv_cache_manager._stream.wait_event.assert_called_once_with(event)
+        mgr.kv_cache_manager._stream.wait_event.assert_not_called()
         cache.resize.assert_called_once_with(1024 + 4096, None)
         assert timeline == [
             "compact_dispatch",
             "enter:triattention.resize",
-            "event",
-            "stream_wait",
             "exit:triattention.resize",
         ]
 
@@ -828,12 +882,78 @@ class TestTopKRouting:
             )
             selected = workspace.keep[: len(request_scores)].clone()
 
-        assert cute_topk.call_count == 2
+        assert cute_topk.call_count == 1
         for actual, expected_keep in zip(selected, expected):
             assert torch.equal(actual, expected_keep)
 
 
 class TestFixedScoreMetadata:
+    @pytest.mark.parametrize("normalize_scores", [False, True])
+    @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
+    def test_eager_bucket_binds_score_after_selection(self, eviction_mode, normalize_scores):
+        from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
+
+        manager = _make_triattention(
+            top_B=4,
+            eviction_mode=eviction_mode,
+            normalize_scores=normalize_scores,
+        )
+        manager._H = 2
+        manager._F = 2
+        manager._freq_scale_sq = torch.ones(2)
+        manager._offsets = torch.ones(2)
+        manager.calibration = {"omega": torch.ones(2)}
+        manager._local_score_calibration = mock.Mock(return_value=(torch.ones(2, 2, 2),) * 3)
+        manager._page_table_pool_keys = mock.Mock(return_value=[("pool", 0)])
+        pool = torch.empty(8, 2, 1, 4, 4)
+        layout = SimpleNamespace(
+            manager=SimpleNamespace(num_pools=1),
+            num_layers=2,
+            global_layers=[0, 1],
+            layer_pools=[pool, pool],
+            dense_layers=[0, 1],
+            swa_layers=[],
+            storage_groups={0: [0, 1]},
+            pool_view_fingerprint=(("fixed",),),
+        )
+        score_workspace = SimpleNamespace(
+            fused_group=SimpleNamespace(output=torch.empty(1, 4, 8)),
+            bind_score_launcher=mock.Mock(),
+        )
+        selection_workspace = SimpleNamespace(valid_widths=torch.empty(1, dtype=torch.int32))
+        prepared = [
+            _prepared_eviction(
+                _make_request(7),
+                request_id=7,
+                seq_len=8,
+                expected_keep_count=4,
+            )
+        ]
+
+        with (
+            mock.patch.object(
+                module,
+                "_FixedScoreMetadataWorkspace",
+                return_value=score_workspace,
+            ),
+            mock.patch.object(
+                manager,
+                "_build_cross_request_selection_workspace",
+                return_value=selection_workspace,
+            ) as build_selection,
+        ):
+            resources = manager._eager_resources_for(layout, prepared)
+
+        score_workspace.bind_score_launcher.assert_called_once_with(
+            selection_workspace.valid_widths,
+            manager.score_aggregation,
+        )
+        plan = build_selection.call_args.args[0]
+        assert plan.eviction_mode == eviction_mode
+        assert build_selection.call_args.kwargs["normalize_scores"] is normalize_scores
+        assert resources.score_workspace is score_workspace
+        assert resources.selection_workspace is selection_workspace
+
     @CUDA_REQUIRED
     def test_bulk_page_table_copy_uses_immutable_host_snapshots(self):
         from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
@@ -854,37 +974,41 @@ class TestFixedScoreMetadata:
         )
         host_table[0, 0, 0, :5] = torch.tensor([3, 4, 5, 6, 7], dtype=torch.int32)
         host_table[0, 1, 0, :5] = torch.tensor([8, 9, 10, 11, 12], dtype=torch.int32)
-        persistent_copy_idx = torch.zeros(1, dtype=torch.int32, device="cpu", pin_memory=True)
+        selected_slot = [0]
+
+        def gather_k_block_offsets(source, destination, request_ids, num_blocks):
+            assert request_ids == [7]
+            destination[:, :1, 0, :num_blocks].copy_(
+                source[:, selected_slot[0], 0, :num_blocks].unsqueeze(1)
+            )
+
+        gather = mock.Mock(side_effect=gather_k_block_offsets)
 
         workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
         workspace.device = device
         workspace.max_requests = 1
-        workspace.staging_capacity = 1
         workspace.page_count = 5
-        workspace.global_representatives = (10,)
-        workspace._bulk_stage_logged = True
-        workspace.bulk_allocation_done = torch.cuda.Event()
+        workspace.copy_block_count = 8
         workspace.bulk_copy_done = torch.cuda.Event()
         workspace.bulk_consume_done = torch.cuda.Event()
-        workspace.bulk_consume_pending = False
+        workspace.page_tables_active = False
         workspace.copy_done = torch.cuda.Event()
         workspace.copy_pending = False
-        workspace._bulk_offsets_src = None
-        workspace._bulk_offsets_dst = None
-        workspace._bulk_staged_request_ids = None
-        workspace._bulk_copy_idx_src = torch.empty(
+        workspace._bulk_offsets_src = torch.empty(
+            1, 1, 2, 8, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        workspace._bulk_copy_idx_src = torch.arange(
             1, dtype=torch.int32, device="cpu", pin_memory=True
         )
-        workspace.page_ids_device = torch.empty(1, 1, 5, dtype=torch.int64, device=device)
+        workspace.block_offsets_device = torch.empty(1, 1, 2, 8, dtype=torch.int32, device=device)
+        workspace.copy_done.record(current_stream)
 
         manager = SimpleNamespace(
             host_kv_cache_block_offsets=host_table,
             kv_factor=2,
             layer_offsets={10: 0},
             layer_to_pool_mapping_dict={0: 0},
-            index_mapper=SimpleNamespace(
-                get_copy_index=lambda request_ids, num_contexts, beam_width: persistent_copy_idx
-            ),
+            index_mapper=SimpleNamespace(gather_k_block_offsets=gather),
             index_scales=torch.tensor([2], dtype=torch.int32, device="cpu", pin_memory=True),
             kv_offset=torch.tensor([1], dtype=torch.int32, device="cpu", pin_memory=True),
             _stream=manager_stream,
@@ -892,28 +1016,94 @@ class TestFixedScoreMetadata:
 
         with torch.cuda.stream(manager_stream):
             torch.cuda._sleep(50_000_000)
-        assert workspace._stage_page_tables_bulk(manager, [7], current_stream)
+        with mock.patch.object(
+            torch,
+            "index_select",
+            side_effect=AssertionError("page-table staging used torch.index_select"),
+        ):
+            assert workspace._stage_page_tables_bulk(manager, [7], current_stream)
         assert workspace._bulk_offsets_src.shape[-1] == 8
-        assert workspace._bulk_offsets_dst.shape[-1] == 8
+        assert workspace._bulk_offsets_src.shape[1] == 1
 
         # Mutate both persistent V2 host inputs before the delayed kernel reads.
         # The staged result must still reflect row 0 values [3, 4, 5, 6, 7].
         host_table[0, 0, 0, :5] = torch.tensor([13, 14, 15, 16, 17], dtype=torch.int32)
-        persistent_copy_idx[0] = 1
+        selected_slot[0] = 1
         current_stream.synchronize()
 
-        assert workspace.page_ids_device[0, 0].tolist() == [3, 4, 5, 6, 7]
+        assert workspace.block_offsets_device[0, 0, 0, :5].tolist() == [6, 8, 10, 12, 14]
+        assert workspace.block_offsets_device[0, 0, 1, :5].tolist() == [7, 9, 11, 13, 15]
 
         host_table[0, 0, 0, :5] = torch.tensor([18, 19, 20, 21, 22], dtype=torch.int32)
-        persistent_copy_idx[0] = 0
+        selected_slot[0] = 0
         with torch.cuda.stream(manager_stream):
             torch.cuda._sleep(50_000_000)
         assert workspace._stage_page_tables_bulk(manager, [7], current_stream)
         host_table[0, 0, 0, :5] = torch.tensor([23, 24, 25, 26, 27], dtype=torch.int32)
-        persistent_copy_idx[0] = 1
+        selected_slot[0] = 1
         current_stream.synchronize()
 
-        assert workspace.page_ids_device[0, 0].tolist() == [18, 19, 20, 21, 22]
+        assert workspace.block_offsets_device[0, 0, 0, :5].tolist() == [36, 38, 40, 42, 44]
+        assert workspace.block_offsets_device[0, 0, 1, :5].tolist() == [37, 39, 41, 43, 45]
+
+    @CUDA_REQUIRED
+    def test_next_bulk_copy_waits_for_page_table_consumers(self):
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            _FixedScoreMetadataWorkspace,
+        )
+
+        device = torch.device("cuda")
+        current_stream = torch.cuda.current_stream(device)
+        manager_stream = torch.cuda.Stream(device=device)
+        host_table = torch.zeros(1, 1, 2, 4, dtype=torch.int32, device="cpu", pin_memory=True)
+        host_table[0, 0, 0] = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+
+        def gather_k_block_offsets(source, destination, request_ids, num_blocks):
+            assert request_ids == [7]
+            destination[:, :1, 0, :num_blocks].copy_(source[:, :1, 0, :num_blocks])
+
+        workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
+        workspace.device = device
+        workspace.max_requests = 1
+        workspace.copy_block_count = 4
+        workspace.bulk_copy_done = torch.cuda.Event()
+        workspace.bulk_consume_done = torch.cuda.Event()
+        workspace.page_tables_active = False
+        workspace.copy_done = torch.cuda.Event()
+        workspace.copy_pending = False
+        workspace._bulk_offsets_src = torch.empty(
+            1, 1, 2, 4, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        workspace._bulk_copy_idx_src = torch.arange(
+            1, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        workspace.block_offsets_device = torch.empty(1, 1, 2, 4, dtype=torch.int32, device=device)
+        workspace.copy_done.record(current_stream)
+        manager = SimpleNamespace(
+            host_kv_cache_block_offsets=host_table,
+            kv_factor=2,
+            index_mapper=SimpleNamespace(
+                gather_k_block_offsets=mock.Mock(side_effect=gather_k_block_offsets)
+            ),
+            index_scales=torch.tensor([2], dtype=torch.int32, device="cpu", pin_memory=True),
+            kv_offset=torch.tensor([1], dtype=torch.int32, device="cpu", pin_memory=True),
+            _stream=manager_stream,
+        )
+
+        assert workspace._stage_page_tables_bulk(manager, [7], current_stream)
+        manager_stream.synchronize()
+        snapshot = torch.empty_like(workspace.block_offsets_device)
+        torch.cuda._sleep(20_000_000)
+        snapshot.copy_(workspace.block_offsets_device)
+        workspace.page_tables_active = True
+        workspace.mark_page_tables_consumed(manager_stream)
+
+        host_table[0, 0, 0] = torch.tensor([5, 6, 7, 8], dtype=torch.int32)
+        assert workspace._stage_page_tables_bulk(manager, [7], current_stream)
+        current_stream.synchronize()
+
+        assert snapshot[0, 0, 0].tolist() == [2, 4, 6, 8]
+        assert workspace.block_offsets_device[0, 0, 0].tolist() == [10, 12, 14, 16]
 
     def test_cross_stream_staging_is_rejected_before_page_table_query(self):
         from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
@@ -924,35 +1114,31 @@ class TestFixedScoreMetadata:
         workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
         workspace.device = torch.device("cuda")
         workspace.max_requests = 8
-        workspace.staging_capacity = 8
         workspace.stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=4)
+        workspace.page_tables_active = False
         workspace.copy_pending = False
         workspace.copy_done = SimpleNamespace(query=mock.Mock(), synchronize=mock.Mock())
-        get_batch = mock.Mock(side_effect=AssertionError("cross-stream workspace queried V2"))
+        manager = mock.Mock()
 
         other_stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=5)
         with mock.patch.object(torch.cuda, "current_stream", return_value=other_stream):
             with pytest.raises(_FixedScoreStreamMismatch, match="first CUDA stream"):
-                workspace.stage(get_batch, [1], [8.0])
+                workspace.stage(manager, [1], [8.0])
         workspace.copy_done.query.assert_not_called()
         workspace.copy_done.synchronize.assert_not_called()
-        get_batch.assert_not_called()
 
     def test_staged_page_tables_bypass_per_request_cuda_materialization(self):
         manager = _make_triattention()
         get_batch = mock.Mock()
         manager.kv_cache_manager = SimpleNamespace(get_batch_cache_indices=get_batch)
-        page_ids = torch.tensor([[[10, 11], [12, 13]], [[20, 21], [22, 23]]])
         workspace = SimpleNamespace(
             stage=mock.Mock(return_value=True),
-            page_ids_device=page_ids,
-            representative_slots={0: 0, 1: 1},
         )
         prepared = [
             _prepared_eviction(
                 SimpleNamespace(),
                 request_id=7,
-                round_start=8.0,
+                round_start=8,
                 seq_len=8,
                 expected_keep_count=6,
                 protected_tail=2,
@@ -960,7 +1146,7 @@ class TestFixedScoreMetadata:
             _prepared_eviction(
                 SimpleNamespace(),
                 request_id=8,
-                round_start=9.0,
+                round_start=9,
                 seq_len=9,
                 expected_keep_count=6,
                 protected_tail=3,
@@ -1014,8 +1200,8 @@ class TestFixedScoreMetadata:
         workspace = _FixedScoreMetadataWorkspace(
             pools,
             dense_groups,
+            [0, 1, 2],
             representatives,
-            [10, 11, 12, 13],
             max_requests,
             seq_len,
             2,
@@ -1052,31 +1238,84 @@ class TestFixedScoreMetadata:
             ],
         }
 
-        def get_batch_side_effect(request_ids, layer, num_blocks_per_seq=None):
-            assert num_blocks_per_seq == [page_count] * request_count
-            return tables[layer]
-
-        get_batch = mock.Mock(side_effect=get_batch_side_effect)
         request_ids = list(range(request_count))
-        round_starts = [float(9 + request) for request in request_ids]
+        round_starts = [131_071 + request for request in request_ids]
+        host_table = torch.zeros(
+            3,
+            max_requests,
+            2,
+            workspace.copy_block_count,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+        for slot, global_layer in enumerate((10, 12, 13)):
+            host_table[slot, :request_count, 0, :page_count].copy_(
+                torch.tensor(tables[global_layer], dtype=torch.int32)
+            )
 
-        assert workspace.stage(
-            get_batch,
+        def gather_k_block_offsets(source, destination, requested_ids, num_blocks):
+            for destination_row, request_id in enumerate(requested_ids):
+                destination[:, destination_row, 0, :num_blocks].copy_(
+                    source[:, request_id, 0, :num_blocks]
+                )
+
+        gather = mock.Mock(side_effect=gather_k_block_offsets)
+        manager = SimpleNamespace(
+            enable_swa_scratch_reuse=False,
+            host_kv_cache_block_offsets=host_table,
+            kv_factor=2,
+            index_mapper=SimpleNamespace(gather_k_block_offsets=gather),
+            index_scales=torch.full((3,), 2, dtype=torch.int32, pin_memory=True),
+            kv_offset=torch.ones(3, dtype=torch.int32, pin_memory=True),
+            _stream=torch.cuda.Stream(device=device),
+        )
+
+        assert not workspace.stage(
+            manager,
             request_ids,
-            round_starts,
+            [2**31] * request_count,
             [seq_len] * request_count,
             [10] * request_count,
         )
+        assert gather.call_count == 0
+        with mock.patch.object(
+            torch,
+            "index_select",
+            side_effect=AssertionError("page-table staging used torch.index_select"),
+        ):
+            assert workspace.stage(
+                manager,
+                request_ids,
+                round_starts,
+                [seq_len] * request_count,
+                [10] * request_count,
+            )
+        workspace.prepare_phase(request_count, "mean")
         torch.cuda.current_stream(device).synchronize()
+        assert workspace.round_starts_device.untyped_storage().data_ptr() == (
+            workspace.valid_seq_lens_device.untyped_storage().data_ptr()
+        )
+        assert torch.equal(
+            workspace.round_starts_device[:request_count],
+            torch.tensor(round_starts, dtype=torch.int32, device=device),
+        )
+        assert torch.equal(
+            workspace.valid_seq_lens_device[:request_count],
+            torch.full((request_count,), seq_len, dtype=torch.int32, device=device),
+        )
         for slot, global_layer in enumerate((10, 12, 13)):
-            expected = torch.tensor(tables[global_layer], dtype=torch.int64, device=device)
-            assert torch.equal(workspace.page_ids_device[slot, :request_count], expected)
-        calls = get_batch.call_count
+            expected = torch.tensor(tables[global_layer], dtype=torch.int32, device=device) * 2
+            assert torch.equal(
+                workspace.block_offsets_device[slot, :request_count, 0, :page_count],
+                expected,
+            )
+        calls = gather.call_count
         other_stream = torch.cuda.Stream(device=device)
         with torch.cuda.stream(other_stream):
             with pytest.raises(_FixedScoreStreamMismatch, match="first CUDA stream"):
-                workspace.stage(get_batch, request_ids, round_starts)
-        assert get_batch.call_count == calls
+                workspace.stage(manager, request_ids, round_starts)
+        assert gather.call_count == calls
 
     @pytest.mark.parametrize("request_count", [1, 7, 8])
     @pytest.mark.parametrize("aggregation", ["mean", "max"])
@@ -1115,7 +1354,7 @@ class TestFixedScoreMetadata:
         assert not freq.is_contiguous()
         assert not omega.is_contiguous()
         assert not offsets.is_contiguous()
-        round_device = torch.arange(max_requests, dtype=torch.float32, device=device) + 9.0
+        round_device = torch.arange(max_requests, dtype=torch.int32, device=device) + 9
         round_starts = round_device[:request_count].tolist()
         seq_lens = [seq_len - request % 2 for request in range(request_count)]
         phase = (round_device[:, None, None] + offsets[None, :, None]) * omega[None, None]
@@ -1141,7 +1380,7 @@ class TestFixedScoreMetadata:
                 page_count,
                 seq_len,
                 2,
-                page_ids.unsqueeze(0).contiguous(),
+                _encode_block_offsets(page_ids),
                 [0] * len(layers),
                 q_real,
                 q_imag,
@@ -1151,17 +1390,21 @@ class TestFixedScoreMetadata:
                 offsets,
                 prompt_len=prompt_len,
             )
-            group.stage_lengths(
-                torch.tensor(seq_lens, dtype=torch.int32, device=device),
-                request_count,
+            valid_widths = torch.empty(
+                request_count, dtype=torch.int32, device=device
             )
             fixed = group.launch(
                 request_count,
+                torch.tensor(seq_lens, dtype=torch.int32, device=device),
+                valid_widths,
                 round_device,
                 torch.cos(phase).mean(dim=1),
                 torch.sin(phase).mean(dim=1),
                 aggregation,
             )
+            assert valid_widths.tolist() == [
+                seq_len - prompt_len for seq_len in seq_lens
+            ]
             assert fixed.shape == (
                 request_count,
                 len(layers),
@@ -1180,7 +1423,7 @@ class TestFixedScoreMetadata:
                     )
                     assert torch.equal(selected, expected_selected)
 
-    @pytest.mark.parametrize("request_count", [1, 7])
+    @pytest.mark.parametrize("request_count", [1, 7, 8])
     @pytest.mark.parametrize("aggregation", ["mean", "max"])
     @CUDA_REQUIRED
     def test_fused_score_spans_distinct_storages_and_block_tables(self, request_count, aggregation):
@@ -1191,13 +1434,18 @@ class TestFixedScoreMetadata:
         the fused path must not assume a shared storage anchor or a shared
         per-request block table.
         """
+        from tensorrt_llm._torch.kv_cache_compression.triattention import triattention_kernels
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            _FixedScoreMetadataWorkspace,
+            _FixedScoreStreamMismatch,
+        )
         from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
             _FixedScoreGroup,
         )
 
         device = torch.device("cuda")
         torch.manual_seed(20260707 + request_count)
-        max_requests = 8
+        max_requests = request_count
         page_count = 2
         seq_len = 7
         prompt_len = 1
@@ -1226,12 +1474,11 @@ class TestFixedScoreMetadata:
         freq = torch.tensor([0.7, 1.3], device=device)
         omega = torch.tensor([0.013, 0.071], device=device)
         offsets = torch.tensor([1.0, 2.0, 4.0], device=device)
-        round_device = torch.arange(max_requests, dtype=torch.float32, device=device) + 9.0
+        round_device = torch.arange(max_requests, dtype=torch.int32, device=device) + 9
         round_starts = round_device[:request_count].tolist()
         seq_lens = [seq_len - request % 2 for request in range(request_count)]
-        phase = (round_device[:, None, None] + offsets[None, :, None]) * omega[None, None]
-
         layer_order = list(range(num_layers))
+        block_offsets = _encode_block_offsets(page_ids_3d)
         group = _FixedScoreGroup(
             pools,
             layer_order,
@@ -1239,7 +1486,7 @@ class TestFixedScoreMetadata:
             page_count,
             seq_len,
             2,
-            page_ids_3d,
+            block_offsets,
             layer_order,  # slot i holds layer i's tables
             q_real,
             q_imag,
@@ -1249,17 +1496,62 @@ class TestFixedScoreMetadata:
             offsets,
             prompt_len=prompt_len,
         )
-        group.stage_lengths(
-            torch.tensor(seq_lens, dtype=torch.int32, device=device),
+        valid_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        valid_widths = torch.empty(request_count, dtype=torch.int32, device=device)
+        mean_cos = torch.empty(request_count, 2, dtype=torch.float32, device=device)
+        mean_sin = torch.empty_like(mean_cos)
+        if aggregation == "mean":
+            triattention_kernels.prepare_mean_phase(
+                round_device,
+                offsets,
+                omega,
+                mean_cos,
+                mean_sin,
+                request_count,
+            )
+        score_sentinel = -12345.0
+        group.output.fill_(score_sentinel)
+        checked = group.launch(
             request_count,
-        )
-        fixed = group.launch(
-            request_count,
+            valid_seq_lens,
+            valid_widths,
             round_device,
-            torch.cos(phase).mean(dim=1),
-            torch.sin(phase).mean(dim=1),
+            mean_cos,
+            mean_sin,
             aggregation,
-        )
+        ).clone()
+        workspace = _FixedScoreMetadataWorkspace.__new__(_FixedScoreMetadataWorkspace)
+        workspace.device = group.output.device
+        workspace.max_requests = request_count
+        workspace.fused_group = group
+        workspace.round_starts_device = round_device
+        workspace.valid_seq_lens_device = valid_seq_lens
+        workspace.mean_cos = mean_cos
+        workspace.mean_sin = mean_sin
+        workspace.offsets = offsets
+        workspace.omega = omega
+        workspace.stream = None
+        workspace._phase_runner = None
+        workspace._phase_args = ()
+        workspace._score_runner = None
+        workspace._score_args = ()
+        workspace.bind_score_launcher(valid_widths, aggregation)
+        group.output.fill_(score_sentinel)
+        with (
+            mock.patch.object(
+                triattention_kernels,
+                "prepare_mean_phase",
+                side_effect=AssertionError("checked phase wrapper was called"),
+            ),
+            mock.patch.object(
+                group,
+                "launch",
+                side_effect=AssertionError("checked score wrapper was called"),
+            ),
+        ):
+            fixed = workspace.launch_prepared_score().clone()
+        torch.testing.assert_close(fixed, checked, rtol=0, atol=0)
+        assert valid_widths.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
 
         # The deployed fused score must agree with the independent Torch oracle
         # when every layer owns a distinct V2 block table.
@@ -1283,6 +1575,60 @@ class TestFixedScoreMetadata:
                 segment = fixed[request, layer_slot, :, :valid_width]
                 expected = oracle[request * num_layers + layer][:, prompt_len:]
                 torch.testing.assert_close(segment, expected, rtol=5e-3, atol=5e-3)
+
+        round_device.add_(17)
+        block_offsets.copy_(_encode_block_offsets(page_ids_3d.roll(1, dims=2)))
+        valid_seq_lens.copy_(
+            torch.tensor(
+                [seq_len - (request + 1) % 2 for request in range(request_count)],
+                dtype=torch.int32,
+                device=device,
+            )
+        )
+        if aggregation == "mean":
+            triattention_kernels.prepare_mean_phase(
+                round_device,
+                offsets,
+                omega,
+                mean_cos,
+                mean_sin,
+                request_count,
+            )
+        expected_replay_widths = valid_seq_lens - prompt_len
+        group.output.fill_(score_sentinel)
+        valid_widths.fill_(-1)
+        checked_replay = group.launch(
+            request_count,
+            valid_seq_lens,
+            valid_widths,
+            round_device,
+            mean_cos,
+            mean_sin,
+            aggregation,
+        ).clone()
+        group.output.fill_(score_sentinel)
+        valid_widths.fill_(-1)
+        with (
+            mock.patch.object(
+                triattention_kernels,
+                "prepare_mean_phase",
+                side_effect=AssertionError("checked phase wrapper was called"),
+            ),
+            mock.patch.object(
+                group,
+                "launch",
+                side_effect=AssertionError("checked score wrapper was called"),
+            ),
+        ):
+            replay = workspace.launch_prepared_score().clone()
+        torch.testing.assert_close(replay, checked_replay, rtol=0, atol=0)
+        assert torch.equal(valid_widths, expected_replay_widths)
+        assert not torch.equal(replay, fixed)
+
+        other_stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(other_stream):
+            with pytest.raises(_FixedScoreStreamMismatch, match="workspace CUDA stream"):
+                workspace.launch_prepared_score()
 
 
 class TestKernelMaskedSwa:
