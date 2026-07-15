@@ -1594,10 +1594,10 @@ class TestFixedScoreMetadata:
                 mean_sin,
                 request_count,
             )
-        expected_replay_widths = valid_seq_lens - prompt_len
+        expected_second_widths = valid_seq_lens - prompt_len
         group.output.fill_(score_sentinel)
         valid_widths.fill_(-1)
-        checked_replay = group.launch(
+        checked_second = group.launch(
             request_count,
             valid_seq_lens,
             valid_widths,
@@ -1620,10 +1620,10 @@ class TestFixedScoreMetadata:
                 side_effect=AssertionError("checked score wrapper was called"),
             ),
         ):
-            replay = workspace.launch_prepared_score().clone()
-        torch.testing.assert_close(replay, checked_replay, rtol=0, atol=0)
-        assert torch.equal(valid_widths, expected_replay_widths)
-        assert not torch.equal(replay, fixed)
+            second_launch = workspace.launch_prepared_score().clone()
+        torch.testing.assert_close(second_launch, checked_second, rtol=0, atol=0)
+        assert torch.equal(valid_widths, expected_second_widths)
+        assert not torch.equal(second_launch, fixed)
 
         other_stream = torch.cuda.Stream(device=device)
         with torch.cuda.stream(other_stream):

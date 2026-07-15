@@ -184,7 +184,7 @@ class _PreparedCuteTopK:
 
 
 class _PreparedTopKFinalizer:
-    """Replay the fixed deterministic finalizer without Triton JIT dispatch."""
+    """Launch the fixed deterministic finalizer without Triton JIT dispatch."""
 
     def __init__(
         self,
@@ -262,7 +262,7 @@ class _PreparedTopKFinalizer:
 
 
 class _PreparedUnionScores:
-    """Replay fixed union score preparation without Triton JIT dispatch."""
+    """Launch fixed union score preparation without Triton JIT dispatch."""
 
     def __init__(
         self,

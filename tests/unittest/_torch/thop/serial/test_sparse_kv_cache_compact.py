@@ -267,6 +267,7 @@ def test_sparse_kv_cache_compact_layers_multiple_tiles():
 
 
 def test_sparse_kv_cache_compact_layers_cuda_graph_replay():
+    """Check operation-level capture safety, not a standalone TriAttention graph."""
     pools_cpu, pools, page_tables = _make_pools(3, torch.bfloat16, 64)
     page_tables_cpu = [page_table.cpu() for page_table in page_tables]
     source_offsets = torch.tensor([0, 3, 6], dtype=torch.int32)

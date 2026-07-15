@@ -192,7 +192,8 @@ def test_draft_cache_context_selects_and_restores_length_domain(context_kind: st
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_cuda_draft_length_refresh_reuses_graph_stable_buffers() -> None:
+def test_draft_length_refresh_is_capture_safe_for_production_decode_graph() -> None:
+    """Keep metadata addresses stable for the normal production decode graph."""
     metadata, _, draft_manager = _metadata_with_separate_draft_cache(cuda_device="cuda")
     metadata._materialize_draft_device_kv_lengths()
     metadata._materialize_draft_host_kv_lengths()

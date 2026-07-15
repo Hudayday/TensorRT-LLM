@@ -49,7 +49,7 @@ def _run_cpp_compact_layers(
 
 
 class _PreparedPackCompactionSources:
-    """Replay one fixed compaction-source packing launch."""
+    """Launch one fixed compaction-source packing kernel."""
 
     def __init__(
         self,

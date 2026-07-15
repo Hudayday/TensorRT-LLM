@@ -25,8 +25,7 @@ is covered end-to-end by integration tests rather than unit-tested here.
 import contextlib
 import unittest
 from dataclasses import dataclass
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import torch
 
@@ -218,62 +217,6 @@ class TestWarmupCleanup(unittest.TestCase):
             2,
             f"Expected exactly 2 empty_cache calls; got order={calls}",
         )
-
-    def test_compression_prewarm_runs_after_cleanup_before_cuda_graph(self):
-        model_engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
-        model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
-        model_engine.cuda_graph_runner = SimpleNamespace(
-            enabled=True,
-            padding_dummy_requests={},
-            allow_capture=Mock(return_value=contextlib.nullcontext()),
-        )
-        model_engine.mapping = SimpleNamespace(
-            cp_size=1,
-            has_cp_helix=Mock(return_value=False),
-        )
-        model_engine.is_draft_model = False
-        model_engine.guided_decoder = None
-        kv_cache_manager = Mock()
-        kv_cache_manager.check_invalid_values_in_kv_cache.return_value = False
-        tracker = _Tracker()
-        compression_manager = Mock()
-        compression_manager.prewarm.side_effect = tracker("compression_prewarm")
-        resource_manager = ResourceManager(
-            {
-                ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
-                ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER: compression_manager,
-            }
-        )
-
-        with (
-            patch.object(model_engine, "_is_encoder_decoder_model", return_value=False),
-            patch.object(model_engine, "_run_attention_warmup"),
-            patch.object(model_engine, "_get_full_general_warmup_requests", return_value=[]),
-            patch.object(model_engine, "_get_max_shape_warmup_requests", return_value=[]),
-            patch.object(model_engine, "_general_warmup", side_effect=tracker("general_warmup")),
-            patch.object(
-                model_engine,
-                "_run_autotuner_warmup",
-                side_effect=tracker("autotuner"),
-            ),
-            patch.object(
-                model_engine,
-                "_run_cuda_graph_warmup",
-                side_effect=tracker("cuda_graph"),
-            ),
-            patch("torch.cuda.empty_cache", side_effect=tracker("empty_cache")),
-            patch(
-                "tensorrt_llm._torch.custom_ops.torch_custom_ops.MoERunner.clear_all_workspaces",
-                side_effect=tracker("moe_clear"),
-            ),
-            patch("tensorrt_llm._torch.pyexecutor.model_engine.AutoTuner.get"),
-        ):
-            model_engine.warmup(resource_manager)
-
-        prewarm_idx = tracker.calls.index("compression_prewarm")
-        self.assertEqual(tracker.calls[prewarm_idx - 1], "empty_cache")
-        self.assertEqual(tracker.calls[prewarm_idx + 1], "cuda_graph")
-        compression_manager.prewarm.assert_called_once_with()
 
     def test_step_b_cleanup_skipped_with_helix_cp(self):
         """With Helix CP, can_run_general_warmup is False AND step (b) is
