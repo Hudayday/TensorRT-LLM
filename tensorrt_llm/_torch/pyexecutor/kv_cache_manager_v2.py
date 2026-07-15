@@ -647,6 +647,9 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_mask=layer_mask,
         )
         self.is_draft = is_draft
+        # A compression manager can keep target physical KV shorter than the
+        # request's logical history. A separate draft manager remains dense.
+        self.generation_capacity_only: bool = False
         self.enable_swa_scratch_reuse = (
             kv_cache_config.enable_swa_scratch_reuse and not self.is_draft
         )
@@ -3061,12 +3064,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
                 else kv_cache.capacity - req.py_rewind_len
             )
-            success = kv_cache.resize(new_capacity, req.max_beam_num_tokens - 1)
+            history_length = None if self.generation_capacity_only else req.max_beam_num_tokens - 1
+            success = kv_cache.resize(new_capacity, history_length)
             if not success:
                 raise ValueError(
                     f"Failed to resize KV cache for request {req.py_request_id} "
                     f"to capacity {new_capacity} and history length "
-                    f"{req.max_beam_num_tokens - 1} tokens at generation update"
+                    f"{history_length} tokens at generation update"
                 )
 
     def copy_batch_block_offsets(

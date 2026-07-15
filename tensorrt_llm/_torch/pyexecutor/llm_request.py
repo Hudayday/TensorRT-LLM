@@ -730,6 +730,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_batch_idx = None
         self.py_draft_pages_allocated = 0
         self.py_rewind_len = 0
+        # KV tokens physically evicted by a compression manager (sole
+        # writer); the model engine subtracts it from the cached-token count.
+        # Logical accounting keeps using max_beam_num_tokens.
+        self.py_num_compressed_tokens = 0
         self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens
         self.py_last_context_chunk = (None, None)
         self.py_draft_logits = None
