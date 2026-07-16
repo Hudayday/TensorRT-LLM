@@ -862,7 +862,7 @@ class _FixedScoreGroup:
         )
         slot_idx = slots_t.repeat(max_requests)
         seg_page_off = slot_idx * block_offsets.stride(0) + req_idx * block_offsets.stride(1)
-        self.token_block = 64
+        self.token_block = 16 if head_dim == 128 else 64
         self.max_ntblk = (self.output_width + self.token_block - 1) // self.token_block
         self.output = torch.empty(
             max_requests,
