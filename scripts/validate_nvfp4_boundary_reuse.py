@@ -17,6 +17,7 @@ import torch
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary import (
     QuantizationForBoundaryCompression,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 
 DEFAULT_SHAPE = (2, 32, 128)
@@ -26,13 +27,12 @@ def _tensor_bytes(tensor: torch.Tensor) -> int:
     return tensor.numel() * tensor.element_size()
 
 
-class _KVCacheManagerV2Harness:
+class _KVCacheManagerV2Harness(KVCacheManagerV2):
     """Only the explicit manager-binding contract needed by this GPU probe.
 
-    KVCM transaction methods have separate CPU contract tests. Keeping this
-    transform probe independent of the full executor import graph makes its
-    SM100 algorithm receipt reproducible even when the available native wheel
-    predates the latest pure-Python KVCM V2 modules.
+    The harness is a real V2 subtype so the production manager's type guard is
+    exercised, but it deliberately bypasses the allocator-heavy V2
+    constructor. KVCM transaction methods have separate CPU contract tests.
     """
 
     def __init__(self, tokens_per_block: int) -> None:
