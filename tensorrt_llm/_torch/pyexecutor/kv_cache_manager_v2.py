@@ -89,6 +89,7 @@ from .kv_cache_stats import (
 )
 from .llm_request import LlmRequest, LlmRequestState, SamplingConfig, get_draft_token_length
 from .resource_manager import (
+    BaseKVCacheCompressionManager,
     BaseResourceManager,
     CacheTypeCpp,
     DataType,
@@ -786,6 +787,7 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_mask=layer_mask,
         )
         self.is_draft = is_draft
+        self._reuse_compression_manager: Optional[BaseKVCacheCompressionManager] = None
         # Set True by a compression manager; generation-step resize then leaves history untouched.
         self.kv_compression_manages_history: bool = False
         self.enable_swa_scratch_reuse = (
@@ -1155,6 +1157,17 @@ class KVCacheManagerV2(BaseResourceManager):
         self._prepare_page_table_tensor(index_mapper_capacity)
 
         self._log_kv_cache_pool_lifecycle_mapping()
+
+    def bind_reuse_compression_hooks(
+        self,
+        manager: BaseKVCacheCompressionManager,
+    ) -> None:
+        """Bind the one compression manager that implements reuse hooks."""
+        if self._reuse_compression_manager is not None:
+            raise ValueError("KVCacheManagerV2 reuse compression hooks are already bound")
+        if not manager.supports_block_reuse:
+            raise ValueError("Reuse compression hooks require a block-reuse-capable manager")
+        self._reuse_compression_manager = manager
 
     def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
         kv_cache_pool_pointers_list = []

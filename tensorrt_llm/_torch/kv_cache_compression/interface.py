@@ -13,6 +13,7 @@ class KvCacheCompressionMode(IntEnum):
     """
 
     NONE = auto()
+    QUANTIZATION_FOR_BOUNDARY = auto()
 
     def is_eviction_method(self):
         """Whether this method physically evicts cached tokens. Evicting

@@ -6,7 +6,8 @@
 ``BaseResourceManager``-based single-manager design.
 
 Covers:
-- :class:`BaseKVCacheCompressionManager` contract: the four lifecycle hooks
+- :class:`BaseKVCacheCompressionManager` contract: the five request/step hooks
+  and two reuse representation hooks
   default to no-op, zero resource counts, and it inherits
   :class:`BaseResourceManager` (so PyExecutor auto-drives it once registered).
 - The resource-manager API -> lifecycle-hook translation, gated on PyExecutor's
@@ -27,12 +28,17 @@ from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
+from tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary import (
+    QuantizationForBoundaryCompression,
+)
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseKVCacheCompressionManager,
     BaseResourceManager,
+    DataType,
     ResourceManager,
     ResourceManagerType,
 )
@@ -56,7 +62,7 @@ class _RecordingMixin:
 
 
 class _MockCompressionManager(_RecordingMixin, BaseKVCacheCompressionManager):
-    """Mock manager that records the four lifecycle hooks."""
+    """Mock manager that records the request/step lifecycle hooks."""
 
     def on_request_init(self, request):
         self._record("on_request_init")
@@ -75,13 +81,17 @@ class _LengthAdjustingCompressionManager(BaseKVCacheCompressionManager):
     adjusts_generation_kv_length: ClassVar[bool] = True
 
 
-def _v2_manager(*, is_draft: bool):
+def _v2_manager(*, is_draft: bool = False):
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
     manager.enable_block_reuse = False
     manager.kv_compression_manages_history = False
     manager.is_draft = is_draft
+    manager.is_disagg = False
+    manager.dtype = DataType.BF16
+    manager.tokens_per_block = 4
+    manager._reuse_compression_manager = None
     return manager
 
 
@@ -117,13 +127,15 @@ class TestBaseABC:
         # So PyExecutor's main loop auto-invokes prepare/update/free_resources.
         assert issubclass(BaseKVCacheCompressionManager, BaseResourceManager)
 
-    def test_four_hooks_default_noop(self, fake_kv_cache_manager):
+    def test_seven_hooks_default_noop(self, fake_kv_cache_manager):
         m = BaseKVCacheCompressionManager(fake_kv_cache_manager)
         assert m.on_request_init(MagicMock()) is None
         assert m.on_context_step_end([MagicMock()]) is None
         assert m.on_generation_step_begin(MagicMock()) is None
         assert m.on_generation_step_end(MagicMock()) is None
         assert m.on_request_finish(MagicMock()) is None
+        assert m.on_reuse_store(torch.empty(1)) is None
+        assert m.on_reuse_materialize(object(), torch.empty(1)) is None
 
     def test_hooks_accept_extra_kwargs(self, fake_kv_cache_manager):
         # **kwargs lets the framework pass new args later without breaking
@@ -293,6 +305,33 @@ class TestFactory:
             is None
         )
 
+    def test_builds_the_one_nvfp4_boundary_manager(self):
+        from tensorrt_llm._torch.kv_cache_compression.interface import KvCacheCompressionMode
+        from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
+
+        config = KvCacheCompressionConfig(
+            algorithm="quantization_for_boundary",
+            quant="nvfp4",
+        )
+        target = _v2_manager()
+        target.enable_block_reuse = True
+
+        manager = create_kv_cache_compression_manager(config, target)
+
+        assert type(manager) is QuantizationForBoundaryCompression
+        assert manager.quant == "nvfp4"
+        assert manager.kv_cache_manager is target
+        assert target._reuse_compression_manager is manager
+        assert config.kv_cache_compression_mode == KvCacheCompressionMode.QUANTIZATION_FOR_BOUNDARY
+
+    def test_boundary_config_requires_nvfp4(self):
+        from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
+
+        with pytest.raises(ValueError, match="requires quant='nvfp4'"):
+            KvCacheCompressionConfig(algorithm="quantization_for_boundary")
+        with pytest.raises(ValueError, match="quant is only valid"):
+            KvCacheCompressionConfig(algorithm="offload", quant="nvfp4")
+
     def test_eviction_method_predicate_defaults_false(self):
         # Non-evicting methods (e.g. offloading) are never restricted by the
         # speculative mode: the call-site gate reads this config predicate.
@@ -358,3 +397,110 @@ class TestBlockReuseGuard:
 
     def test_ok_when_reuse_off(self):
         BaseKVCacheCompressionManager(self._mgr(enable_block_reuse=False))  # no raise
+
+
+# ---------------------------------------------------------------------- #
+# 6. Reuse-only NVFP4 transform contract                                  #
+# ---------------------------------------------------------------------- #
+
+
+class TestNVFP4BoundaryReuse:
+    @staticmethod
+    def _manager(**overrides):
+        target = _v2_manager(is_draft=overrides.pop("is_draft", False))
+        target.enable_block_reuse = overrides.pop("enable_block_reuse", True)
+        target.is_disagg = overrides.pop("is_disagg", False)
+        target.dtype = overrides.pop("dtype", DataType.BF16)
+        assert not overrides
+        return QuantizationForBoundaryCompression(target, quant="nvfp4"), target
+
+    def test_requires_reuse_only_raw_target_cache(self):
+        with pytest.raises(ValueError, match="requires KV-cache block reuse"):
+            self._manager(enable_block_reuse=False)
+        with pytest.raises(ValueError, match="target KV cache"):
+            self._manager(is_draft=True)
+        with pytest.raises(ValueError, match="does not support disaggregation"):
+            self._manager(is_disagg=True)
+        with pytest.raises(ValueError, match="must remain FP16 or BF16"):
+            self._manager(dtype=DataType.NVFP4)
+
+    def test_rejects_draft_cache_and_second_manager(self):
+        target = _v2_manager()
+        target.enable_block_reuse = True
+        draft = _v2_manager(is_draft=True)
+        draft.enable_block_reuse = True
+        with pytest.raises(ValueError, match="does not support a draft"):
+            QuantizationForBoundaryCompression(
+                target,
+                draft_kv_cache_manager=draft,
+                quant="nvfp4",
+            )
+
+        QuantizationForBoundaryCompression(target, quant="nvfp4")
+        with pytest.raises(ValueError, match="already bound"):
+            QuantizationForBoundaryCompression(target, quant="nvfp4")
+
+    def test_partial_or_unaligned_payload_falls_back_to_raw(self):
+        manager, _ = self._manager()
+        partial = torch.ones((2, 4, 16), dtype=torch.bfloat16)
+        unaligned = torch.ones((4, 15), dtype=torch.bfloat16)
+
+        with patch.object(torch.ops.trtllm, "fp4_quantize", create=True) as quantize:
+            assert manager.on_reuse_store(partial, valid_token_count=3) is None
+            assert manager.on_reuse_store(unaligned, valid_token_count=4) is None
+            quantize.assert_not_called()
+
+    def test_encode_reuses_nvfp4_op_with_local_linear_scales(self):
+        manager, _ = self._manager()
+        raw = torch.arange(1, 129, dtype=torch.bfloat16).reshape(2, 4, 16)
+        packed = torch.zeros((2, 4, 8), dtype=torch.uint8)
+        linear_scales = torch.zeros(8, dtype=torch.uint8)
+
+        with patch.object(torch.ops.trtllm, "fp4_quantize", create=True) as quantize:
+            quantize.return_value = packed, linear_scales
+            encoded = manager.on_reuse_store(raw, valid_token_count=4)
+
+        assert encoded is not None
+        encoded_packed, encoded_scales, inverse_global_scale = encoded
+        assert encoded_packed is packed
+        assert encoded_scales.shape == (8, 1)
+        assert encoded_scales.data_ptr() == linear_scales.data_ptr()
+        assert inverse_global_scale.shape == (1,)
+        torch.testing.assert_close(
+            inverse_global_scale,
+            torch.tensor([128.0 / (448.0 * 6.0)]),
+        )
+
+        args = quantize.call_args.args
+        assert args[0] is raw
+        torch.testing.assert_close(
+            args[1],
+            torch.tensor((448.0 * 6.0) / 128.0),
+        )
+        assert args[2:] == (16, False, False)
+
+    def test_materialize_reuses_decoder_into_kvcm_raw_slot(self):
+        manager, _ = self._manager()
+        packed = torch.zeros((2, 2, 8), dtype=torch.uint8)
+        scales = torch.zeros((4, 1), dtype=torch.uint8)
+        inverse_global_scale = torch.ones(1, dtype=torch.float32)
+        destination = torch.empty((2, 2, 16), dtype=torch.bfloat16)
+
+        with patch(
+            "tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4.dequant_nvfp4_2d_triton"
+        ) as decode:
+            manager.on_reuse_materialize(
+                (packed, scales, inverse_global_scale),
+                destination,
+            )
+
+        args = decode.call_args.args
+        assert args[0].shape == (4, 8)
+        assert args[0].data_ptr() == packed.data_ptr()
+        assert args[1] is scales
+        assert args[2] is inverse_global_scale
+        kwargs = decode.call_args.kwargs
+        assert kwargs["target_dtype"] == torch.bfloat16
+        assert kwargs["sf_vec_size"] == 16
+        assert kwargs["out"].shape == (4, 16)
+        assert kwargs["out"].data_ptr() == destination.data_ptr()

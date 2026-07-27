@@ -2429,13 +2429,15 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
     any cache manager because this layer decides *how* the physical KV is used,
     not *what* physical KV exists. Subclasses hold ``KVCacheManagerV2`` as a tool.
 
-    A subclass compacts through the ``KVCacheManagerV2`` it holds and records
-    the evicted count on ``LlmRequest.py_num_compressed_tokens``; the model
-    engine subtracts that count when building ``num_cached_tokens_per_seq``.
+    Eviction subclasses record an evicted count on
+    ``LlmRequest.py_num_compressed_tokens``; boundary-representation
+    subclasses instead transform payloads selected and owned by KVCM V2.
     """
 
     adjusts_generation_kv_length: ClassVar[bool] = False
     """Whether this manager can make target and logical KV lengths diverge."""
+    supports_block_reuse: ClassVar[bool] = False
+    """Whether this manager preserves the block-reuse identity contract."""
 
     def __init__(
         self,
@@ -2452,9 +2454,8 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
                 "draft KV-cache compression requires KVCacheManagerV2")
         self.kv_cache_manager = kv_cache_manager
         self.draft_kv_cache_manager = draft_kv_cache_manager
-        # Compression evicts/rewrites stored keys and values, so a shared prefix
-        # block is no longer safe to reuse (same constraint as RocketKVCacheManager).
-        if kv_cache_manager.enable_block_reuse:
+        if (kv_cache_manager.enable_block_reuse
+                and not self.supports_block_reuse):
             raise ValueError(
                 f"{type(self).__name__} changes stored keys and values and cannot "
                 f"run with KV-cache block reuse. Set "
@@ -2470,7 +2471,7 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         return self.draft_kv_cache_manager is not None
 
     # ================================================================== #
-    # KV-cache lifecycle hooks (5, in temporal order).                   #
+    # Request/step lifecycle hooks (5, in temporal order).               #
     # Subclasses override what they need; all default to no-op.          #
     # ================================================================== #
 
@@ -2513,6 +2514,25 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         """
 
     # ================================================================== #
+    # Reuse representation hooks. Production KVCM V2 wiring calls these  #
+    # for each payload and atomically owns the aggregate committed page.  #
+    # ================================================================== #
+
+    def on_reuse_store(self, raw_payload: torch.Tensor,
+                       **kwargs) -> object | None:
+        """Encode one stable raw payload from a reusable page.
+
+        KVCM V2 owns admission, backing allocation, events, and atomic
+        publication of every payload belonging to the committed page. A
+        concrete manager only implements the representation transform and
+        returns its encoded tensors.
+        """
+
+    def on_reuse_materialize(self, encoded_payload: object,
+                             raw_destination: torch.Tensor, **kwargs) -> None:
+        """Materialize one encoded payload into a KVCM-owned raw slot."""
+
+    # ================================================================== #
     # BaseResourceManager interface — PyExecutor auto-invokes these each  #
     # iteration; they translate into the semantic lifecycle hooks above.  #
     # ================================================================== #
@@ -2542,8 +2562,6 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
     def update_resources(
         self,
         scheduled_batch: "ScheduledRequests",
-        attn_metadata: Optional["AttentionMetadata"] = None,
-        kv_cache_dtype_byte_size: Optional[float] = None,
     ) -> None:
         """Fire :meth:`on_context_step_end` with the requests whose final
         prefill chunk ran this iteration, then :meth:`on_generation_step_end`.
@@ -2553,9 +2571,8 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         request-state transitions: it is iteration-exact and immune to a
         short-output request going straight to ``GENERATION_TO_COMPLETE``
         (which, under the overlap scheduler, never passes through
-        ``GENERATION_IN_PROGRESS``). Signature matches the other resource
-        managers so PyExecutor passes ``attn_metadata`` /
-        ``kv_cache_dtype_byte_size`` through transparently.
+        ``GENERATION_IN_PROGRESS``). The compression manager intentionally
+        receives scheduler lifecycle state only.
         """
         if scheduled_batch.context_requests_last_chunk:
             self.on_context_step_end(

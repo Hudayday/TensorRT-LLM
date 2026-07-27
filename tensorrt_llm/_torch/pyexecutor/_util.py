@@ -2139,10 +2139,24 @@ def create_kv_cache_compression_manager(
     None if no algorithm matches.
 
     Called from ``create_py_executor`` and registered as a resource manager,
-    like the KV cache manager itself. Concrete algorithms add a dispatch branch
-    here; the framework ships none. Speculative-decoding compatibility is
+    like the KV cache manager itself. Speculative-decoding compatibility is
     checked by the caller via ``validate_kv_cache_compression_with_spec``.
     """
+    if config.algorithm == "quantization_for_boundary":
+        from ..kv_cache_compression.quantization_for_boundary import \
+            QuantizationForBoundaryCompression
+
+        logger.warning(
+            "quantization_for_boundary is a reuse transform/API prototype; "
+            "KVCM V2 compact backing and commit/resume lifecycle wiring are "
+            "not implemented yet, so this configuration does not increase "
+            "reuse capacity.")
+        return QuantizationForBoundaryCompression(
+            kv_cache_manager,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+            quant=config.quant,
+        )
+
     logger.warning(
         "KV-cache compression algorithm '%s' is not registered; running without "
         "a compression manager.",

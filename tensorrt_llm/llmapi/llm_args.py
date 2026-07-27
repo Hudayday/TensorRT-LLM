@@ -3535,6 +3535,22 @@ class KvCacheCompressionConfig(StrictBaseModel):
         "Name of the KV-cache compression algorithm to run; selects which "
         "compression manager is built. Concrete algorithm configs subclass this "
         "and set the value.")
+    quant: Optional[Literal["nvfp4"]] = Field(
+        default=None,
+        description=
+        "Quantization used by boundary compression. The initial reuse-only "
+        "proof supports NVFP4.")
+
+    @model_validator(mode="after")
+    def validate_boundary_quantization(self) -> "KvCacheCompressionConfig":
+        if self.algorithm == "quantization_for_boundary":
+            if self.quant != "nvfp4":
+                raise ValueError(
+                    "quantization_for_boundary requires quant='nvfp4'")
+        elif self.quant is not None:
+            raise ValueError(
+                "quant is only valid for algorithm='quantization_for_boundary'")
+        return self
 
     @property
     def kv_cache_compression_mode(self):

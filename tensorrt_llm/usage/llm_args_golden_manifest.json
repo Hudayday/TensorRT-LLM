@@ -555,6 +555,15 @@
       "path": "iter_stats_max_iterations"
     },
     {
+      "allowed_values": [
+        "nvfp4"
+      ],
+      "annotation": "Optional[Literal['nvfp4']]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.quant"
+    },
+    {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
