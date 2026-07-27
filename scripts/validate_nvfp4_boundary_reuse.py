@@ -17,9 +17,7 @@ import torch
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary import (
     QuantizationForBoundaryCompression,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
-
 
 DEFAULT_SHAPE = (2, 32, 128)
 
@@ -28,18 +26,35 @@ def _tensor_bytes(tensor: torch.Tensor) -> int:
     return tensor.numel() * tensor.element_size()
 
 
-def _make_kvcm_v2_harness(tokens_per_block: int) -> KVCacheManagerV2:
-    """Construct only the V2 attributes consumed by the boundary manager."""
-    kv_cache_manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
-    kv_cache_manager.enable_block_reuse = True
-    kv_cache_manager.kv_compression_manages_history = False
-    kv_cache_manager.is_draft = False
-    kv_cache_manager.is_disagg = False
-    kv_cache_manager.dtype = DataType.BF16
-    kv_cache_manager.tokens_per_block = tokens_per_block
-    kv_cache_manager._reuse_compression_manager = None
-    kv_cache_manager._reuse_backing_store = None
-    return kv_cache_manager
+class _KVCacheManagerV2Harness:
+    """Only the explicit manager-binding contract needed by this GPU probe.
+
+    KVCM transaction methods have separate CPU contract tests. Keeping this
+    transform probe independent of the full executor import graph makes its
+    SM100 algorithm receipt reproducible even when the available native wheel
+    predates the latest pure-Python KVCM V2 modules.
+    """
+
+    def __init__(self, tokens_per_block: int) -> None:
+        self.enable_block_reuse = True
+        self.kv_compression_manages_history = False
+        self.is_draft = False
+        self.is_disagg = False
+        self.dtype = DataType.BF16
+        self.tokens_per_block = tokens_per_block
+        self._reuse_compression_manager = None
+
+    def bind_reuse_compression_hooks(
+        self,
+        manager: QuantizationForBoundaryCompression,
+    ) -> None:
+        if self._reuse_compression_manager is not None:
+            raise RuntimeError("A reuse compression manager is already bound")
+        self._reuse_compression_manager = manager
+
+
+def _make_kvcm_v2_harness(tokens_per_block: int) -> _KVCacheManagerV2Harness:
+    return _KVCacheManagerV2Harness(tokens_per_block)
 
 
 def _make_input(shape: tuple[int, int, int], device: torch.device) -> torch.Tensor:
@@ -100,34 +115,28 @@ def _validate(
     # Do not share the FP32 global scale across K/V roles.
     role_payloads = tuple(component.contiguous() for component in raw.unbind(0))
     encoded_records = tuple(
-        _encode(manager, payload, valid_token_count=shape[-2])
-        for payload in role_payloads
+        _encode(manager, payload, valid_token_count=shape[-2]) for payload in role_payloads
     )
 
     destination = torch.full_like(raw, torch.nan)
     destination_pointer = destination.data_ptr()
-    for encoded, role_destination in zip(
-        encoded_records, destination.unbind(0), strict=True
-    ):
+    for encoded, role_destination in zip(encoded_records, destination.unbind(0), strict=True):
         _materialize(manager, encoded, role_destination)
     torch.cuda.synchronize(device)
 
-    decode_into_destination = (
-        destination.data_ptr() == destination_pointer
-        and not bool(torch.isnan(destination).any().item())
+    decode_into_destination = destination.data_ptr() == destination_pointer and not bool(
+        torch.isnan(destination).any().item()
     )
     if not decode_into_destination:
         raise RuntimeError("NVFP4 decode did not populate the supplied raw destination")
 
-    partial_fallback = (
-        all(
-            manager.on_reuse_store(
-                payload,
-                valid_token_count=shape[-2] - 1,
-            )
-            is None
-            for payload in role_payloads
+    partial_fallback = all(
+        manager.on_reuse_store(
+            payload,
+            valid_token_count=shape[-2] - 1,
         )
+        is None
+        for payload in role_payloads
     )
     if not partial_fallback:
         raise RuntimeError("A partial reuse page was encoded instead of remaining raw")
@@ -138,9 +147,7 @@ def _validate(
         for payload in zero_raw.unbind(0)
     )
     zero_destination = torch.full_like(zero_raw, 1.0)
-    for encoded, role_destination in zip(
-        zero_records, zero_destination.unbind(0), strict=True
-    ):
+    for encoded, role_destination in zip(zero_records, zero_destination.unbind(0), strict=True):
         _materialize(manager, encoded, role_destination)
     torch.cuda.synchronize(device)
     zero_roundtrip = bool(torch.count_nonzero(zero_destination).item() == 0)
@@ -154,13 +161,9 @@ def _validate(
     mean_absolute_error = difference.abs().mean().item()
 
     component_bytes = {
-        "block_scales": sum(
-            _tensor_bytes(block_scales)
-            for _, block_scales, _ in encoded_records
-        ),
+        "block_scales": sum(_tensor_bytes(block_scales) for _, block_scales, _ in encoded_records),
         "inverse_global_scale": sum(
-            _tensor_bytes(inverse_global_scale)
-            for _, _, inverse_global_scale in encoded_records
+            _tensor_bytes(inverse_global_scale) for _, _, inverse_global_scale in encoded_records
         ),
         "packed": sum(_tensor_bytes(packed) for packed, _, _ in encoded_records),
     }
