@@ -17,13 +17,13 @@ from typing import Optional
 
 import torch
 
-from ..pyexecutor.resource_manager import BaseKVCacheCompressionManager, DataType
+from ..pyexecutor.resource_manager import DataType, KVCacheCompressionManager
 
 _NVFP4_BLOCK_SIZE = 16
 _NVFP4_GLOBAL_SCALE_DENOMINATOR = 448.0 * 6.0
 
 
-class QuantizationForBoundaryCompression(BaseKVCacheCompressionManager):
+class QuantizationForBoundaryCompression(KVCacheCompressionManager):
     """Quantize cold reusable pages while keeping active runtime KV raw.
 
     This proof supports one boundary and one quantization:
