@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -24,6 +24,7 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary import (
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_reuse_backing import ReuseBackingState
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
+from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import Slot, SlotAllocator
 
 _PAGE_KEY = (0, 17)
 
@@ -36,27 +37,42 @@ class _FakeEvent:
         return self.ready
 
 
-class _ByteLedger:
-    def __init__(self) -> None:
-        self.used_bytes = 0
-        self.release_count = 0
-
-    def reserve(self, size_bytes: int) -> None:
-        self.used_bytes += size_bytes
-
-    def release(self, size_bytes: int) -> None:
-        if size_bytes > self.used_bytes:
-            raise RuntimeError("Byte ledger underflow")
-        self.used_bytes -= size_bytes
-        self.release_count += 1
+class _FailingEvent:
+    def query(self) -> bool:
+        raise RuntimeError("event query failed")
 
 
-class _RawReaderGate:
+class _SourceReaderGate:
     def __init__(self, drained: bool = True) -> None:
         self.drained = drained
 
     def __call__(self) -> bool:
         return self.drained
+
+
+class _KVCMReuseContractHarness(KVCacheManagerV2):
+    """CPU harness that executes the production V2 wrapper contract.
+
+    It intentionally bypasses the full CUDA-backed constructor, but remains an
+    actual ``KVCacheManagerV2`` instance so the compression manager's ownership
+    type guard is exercised.
+    """
+
+    def __init__(self, compressed_capacity_bytes: int) -> None:
+        self.enable_block_reuse = True
+        self.kv_compression_manages_history = False
+        self.is_draft = False
+        self.is_disagg = False
+        self.dtype = DataType.BF16
+        self.tokens_per_block = 4
+        self._reuse_compression_manager = None
+        self._reuse_backing_store = None
+
+        self.manager = QuantizationForBoundaryCompression(
+            self,
+            quant="nvfp4",
+            compressed_capacity_bytes=compressed_capacity_bytes,
+        )
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -74,7 +90,7 @@ def _raw_payloads() -> tuple[torch.Tensor, ...]:
     )
 
 
-def _encode_payload(raw_payload: torch.Tensor) -> tuple[torch.Tensor, ...]:
+def _compressed_payload(raw_payload: torch.Tensor) -> tuple[torch.Tensor, ...]:
     feature_count = raw_payload.shape[-1]
     row_count = raw_payload.numel() // feature_count
     return (
@@ -90,285 +106,831 @@ def _encode_payload(raw_payload: torch.Tensor) -> tuple[torch.Tensor, ...]:
     )
 
 
-class _KVCMReuseContractHarness:
-    """CPU harness that executes the production KVCM reuse methods.
-
-    It models only the explicit reuse-boundary contract and does not pretend to
-    be a partially constructed ``KVCacheManagerV2``.
-    """
-
-    bind_reuse_compression_hooks = KVCacheManagerV2.bind_reuse_compression_hooks
-    configure_reuse_encoded_backing = KVCacheManagerV2.configure_reuse_encoded_backing
-    register_reuse_raw_backing = KVCacheManagerV2.register_reuse_raw_backing
-    try_encode_reuse_backing = KVCacheManagerV2.try_encode_reuse_backing
-    materialize_reuse_backing = KVCacheManagerV2.materialize_reuse_backing
-    poll_reuse_backing = KVCacheManagerV2.poll_reuse_backing
-    evict_reuse_encoded_backing = KVCacheManagerV2.evict_reuse_encoded_backing
-    get_reuse_backing_snapshot = KVCacheManagerV2.get_reuse_backing_snapshot
-    get_reuse_backing_pool_snapshot = KVCacheManagerV2.get_reuse_backing_pool_snapshot
-    _require_reuse_compression_manager = KVCacheManagerV2._require_reuse_compression_manager
-    _require_reuse_backing_store = KVCacheManagerV2._require_reuse_backing_store
-    _record_reuse_completion_event = staticmethod(KVCacheManagerV2._record_reuse_completion_event)
-
-    def __init__(self, encoded_capacity_bytes: int) -> None:
-        self.enable_block_reuse = True
-        self.kv_compression_manages_history = False
-        self.is_draft = False
-        self.is_disagg = False
-        self.dtype = DataType.BF16
-        self.tokens_per_block = 4
-        self._reuse_compression_manager = None
-        self._reuse_backing_store = None
-
-        self.manager = QuantizationForBoundaryCompression(self, quant="nvfp4")
-        self.configure_reuse_encoded_backing(encoded_capacity_bytes)
+def _new_source_slot() -> tuple[SlotAllocator, Slot]:
+    allocator = SlotAllocator(1)
+    slot = allocator.allocate()
+    assert allocator.num_free_slots == 0
+    return allocator, slot
 
 
-def _make_manager(
-    encoded_capacity_bytes: int,
-) -> tuple[_KVCMReuseContractHarness, QuantizationForBoundaryCompression]:
-    target = _KVCMReuseContractHarness(encoded_capacity_bytes)
-    return target, target.manager
+def _destroy_allocator(allocator: SlotAllocator) -> None:
+    assert allocator.num_occupied_slots == 0
+    allocator.prepare_for_shrink(0)
+    allocator.finish_shrink()
 
 
-def _register_raw_page(
-    target: _KVCMReuseContractHarness,
-    raw_payloads: tuple[torch.Tensor, ...],
-    raw_ledger: _ByteLedger,
-    raw_reader_gate: _RawReaderGate | None = None,
-) -> int:
-    if raw_reader_gate is None:
-        raw_reader_gate = _RawReaderGate()
-    raw_size_bytes = sum(_tensor_nbytes(payload) for payload in raw_payloads)
-    raw_ledger.reserve(raw_size_bytes)
-    target.register_reuse_raw_backing(
-        _PAGE_KEY,
-        raw_payloads,
-        can_release_raw=raw_reader_gate,
-        release_raw_slot=lambda: raw_ledger.release(raw_size_bytes),
-    )
-    return raw_size_bytes
-
-
-def _publish_encoded_page(
+def _store_compressed_page(
     target: _KVCMReuseContractHarness,
     manager: QuantizationForBoundaryCompression,
-    raw_payloads: tuple[torch.Tensor, ...],
-    raw_ledger: _ByteLedger,
-) -> int:
-    _register_raw_page(target, raw_payloads, raw_ledger)
-    encoded_payloads = tuple(_encode_payload(payload) for payload in raw_payloads)
-    manager.on_reuse_store = MagicMock(side_effect=encoded_payloads)
-    assert target.try_encode_reuse_backing(
-        _PAGE_KEY,
-        valid_token_count=4,
-    )
-    return sum(_payload_nbytes(payload) for payload in encoded_payloads)
-
-
-def test_raw_dual_encoded_releases_raw_slot_and_evicts_compact_capacity() -> None:
-    target, manager = _make_manager(encoded_capacity_bytes=1024)
+    *,
+    source_gate: _SourceReaderGate | None = None,
+    compression_event: _FakeEvent | None = None,
+) -> tuple[int, SlotAllocator, Slot]:
     raw_payloads = _raw_payloads()
-    raw_ledger = _ByteLedger()
-    raw_reader_gate = _RawReaderGate(drained=False)
-    raw_size_bytes = _register_raw_page(
-        target,
-        raw_payloads,
-        raw_ledger,
-        raw_reader_gate,
-    )
-    encoded_payloads = tuple(_encode_payload(payload) for payload in raw_payloads)
-    encoded_size_bytes = sum(_payload_nbytes(payload) for payload in encoded_payloads)
-    manager.on_reuse_store = MagicMock(side_effect=encoded_payloads)
-    encode_event = _FakeEvent()
+    compressed_payloads = tuple(_compressed_payload(payload) for payload in raw_payloads)
+    compressed_size_bytes = sum(_payload_nbytes(payload) for payload in compressed_payloads)
+    manager.on_reuse_store = MagicMock(side_effect=compressed_payloads)
+    source_allocator, source_slot = _new_source_slot()
+    if source_gate is None:
+        source_gate = _SourceReaderGate()
 
-    raw_snapshot = target.get_reuse_backing_snapshot(_PAGE_KEY)
-    assert raw_snapshot.state is ReuseBackingState.RAW
-    assert raw_snapshot.raw_resident_bytes == raw_size_bytes
-    assert raw_snapshot.encoded_resident_bytes == 0
-
-    assert target.try_encode_reuse_backing(
+    assert target.try_store_compressed_reuse_backing(
         _PAGE_KEY,
+        raw_payloads,
         valid_token_count=4,
-        completion_event=encode_event,
+        can_publish_compressed=source_gate,
+        publish_compressed_and_release_source=lambda: source_allocator.release(
+            source_slot
+        ),
+        drop_reuse_candidate=MagicMock(),
+        completion_event_factory=(
+            None if compression_event is None else lambda: compression_event
+        ),
     )
-    dual_snapshot = target.get_reuse_backing_snapshot(_PAGE_KEY)
-    assert dual_snapshot.state is ReuseBackingState.DUAL
-    assert dual_snapshot.raw_resident_bytes == raw_size_bytes
-    assert dual_snapshot.encoded_resident_bytes == encoded_size_bytes
-    assert dual_snapshot.encoding_read_leases == 1
-    assert raw_ledger.used_bytes == raw_size_bytes
-    assert target.get_reuse_backing_pool_snapshot().used_bytes == encoded_size_bytes
-    assert target.poll_reuse_backing(_PAGE_KEY) == 0
-    assert not target.evict_reuse_encoded_backing(_PAGE_KEY)
-    assert raw_ledger.used_bytes == raw_size_bytes
+    return compressed_size_bytes, source_allocator, source_slot
 
-    encode_event.ready = True
-    assert target.poll_reuse_backing(_PAGE_KEY) == 0
-    assert target.get_reuse_backing_snapshot(_PAGE_KEY).state is ReuseBackingState.DUAL
-    assert raw_ledger.used_bytes == raw_size_bytes
-    assert not target.evict_reuse_encoded_backing(_PAGE_KEY)
 
-    raw_reader_gate.drained = True
+def test_compression_retires_source_slot_contract_and_has_no_stable_raw_state() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    manager = target.manager
+    raw_payloads = _raw_payloads()
+    compressed_payloads = tuple(_compressed_payload(payload) for payload in raw_payloads)
+    compressed_size_bytes = sum(_payload_nbytes(payload) for payload in compressed_payloads)
+    manager.on_reuse_store = MagicMock(side_effect=compressed_payloads)
+    compression_event = _FakeEvent()
+    source_gate = _SourceReaderGate(drained=False)
+    source_allocator, source_slot = _new_source_slot()
+    drop_reuse_candidate = MagicMock()
+
+    assert target.try_store_compressed_reuse_backing(
+        _PAGE_KEY,
+        raw_payloads,
+        valid_token_count=4,
+        can_publish_compressed=source_gate,
+        publish_compressed_and_release_source=lambda: source_allocator.release(
+            source_slot
+        ),
+        drop_reuse_candidate=drop_reuse_candidate,
+        completion_event_factory=lambda: compression_event,
+    )
+
+    compressing = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert compressing.state is ReuseBackingState.COMPRESSING
+    assert compressing.compressed_resident_bytes == compressed_size_bytes
+    assert compressing.compression_source_leases == 1
+    assert not hasattr(compressing, "raw_resident_bytes")
+    assert source_allocator.num_free_slots == 0
+    assert not target.evict_compressed_reuse_backing(_PAGE_KEY, MagicMock())
+
+    compression_event.ready = True
+    assert target.poll_reuse_backing(_PAGE_KEY) == 0
+    assert source_allocator.num_free_slots == 0
+
+    source_gate.drained = True
     assert target.poll_reuse_backing(_PAGE_KEY) == 1
-    encoded_snapshot = target.get_reuse_backing_snapshot(_PAGE_KEY)
-    assert encoded_snapshot.state is ReuseBackingState.ENCODED
-    assert encoded_snapshot.raw_resident_bytes == 0
-    assert encoded_snapshot.encoded_resident_bytes == encoded_size_bytes
-    assert encoded_snapshot.encoding_read_leases == 0
-    assert raw_ledger.used_bytes == 0
-    assert raw_ledger.release_count == 1
-    assert target.poll_reuse_backing(_PAGE_KEY) == 0
-    assert raw_ledger.release_count == 1
+    compressed = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert compressed.state is ReuseBackingState.COMPRESSED
+    assert compressed.compression_source_leases == 0
+    assert source_allocator.num_free_slots == 1
+    drop_reuse_candidate.assert_not_called()
 
-    assert target.evict_reuse_encoded_backing(_PAGE_KEY)
-    evicted_snapshot = target.get_reuse_backing_snapshot(_PAGE_KEY)
-    assert evicted_snapshot.state is ReuseBackingState.EVICTED
-    assert evicted_snapshot.encoded_resident_bytes == 0
-    pool_snapshot = target.get_reuse_backing_pool_snapshot()
-    assert pool_snapshot.used_bytes == 0
-    assert pool_snapshot.allocation_count == 0
-
-
-def test_encoded_pool_admission_failure_keeps_raw_backing() -> None:
-    raw_payloads = _raw_payloads()
-    encoded_payloads = tuple(_encode_payload(payload) for payload in raw_payloads)
-    encoded_size_bytes = sum(_payload_nbytes(payload) for payload in encoded_payloads)
-    target, manager = _make_manager(encoded_capacity_bytes=encoded_size_bytes - 1)
-    raw_ledger = _ByteLedger()
-    raw_size_bytes = _register_raw_page(target, raw_payloads, raw_ledger)
-    manager.on_reuse_store = MagicMock(side_effect=encoded_payloads)
-
-    assert not target.try_encode_reuse_backing(
-        _PAGE_KEY,
-        valid_token_count=4,
-    )
-    snapshot = target.get_reuse_backing_snapshot(_PAGE_KEY)
-    assert snapshot.state is ReuseBackingState.RAW
-    assert snapshot.raw_resident_bytes == raw_size_bytes
-    assert snapshot.encoded_resident_bytes == 0
-    assert snapshot.encoding_read_leases == 0
-    assert raw_ledger.used_bytes == raw_size_bytes
-    assert raw_ledger.release_count == 0
+    unpublish = MagicMock()
+    assert target.evict_compressed_reuse_backing(_PAGE_KEY, unpublish)
+    unpublish.assert_called_once_with()
+    with pytest.raises(KeyError, match="Unknown reuse backing page"):
+        target.get_reuse_backing_snapshot(_PAGE_KEY)
     assert target.get_reuse_backing_pool_snapshot().used_bytes == 0
+    assert target._reuse_backing_store.page_count == 0
+    _destroy_allocator(source_allocator)
 
 
-def test_materialize_failure_rolls_back_raw_admission_and_keeps_encoded() -> None:
-    target, manager = _make_manager(encoded_capacity_bytes=1024)
+def test_capacity_miss_drops_reuse_candidate_without_creating_raw_backing() -> None:
     raw_payloads = _raw_payloads()
-    raw_ledger = _ByteLedger()
-    encoded_size_bytes = _publish_encoded_page(
-        target,
-        manager,
-        raw_payloads,
-        raw_ledger,
+    compressed_payloads = tuple(_compressed_payload(payload) for payload in raw_payloads)
+    compressed_size_bytes = sum(_payload_nbytes(payload) for payload in compressed_payloads)
+    target = _KVCMReuseContractHarness(
+        compressed_capacity_bytes=compressed_size_bytes - 1
     )
-    assert raw_ledger.used_bytes == 0
+    target.manager.on_reuse_store = MagicMock(side_effect=compressed_payloads)
+    source_allocator, source_slot = _new_source_slot()
+    drop_reuse_candidate = MagicMock()
 
-    raw_destinations = tuple(torch.empty_like(payload) for payload in raw_payloads)
-    destination_size_bytes = sum(_tensor_nbytes(destination) for destination in raw_destinations)
-    raw_ledger.reserve(destination_size_bytes)
-    manager.on_reuse_materialize = MagicMock(side_effect=[None, RuntimeError("decode failed")])
-    publish_raw_slot = MagicMock()
-    rollback_raw_slot = MagicMock(side_effect=lambda: raw_ledger.release(destination_size_bytes))
+    assert not target.try_store_compressed_reuse_backing(
+        _PAGE_KEY,
+        raw_payloads,
+        valid_token_count=4,
+        can_publish_compressed=_SourceReaderGate(),
+        publish_compressed_and_release_source=lambda: source_allocator.release(
+            source_slot
+        ),
+        drop_reuse_candidate=drop_reuse_candidate,
+    )
 
-    with pytest.raises(RuntimeError, match="decode failed"):
-        target.materialize_reuse_backing(
+    drop_reuse_candidate.assert_called_once_with()
+    with pytest.raises(KeyError, match="Unknown reuse backing page"):
+        target.get_reuse_backing_snapshot(_PAGE_KEY)
+    pool = target.get_reuse_backing_pool_snapshot()
+    assert pool.used_bytes == 0
+    assert pool.allocation_count == 0
+    # The active request still owns its raw source; it is not a cold backing.
+    assert source_allocator.num_free_slots == 0
+    source_allocator.release(source_slot)
+    _destroy_allocator(source_allocator)
+
+
+def test_capacity_miss_defers_source_drop_until_compression_event() -> None:
+    raw_payloads = _raw_payloads()
+    compressed_payloads = tuple(_compressed_payload(payload) for payload in raw_payloads)
+    compressed_size_bytes = sum(_payload_nbytes(payload) for payload in compressed_payloads)
+    target = _KVCMReuseContractHarness(
+        compressed_capacity_bytes=compressed_size_bytes - 1
+    )
+    target.manager.on_reuse_store = MagicMock(side_effect=compressed_payloads)
+    compression_event = _FakeEvent()
+    source_allocator, source_slot = _new_source_slot()
+    drop_reuse_candidate = MagicMock(
+        side_effect=lambda: source_allocator.release(source_slot)
+    )
+
+    assert not target.try_store_compressed_reuse_backing(
+        _PAGE_KEY,
+        raw_payloads,
+        valid_token_count=4,
+        can_publish_compressed=_SourceReaderGate(),
+        publish_compressed_and_release_source=MagicMock(),
+        drop_reuse_candidate=drop_reuse_candidate,
+        completion_event_factory=lambda: compression_event,
+    )
+
+    cancelling = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert cancelling.state is ReuseBackingState.CANCELLING
+    assert cancelling.compression_source_leases == 1
+    # The already-created transform outputs are transient workspace and may
+    # temporarily exceed stable compressed admission capacity.
+    assert target.get_reuse_backing_pool_snapshot().used_bytes == compressed_size_bytes
+    drop_reuse_candidate.assert_not_called()
+    assert source_allocator.num_free_slots == 0
+
+    compression_event.ready = True
+    assert target.poll_reuse_backing(_PAGE_KEY) == 1
+    drop_reuse_candidate.assert_called_once_with()
+    assert source_allocator.num_free_slots == 1
+    assert target.get_reuse_backing_pool_snapshot().used_bytes == 0
+    _destroy_allocator(source_allocator)
+
+
+def test_transform_rejection_drops_partial_page_instead_of_retaining_raw() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    target.manager.on_reuse_store = MagicMock(return_value=None)
+    source_allocator, source_slot = _new_source_slot()
+    drop_reuse_candidate = MagicMock()
+
+    assert not target.try_store_compressed_reuse_backing(
+        _PAGE_KEY,
+        _raw_payloads(),
+        valid_token_count=3,
+        can_publish_compressed=_SourceReaderGate(),
+        publish_compressed_and_release_source=lambda: source_allocator.release(
+            source_slot
+        ),
+        drop_reuse_candidate=drop_reuse_candidate,
+    )
+
+    drop_reuse_candidate.assert_called_once_with()
+    with pytest.raises(KeyError, match="Unknown reuse backing page"):
+        target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert source_allocator.num_free_slots == 0
+    source_allocator.release(source_slot)
+    _destroy_allocator(source_allocator)
+
+
+def test_transform_failure_defers_source_drop_until_prior_launches_finish() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    raw_payloads = _raw_payloads()
+    target.manager.on_reuse_store = MagicMock(
+        side_effect=[
+            _compressed_payload(raw_payloads[0]),
+            RuntimeError("second compression failed"),
+        ]
+    )
+    compression_event = _FakeEvent()
+    source_allocator, source_slot = _new_source_slot()
+    drop_reuse_candidate = MagicMock(
+        side_effect=lambda: source_allocator.release(source_slot)
+    )
+
+    with pytest.raises(RuntimeError, match="second compression failed"):
+        target.try_store_compressed_reuse_backing(
+            _PAGE_KEY,
+            raw_payloads,
+            valid_token_count=4,
+            can_publish_compressed=_SourceReaderGate(),
+            publish_compressed_and_release_source=MagicMock(),
+            drop_reuse_candidate=drop_reuse_candidate,
+            completion_event_factory=lambda: compression_event,
+        )
+
+    failed_transform = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert failed_transform.state is ReuseBackingState.CANCELLING
+    assert failed_transform.compression_source_leases == 1
+    drop_reuse_candidate.assert_not_called()
+    assert source_allocator.num_free_slots == 0
+
+    compression_event.ready = True
+    assert target.poll_reuse_backing(_PAGE_KEY) == 1
+    drop_reuse_candidate.assert_called_once_with()
+    assert source_allocator.num_free_slots == 1
+    _destroy_allocator(source_allocator)
+
+
+def test_duplicate_generation_fails_before_any_compression_hook() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    _, source_allocator, _ = _store_compressed_page(target, target.manager)
+    target.manager.on_reuse_store = MagicMock()
+    drop_reuse_candidate = MagicMock()
+
+    with pytest.raises(ValueError, match="already exists"):
+        target.try_store_compressed_reuse_backing(
+            _PAGE_KEY,
+            _raw_payloads(),
+            valid_token_count=4,
+            can_publish_compressed=_SourceReaderGate(),
+            publish_compressed_and_release_source=MagicMock(),
+            drop_reuse_candidate=drop_reuse_candidate,
+        )
+
+    target.manager.on_reuse_store.assert_not_called()
+    drop_reuse_candidate.assert_not_called()
+    assert target.get_reuse_backing_snapshot(_PAGE_KEY).state is ReuseBackingState.COMPRESSED
+    assert target.evict_compressed_reuse_backing(_PAGE_KEY, MagicMock())
+    _destroy_allocator(source_allocator)
+
+
+def test_empty_compression_result_uses_deferred_abort_transaction() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    target.manager.on_reuse_store = MagicMock(
+        return_value=(torch.empty(0, dtype=torch.uint8),)
+    )
+    compression_event = _FakeEvent()
+    source_allocator, source_slot = _new_source_slot()
+    drop_reuse_candidate = MagicMock(
+        side_effect=lambda: source_allocator.release(source_slot)
+    )
+
+    with pytest.raises(ValueError, match="empty payload"):
+        target.try_store_compressed_reuse_backing(
+            _PAGE_KEY,
+            _raw_payloads(),
+            valid_token_count=4,
+            can_publish_compressed=_SourceReaderGate(),
+            publish_compressed_and_release_source=MagicMock(),
+            drop_reuse_candidate=drop_reuse_candidate,
+            completion_event_factory=lambda: compression_event,
+        )
+
+    cancelling = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert cancelling.state is ReuseBackingState.CANCELLING
+    assert cancelling.compressed_resident_bytes == 0
+    assert cancelling.compression_source_leases == 1
+    drop_reuse_candidate.assert_not_called()
+
+    compression_event.ready = True
+    assert target.poll_reuse_backing(_PAGE_KEY) == 1
+    drop_reuse_candidate.assert_called_once_with()
+    assert source_allocator.num_free_slots == 1
+    _destroy_allocator(source_allocator)
+
+
+def test_invalid_source_contract_drops_candidate_once() -> None:
+    bad_inputs = (
+        (),
+        (torch.ones((3, 32), dtype=torch.bfloat16),),
+        (torch.ones((32, 4), dtype=torch.bfloat16).transpose(0, 1),),
+    )
+    for generation, raw_payloads in enumerate(bad_inputs, start=100):
+        target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+        drop_reuse_candidate = MagicMock()
+        with pytest.raises(ValueError):
+            target.try_store_compressed_reuse_backing(
+                (0, generation),
+                raw_payloads,
+                valid_token_count=4,
+                can_publish_compressed=_SourceReaderGate(),
+                publish_compressed_and_release_source=MagicMock(),
+                drop_reuse_candidate=drop_reuse_candidate,
+            )
+        drop_reuse_candidate.assert_called_once_with()
+        assert target._reuse_backing_store.page_count == 0
+        assert target.get_reuse_backing_pool_snapshot().used_bytes == 0
+
+
+def test_completion_event_factory_runs_after_every_compression_hook() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    raw_payloads = _raw_payloads()
+    compressed_payloads = tuple(_compressed_payload(payload) for payload in raw_payloads)
+    hook_calls = 0
+
+    def compress(raw_payload, **kwargs):
+        nonlocal hook_calls
+        del raw_payload, kwargs
+        result = compressed_payloads[hook_calls]
+        hook_calls += 1
+        return result
+
+    completion_event = _FakeEvent()
+
+    def record_after_launches():
+        assert hook_calls == len(raw_payloads)
+        return completion_event
+
+    target.manager.on_reuse_store = MagicMock(side_effect=compress)
+    assert target.try_store_compressed_reuse_backing(
+        (0, 120),
+        raw_payloads,
+        valid_token_count=4,
+        can_publish_compressed=_SourceReaderGate(),
+        publish_compressed_and_release_source=MagicMock(),
+        drop_reuse_candidate=MagicMock(),
+        completion_event_factory=record_after_launches,
+    )
+    assert hook_calls == len(raw_payloads)
+    assert target.get_reuse_backing_snapshot((0, 120)).state is ReuseBackingState.COMPRESSING
+
+
+def test_event_query_failure_quarantines_transaction_until_owner_reconciles() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    raw_payloads = _raw_payloads()
+    compressed_payloads = tuple(_compressed_payload(payload) for payload in raw_payloads)
+    compressed_size_bytes = sum(_payload_nbytes(payload) for payload in compressed_payloads)
+    target.manager.on_reuse_store = MagicMock(side_effect=compressed_payloads)
+    source_allocator, source_slot = _new_source_slot()
+    publish = MagicMock()
+    drop_reuse_candidate = MagicMock()
+
+    with pytest.raises(RuntimeError, match="event query failed"):
+        target.try_store_compressed_reuse_backing(
+            (0, 119),
+            raw_payloads,
+            valid_token_count=4,
+            can_publish_compressed=_SourceReaderGate(),
+            publish_compressed_and_release_source=publish,
+            drop_reuse_candidate=drop_reuse_candidate,
+            completion_event_factory=_FailingEvent,
+        )
+
+    failed = target.get_reuse_backing_snapshot((0, 119))
+    assert failed.state is ReuseBackingState.FAILED
+    assert failed.compressed_resident_bytes == compressed_size_bytes
+    assert failed.compression_source_leases == 1
+    assert target.poll_reuse_backing((0, 119)) == 0
+    publish.assert_not_called()
+    drop_reuse_candidate.assert_not_called()
+    assert not target.reconcile_failed_reuse_backing((0, 119), lambda: False)
+    assert target.get_reuse_backing_pool_snapshot().used_bytes == compressed_size_bytes
+
+    # Native V2 owns cleanup; only a read-only confirmation may release the
+    # quarantined compact allocation.
+    source_allocator.release(source_slot)
+    assert target.reconcile_failed_reuse_backing((0, 119), lambda: True)
+    assert target.get_reuse_backing_pool_snapshot().used_bytes == 0
+    _destroy_allocator(source_allocator)
+
+
+def test_atomic_publish_callback_is_at_most_once_on_failure() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    raw_payloads = _raw_payloads()
+    target.manager.on_reuse_store = MagicMock(
+        side_effect=tuple(_compressed_payload(payload) for payload in raw_payloads)
+    )
+    source_allocator, source_slot = _new_source_slot()
+    publish_count = 0
+
+    def publish_then_fail() -> None:
+        nonlocal publish_count
+        publish_count += 1
+        assert target.poll_reuse_backing((0, 121)) == 0
+        source_allocator.release(source_slot)
+        raise RuntimeError("native atomic publish failed")
+
+    drop_reuse_candidate = MagicMock()
+    with pytest.raises(RuntimeError, match="atomic publish failed"):
+        target.try_store_compressed_reuse_backing(
+            (0, 121),
+            raw_payloads,
+            valid_token_count=4,
+            can_publish_compressed=_SourceReaderGate(),
+            publish_compressed_and_release_source=publish_then_fail,
+            drop_reuse_candidate=drop_reuse_candidate,
+        )
+
+    assert publish_count == 1
+    assert source_allocator.num_free_slots == 1
+    drop_reuse_candidate.assert_not_called()
+    assert target.poll_reuse_backing((0, 121)) == 0
+    failed = target.get_reuse_backing_snapshot((0, 121))
+    assert failed.state is ReuseBackingState.FAILED
+    assert publish_count == 1
+    assert target.get_reuse_backing_pool_snapshot().used_bytes != 0
+    assert target.reconcile_failed_reuse_backing((0, 121), lambda: True)
+    assert target.get_reuse_backing_pool_snapshot().used_bytes == 0
+    _destroy_allocator(source_allocator)
+
+
+def test_compression_event_record_double_failure_quarantines_source_ownership() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    raw_payloads = _raw_payloads()
+    target.manager.on_reuse_store = MagicMock(
+        side_effect=[
+            _compressed_payload(raw_payloads[0]),
+            RuntimeError("compression failed"),
+        ]
+    )
+    source_allocator, source_slot = _new_source_slot()
+    drop_reuse_candidate = MagicMock()
+
+    with (
+        patch.object(
+            KVCacheManagerV2,
+            "_record_reuse_completion_event",
+            side_effect=RuntimeError("event record failed"),
+        ),
+        pytest.raises(RuntimeError, match="event record failed"),
+    ):
+        target.try_store_compressed_reuse_backing(
+            (0, 122),
+            raw_payloads,
+            valid_token_count=4,
+            can_publish_compressed=_SourceReaderGate(),
+            publish_compressed_and_release_source=MagicMock(),
+            drop_reuse_candidate=drop_reuse_candidate,
+        )
+
+    failed = target.get_reuse_backing_snapshot((0, 122))
+    assert failed.state is ReuseBackingState.FAILED
+    assert failed.compression_source_leases == 1
+    drop_reuse_candidate.assert_not_called()
+    assert source_allocator.num_free_slots == 0
+
+    source_allocator.release(source_slot)
+    assert target.reconcile_failed_reuse_backing((0, 122), lambda: True)
+    assert target.get_reuse_backing_pool_snapshot().used_bytes == 0
+    _destroy_allocator(source_allocator)
+
+
+def test_cancelled_compression_waits_for_gpu_work_then_reclaims_capacity() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    compression_event = _FakeEvent()
+    compressed_size_bytes, source_allocator, source_slot = _store_compressed_page(
+        target,
+        target.manager,
+        compression_event=compression_event,
+    )
+    assert source_allocator.num_free_slots == 0
+    cancel_native_transaction = MagicMock(
+        side_effect=lambda: source_allocator.release(source_slot)
+    )
+
+    assert not target.cancel_compressed_reuse_store(
+        _PAGE_KEY,
+        cancel_native_transaction,
+    )
+    cancelling = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert cancelling.state is ReuseBackingState.CANCELLING
+    assert cancelling.compressed_resident_bytes == compressed_size_bytes
+    cancel_native_transaction.assert_not_called()
+
+    compression_event.ready = True
+    assert target.poll_reuse_backing(_PAGE_KEY) == 1
+    cancel_native_transaction.assert_called_once_with()
+    with pytest.raises(KeyError, match="Unknown reuse backing page"):
+        target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert target.get_reuse_backing_pool_snapshot().used_bytes == 0
+    # The native cancellation callback, not the compressed store, decides
+    # when the full-precision source slot can be released.
+    assert source_allocator.num_free_slots == 1
+    _destroy_allocator(source_allocator)
+
+
+def test_cancel_failure_is_quarantined_and_never_retried() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    compression_event = _FakeEvent()
+    compressed_size_bytes, source_allocator, source_slot = _store_compressed_page(
+        target,
+        target.manager,
+        compression_event=compression_event,
+    )
+    cancel_count = 0
+
+    def cancel_then_fail() -> None:
+        nonlocal cancel_count
+        cancel_count += 1
+        assert target.poll_reuse_backing(_PAGE_KEY) == 0
+        raise RuntimeError("native cancel failed")
+
+    assert not target.cancel_compressed_reuse_store(_PAGE_KEY, cancel_then_fail)
+    compression_event.ready = True
+    with pytest.raises(RuntimeError, match="native cancel failed"):
+        target.poll_reuse_backing(_PAGE_KEY)
+
+    failed = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert failed.state is ReuseBackingState.FAILED
+    assert failed.compressed_resident_bytes == compressed_size_bytes
+    assert failed.compression_source_leases == 1
+    assert target.poll_reuse_backing(_PAGE_KEY) == 0
+    assert cancel_count == 1
+
+    source_allocator.release(source_slot)
+    assert target.reconcile_failed_reuse_backing(_PAGE_KEY, lambda: True)
+    assert target.get_reuse_backing_pool_snapshot().used_bytes == 0
+    _destroy_allocator(source_allocator)
+
+
+def test_decompression_failure_rolls_back_raw_admission_and_keeps_compressed() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    compressed_size_bytes, source_allocator, _ = _store_compressed_page(
+        target, target.manager
+    )
+    assert source_allocator.num_free_slots == 1
+
+    raw_destinations = tuple(torch.empty_like(payload) for payload in _raw_payloads())
+    target.manager.on_reuse_materialize = MagicMock(
+        side_effect=[None, RuntimeError("decompression failed")]
+    )
+    rollback_raw_slot = MagicMock()
+    rollback_event = _FakeEvent()
+
+    with pytest.raises(RuntimeError, match="decompression failed"):
+        target.decompress_reuse_backing(
             _PAGE_KEY,
             raw_destinations,
-            publish_raw_slot=publish_raw_slot,
+            publish_raw_slot=MagicMock(),
+            rollback_raw_slot=rollback_raw_slot,
+            completion_event_factory=lambda: rollback_event,
+        )
+
+    rollback_raw_slot.assert_not_called()
+    pending = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert pending.state is ReuseBackingState.COMPRESSED
+    assert pending.compressed_resident_bytes == compressed_size_bytes
+    assert pending.compressed_read_leases == 1
+    assert pending.pending_decompressions == 1
+    assert not target.evict_compressed_reuse_backing(_PAGE_KEY, MagicMock())
+
+    rollback_event.ready = True
+    assert target.poll_reuse_backing(_PAGE_KEY) == 1
+    rollback_raw_slot.assert_called_once_with(rollback_event)
+    complete = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert complete.compressed_read_leases == 0
+    assert complete.pending_decompressions == 0
+    _destroy_allocator(source_allocator)
+
+
+def test_mixed_destination_devices_fail_before_any_decompression_launch() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    compressed_size_bytes, source_allocator, _ = _store_compressed_page(
+        target, target.manager
+    )
+    target.manager.on_reuse_materialize = MagicMock(return_value=None)
+    rollback_raw_slot = MagicMock()
+    destinations = (
+        torch.empty_like(_raw_payloads()[0]),
+        torch.empty(_raw_payloads()[1].shape, device="meta", dtype=torch.bfloat16),
+    )
+
+    with pytest.raises(ValueError, match="share a device"):
+        target.decompress_reuse_backing(
+            _PAGE_KEY,
+            destinations,
+            publish_raw_slot=MagicMock(),
             rollback_raw_slot=rollback_raw_slot,
         )
 
+    target.manager.on_reuse_materialize.assert_not_called()
+    rollback_raw_slot.assert_called_once_with(None)
     snapshot = target.get_reuse_backing_snapshot(_PAGE_KEY)
-    assert snapshot.state is ReuseBackingState.ENCODED
-    assert snapshot.encoded_resident_bytes == encoded_size_bytes
-    assert snapshot.encoded_read_leases == 0
-    assert snapshot.pending_materializations == 0
-    assert target.get_reuse_backing_pool_snapshot().used_bytes == encoded_size_bytes
-    assert raw_ledger.used_bytes == 0
-    publish_raw_slot.assert_not_called()
-    rollback_raw_slot.assert_called_once_with()
+    assert snapshot.state is ReuseBackingState.COMPRESSED
+    assert snapshot.compressed_resident_bytes == compressed_size_bytes
+    assert snapshot.compressed_read_leases == 0
+    _destroy_allocator(source_allocator)
 
 
-def test_materialized_active_raw_survives_cold_encoded_eviction() -> None:
-    target, manager = _make_manager(encoded_capacity_bytes=1024)
-    raw_payloads = _raw_payloads()
-    raw_ledger = _ByteLedger()
-    encoded_size_bytes = _publish_encoded_page(
-        target,
-        manager,
-        raw_payloads,
-        raw_ledger,
+def test_decompression_publish_waits_for_event_and_blocks_compressed_eviction() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    compressed_size_bytes, source_allocator, _ = _store_compressed_page(
+        target, target.manager
     )
-    raw_destinations = tuple(torch.empty_like(payload) for payload in raw_payloads)
-    destination_size_bytes = sum(_tensor_nbytes(destination) for destination in raw_destinations)
-    raw_ledger.reserve(destination_size_bytes)
-    manager.on_reuse_materialize = MagicMock(return_value=None)
+    target.manager.on_reuse_materialize = MagicMock(return_value=None)
+    decompression_event = _FakeEvent()
     publish_raw_slot = MagicMock()
-    rollback_raw_slot = MagicMock(side_effect=lambda: raw_ledger.release(destination_size_bytes))
-    decode_event = _FakeEvent()
+    rollback_raw_slot = MagicMock()
 
-    materialization_id = target.materialize_reuse_backing(
+    decompression_id = target.decompress_reuse_backing(
         _PAGE_KEY,
-        raw_destinations,
+        tuple(torch.empty_like(payload) for payload in _raw_payloads()),
         publish_raw_slot=publish_raw_slot,
         rollback_raw_slot=rollback_raw_slot,
-        completion_event=decode_event,
+        completion_event_factory=lambda: decompression_event,
     )
-    assert materialization_id >= 0
-    pending_snapshot = target.get_reuse_backing_snapshot(_PAGE_KEY)
-    assert pending_snapshot.state is ReuseBackingState.ENCODED
-    assert pending_snapshot.encoded_read_leases == 1
-    assert pending_snapshot.pending_materializations == 1
-    assert not target.evict_reuse_encoded_backing(_PAGE_KEY)
-    publish_raw_slot.assert_not_called()
-    rollback_raw_slot.assert_not_called()
+    assert decompression_id == 0
 
-    decode_event.ready = True
+    pending = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert pending.state is ReuseBackingState.COMPRESSED
+    assert pending.compressed_read_leases == 1
+    assert pending.pending_decompressions == 1
+    assert not target.evict_compressed_reuse_backing(_PAGE_KEY, MagicMock())
+    publish_raw_slot.assert_not_called()
+
+    decompression_event.ready = True
     assert target.poll_reuse_backing(_PAGE_KEY) == 1
-    ready_snapshot = target.get_reuse_backing_snapshot(_PAGE_KEY)
-    assert ready_snapshot.encoded_read_leases == 0
-    assert ready_snapshot.pending_materializations == 0
     publish_raw_slot.assert_called_once_with()
     rollback_raw_slot.assert_not_called()
-    assert target.get_reuse_backing_pool_snapshot().used_bytes == encoded_size_bytes
+    ready = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert ready.compressed_resident_bytes == compressed_size_bytes
+    assert ready.compressed_read_leases == 0
+    assert ready.pending_decompressions == 0
 
-    assert target.evict_reuse_encoded_backing(_PAGE_KEY)
-    assert target.get_reuse_backing_pool_snapshot().used_bytes == 0
-    assert raw_ledger.used_bytes == destination_size_bytes
+    assert target.evict_compressed_reuse_backing(_PAGE_KEY, MagicMock())
+    _destroy_allocator(source_allocator)
 
 
-def test_materialize_publish_failure_rolls_back_raw_admission() -> None:
-    target, manager = _make_manager(encoded_capacity_bytes=1024)
-    raw_payloads = _raw_payloads()
-    raw_ledger = _ByteLedger()
-    encoded_size_bytes = _publish_encoded_page(
-        target,
-        manager,
-        raw_payloads,
-        raw_ledger,
+def test_decompression_publish_is_consumed_before_reentrant_poll() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    _, source_allocator, _ = _store_compressed_page(target, target.manager)
+    target.manager.on_reuse_materialize = MagicMock(return_value=None)
+    publish_count = 0
+
+    def publish_with_reentrant_poll() -> None:
+        nonlocal publish_count
+        publish_count += 1
+        assert target.poll_reuse_backing(_PAGE_KEY) == 0
+        assert not target.evict_compressed_reuse_backing(_PAGE_KEY, MagicMock())
+
+    target.decompress_reuse_backing(
+        _PAGE_KEY,
+        tuple(torch.empty_like(payload) for payload in _raw_payloads()),
+        publish_raw_slot=publish_with_reentrant_poll,
+        rollback_raw_slot=MagicMock(),
     )
-    raw_destinations = tuple(torch.empty_like(payload) for payload in raw_payloads)
-    destination_size_bytes = sum(_tensor_nbytes(payload) for payload in raw_destinations)
-    raw_ledger.reserve(destination_size_bytes)
-    manager.on_reuse_materialize = MagicMock(return_value=None)
-    publish_raw_slot = MagicMock(side_effect=RuntimeError("raw publish failed"))
-    rollback_raw_slot = MagicMock(side_effect=lambda: raw_ledger.release(destination_size_bytes))
 
-    with pytest.raises(RuntimeError, match="raw publish failed"):
-        target.materialize_reuse_backing(
+    assert publish_count == 1
+    snapshot = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert snapshot.compressed_read_leases == 0
+    assert snapshot.pending_decompressions == 0
+    _destroy_allocator(source_allocator)
+
+
+def test_decompression_event_query_failure_quarantines_pending_raw_reservation() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    compressed_size_bytes, source_allocator, _ = _store_compressed_page(
+        target, target.manager
+    )
+    target.manager.on_reuse_materialize = MagicMock(return_value=None)
+    failing_event = _FailingEvent()
+    rollback_raw_slot = MagicMock()
+
+    with pytest.raises(RuntimeError, match="event query failed"):
+        target.decompress_reuse_backing(
             _PAGE_KEY,
-            raw_destinations,
-            publish_raw_slot=publish_raw_slot,
+            tuple(torch.empty_like(payload) for payload in _raw_payloads()),
+            publish_raw_slot=MagicMock(),
+            rollback_raw_slot=rollback_raw_slot,
+            completion_event_factory=lambda: failing_event,
+        )
+
+    failed = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert failed.state is ReuseBackingState.FAILED
+    assert failed.compressed_resident_bytes == compressed_size_bytes
+    assert failed.compressed_read_leases == 1
+    assert failed.pending_decompressions == 1
+    rollback_raw_slot.assert_not_called()
+
+    # The owner first cleans the raw reservation out-of-band, then supplies a
+    # read-only confirmation that both GPU and native state are reconciled.
+    rollback_raw_slot(failing_event)
+    assert target.reconcile_failed_reuse_backing(_PAGE_KEY, lambda: True)
+    assert target.get_reuse_backing_pool_snapshot().used_bytes == 0
+    _destroy_allocator(source_allocator)
+
+
+def test_decompression_event_record_double_failure_quarantines_both_reservations() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    compressed_size_bytes, source_allocator, _ = _store_compressed_page(
+        target, target.manager
+    )
+    target.manager.on_reuse_materialize = MagicMock(
+        side_effect=RuntimeError("decompression failed")
+    )
+    rollback_raw_slot = MagicMock()
+
+    with (
+        patch.object(
+            KVCacheManagerV2,
+            "_record_reuse_completion_event",
+            side_effect=RuntimeError("event record failed"),
+        ),
+        pytest.raises(RuntimeError, match="event record failed"),
+    ):
+        target.decompress_reuse_backing(
+            _PAGE_KEY,
+            tuple(torch.empty_like(payload) for payload in _raw_payloads()),
+            publish_raw_slot=MagicMock(),
             rollback_raw_slot=rollback_raw_slot,
         )
 
+    failed = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert failed.state is ReuseBackingState.FAILED
+    assert failed.compressed_resident_bytes == compressed_size_bytes
+    assert failed.compressed_read_leases == 1
+    assert failed.pending_decompressions == 1
+    rollback_raw_slot.assert_not_called()
+
+    rollback_raw_slot(None)
+    assert target.reconcile_failed_reuse_backing(_PAGE_KEY, lambda: True)
+    assert target.get_reuse_backing_pool_snapshot().used_bytes == 0
+    _destroy_allocator(source_allocator)
+
+
+def test_raw_publish_failure_rolls_back_once_and_preserves_compressed_source() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    compressed_size_bytes, source_allocator, _ = _store_compressed_page(
+        target, target.manager
+    )
+    target.manager.on_reuse_materialize = MagicMock(return_value=None)
+    rollback_raw_slot = MagicMock()
+
+    with pytest.raises(RuntimeError, match="publish failed"):
+        target.decompress_reuse_backing(
+            _PAGE_KEY,
+            tuple(torch.empty_like(payload) for payload in _raw_payloads()),
+            publish_raw_slot=MagicMock(side_effect=RuntimeError("publish failed")),
+            rollback_raw_slot=rollback_raw_slot,
+        )
+
+    rollback_raw_slot.assert_called_once_with(None)
     snapshot = target.get_reuse_backing_snapshot(_PAGE_KEY)
-    assert snapshot.state is ReuseBackingState.ENCODED
-    assert snapshot.encoded_read_leases == 0
-    assert snapshot.pending_materializations == 0
-    assert target.get_reuse_backing_pool_snapshot().used_bytes == encoded_size_bytes
-    assert raw_ledger.used_bytes == 0
-    publish_raw_slot.assert_called_once_with()
-    rollback_raw_slot.assert_called_once_with()
+    assert snapshot.state is ReuseBackingState.COMPRESSED
+    assert snapshot.compressed_resident_bytes == compressed_size_bytes
+    assert snapshot.compressed_read_leases == 0
+    assert snapshot.pending_decompressions == 0
+    _destroy_allocator(source_allocator)
+
+
+def test_raw_publish_and_rollback_double_failure_is_quarantined() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    compressed_size_bytes, source_allocator, _ = _store_compressed_page(
+        target, target.manager
+    )
+    target.manager.on_reuse_materialize = MagicMock(return_value=None)
+    rollback_raw_slot = MagicMock(side_effect=RuntimeError("rollback failed"))
+
+    with pytest.raises(RuntimeError, match="rollback failed"):
+        target.decompress_reuse_backing(
+            _PAGE_KEY,
+            tuple(torch.empty_like(payload) for payload in _raw_payloads()),
+            publish_raw_slot=MagicMock(side_effect=RuntimeError("publish failed")),
+            rollback_raw_slot=rollback_raw_slot,
+        )
+
+    rollback_raw_slot.assert_called_once_with(None)
+    failed = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert failed.state is ReuseBackingState.FAILED
+    assert failed.compressed_resident_bytes == compressed_size_bytes
+    assert failed.compressed_read_leases == 1
+    assert failed.pending_decompressions == 1
+    assert target.reconcile_failed_reuse_backing(_PAGE_KEY, lambda: True)
+    assert target.get_reuse_backing_pool_snapshot().used_bytes == 0
+    _destroy_allocator(source_allocator)
+
+
+def test_eviction_failure_is_quarantined_after_unknown_native_side_effect() -> None:
+    target = _KVCMReuseContractHarness(compressed_capacity_bytes=1024)
+    compressed_size_bytes, source_allocator, _ = _store_compressed_page(
+        target, target.manager
+    )
+    unpublish_count = 0
+
+    def unpublish_then_fail() -> None:
+        nonlocal unpublish_count
+        unpublish_count += 1
+        raise RuntimeError("unpublish failed")
+
+    with pytest.raises(RuntimeError, match="unpublish failed"):
+        target.evict_compressed_reuse_backing(
+            _PAGE_KEY,
+            unpublish_then_fail,
+        )
+
+    snapshot = target.get_reuse_backing_snapshot(_PAGE_KEY)
+    assert snapshot.state is ReuseBackingState.FAILED
+    assert snapshot.compressed_resident_bytes == compressed_size_bytes
+    assert target.get_reuse_backing_pool_snapshot().used_bytes == compressed_size_bytes
+    assert target.poll_reuse_backing(_PAGE_KEY) == 0
+    with pytest.raises(RuntimeError, match="requires COMPRESSED"):
+        target.evict_compressed_reuse_backing(_PAGE_KEY, MagicMock())
+    assert unpublish_count == 1
+
+    assert not target.reconcile_failed_reuse_backing(_PAGE_KEY, lambda: False)
+    assert target.reconcile_failed_reuse_backing(_PAGE_KEY, lambda: True)
+    assert target._reuse_backing_store.page_count == 0
+    assert target.get_reuse_backing_pool_snapshot().used_bytes == 0
+    _destroy_allocator(source_allocator)

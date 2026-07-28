@@ -92,6 +92,7 @@ def _v2_manager(*, is_draft: bool = False):
     manager.dtype = DataType.BF16
     manager.tokens_per_block = 4
     manager._reuse_compression_manager = None
+    manager._reuse_backing_store = None
     return manager
 
 
@@ -312,6 +313,7 @@ class TestFactory:
         config = KvCacheCompressionConfig(
             algorithm="quantization_for_boundary",
             quant="nvfp4",
+            compressed_reuse_capacity_bytes=1024,
         )
         target = _v2_manager()
         target.enable_block_reuse = True
@@ -322,6 +324,7 @@ class TestFactory:
         assert manager.quant == "nvfp4"
         assert manager.kv_cache_manager is target
         assert target._reuse_compression_manager is manager
+        assert target.get_reuse_backing_pool_snapshot().capacity_bytes == 1024
         assert config.kv_cache_compression_mode == KvCacheCompressionMode.QUANTIZATION_FOR_BOUNDARY
 
     def test_boundary_config_requires_nvfp4(self):
@@ -329,8 +332,18 @@ class TestFactory:
 
         with pytest.raises(ValueError, match="requires quant='nvfp4'"):
             KvCacheCompressionConfig(algorithm="quantization_for_boundary")
+        with pytest.raises(ValueError, match="compressed_reuse_capacity_bytes > 0"):
+            KvCacheCompressionConfig(
+                algorithm="quantization_for_boundary",
+                quant="nvfp4",
+            )
         with pytest.raises(ValueError, match="quant is only valid"):
             KvCacheCompressionConfig(algorithm="offload", quant="nvfp4")
+        with pytest.raises(ValueError, match="only valid"):
+            KvCacheCompressionConfig(
+                algorithm="offload",
+                compressed_reuse_capacity_bytes=1024,
+            )
 
     def test_eviction_method_predicate_defaults_false(self):
         # Non-evicting methods (e.g. offloading) are never restricted by the
@@ -412,7 +425,14 @@ class TestNVFP4BoundaryReuse:
         target.is_disagg = overrides.pop("is_disagg", False)
         target.dtype = overrides.pop("dtype", DataType.BF16)
         assert not overrides
-        return QuantizationForBoundaryCompression(target, quant="nvfp4"), target
+        return (
+            QuantizationForBoundaryCompression(
+                target,
+                quant="nvfp4",
+                compressed_capacity_bytes=1024,
+            ),
+            target,
+        )
 
     def test_requires_reuse_only_raw_target_cache(self):
         with pytest.raises(ValueError, match="requires KV-cache block reuse"):
@@ -434,13 +454,22 @@ class TestNVFP4BoundaryReuse:
                 target,
                 draft_kv_cache_manager=draft,
                 quant="nvfp4",
+                compressed_capacity_bytes=1024,
             )
 
-        QuantizationForBoundaryCompression(target, quant="nvfp4")
+        QuantizationForBoundaryCompression(
+            target,
+            quant="nvfp4",
+            compressed_capacity_bytes=1024,
+        )
         with pytest.raises(ValueError, match="already bound"):
-            QuantizationForBoundaryCompression(target, quant="nvfp4")
+            QuantizationForBoundaryCompression(
+                target,
+                quant="nvfp4",
+                compressed_capacity_bytes=1024,
+            )
 
-    def test_partial_or_unaligned_payload_falls_back_to_raw(self):
+    def test_partial_or_unaligned_payload_is_not_admitted_to_cold_reuse(self):
         manager, _ = self._manager()
         partial = torch.ones((2, 4, 16), dtype=torch.bfloat16)
         unaligned = torch.ones((4, 15), dtype=torch.bfloat16)
@@ -458,13 +487,13 @@ class TestNVFP4BoundaryReuse:
 
         with patch.object(torch.ops.trtllm, "fp4_quantize", create=True) as quantize:
             quantize.return_value = packed, linear_scales
-            encoded = manager.on_reuse_store(raw, valid_token_count=4)
+            compressed = manager.on_reuse_store(raw, valid_token_count=4)
 
-        assert encoded is not None
-        encoded_packed, encoded_scales, inverse_global_scale = encoded
-        assert encoded_packed is packed
-        assert encoded_scales.shape == (8, 1)
-        assert encoded_scales.data_ptr() == linear_scales.data_ptr()
+        assert compressed is not None
+        compressed_packed, compressed_scales, inverse_global_scale = compressed
+        assert compressed_packed is packed
+        assert compressed_scales.shape == (8, 1)
+        assert compressed_scales.data_ptr() == linear_scales.data_ptr()
         assert inverse_global_scale.shape == (1,)
         torch.testing.assert_close(
             inverse_global_scale,

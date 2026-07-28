@@ -43,6 +43,7 @@ class _KVCacheManagerV2Harness(KVCacheManagerV2):
         self.dtype = DataType.BF16
         self.tokens_per_block = tokens_per_block
         self._reuse_compression_manager = None
+        self._reuse_backing_store = None
 
     def bind_reuse_compression_hooks(
         self,
@@ -75,18 +76,18 @@ def _encode(
     raw: torch.Tensor,
     valid_token_count: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    encoded = manager.on_reuse_store(raw, valid_token_count=valid_token_count)
-    if encoded is None:
-        raise RuntimeError("A full, feature-aligned page unexpectedly used raw fallback")
-    return encoded
+    compressed = manager.on_reuse_store(raw, valid_token_count=valid_token_count)
+    if compressed is None:
+        raise RuntimeError("A full, feature-aligned Page was not admitted to compressed reuse")
+    return compressed
 
 
-def _materialize(
+def _decompress(
     manager: QuantizationForBoundaryCompression,
-    encoded: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    compressed: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     destination: torch.Tensor,
 ) -> None:
-    result = manager.on_reuse_materialize(encoded, destination)
+    result = manager.on_reuse_materialize(compressed, destination)
     if result is not None:
         raise RuntimeError("on_reuse_materialize must write in place and return None")
 
@@ -108,20 +109,26 @@ def _validate(
         )
 
     kv_cache_manager = _make_kvcm_v2_harness(tokens_per_block=shape[-2])
-    manager = QuantizationForBoundaryCompression(kv_cache_manager, quant="nvfp4")
+    manager = QuantizationForBoundaryCompression(
+        kv_cache_manager,
+        quant="nvfp4",
+        compressed_capacity_bytes=1 << 20,
+    )
     raw = _make_input(shape, device)
 
     # One invocation is one independently evictable physical role payload.
     # Do not share the FP32 global scale across K/V roles.
     role_payloads = tuple(component.contiguous() for component in raw.unbind(0))
-    encoded_records = tuple(
+    compressed_records = tuple(
         _encode(manager, payload, valid_token_count=shape[-2]) for payload in role_payloads
     )
 
     destination = torch.full_like(raw, torch.nan)
     destination_pointer = destination.data_ptr()
-    for encoded, role_destination in zip(encoded_records, destination.unbind(0), strict=True):
-        _materialize(manager, encoded, role_destination)
+    for compressed, role_destination in zip(
+        compressed_records, destination.unbind(0), strict=True
+    ):
+        _decompress(manager, compressed, role_destination)
     torch.cuda.synchronize(device)
 
     decode_into_destination = destination.data_ptr() == destination_pointer and not bool(
@@ -130,7 +137,7 @@ def _validate(
     if not decode_into_destination:
         raise RuntimeError("NVFP4 decode did not populate the supplied raw destination")
 
-    partial_fallback = all(
+    partial_not_admitted = all(
         manager.on_reuse_store(
             payload,
             valid_token_count=shape[-2] - 1,
@@ -138,8 +145,8 @@ def _validate(
         is None
         for payload in role_payloads
     )
-    if not partial_fallback:
-        raise RuntimeError("A partial reuse page was encoded instead of remaining raw")
+    if not partial_not_admitted:
+        raise RuntimeError("A partial reuse Page was admitted to compressed cold reuse")
 
     zero_raw = torch.zeros_like(raw)
     zero_records = tuple(
@@ -147,8 +154,10 @@ def _validate(
         for payload in zero_raw.unbind(0)
     )
     zero_destination = torch.full_like(zero_raw, 1.0)
-    for encoded, role_destination in zip(zero_records, zero_destination.unbind(0), strict=True):
-        _materialize(manager, encoded, role_destination)
+    for compressed, role_destination in zip(
+        zero_records, zero_destination.unbind(0), strict=True
+    ):
+        _decompress(manager, compressed, role_destination)
     torch.cuda.synchronize(device)
     zero_roundtrip = bool(torch.count_nonzero(zero_destination).item() == 0)
     if not zero_roundtrip:
@@ -161,14 +170,17 @@ def _validate(
     mean_absolute_error = difference.abs().mean().item()
 
     component_bytes = {
-        "block_scales": sum(_tensor_bytes(block_scales) for _, block_scales, _ in encoded_records),
-        "inverse_global_scale": sum(
-            _tensor_bytes(inverse_global_scale) for _, _, inverse_global_scale in encoded_records
+        "block_scales": sum(
+            _tensor_bytes(block_scales) for _, block_scales, _ in compressed_records
         ),
-        "packed": sum(_tensor_bytes(packed) for packed, _, _ in encoded_records),
+        "inverse_global_scale": sum(
+            _tensor_bytes(inverse_global_scale)
+            for _, _, inverse_global_scale in compressed_records
+        ),
+        "packed": sum(_tensor_bytes(packed) for packed, _, _ in compressed_records),
     }
     raw_bytes = _tensor_bytes(raw)
-    encoded_bytes = sum(component_bytes.values())
+    compressed_bytes = sum(component_bytes.values())
 
     return {
         "status": "PASS",
@@ -183,12 +195,12 @@ def _validate(
             "shape": list(shape),
         },
         "payload": {
-            "encoded_bytes": encoded_bytes,
-            "encoded_component_bytes": component_bytes,
-            "encoded_record_count": len(encoded_records),
+            "compressed_bytes": compressed_bytes,
+            "compressed_component_bytes": component_bytes,
+            "compressed_record_count": len(compressed_records),
             "global_scale_scope": "one_fp32_scalar_per_role_payload",
             "raw_bytes": raw_bytes,
-            "raw_to_encoded_ratio": round(raw_bytes / encoded_bytes, 12),
+            "raw_to_compressed_ratio": round(raw_bytes / compressed_bytes, 12),
         },
         "accuracy": {
             "mean_absolute_error": round(mean_absolute_error, 12),
@@ -196,7 +208,7 @@ def _validate(
         },
         "checks": {
             "decode_writes_into_supplied_destination": decode_into_destination,
-            "partial_page_raw_fallback": partial_fallback,
+            "partial_page_not_admitted_to_cold_reuse": partial_not_admitted,
             "zero_roundtrip": zero_roundtrip,
         },
         "lifecycle_wired": False,

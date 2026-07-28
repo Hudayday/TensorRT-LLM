@@ -130,7 +130,7 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
 
 
 def _reuse_payload_nbytes(payload: object) -> int:
-    """Return the represented bytes in a tensor-only encoded payload tree."""
+    """Return the represented bytes in a tensor-only compressed payload tree."""
     if isinstance(payload, torch.Tensor):
         return payload.numel() * payload.element_size()
     if isinstance(payload, tuple):
@@ -1198,145 +1198,244 @@ class KVCacheManagerV2(BaseResourceManager):
             raise ValueError("Reuse compression hooks require a block-reuse-capable manager")
         self._reuse_compression_manager = manager
 
-    def configure_reuse_encoded_backing(self, capacity_bytes: int) -> None:
-        """Configure the logical compact-capacity ledger owned by this manager.
+    def configure_compressed_reuse_backing(self, capacity_bytes: int) -> None:
+        """Configure the compressed-only cold-reuse capacity ledger.
 
         This prototype API is intentionally separate from normal page-pool
-        construction until encoded storage is represented by native V2 tier
-        descriptors.
+        construction until compressed storage is represented by a native V2
+        compact slot arena. Production wiring must reserve ``capacity_bytes``
+        from the same total GPU budget as the raw V2 pool.
         """
         if self._reuse_compression_manager is None:
             raise RuntimeError("Bind a reuse compression manager before configuring backing")
         if self._reuse_backing_store is not None:
-            raise RuntimeError("Reuse encoded backing is already configured")
+            raise RuntimeError("Compressed reuse backing is already configured")
         self._reuse_backing_store = KVCacheReuseBackingStore(capacity_bytes)
 
-    def register_reuse_raw_backing(
+    def try_store_compressed_reuse_backing(
         self,
         page_key: ReusePageKey,
         raw_payloads: Sequence[torch.Tensor],
         *,
-        can_release_raw: Callable[[], bool],
-        release_raw_slot: Callable[[], None],
-    ) -> None:
-        """Register a stable, independently retireable raw page.
+        valid_token_count: int,
+        can_publish_compressed: Callable[[], bool],
+        publish_compressed_and_release_source: Callable[[], None],
+        drop_reuse_candidate: Callable[[], None],
+        completion_event_factory: Callable[[], ReuseBackingEvent | None] | None = None,
+    ) -> bool:
+        """Compress one KVCM-owned reuse candidate without a raw fallback.
 
         ``raw_payloads`` contains each physical layer/role payload exactly once,
         normalized to contiguous ``[tokens_per_block, full_feature_width]``.
-        ``can_release_raw`` is the mandatory external raw-reader/retire gate.
-        Live wiring must make it atomic with V2's holder/read-lock rules: it
-        becomes true only when no new ``_SharedPageLock`` can be acquired and
-        the merged reader finish event is complete. The raw slot is released
-        only after both that gate and encoding completion are ready.
-        """
-        store = self._require_reuse_backing_store()
-        payload_tuple = tuple(raw_payloads)
-        if not payload_tuple:
-            raise ValueError("raw_payloads must not be empty")
-        for payload in payload_tuple:
-            if payload.dim() != 2 or payload.shape[0] != self.tokens_per_block:
-                raise ValueError(
-                    "Every raw reuse payload must have shape [tokens_per_block, full_feature_width]"
-                )
-            if not payload.is_contiguous():
-                raise ValueError("Every raw reuse payload must be contiguous")
-        raw_size_bytes = sum(_reuse_payload_nbytes(payload) for payload in payload_tuple)
-        store.register_raw(
-            page_key,
-            payload_tuple,
-            raw_size_bytes,
-            can_release_raw,
-            release_raw_slot,
-        )
 
-    def try_encode_reuse_backing(
-        self,
-        page_key: ReusePageKey,
-        *,
-        valid_token_count: int,
-        completion_event: ReuseBackingEvent | None = None,
-    ) -> bool:
-        """Run the bound transform and atomically publish a compact backing.
+        Raw tensors are borrowed only for this call and are never stored in the
+        cold-backing record. A transform rejection (including a partial Page)
+        or compact-capacity miss invokes ``drop_reuse_candidate`` and returns
+        ``False``. The active request may keep using its native raw Page, but
+        that Page is no longer eligible for cross-request reuse.
 
-        A normal raw fallback or compact-pool admission miss returns ``False``
-        without releasing the raw slot. Exceptions also restore the RAW state
-        before propagating.
+        On success, KVCM records completion after every compression launch.
+        Once that event and the native reader gate are complete,
+        ``publish_compressed_and_release_source`` atomically swaps the Page's
+        storage from full precision to compressed and returns the source slot.
         """
         manager = self._require_reuse_compression_manager()
         store = self._require_reuse_backing_store()
-        raw_payloads = store.begin_encoding(page_key)
-        encoded_payloads: list[object] = []
-        encoded_size_bytes = 0
+        # A generation collision is an owner bug. Detect it before invoking
+        # any potentially asynchronous transform or mutating radix state.
+        store.validate_new_page_key(page_key)
+        candidate_dropped = False
+
+        def drop_once() -> None:
+            nonlocal candidate_dropped
+            if candidate_dropped:
+                return
+            candidate_dropped = True
+            drop_reuse_candidate()
+
+        payload_tuple: tuple[torch.Tensor, ...] = ()
+        compressed_payloads: list[object] = []
+        compressed_size_bytes = 0
+
+        def defer_abort_after_launch() -> None:
+            try:
+                abort_event = self._record_reuse_abort_completion_event(
+                    payload_tuple,
+                    completion_event_factory,
+                )
+            except Exception:
+                # No trustworthy completion event exists. Keep source and
+                # transient output ownership quarantined for owner recovery.
+                store.quarantine_compression_abort(
+                    page_key,
+                    tuple(compressed_payloads),
+                    compressed_size_bytes,
+                )
+                raise
+            store.defer_compression_abort(
+                page_key,
+                tuple(compressed_payloads),
+                compressed_size_bytes,
+                abort_event,
+                drop_once,
+            )
+
         try:
-            for raw_payload in raw_payloads:
-                if not isinstance(raw_payload, torch.Tensor):
-                    raise TypeError("Registered raw reuse payload is not a tensor")
-                encoded_payload = manager.on_reuse_store(
+            payload_tuple = tuple(raw_payloads)
+            if not payload_tuple:
+                raise ValueError("raw_payloads must not be empty")
+            for payload in payload_tuple:
+                if payload.dim() != 2 or payload.shape[0] != self.tokens_per_block:
+                    raise ValueError(
+                        "Every raw reuse payload must have shape "
+                        "[tokens_per_block, full_feature_width]"
+                    )
+                if not payload.is_contiguous():
+                    raise ValueError("Every raw reuse payload must be contiguous")
+            self._validate_reuse_transaction_device(payload_tuple)
+        except Exception:
+            drop_once()
+            raise
+
+        compression_started = False
+        rejected = False
+        try:
+            for raw_payload in payload_tuple:
+                # Treat every hook invocation as potentially asynchronous,
+                # including one that ultimately rejects or raises.
+                compression_started = True
+                compressed_payload = manager.on_reuse_store(
                     raw_payload,
                     valid_token_count=valid_token_count,
                 )
-                if encoded_payload is None:
-                    store.cancel_encoding(page_key)
-                    return False
-                encoded_payloads.append(encoded_payload)
-                encoded_size_bytes += _reuse_payload_nbytes(encoded_payload)
-            resolved_event = self._record_reuse_completion_event(
-                tuple(raw_payloads),
-                completion_event,
-            )
+                if compressed_payload is None:
+                    rejected = True
+                    break
+                compressed_payloads.append(compressed_payload)
+                compressed_size_bytes += _reuse_payload_nbytes(compressed_payload)
         except Exception:
-            store.cancel_encoding(page_key)
+            defer_abort_after_launch()
             raise
 
-        published = store.try_publish_encoded(
-            page_key,
-            tuple(encoded_payloads),
-            encoded_size_bytes,
-            resolved_event,
-        )
-        if published:
-            store.poll(page_key)
-        return published
+        if rejected:
+            defer_abort_after_launch()
+            return False
+        if compressed_size_bytes <= 0:
+            defer_abort_after_launch()
+            raise ValueError("Compression produced an empty payload")
 
-    def materialize_reuse_backing(
+        try:
+            resolved_event = self._record_reuse_completion_event(
+                payload_tuple,
+                completion_event_factory,
+            )
+        except Exception:
+            if compression_started:
+                defer_abort_after_launch()
+            else:
+                drop_once()
+            raise
+
+        try:
+            admitted = store.try_admit_compression(
+                page_key,
+                tuple(compressed_payloads),
+                compressed_size_bytes,
+                resolved_event,
+                can_publish_compressed,
+                publish_compressed_and_release_source,
+            )
+        except Exception:
+            # Future admission validation/allocation errors must obey the same
+            # post-launch source-lease protocol as an ordinary capacity miss.
+            store.defer_compression_abort(
+                page_key,
+                tuple(compressed_payloads),
+                compressed_size_bytes,
+                resolved_event,
+                drop_once,
+            )
+            raise
+        if not admitted:
+            store.defer_compression_abort(
+                page_key,
+                tuple(compressed_payloads),
+                compressed_size_bytes,
+                resolved_event,
+                drop_once,
+            )
+            return False
+        # Once admitted, every poll failure is owned by the backing store's
+        # fail-closed state. Do not perform a second native drop here.
+        store.poll(page_key)
+        return True
+
+    def cancel_compressed_reuse_store(
+        self,
+        page_key: ReusePageKey,
+        cancel_native_transaction: Callable[[], None],
+    ) -> bool:
+        """Cancel a compression transaction without retaining cold raw KV.
+
+        ``cancel_native_transaction`` atomically removes the reuse candidate
+        and releases KVCM's compression source lease. Already-launched GPU work
+        drains before that callback and compact-capacity reclamation.
+        """
+        return self._require_reuse_backing_store().cancel_compression(
+            page_key,
+            cancel_native_transaction,
+        )
+
+    def decompress_reuse_backing(
         self,
         page_key: ReusePageKey,
         raw_destinations: Sequence[torch.Tensor],
         *,
         publish_raw_slot: Callable[[], None],
-        rollback_raw_slot: Callable[[], None],
-        completion_event: ReuseBackingEvent | None = None,
+        rollback_raw_slot: Callable[[ReuseBackingEvent | None], None],
+        completion_event_factory: Callable[[], ReuseBackingEvent | None] | None = None,
     ) -> int:
-        """Decode an encoded page into a pre-admitted V2 raw reservation.
+        """Decompress a cold Page into a pre-admitted active raw reservation.
 
-        The encoded allocation remains canonical and read-leased until decode
-        completion. Any validation or transform failure invokes
-        ``rollback_raw_slot`` and leaves the encoded capacity ledger unchanged.
+        The compressed allocation remains canonical and read-leased until
+        decompression completes. Any validation or transform failure invokes
+        ``rollback_raw_slot`` and leaves compressed capacity unchanged.
+        Rollback receives an event recorded after any already-launched GPU
+        writes; the raw allocator must not recycle the destination before that
+        event completes.
         On success, ``publish_raw_slot`` transfers a transient raw reservation
         to the active request; it is not added to this cold-backing ledger.
         Live wiring must publish it at resume's native page-lock boundary.
         """
         manager = self._require_reuse_compression_manager()
         store = self._require_reuse_backing_store()
-        materialization_id: int | None = None
+        decompression_id: int | None = None
         committed = False
+        decompression_started = False
+        destination_tuple = tuple(raw_destinations)
         try:
-            materialization_id, encoded_payloads = store.begin_materialization(page_key)
-            destination_tuple = tuple(raw_destinations)
-            if len(destination_tuple) != len(encoded_payloads):
-                raise ValueError("raw destination count must match encoded physical payload count")
-            for encoded_payload, raw_destination in zip(
-                encoded_payloads, destination_tuple, strict=True
+            # Validate the whole destination transaction before the first
+            # decompression launch. A late mixed-device failure cannot be
+            # rolled back safely after GPU writes have started.
+            self._validate_reuse_transaction_device(destination_tuple)
+            decompression_id, compressed_payloads = store.begin_decompression(page_key)
+            if len(destination_tuple) != len(compressed_payloads):
+                raise ValueError(
+                    "raw destination count must match compressed physical payload count"
+                )
+            for compressed_payload, raw_destination in zip(
+                compressed_payloads, destination_tuple, strict=True
             ):
-                manager.on_reuse_materialize(encoded_payload, raw_destination)
+                decompression_started = True
+                manager.on_reuse_materialize(compressed_payload, raw_destination)
             resolved_event = self._record_reuse_completion_event(
                 destination_tuple,
-                completion_event,
+                completion_event_factory,
             )
-            assert materialization_id is not None
-            store.commit_materialization(
+            assert decompression_id is not None
+            store.commit_decompression(
                 page_key,
-                materialization_id,
+                decompression_id,
                 resolved_event,
                 publish_raw_slot,
                 rollback_raw_slot,
@@ -1345,25 +1444,67 @@ class KVCacheManagerV2(BaseResourceManager):
             store.poll(page_key)
         except Exception:
             if not committed:
-                if materialization_id is not None:
-                    store.cancel_materialization(page_key, materialization_id)
-                rollback_raw_slot()
+                if decompression_id is None:
+                    rollback_raw_slot(None)
+                else:
+                    rollback_event = None
+                    if decompression_started:
+                        try:
+                            rollback_event = self._record_reuse_abort_completion_event(
+                                destination_tuple,
+                                completion_event_factory,
+                            )
+                        except Exception:
+                            store.quarantine_decompression_abort(
+                                page_key,
+                                decompression_id,
+                                rollback_raw_slot,
+                            )
+                            raise
+                    store.abort_decompression(
+                        page_key,
+                        decompression_id,
+                        rollback_event,
+                        rollback_raw_slot,
+                    )
             raise
-        return materialization_id
+        return decompression_id
 
     def poll_reuse_backing(self, page_key: ReusePageKey) -> int:
-        """Advance ready encode/materialize events for one reusable page."""
+        """Advance ready compression/decompression events for one Page."""
         return self._require_reuse_backing_store().poll(page_key)
 
-    def evict_reuse_encoded_backing(self, page_key: ReusePageKey) -> bool:
-        """Evict one cold backing when no encoded read lease is active.
+    def evict_compressed_reuse_backing(
+        self,
+        page_key: ReusePageKey,
+        unpublish_reuse_candidate: Callable[[], None],
+    ) -> bool:
+        """Evict one cold backing when no compressed read lease is active.
 
-        This never releases transient raw materializations already published
+        This never releases transient raw reservations already published
         to active requests.
         """
         store = self._require_reuse_backing_store()
         store.poll(page_key)
-        return store.evict_encoded(page_key)
+        return store.evict_compressed(page_key, unpublish_reuse_candidate)
+
+    def reconcile_failed_reuse_backing(
+        self,
+        page_key: ReusePageKey,
+        native_cleanup_is_complete: Callable[[], bool],
+    ) -> bool:
+        """Reclaim a fail-closed record after native V2 cleanup is confirmed.
+
+        The confirmation callback must be read-only. It may return ``True``
+        only after the Page is unreachable to reuse hits, any source/raw slot
+        ownership has been reconciled, and all GPU work touching the compact
+        allocation has drained.
+        """
+
+        return self._require_reuse_backing_store().reconcile_failed(
+            page_key,
+            native_cleanup_is_complete,
+        )
 
     def get_reuse_backing_snapshot(self, page_key: ReusePageKey) -> ReuseBackingSnapshot:
         return self._require_reuse_backing_store().page_snapshot(page_key)
@@ -1380,25 +1521,59 @@ class KVCacheManagerV2(BaseResourceManager):
     def _require_reuse_backing_store(self) -> KVCacheReuseBackingStore:
         store = self._reuse_backing_store
         if store is None:
-            raise RuntimeError("Reuse encoded backing is not configured")
+            raise RuntimeError("Compressed reuse backing is not configured")
         return store
 
     @staticmethod
     def _record_reuse_completion_event(
         payloads: Sequence[torch.Tensor],
-        completion_event: ReuseBackingEvent | None,
+        completion_event_factory: Callable[[], ReuseBackingEvent | None] | None,
     ) -> ReuseBackingEvent | None:
-        devices = {payload.device for payload in payloads}
-        if len(devices) != 1:
-            raise ValueError("Every payload in one reuse transaction must share a device")
-        if completion_event is not None:
-            return completion_event
-        device = next(iter(devices))
+        device = KVCacheManagerV2._validate_reuse_transaction_device(payloads)
+        if completion_event_factory is not None:
+            # Invoke only here, after every hook launch. Accepting a caller's
+            # pre-created event would allow an old/unrecorded event to publish
+            # or recycle storage too early. Production wiring must pass only a
+            # KVCM-owned record-after-launch callback.
+            event = completion_event_factory()
+            if device.type == "cuda" and event is None:
+                raise RuntimeError(
+                    "CUDA reuse transactions require a post-launch completion event"
+                )
+            return event
         if device.type != "cuda":
             return None
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream(device))
         return event
+
+    @staticmethod
+    def _record_reuse_abort_completion_event(
+        payloads: Sequence[torch.Tensor],
+        completion_event_factory: Callable[[], ReuseBackingEvent | None] | None,
+    ) -> ReuseBackingEvent | None:
+        """Record a fail-safe event after a hook rejects or raises."""
+
+        try:
+            return KVCacheManagerV2._record_reuse_completion_event(
+                payloads,
+                completion_event_factory,
+            )
+        except Exception:
+            # A test/integration recorder must not make already-launched work
+            # unsafe. The native KVCM path records on the current stream.
+            return KVCacheManagerV2._record_reuse_completion_event(payloads, None)
+
+    @staticmethod
+    def _validate_reuse_transaction_device(
+        payloads: Sequence[torch.Tensor],
+    ) -> torch.device:
+        if not payloads:
+            raise ValueError("A reuse transaction must contain at least one payload")
+        devices = {payload.device for payload in payloads}
+        if len(devices) != 1:
+            raise ValueError("Every payload in one reuse transaction must share a device")
+        return next(iter(devices))
 
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
         """Return the roles represented by the two page-table index lanes.

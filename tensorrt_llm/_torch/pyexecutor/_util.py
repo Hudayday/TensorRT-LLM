@@ -2296,14 +2296,15 @@ def create_kv_cache_compression_manager(
             QuantizationForBoundaryCompression
 
         logger.warning(
-            "quantization_for_boundary is a reuse transform/API prototype; "
-            "KVCM V2 compact backing and commit/resume lifecycle wiring are "
-            "not implemented yet, so this configuration does not increase "
-            "reuse capacity.")
+            "quantization_for_boundary has a compressed-only reuse transaction "
+            "prototype, but native KVCM V2 compact-slot and commit/resume wiring "
+            "are not implemented yet; do not treat its byte ledger as an "
+            "end-to-end reuse-capacity result.")
         return QuantizationForBoundaryCompression(
             kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
             quant=config.quant,
+            compressed_capacity_bytes=config.compressed_reuse_capacity_bytes,
         )
 
     logger.warning(

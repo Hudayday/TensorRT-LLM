@@ -2534,17 +2534,18 @@ class KVCacheCompressionManager(BaseResourceManager):
 
     def on_reuse_store(self, raw_payload: torch.Tensor,
                        **kwargs) -> object | None:
-        """Encode one stable raw payload from a reusable page.
+        """Compress one stable raw payload from a reusable Page.
 
         KVCM V2 owns admission, backing allocation, events, and atomic
         publication of every payload belonging to the committed page. A
         concrete manager only implements the representation transform and
-        returns its encoded tensors.
+        returns its compressed tensors. Returning ``None`` rejects the Page
+        from cold reuse; it does not request a stable raw fallback.
         """
 
-    def on_reuse_materialize(self, encoded_payload: object,
+    def on_reuse_materialize(self, compressed_payload: object,
                              raw_destination: torch.Tensor, **kwargs) -> None:
-        """Materialize one encoded payload into a KVCM-owned raw slot."""
+        """Decompress one payload into a KVCM-owned active raw slot."""
 
     # ================================================================== #
     # BaseResourceManager interface — PyExecutor auto-invokes these each  #

@@ -3538,6 +3538,15 @@ class KvCacheCompressionConfig(StrictBaseModel):
         description=
         "Quantization used by boundary compression. The initial reuse-only "
         "proof supports NVFP4.")
+    compressed_reuse_capacity_bytes: int = Field(
+        default=0,
+        ge=0,
+        description=
+        "Maximum GPU bytes admitted for compressed-only cold reuse records. "
+        "The current transaction prototype enforces this as a byte limit but "
+        "does not yet reserve a native KVCM V2 compact pool. Product wiring "
+        "must deduct and reserve it from the same total GPU budget as the "
+        "active full-precision KV pool.")
 
     @model_validator(mode="after")
     def validate_boundary_quantization(self) -> "KvCacheCompressionConfig":
@@ -3545,9 +3554,17 @@ class KvCacheCompressionConfig(StrictBaseModel):
             if self.quant != "nvfp4":
                 raise ValueError(
                     "quantization_for_boundary requires quant='nvfp4'")
+            if self.compressed_reuse_capacity_bytes <= 0:
+                raise ValueError(
+                    "quantization_for_boundary requires "
+                    "compressed_reuse_capacity_bytes > 0")
         elif self.quant is not None:
             raise ValueError(
                 "quant is only valid for algorithm='quantization_for_boundary'")
+        elif self.compressed_reuse_capacity_bytes != 0:
+            raise ValueError(
+                "compressed_reuse_capacity_bytes is only valid for "
+                "algorithm='quantization_for_boundary'")
         return self
 
     @property

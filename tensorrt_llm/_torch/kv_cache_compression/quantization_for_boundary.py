@@ -37,10 +37,11 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
     :meth:`on_reuse_materialize`. This manager neither traverses KVCM internals
     nor owns eviction, tier migration, or page publication.
 
-    The proof deliberately falls back to raw for partial pages. Production
-    wiring still requires a compact representation pool and atomic
-    RAW/DUAL/ENCODED transitions in KVCM V2; storing these tensors in a raw
-    slot would not increase reuse capacity.
+    A partial or unsupported Page is rejected from cold reuse; it never falls
+    back to a stable raw backing. Production wiring still requires a compact
+    compressed pool and atomic source-retirement/decompression transactions in
+    KVCM V2. Storing compressed tensors in a raw slot would not increase reuse
+    capacity.
     """
 
     supports_block_reuse = True
@@ -51,9 +52,12 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
         draft_kv_cache_manager=None,
         *,
         quant: str,
+        compressed_capacity_bytes: int,
     ) -> None:
         if draft_kv_cache_manager is not None:
             raise ValueError("NVFP4 boundary reuse does not support a draft KV cache")
+        if compressed_capacity_bytes <= 0:
+            raise ValueError("compressed_capacity_bytes must be positive")
         super().__init__(kv_cache_manager, draft_kv_cache_manager)
         if quant != "nvfp4":
             raise ValueError("QuantizationForBoundaryCompression only supports quant='nvfp4'")
@@ -68,6 +72,7 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
 
         self.quant = quant
         kv_cache_manager.bind_reuse_compression_hooks(self)
+        kv_cache_manager.configure_compressed_reuse_backing(compressed_capacity_bytes)
 
     def on_reuse_store(
         self,
@@ -76,7 +81,7 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
         valid_token_count: Optional[int] = None,
         **kwargs,
     ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Encode one full, stable ``[..., features]`` raw payload.
+        """Compress one full, stable ``[..., features]`` full-precision payload.
 
         The tuple is packed E2M1 data, linear per-16-value FP8 scales, and one
         inverse global FP32 scale. Every invocation is independently decodable.
@@ -85,9 +90,9 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
 
         ``valid_token_count`` is lifecycle information supplied by KVCM V2;
         the manager never infers a token axis or reads attention layout
-        metadata. ``None`` requests KVCM V2's raw fallback. The proof uses that
-        path for partial pages and feature widths that do not satisfy NVFP4
-        alignment.
+        metadata. ``None`` rejects this Page from compressed cold reuse. The
+        initial proof rejects partial pages and feature widths that do not
+        satisfy NVFP4 alignment.
         """
         del kwargs
         if raw_payload.dim() < 2:
@@ -132,15 +137,15 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
 
     def on_reuse_materialize(
         self,
-        encoded_payload: object,
+        compressed_payload: object,
         raw_destination: torch.Tensor,
         **kwargs,
     ) -> None:
         """Decode one NVFP4 backing into a KVCM-owned raw runtime slot."""
         del kwargs
-        if not isinstance(encoded_payload, tuple) or len(encoded_payload) != 3:
+        if not isinstance(compressed_payload, tuple) or len(compressed_payload) != 3:
             raise TypeError("NVFP4 reuse backing must be (packed, block_scales, global_scale)")
-        packed, block_scales, inverse_global_scale = encoded_payload
+        packed, block_scales, inverse_global_scale = compressed_payload
         if not all(
             isinstance(tensor, torch.Tensor)
             for tensor in (packed, block_scales, inverse_global_scale)
@@ -150,12 +155,12 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
         if tuple(raw_destination.shape) != expected_shape:
             raise ValueError(
                 f"raw destination shape {tuple(raw_destination.shape)} does "
-                f"not match encoded page shape {expected_shape}"
+                f"not match compressed Page shape {expected_shape}"
             )
         if raw_destination.dtype not in (torch.float16, torch.bfloat16):
-            raise TypeError("NVFP4 materialization requires an FP16/BF16 slot")
+            raise TypeError("NVFP4 decompression requires an FP16/BF16 slot")
         if not raw_destination.is_contiguous():
-            raise ValueError("KVCM V2 must provide a contiguous raw materialization slot")
+            raise ValueError("KVCM V2 must provide a contiguous raw decompression slot")
 
         from tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4 import (
             dequant_nvfp4_2d_triton,
