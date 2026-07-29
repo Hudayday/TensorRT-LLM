@@ -2444,8 +2444,8 @@ class KVCacheCompressionManager(BaseResourceManager):
     not *what* physical KV exists. Subclasses hold ``KVCacheManagerV2`` as a tool.
 
     Eviction subclasses record an evicted count on
-    ``LlmRequest.py_num_compressed_tokens``; boundary-representation
-    subclasses instead transform payloads selected and owned by KVCM V2.
+    ``LlmRequest.py_num_compressed_tokens``. Boundary-compression subclasses
+    instead transform migrations selected and owned by KVCM V2.
     """
 
     adjusts_generation_kv_length: ClassVar[bool] = False
@@ -2528,24 +2528,25 @@ class KVCacheCompressionManager(BaseResourceManager):
         """
 
     # ================================================================== #
-    # Reuse representation hooks. Production KVCM V2 wiring calls these  #
-    # for each payload and atomically owns the aggregate committed page.  #
+    # Storage-boundary hooks. KVCM V2 calls these from StorageManager's   #
+    # migration transaction; subclasses enqueue only the transform.      #
     # ================================================================== #
 
-    def on_reuse_store(self, raw_payload: torch.Tensor,
-                       **kwargs) -> object | None:
-        """Compress one stable raw payload from a reusable Page.
+    def on_offload_compress(self, **kwargs) -> None:
+        """Enqueue GPU→Host compression for one KVCM V2 migration batch.
 
-        KVCM V2 owns admission, backing allocation, events, and atomic
-        publication of every payload belonging to the committed page. A
-        concrete manager only implements the representation transform and
-        returns its compressed tensors. Returning ``None`` rejects the Page
-        from cold reuse; it does not request a stable raw fallback.
+        ``StorageManager`` owns source leases, compact destination admission,
+        completion events, publication, source release, and rollback. The
+        hook must not change Page ownership or attention state.
         """
 
-    def on_reuse_materialize(self, compressed_payload: object,
-                             raw_destination: torch.Tensor, **kwargs) -> None:
-        """Decompress one payload into a KVCM-owned active raw slot."""
+    def on_onboard_decompress(self, **kwargs) -> None:
+        """Enqueue Host→GPU decompression before KVCM V2 publishes Pages.
+
+        The destination is an already-admitted runtime-format GPU Page.
+        ``StorageManager`` keeps the compressed Host source authoritative until
+        this work completes successfully.
+        """
 
     # ================================================================== #
     # BaseResourceManager interface — PyExecutor auto-invokes these each  #

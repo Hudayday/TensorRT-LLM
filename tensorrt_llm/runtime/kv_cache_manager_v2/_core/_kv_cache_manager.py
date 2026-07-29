@@ -616,6 +616,14 @@ class KVCacheManager:
     def cache_tier_list(self) -> HomoTuple[CacheTier]:
         return self._storage.cache_tiers
 
+    def bind_boundary_compression_hooks(
+        self,
+        offload_hook: Callable[..., None],
+        onboard_hook: Callable[..., None],
+    ) -> None:
+        """Bind one compression manager at the StorageManager migration boundary."""
+        self._storage.bind_boundary_compression_hooks(offload_hook, onboard_hook)
+
     @property
     def tokens_per_block(self) -> int:
         return self._radix_tree.tokens_per_block

@@ -555,13 +555,6 @@
       "path": "iter_stats_max_iterations"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'int'>",
-      "converter": "",
-      "kind": "value",
-      "path": "kv_cache_compression_config.compressed_reuse_capacity_bytes"
-    },
-    {
       "allowed_values": [
         "nvfp4"
       ],

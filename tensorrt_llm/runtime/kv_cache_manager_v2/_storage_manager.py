@@ -179,6 +179,24 @@ MigrationRecorder = Callable[[Sequence[Page], Sequence[Slot], CacheLevel, CacheL
 # Invoked when pages at the last cache level are released to free their slots
 # without being migrated to any further tier (i.e. dropped from the cache hierarchy).
 DropRecorder = Callable[[Sequence[Page], CacheLevel], None]
+BoundaryMigrationHook = Callable[..., None]
+
+
+def _select_boundary_migration_hook(
+    offload_hook: BoundaryMigrationHook | None,
+    onboard_hook: BoundaryMigrationHook | None,
+    src_tier: CacheTier,
+    dst_tier: CacheTier,
+    defrag: bool,
+) -> BoundaryMigrationHook | None:
+    """Select only direct GPU↔Host representation-changing migrations."""
+    if defrag:
+        return None
+    if src_tier == CacheTier.GPU_MEM and dst_tier == CacheTier.HOST_MEM:
+        return offload_hook
+    if src_tier == CacheTier.HOST_MEM and dst_tier == CacheTier.GPU_MEM:
+        return onboard_hook
+    return None
 
 
 class StorageManager:
@@ -194,6 +212,8 @@ class StorageManager:
         "_levels",
         "_min_slots",
         "_event_manager",
+        "_offload_compression_hook",
+        "_onboard_decompression_hook",
         "__rawref__",
     )
     _life_cycles: LifeCycleRegistry
@@ -207,6 +227,8 @@ class StorageManager:
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
     _min_slots: TypedIndexList[PoolGroupIndex, int]
     _event_manager: "KVCacheEventManager | None"
+    _offload_compression_hook: BoundaryMigrationHook | None
+    _onboard_decompression_hook: BoundaryMigrationHook | None
     __rawref__: rawref.ref["StorageManager"]
 
     def __init__(
@@ -223,6 +245,8 @@ class StorageManager:
     ) -> None:
         self.__rawref__ = rawref.NULL
         self._event_manager = event_manager
+        self._offload_compression_hook = None
+        self._onboard_decompression_hook = None
         assert config.cache_tiers[GPU_LEVEL].tier == CacheTier.GPU_MEM, (
             "The first cache tier must be GPU memory"
         )
@@ -305,10 +329,35 @@ class StorageManager:
         self.destroy()
 
     def destroy(self) -> None:
+        self._offload_compression_hook = None
+        self._onboard_decompression_hook = None
         if self.__rawref__.is_valid:
             self.__rawref__.invalidate()
             for lvl in self._levels:
                 lvl.storage.destroy()
+
+    def bind_boundary_compression_hooks(
+        self,
+        offload_hook: BoundaryMigrationHook,
+        onboard_hook: BoundaryMigrationHook,
+    ) -> None:
+        """Bind one manager's GPU↔Host compression callbacks.
+
+        The initial contract deliberately supports only GPU and Host tiers.
+        Allowing a Disk tier before its representation is defined could copy a
+        compressed Host slot using the wrong byte count.
+        """
+        if (
+            self._offload_compression_hook is not None
+            or self._onboard_decompression_hook is not None
+        ):
+            raise ValueError("Boundary compression hooks are already bound")
+        if self.cache_tiers != (CacheTier.GPU_MEM, CacheTier.HOST_MEM):
+            raise ValueError(
+                "Boundary compression currently requires exactly GPU and Host cache tiers"
+            )
+        self._offload_compression_hook = offload_hook
+        self._onboard_decompression_hook = onboard_hook
 
     def get_pool_group_index(self, life_cycle: LifeCycleId) -> PoolGroupIndex:
         return self._life_cycle_grouping[life_cycle]
@@ -598,6 +647,8 @@ class StorageManager:
         try:
             assert len(dst_slots) == num_slots
             prior_events: set[CachedCudaEvent] = set()
+            src_slot_addresses: list[tuple[Address, ...]] = []
+            dst_slot_addresses: list[tuple[Address, ...]] = []
             tasks_per_pool: TypedIndexList[PoolIndex, list[CopyTask]] = make_typed(
                 lambda _: list[CopyTask](), num_pools
             )
@@ -606,6 +657,8 @@ class StorageManager:
                 prior_events.update((dst.ready_event, src.ready_event))
                 dst_addresses = dst_pool_group.slot_address(dst.slot_id)
                 src_addresses = src_pool_group.slot_address(src.slot_id)
+                dst_slot_addresses.append(tuple(dst_addresses))
+                src_slot_addresses.append(tuple(src_addresses))
                 for pool_idx in typed_range(num_pools):
                     tasks_per_pool[pool_idx].append(
                         CopyTask(dst_addresses[pool_idx], src_addresses[pool_idx])
@@ -613,9 +666,47 @@ class StorageManager:
             dst_tier = self._levels[dst_level].cache_tier
             src_tier = self._levels[src_level].cache_tier
             with TemporaryCudaStream(prior_events) as stream:
-                slot_sizes = self.slot_size(pool_group_index)
-                for pool_idx, tasks in typed_enumerate(tasks_per_pool):
-                    batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks, stream.get())
+                try:
+                    migration_hook = _select_boundary_migration_hook(
+                        self._offload_compression_hook,
+                        self._onboard_decompression_hook,
+                        src_tier,
+                        dst_tier,
+                        defrag,
+                    )
+                    if migration_hook is None:
+                        slot_sizes = self.slot_size(pool_group_index, src_level)
+                        for pool_idx, tasks in typed_enumerate(tasks_per_pool):
+                            batched_copy(
+                                dst_tier,
+                                src_tier,
+                                slot_sizes[pool_idx],
+                                tasks,
+                                stream.get(),
+                            )
+                    else:
+                        migration_hook(
+                            pool_group_index=pool_group_index,
+                            src_pages=src_pages,
+                            dst_slots=dst_slots,
+                            src_addresses=tuple(src_slot_addresses),
+                            dst_addresses=tuple(dst_slot_addresses),
+                            src_slot_sizes=tuple(self.slot_size(pool_group_index, src_level)),
+                            dst_slot_sizes=tuple(self.slot_size(pool_group_index, dst_level)),
+                            stream=stream.get(),
+                        )
+                except Exception:
+                    # A hook may validate and enqueue several kernels before a
+                    # later payload fails. Record an abort fence so neither the
+                    # source nor the destination slot can be reused while that
+                    # already-submitted work is still in flight. The outer
+                    # rollback keeps the source Page authoritative and returns
+                    # only the fenced destination slots to their pool.
+                    abort_event = stream.record_event()
+                    for src, dst in zip(src_pages, dst_slots):
+                        src.ready_event = abort_event
+                        dst.ready_event = abort_event
+                    raise
             finish_event = stream.take_finish_event()
             emit_cache_level_updates = (
                 update_src
@@ -688,8 +779,14 @@ class StorageManager:
             self._levels, lambda level: level.storage._pool_groups[pool_group_index].num_pools
         )
 
-    def slot_size(self, pool_group_index: PoolGroupIndex) -> TypedIndexList[PoolIndex, int]:
-        return self._slot_desc_list[pool_group_index].slot_size_list
+    def slot_size(
+        self,
+        pool_group_index: PoolGroupIndex,
+        cache_level: CacheLevel | None = None,
+    ) -> TypedIndexList[PoolIndex, int]:
+        if cache_level is None:
+            return self._slot_desc_list[pool_group_index].slot_size_list
+        return self._levels[cache_level].storage.slot_size_lists[pool_group_index]
 
     def num_slots(
         self, pool_group_index: PoolGroupIndex, cache_level: CacheLevel = GPU_LEVEL

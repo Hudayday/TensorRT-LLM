@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
-
 import torch
 
 from ..pyexecutor.resource_manager import DataType, KVCacheCompressionManager
@@ -24,24 +22,24 @@ _NVFP4_GLOBAL_SCALE_DENOMINATOR = 448.0 * 6.0
 
 
 class QuantizationForBoundaryCompression(KVCacheCompressionManager):
-    """Quantize cold reusable pages while keeping active runtime KV raw.
+    """Compress GPU KV while KVCM V2 offloads it to the Host tier.
 
-    This proof supports one boundary and one quantization:
+    The active GPU cache keeps its configured runtime representation (FP16 or
+    BF16 in the initial proof). The stable Host copy is compressed-only. On
+    recall, KVCM V2 allocates the normal GPU Page first and this same manager
+    restores the Host record into that Page before KVCM publishes it.
 
-    ``full committed raw reuse page -> NVFP4 backing -> raw reuse hit``.
+    ``StorageManager`` remains responsible for page selection, destination
+    admission, CUDA-event ordering, publication, source release, and rollback.
+    This manager owns only the two representation transforms. It never reads
+    attention state or attention metadata.
 
-    KVCM V2 remains the lifecycle and storage owner. Production wiring must
-    supply each stable contiguous physical payload (one layer and K/V role) to
-    :meth:`on_reuse_store`, aggregate all returned tensors for a committed page
-    into one atomic backing, and supply pre-admitted raw destinations to
-    :meth:`on_reuse_materialize`. This manager neither traverses KVCM internals
-    nor owns eviction, tier migration, or page publication.
-
-    A partial or unsupported Page is rejected from cold reuse; it never falls
-    back to a stable raw backing. Production wiring still requires a compact
-    compressed pool and atomic source-retirement/decompression transactions in
-    KVCM V2. Storing compressed tensors in a raw slot would not increase reuse
-    capacity.
+    The lifecycle callbacks are intentionally fail-closed in this scaffold.
+    KVCM V2 still has one slot schema shared by GPU and Host, so a compact Host
+    record cannot yet be allocated. TensorRT-LLM main also has no production
+    standalone NVFP4 Page-to-FP16/BF16 restore operation that writes directly
+    into a pre-admitted KVCM Page. Both gaps must be closed before enabling
+    this algorithm in serving.
     """
 
     supports_block_reuse = True
@@ -52,71 +50,65 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
         draft_kv_cache_manager=None,
         *,
         quant: str,
-        compressed_capacity_bytes: int,
     ) -> None:
         if draft_kv_cache_manager is not None:
-            raise ValueError("NVFP4 boundary reuse does not support a draft KV cache")
-        if compressed_capacity_bytes <= 0:
-            raise ValueError("compressed_capacity_bytes must be positive")
+            raise ValueError("NVFP4 Host offload does not support a draft KV cache")
         super().__init__(kv_cache_manager, draft_kv_cache_manager)
         if quant != "nvfp4":
             raise ValueError("QuantizationForBoundaryCompression only supports quant='nvfp4'")
-        if not kv_cache_manager.enable_block_reuse:
-            raise ValueError("NVFP4 boundary reuse requires KV-cache block reuse")
         if kv_cache_manager.is_draft:
-            raise ValueError("NVFP4 boundary reuse must bind to the target KV cache")
-        if kv_cache_manager.is_disagg:
-            raise ValueError("The reuse-only NVFP4 proof does not support disaggregation")
+            raise ValueError("NVFP4 Host offload must bind to the target KV cache")
         if kv_cache_manager.dtype not in (DataType.HALF, DataType.BF16):
-            raise ValueError("Active runtime KV must remain FP16 or BF16 for boundary reuse")
+            raise ValueError("Active runtime KV must remain FP16 or BF16")
 
         self.quant = quant
-        kv_cache_manager.bind_reuse_compression_hooks(self)
-        kv_cache_manager.configure_compressed_reuse_backing(compressed_capacity_bytes)
+        kv_cache_manager.bind_boundary_compression_hooks(self)
 
-    def on_reuse_store(
-        self,
+    @staticmethod
+    def compress_tensor(
         raw_payload: torch.Tensor,
         *,
-        valid_token_count: Optional[int] = None,
-        **kwargs,
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Compress one full, stable ``[..., features]`` full-precision payload.
+        valid_token_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reuse the existing NVFP4 quantization op for one normalized Page.
 
-        The tuple is packed E2M1 data, linear per-16-value FP8 scales, and one
-        inverse global FP32 scale. Every invocation is independently decodable.
-        The global scale is local to one committed page x layer x K/V role;
-        it is never shared across an eviction unit, layer, or role.
-
-        ``valid_token_count`` is lifecycle information supplied by KVCM V2;
-        the manager never infers a token axis or reads attention layout
-        metadata. ``None`` rejects this Page from compressed cold reuse. The
-        initial proof rejects partial pages and feature widths that do not
-        satisfy NVFP4 alignment.
+        The storage adapter must expose the Page as ``[tokens, features]`` and
+        provide its logical valid-token count without consulting Attention or
+        AttentionMetadata. The fixed-size record includes the whole physical
+        Page, but a partial Page's unused rows are zeroed before scale
+        calculation so stale slot contents cannot change the scale or leak
+        into the compressed backing.
         """
-        del kwargs
-        if raw_payload.dim() < 2:
-            raise ValueError("NVFP4 boundary reuse expects [..., features]")
+        if raw_payload.dim() != 2:
+            raise ValueError("NVFP4 boundary compression expects [tokens, features]")
         if raw_payload.dtype not in (torch.float16, torch.bfloat16):
-            raise TypeError("NVFP4 boundary reuse expects FP16 or BF16 input")
+            raise TypeError("NVFP4 boundary compression expects FP16 or BF16 input")
         if not raw_payload.is_contiguous():
-            raise ValueError("KVCM V2 must provide a contiguous stable raw payload lease")
+            raise ValueError("KVCM V2 must provide a contiguous stable payload lease")
+        if valid_token_count <= 0 or valid_token_count > raw_payload.shape[0]:
+            raise ValueError(
+                "valid_token_count must be in [1, physical token rows], "
+                f"got {valid_token_count} for {raw_payload.shape[0]} rows"
+            )
 
         feature_count = raw_payload.shape[-1]
-        if valid_token_count is None:
-            raise ValueError("KVCM V2 must provide valid_token_count for reuse storage")
-        if valid_token_count != self.kv_cache_manager.tokens_per_block:
-            return None
         if feature_count % _NVFP4_BLOCK_SIZE != 0:
-            return None
+            raise ValueError(
+                f"NVFP4 feature width must be divisible by {_NVFP4_BLOCK_SIZE}, got {feature_count}"
+            )
         if raw_payload.is_cuda:
             major, _ = torch.cuda.get_device_capability(raw_payload.device)
             if major < 10:
-                raise RuntimeError("The NVFP4 boundary reuse proof requires SM100 or newer")
+                raise RuntimeError("NVFP4 boundary compression requires SM100 or newer")
 
-        amax = raw_payload.float().abs().max()
+        quant_input = raw_payload
+        if valid_token_count < raw_payload.shape[0]:
+            quant_input = raw_payload.clone()
+            quant_input[valid_token_count:].zero_()
+
+        amax = quant_input.float().abs().max()
         if not bool(torch.isfinite(amax).item()):
-            return None
+            raise ValueError("NVFP4 boundary compression requires finite input")
         if float(amax.item()) == 0.0:
             global_scale = torch.ones((), dtype=torch.float32, device=raw_payload.device)
             inverse_global_scale = global_scale.clone()
@@ -125,7 +117,7 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
             inverse_global_scale = (amax / _NVFP4_GLOBAL_SCALE_DENOMINATOR).to(torch.float32)
 
         packed, block_scales = torch.ops.trtllm.fp4_quantize(
-            raw_payload,
+            quant_input,
             global_scale,
             _NVFP4_BLOCK_SIZE,
             False,
@@ -135,43 +127,18 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
         block_scales = block_scales.view(row_count, feature_count // _NVFP4_BLOCK_SIZE)
         return packed, block_scales, inverse_global_scale.reshape(1)
 
-    def on_reuse_materialize(
-        self,
-        compressed_payload: object,
-        raw_destination: torch.Tensor,
-        **kwargs,
-    ) -> None:
-        """Decode one NVFP4 backing into a KVCM-owned raw runtime slot."""
+    def on_offload_compress(self, **kwargs) -> None:
+        """GPU→Host migration hook invoked by KVCM V2 ``StorageManager``."""
         del kwargs
-        if not isinstance(compressed_payload, tuple) or len(compressed_payload) != 3:
-            raise TypeError("NVFP4 reuse backing must be (packed, block_scales, global_scale)")
-        packed, block_scales, inverse_global_scale = compressed_payload
-        if not all(
-            isinstance(tensor, torch.Tensor)
-            for tensor in (packed, block_scales, inverse_global_scale)
-        ):
-            raise TypeError("Every NVFP4 reuse backing component must be a tensor")
-        expected_shape = (*packed.shape[:-1], packed.shape[-1] * 2)
-        if tuple(raw_destination.shape) != expected_shape:
-            raise ValueError(
-                f"raw destination shape {tuple(raw_destination.shape)} does "
-                f"not match compressed Page shape {expected_shape}"
-            )
-        if raw_destination.dtype not in (torch.float16, torch.bfloat16):
-            raise TypeError("NVFP4 decompression requires an FP16/BF16 slot")
-        if not raw_destination.is_contiguous():
-            raise ValueError("KVCM V2 must provide a contiguous raw decompression slot")
-
-        from tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4 import (
-            dequant_nvfp4_2d_triton,
+        raise NotImplementedError(
+            "NVFP4 Host offload needs tier-specific compact Host slots and a "
+            "GPU-Page-to-Host-record adapter before it can replace the raw copy"
         )
 
-        feature_count = expected_shape[-1]
-        dequant_nvfp4_2d_triton(
-            packed.view(-1, feature_count // 2),
-            block_scales,
-            inverse_global_scale,
-            target_dtype=raw_destination.dtype,
-            sf_vec_size=_NVFP4_BLOCK_SIZE,
-            out=raw_destination.view(-1, feature_count),
+    def on_onboard_decompress(self, **kwargs) -> None:
+        """Host→GPU migration hook invoked before KVCM V2 publishes the Page."""
+        del kwargs
+        raise NotImplementedError(
+            "NVFP4 Host recall needs a standalone SM100 Page restore operation "
+            "that writes into the pre-admitted FP16/BF16 KVCM V2 destination"
         )

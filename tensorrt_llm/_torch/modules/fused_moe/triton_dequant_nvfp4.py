@@ -9,8 +9,6 @@ fused_moe only reads rows in token_selected_experts, so leaving inactive
 rows uninitialized is safe.
 """
 
-from typing import Optional
-
 import torch
 import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
@@ -265,7 +263,6 @@ def dequant_nvfp4_2d_triton(
     sf_vec_size: int = 16,
     block_n: int = 32,
     block_k: int = 64,
-    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """2D (Linear) NVFP4 dequant via a dedicated Triton kernel.
 
@@ -286,9 +283,6 @@ def dequant_nvfp4_2d_triton(
         sf_vec_size: NVFP4 per-block size (16).
         block_n, block_k: Triton tile shape. ``block_k`` must be a multiple
             of ``sf_vec_size``.
-        out: Optional preallocated ``[N, K]`` FP16/BF16 destination. This lets
-            storage owners materialize directly into an admitted slot.
-
     Returns:
         ``[N, K]`` in ``target_dtype``.
     """
@@ -313,19 +307,7 @@ def dequant_nvfp4_2d_triton(
     elif weight_scale.dim() != 2:
         raise ValueError(f"weight_scale must be 1D or 2D, got shape {tuple(weight_scale.shape)}")
 
-    if out is None:
-        out = torch.empty(N, K, dtype=target_dtype, device=device)
-    else:
-        if out.shape != (N, K):
-            raise ValueError(f"out must have shape {(N, K)}, got {tuple(out.shape)}")
-        if out.device != device:
-            raise ValueError(f"out must be on {device}, got {out.device}")
-        if out.dtype not in (torch.float16, torch.bfloat16):
-            raise TypeError(f"out must be FP16 or BF16, got {out.dtype}")
-        if not out.is_contiguous():
-            raise ValueError("out must be contiguous")
-        if target_dtype != out.dtype:
-            raise ValueError(f"target_dtype {target_dtype} must match out dtype {out.dtype}")
+    out = torch.empty(N, K, dtype=target_dtype, device=device)
     e2m1_table = _get_e2m1_codebook(device)
 
     # The kernel reads the per-tensor scale via a single pointer load; flatten
