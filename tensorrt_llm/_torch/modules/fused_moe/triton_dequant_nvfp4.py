@@ -283,6 +283,7 @@ def dequant_nvfp4_2d_triton(
         sf_vec_size: NVFP4 per-block size (16).
         block_n, block_k: Triton tile shape. ``block_k`` must be a multiple
             of ``sf_vec_size``.
+
     Returns:
         ``[N, K]`` in ``target_dtype``.
     """
