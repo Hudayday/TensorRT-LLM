@@ -64,9 +64,9 @@ def _make_hf_config(**values):
 
 
 class TestConfigAndFactory:
-    def test_factory_returns_triattention_and_propagates_config_fields(self):
+    def test_factory_allows_block_reuse_and_propagates_config_fields(self):
         # The factory contract is independent of GPU-owned persistent buffers.
-        fake_v2 = _make_fake_v2(enable_block_reuse=False)
+        fake_v2 = _make_fake_v2(enable_block_reuse=True)
         cfg = _make_tri_config(budget=32, beta=16, eviction_mode="per_head")
         with mock.patch.object(TriAttention, "_initialize_eviction_state") as initialize:
             mgr = create_kv_cache_compression_manager(cfg, kv_cache_manager=fake_v2)

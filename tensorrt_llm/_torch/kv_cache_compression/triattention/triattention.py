@@ -142,6 +142,8 @@ class TriAttention(KVCacheCompressionManager):
     """Periodic physical KV eviction driven by trigonometric importance scoring."""
 
     adjusts_generation_kv_length = True
+    # V2 only reuses committed prompt pages; TriAttention rewrites the decode suffix.
+    supports_block_reuse = True
 
     # ---- construction ----
 

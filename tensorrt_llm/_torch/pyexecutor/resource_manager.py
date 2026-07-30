@@ -2451,6 +2451,9 @@ class KVCacheCompressionManager(BaseResourceManager):
     adjusts_generation_kv_length: ClassVar[bool] = False
     """Whether this manager can make target and logical KV lengths diverge."""
 
+    supports_block_reuse: ClassVar[bool] = False
+    """Whether this manager preserves KV pages committed for prefix reuse."""
+
     def __init__(
         self,
         kv_cache_manager: "KVCacheManagerV2",
@@ -2466,12 +2469,10 @@ class KVCacheCompressionManager(BaseResourceManager):
                 "draft KV-cache compression requires KVCacheManagerV2")
         self.kv_cache_manager = kv_cache_manager
         self.draft_kv_cache_manager = draft_kv_cache_manager
-        # Compression evicts/rewrites stored keys and values, so a shared prefix
-        # block is no longer safe to reuse (same constraint as RocketKVCacheManager).
-        if kv_cache_manager.enable_block_reuse:
+        if (kv_cache_manager.enable_block_reuse
+                and not self.supports_block_reuse):
             raise ValueError(
-                f"{type(self).__name__} changes stored keys and values and cannot "
-                f"run with KV-cache block reuse. Set "
+                f"{type(self).__name__} does not support KV-cache block reuse. Set "
                 f"KvCacheConfig.enable_block_reuse to False.")
         kv_cache_manager.kv_compression_manages_history = self.adjusts_generation_kv_length
         if draft_kv_cache_manager is not None:

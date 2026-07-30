@@ -75,6 +75,10 @@ class _LengthAdjustingCompressionManager(KVCacheCompressionManager):
     adjusts_generation_kv_length: ClassVar[bool] = True
 
 
+class _BlockReuseCompatibleCompressionManager(KVCacheCompressionManager):
+    supports_block_reuse: ClassVar[bool] = True
+
+
 def _v2_manager(*, is_draft: bool):
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 
@@ -344,8 +348,7 @@ class TestCanonicalImports:
 
 
 class TestBlockReuseGuard:
-    """__init__ refuses block reuse for a method that changes the stored keys
-    and values, the same check RocketKVCacheManager makes."""
+    """Block reuse requires an explicit compression-method capability."""
 
     def _mgr(self, enable_block_reuse):
         m = _v2_manager(is_draft=False)
@@ -358,3 +361,6 @@ class TestBlockReuseGuard:
 
     def test_ok_when_reuse_off(self):
         KVCacheCompressionManager(self._mgr(enable_block_reuse=False))  # no raise
+
+    def test_supported_method_ok_when_reuse_on(self):
+        _BlockReuseCompatibleCompressionManager(self._mgr(enable_block_reuse=True))
