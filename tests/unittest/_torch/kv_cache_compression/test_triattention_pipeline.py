@@ -75,6 +75,9 @@ class TestConfigAndFactory:
         assert mgr.beta == 16
         assert mgr.eviction_mode == "per_head"
         assert mgr.kv_cache_manager is fake_v2
+        assert fake_v2.kv_compression_manages_history
+        assert cfg.changes_physical_kv_length
+        assert cfg.preserves_reusable_prefix
         initialize.assert_called_once_with()
 
 

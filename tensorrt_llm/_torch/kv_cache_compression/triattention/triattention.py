@@ -141,10 +141,6 @@ class _MeanPhaseTable:
 class TriAttention(KVCacheCompressionManager):
     """Periodic physical KV eviction driven by trigonometric importance scoring."""
 
-    adjusts_generation_kv_length = True
-    # V2 only reuses committed prompt pages; TriAttention rewrites the decode suffix.
-    supports_block_reuse = True
-
     # ---- construction ----
 
     def __init__(
@@ -153,7 +149,7 @@ class TriAttention(KVCacheCompressionManager):
         kv_cache_manager: KVCacheManagerV2,
         draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
     ) -> None:
-        super().__init__(kv_cache_manager, draft_kv_cache_manager)
+        super().__init__(config, kv_cache_manager, draft_kv_cache_manager)
         self.budget = config.budget
         self.beta = config.beta
         self.eviction_mode = config.eviction_mode

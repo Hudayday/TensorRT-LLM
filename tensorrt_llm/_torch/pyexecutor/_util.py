@@ -2266,7 +2266,7 @@ def validate_kv_cache_compression_with_spec(
     """Reject speculative setups the compression method cannot run with."""
     if spec_config is None:
         return
-    if not config.kv_cache_compression_mode.is_eviction_method():
+    if not config.changes_physical_kv_length:
         return
     if config.algorithm != "triattention":
         raise ValueError(

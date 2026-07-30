@@ -2969,6 +2969,10 @@ kv_cache_compression_config:
     assert config.beta == 17
     assert config.eviction_mode == "per_head"
     assert config.normalize_scores is False
+    assert config.changes_physical_kv_length
+    assert config.preserves_reusable_prefix
+    assert "changes_physical_kv_length" not in config.model_dump()
+    assert "preserves_reusable_prefix" not in config.model_dump()
 
 
 class TestSkipSoftmaxAttentionConfig:
