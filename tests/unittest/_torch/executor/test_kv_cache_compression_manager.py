@@ -91,8 +91,12 @@ class _KVCacheManagerV2Harness(KVCacheManagerV2):
         self.is_disagg = False
         self.dtype = DataType.BF16
         self.tokens_per_block = 4
+        self.boundary_compression_quant = "nvfp4"
+        self.num_kv_heads_per_layer = [1]
+        self.head_dim_per_layer = [32]
         self._boundary_compression_manager = None
         self.impl = MagicMock(name="KVCacheManagerPy")
+        self.impl.pool_group_descs = []
 
 
 def _v2_manager(*, is_draft: bool = False):
@@ -408,7 +412,7 @@ class TestBlockReuseGuard:
 
 
 # ---------------------------------------------------------------------- #
-# 6. GPU/Host NVFP4 boundary-compression scaffold                        #
+# 6. GPU/Host NVFP4 boundary compression                                #
 # ---------------------------------------------------------------------- #
 
 
@@ -476,6 +480,22 @@ class TestNVFP4BoundaryOffload:
         assert torch.all(raw[3] == 4096)
         assert args[2:] == (16, False, False)
 
+    def test_hnd_partial_page_zeroes_tail_for_every_head(self):
+        manager, _ = self._manager()
+        raw = torch.arange(1, 257, dtype=torch.bfloat16).reshape(2, 4, 32)
+        raw[:, 3].fill_(4096)
+        packed = torch.zeros((8, 16), dtype=torch.uint8)
+        linear_scales = torch.zeros(16, dtype=torch.uint8)
+
+        with patch.object(torch.ops.trtllm, "fp4_quantize", create=True) as quantize:
+            quantize.return_value = packed, linear_scales
+            manager.compress_tensor(raw, valid_token_count=3)
+
+        quant_input = quantize.call_args.args[0].view(2, 4, 32)
+        torch.testing.assert_close(quant_input[:, :3], raw[:, :3])
+        assert torch.count_nonzero(quant_input[:, 3]) == 0
+        assert torch.all(raw[:, 3] == 4096)
+
     def test_rejects_unaligned_feature_width_before_quantization(self):
         manager, _ = self._manager()
         raw = torch.ones((4, 15), dtype=torch.bfloat16)
@@ -491,12 +511,20 @@ class TestNVFP4BoundaryOffload:
             manager.compress_tensor(raw, valid_token_count=0)
         with pytest.raises(ValueError, match="valid_token_count"):
             manager.compress_tensor(raw, valid_token_count=5)
-        with pytest.raises(ValueError, match=r"\[tokens, features\]"):
-            manager.compress_tensor(raw.reshape(2, 2, 16), valid_token_count=2)
+        with pytest.raises(ValueError, match="expects NHD"):
+            manager.compress_tensor(
+                raw.reshape(1, 2, 2, 16), valid_token_count=2
+            )
 
-    def test_migration_callbacks_fail_closed_at_the_two_known_product_gaps(self):
+    def test_compact_record_size_contains_payload_scales_and_global_scale(self):
         manager, _ = self._manager()
-        with pytest.raises(NotImplementedError, match="tier-specific compact Host slots"):
-            manager.on_offload_compress()
-        with pytest.raises(NotImplementedError, match="standalone SM100 Page restore"):
-            manager.on_onboard_decompress()
+        raw_size = 4 * 32 * 2
+        host_size = manager._record_size(raw_size)
+        packed_size, scale_size, inverse_scale_offset = (
+            manager._record_sections(raw_size, host_size)
+        )
+        assert packed_size == 64
+        assert scale_size == 8
+        assert inverse_scale_offset == 72
+        assert host_size == 80
+        assert host_size < raw_size

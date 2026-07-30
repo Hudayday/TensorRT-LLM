@@ -45,11 +45,16 @@ class CoalescedBuffer:
     """Each coalesced buffer has multiple buffers with the same size and life cycle."""
 
     single_buffer_size: int  # identical for all buffers in the same coalesced buffer
+    host_single_buffer_size: int
     buffer_ids: HomoTuple[BufferId]
 
     @property
     def size(self) -> int:
         return self.single_buffer_size * len(self.buffer_ids)
+
+    @property
+    def host_size(self) -> int:
+        return self.host_single_buffer_size * len(self.buffer_ids)
 
     @property
     def num_buffers(self) -> int:
@@ -77,11 +82,16 @@ class SlotDescVariant:
     def slot_size_list(self) -> TypedIndexList[PoolIndex, int]:
         return typed_map(self.coalesced_buffers, lambda cb: cb.size)
 
+    @property
+    def host_slot_size_list(self) -> TypedIndexList[PoolIndex, int]:
+        return typed_map(self.coalesced_buffers, lambda cb: cb.host_size)
+
 
 @dataclass(slots=True, frozen=True)
 class SlotDesc:
     """
-    A slot in a memory pool group can have different composition, if they have the same slot_size_list.
+    A slot in a memory pool group can have different composition, if they
+    have the same GPU and Host slot-size lists.
     """
 
     variants: HomoTuple[SlotDescVariant]
@@ -89,6 +99,10 @@ class SlotDesc:
     @property
     def slot_size_list(self) -> TypedIndexList[PoolIndex, int]:
         return get_uniform_attribute(self.variants, lambda s: s.slot_size_list)
+
+    @property
+    def host_slot_size_list(self) -> TypedIndexList[PoolIndex, int]:
+        return get_uniform_attribute(self.variants, lambda s: s.host_slot_size_list)
 
 
 @dataclass(slots=True, frozen=True)
@@ -195,9 +209,13 @@ class StorageConfig:
 
 
 def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
-    # group buffers first by life cycle, then by single buffer size.
-    buffer_groups = defaultdict[LifeCycleId, defaultdict[int, list[BufferId]]](
-        lambda: defaultdict[int, list[BufferId]](list[BufferId])
+    # Group buffers first by life cycle, then by their GPU/Host physical
+    # sizes. Buffers may share one physical pool only when both tier layouts
+    # agree.
+    buffer_groups = defaultdict[
+        LifeCycleId, defaultdict[tuple[int, int], list[BufferId]]
+    ](
+        lambda: defaultdict[tuple[int, int], list[BufferId]](list[BufferId])
     )
     life_cycle_registry = LifeCycleRegistry(config)
     tokens_per_block = config.tokens_per_block
@@ -210,27 +228,35 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
             tokens_per_block_override = value_or(buffer.tokens_per_block_override, tokens_per_block)
             expansion = exact_div(tokens_per_block, tokens_per_block_override)
             size = buffer.size * expansion
+            host_size = value_or(buffer.host_size, buffer.size) * expansion
             buf_id = BufferId(layer.layer_id, buffer.role)
             expansion_map[buf_id] = expansion
-            size_to_buffers[size].append(buf_id)
+            size_to_buffers[(size, host_size)].append(buf_id)
     # Create one slot group for each life cycle.
     # It's possible that buffers with different sizes form coalesced buffers with the same coalesced size.
     # @TODO: add test for this case.
     slot_groups: list[SlotDescVariant] = []
     for life_cycle_id, size_to_buffers in buffer_groups.items():
         slots = [
-            CoalescedBuffer(size, tuple(buffer_ids)) for size, buffer_ids in size_to_buffers.items()
+            CoalescedBuffer(size, host_size, tuple(buffer_ids))
+            for (size, host_size), buffer_ids in size_to_buffers.items()
         ]
         slots.sort(key=lambda p: p.size, reverse=True)
         slot_groups.append(
             SlotDescVariant(life_cycle_id, cast(TypedIndexList[PoolIndex, CoalescedBuffer], slots))
         )
-    # Merge slot groups with the same slot_size_list
-    pool_groups_by_slot_size_list = defaultdict[HomoTuple[int], list[SlotDescVariant]](
+    # Merge life-cycle variants only when both physical tier layouts match.
+    pool_groups_by_slot_size_list = defaultdict[
+        tuple[HomoTuple[int], HomoTuple[int]], list[SlotDescVariant]
+    ](
         list[SlotDescVariant]
     )
     for slot_group in slot_groups:
-        pool_groups_by_slot_size_list[tuple(slot_group.slot_size_list)].append(slot_group)
+        key = (
+            tuple(slot_group.slot_size_list),
+            tuple(slot_group.host_slot_size_list),
+        )
+        pool_groups_by_slot_size_list[key].append(slot_group)
     slot_desc_list = cast(
         TypedIndexList[PoolGroupIndex, SlotDesc],
         [SlotDesc(tuple(slot_groups)) for slot_groups in pool_groups_by_slot_size_list.values()],

@@ -92,6 +92,23 @@ class BufferConfig:
     KVCacheManagerConfig and size should be based on tokens_per_block_override.
     """
 
+    host_size: int | None = None
+    """
+    Optional physical bytes used by this logical buffer in the Host tier.
+
+    ``None`` preserves the runtime representation and uses ``size``. A
+    boundary-compression manager may set a smaller fixed size before
+    ``StorageManager`` is constructed. The field describes storage geometry
+    only; KVCM V2 remains unaware of the codec and invokes the registered
+    GPU/Host transform hooks whenever source and destination sizes differ.
+    """
+
+    def __post_init__(self) -> None:
+        assert self.size > 0, "Buffer size must be positive"
+        assert self.host_size is None or self.host_size > 0, (
+            "Host buffer size must be positive"
+        )
+
 
 class LayerType(IntEnum):
     ATTENTION = 0

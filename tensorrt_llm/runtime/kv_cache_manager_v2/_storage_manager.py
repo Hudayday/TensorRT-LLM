@@ -51,7 +51,7 @@ from ._life_cycle_registry import (
     LifeCycleRegistry,
     compute_scratch_range,
 )
-from ._page import CommittedPage, Page
+from ._page import CommittedPage, Page, SsmCommittedPage, UncommittedPage
 from ._storage import CacheLevelStorage
 from ._storage._config import BufferAttr, BufferId, LayerAttr, SlotDesc, StorageConfig
 from ._storage._core import (
@@ -263,7 +263,10 @@ class StorageManager:
         self._slot_desc_list = config.slot_desc_list
         assert all(pg < self.num_pool_groups for pg in self._life_cycle_grouping)
         assert self.num_pool_groups == PoolGroupIndex(len(set(self._life_cycle_grouping)))
-        slot_size_lists = typed_map(self._slot_desc_list, lambda pg: pg.slot_size_list)
+        gpu_slot_size_lists = typed_map(self._slot_desc_list, lambda pg: pg.slot_size_list)
+        host_slot_size_lists = typed_map(
+            self._slot_desc_list, lambda pg: pg.host_slot_size_list
+        )
 
         gpu_quota = config.cache_tiers[GPU_LEVEL].quota
         gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
@@ -313,9 +316,19 @@ class StorageManager:
                     self._life_cycle_grouping,
                     i,
                     config.cache_tiers[i],
-                    slot_size_lists,
+                    (
+                        host_slot_size_lists
+                        if config.cache_tiers[i].tier == CacheTier.HOST_MEM
+                        else gpu_slot_size_lists
+                    ),
                     self._compute_slot_count_for_level(
-                        config.cache_tiers[i], slot_size_lists, init_ratio
+                        config.cache_tiers[i],
+                        (
+                            host_slot_size_lists
+                            if config.cache_tiers[i].tier == CacheTier.HOST_MEM
+                            else gpu_slot_size_lists
+                        ),
+                        init_ratio,
                     ),
                 )
                 for i in typed_range(num_levels)
@@ -653,7 +666,7 @@ class StorageManager:
                 lambda _: list[CopyTask](), num_pools
             )
             for src, dst in zip(src_pages, dst_slots):
-                assert defrag or src.node_ref is None
+                assert defrag or not update_src or src.node_ref is None
                 prior_events.update((dst.ready_event, src.ready_event))
                 dst_addresses = dst_pool_group.slot_address(dst.slot_id)
                 src_addresses = src_pool_group.slot_address(src.slot_id)
@@ -676,6 +689,13 @@ class StorageManager:
                     )
                     if migration_hook is None:
                         slot_sizes = self.slot_size(pool_group_index, src_level)
+                        dst_slot_sizes = self.slot_size(pool_group_index, dst_level)
+                        if slot_sizes != dst_slot_sizes:
+                            raise RuntimeError(
+                                "KVCM V2 cannot copy between cache tiers with "
+                                "different physical slot sizes until boundary "
+                                "compression hooks are bound"
+                            )
                         for pool_idx, tasks in typed_enumerate(tasks_per_pool):
                             batched_copy(
                                 dst_tier,
@@ -693,6 +713,9 @@ class StorageManager:
                             dst_addresses=tuple(dst_slot_addresses),
                             src_slot_sizes=tuple(self.slot_size(pool_group_index, src_level)),
                             dst_slot_sizes=tuple(self.slot_size(pool_group_index, dst_level)),
+                            valid_token_counts=tuple(
+                                self._valid_token_count(page) for page in src_pages
+                            ),
                             stream=stream.get(),
                         )
                 except Exception:
@@ -740,6 +763,24 @@ class StorageManager:
             for s in dst_slots:
                 dst_pool_group.release(s)
             raise
+
+    @staticmethod
+    def _valid_token_count(page: Page) -> int:
+        """Return KVCM-owned valid rows without consulting attention state."""
+        if isinstance(page, SsmCommittedPage):
+            return page.num_tokens_in_block
+        if isinstance(page, CommittedPage):
+            return page.valid_token_count
+        if isinstance(page, UncommittedPage):
+            kv_cache = page.kv_cache()
+            if kv_cache is None:
+                raise RuntimeError("Uncommitted Page lost its owning KV cache")
+            block_start = int(page.ordinal) * kv_cache.tokens_per_block
+            return min(
+                kv_cache.tokens_per_block,
+                max(0, kv_cache.history_length - block_start),
+            )
+        raise TypeError(f"Unsupported Page type: {type(page).__name__}")
 
     def _emit_cache_level_updated_event(
         self,

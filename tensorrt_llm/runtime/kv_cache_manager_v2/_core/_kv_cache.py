@@ -521,12 +521,13 @@ class _KVCache:
             if life_cycle_key is None:
                 continue
             pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
-            page_size = sum(self.manager._storage.slot_size(pg_idx))
             stats = KVCacheStatsDelta()
             iteration_stats = KVCacheIterationStatsDelta()
             if src_level == GPU_LEVEL and dst_level > GPU_LEVEL:
                 iteration_stats.iter_offload_blocks = 1
-                iteration_stats.iter_offload_bytes = page_size
+                iteration_stats.iter_offload_bytes = sum(
+                    self.manager._storage.slot_size(pg_idx, dst_level)
+                )
             elif dst_level == GPU_LEVEL:
                 stats.alloc_total_blocks = 1
                 stats.alloc_new_blocks = 1
@@ -534,10 +535,14 @@ class _KVCache:
                 iteration_stats.iter_alloc_new_blocks = 1
                 if src_level > GPU_LEVEL:
                     iteration_stats.iter_onboard_blocks = 1
-                    iteration_stats.iter_onboard_bytes = page_size
+                    iteration_stats.iter_onboard_bytes = sum(
+                        self.manager._storage.slot_size(pg_idx, src_level)
+                    )
                 elif src_level == GPU_LEVEL:
                     iteration_stats.iter_intra_device_copy_blocks = 1
-                    iteration_stats.iter_intra_device_copy_bytes = page_size
+                    iteration_stats.iter_intra_device_copy_bytes = sum(
+                        self.manager._storage.slot_size(pg_idx, GPU_LEVEL)
+                    )
             if not stats.empty or not iteration_stats.empty:
                 self.manager.commit_stats(stats, {life_cycle_key: iteration_stats})
 
@@ -549,10 +554,8 @@ class _KVCache:
         """Record host-tier LRU drops (pages released without onboarding back to GPU).
 
         Mirrors _record_migrated_slots in structure: per-life-cycle attribution,
-        gated on _should_record_stats(), per-page bytes computed from slot_size.
-        cache_level is unused for now (we only have a 2-tier setup in practice;
-        all last-level drops are host drops) but kept in the signature for future
-        per-tier disambiguation.
+        gated on _should_record_stats(), with bytes computed from the physical
+        slot size of the tier being dropped.
         """
         if not self._should_record_stats() or not pages:
             return
@@ -561,7 +564,9 @@ class _KVCache:
             if life_cycle_key is None:
                 continue
             pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
-            page_size = sum(self.manager._storage.slot_size(pg_idx))
+            page_size = sum(
+                self.manager._storage.slot_size(pg_idx, cache_level)
+            )
             iteration_stats = KVCacheIterationStatsDelta()
             iteration_stats.iter_host_dropped_blocks = 1
             iteration_stats.iter_host_dropped_bytes = page_size
@@ -1461,23 +1466,40 @@ class _KVCache:
         pg_idx = storage.get_pool_group_index(lc_idx)
         for lvl in typed_range(src_page.cache_level, storage.num_cache_levels):
             try:
-                new_slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1)[0]
+                if lvl == src_page.cache_level:
+                    new_slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1)[0]
+                else:
+                    requirements = filled_list(0, storage.num_pool_groups)
+                    requirements[pg_idx] = 1
+                    storage.prepare_free_slots(lvl, requirements)
+                    migrated = storage._batched_migrate(
+                        pg_idx,
+                        lvl,
+                        src_page.cache_level,
+                        [src_page],
+                        update_src=False,
+                    )
+                    assert migrated is not None and len(migrated) == 1
+                    new_slot = migrated[0]
             except OutOfPagesError:
                 continue
-            cuda_stream = self.cuda_stream
-            new_slot.ready_event.wait_in_stream(cuda_stream)
-            slot_size = storage.slot_size(pg_idx)
-            for p in typed_range(storage.num_pools(pg_idx)):
-                dst = storage.slot_address(lvl, pg_idx, new_slot.slot_id, p)
-                src = storage.slot_address(src_page.cache_level, pg_idx, src_page.slot_id, p)
-                batched_copy(
-                    storage.cache_tiers[lvl],
-                    storage.cache_tiers[src_page.cache_level],
-                    slot_size[p],
-                    [CopyTask(dst, src)],
-                    cuda_stream,
-                )
-            new_slot.ready_event = CachedCudaEvent(cuda_stream)
+            if lvl == src_page.cache_level:
+                cuda_stream = self.cuda_stream
+                new_slot.ready_event.wait_in_stream(cuda_stream)
+                slot_size = storage.slot_size(pg_idx, lvl)
+                for p in typed_range(storage.num_pools(pg_idx)):
+                    dst = storage.slot_address(lvl, pg_idx, new_slot.slot_id, p)
+                    src = storage.slot_address(
+                        src_page.cache_level, pg_idx, src_page.slot_id, p
+                    )
+                    batched_copy(
+                        storage.cache_tiers[lvl],
+                        storage.cache_tiers[src_page.cache_level],
+                        slot_size[p],
+                        [CopyTask(dst, src)],
+                        cuda_stream,
+                    )
+                new_slot.ready_event = CachedCudaEvent(cuda_stream)
             priority = self._get_priority(tree_block.ordinal, self.manager._life_cycles[lc_idx])
             if ssm_num_tokens_in_block is None:
                 committed = CommittedPage(storage, tree_block, lc_idx, lvl, new_slot, priority)

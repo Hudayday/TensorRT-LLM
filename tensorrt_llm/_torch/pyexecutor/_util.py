@@ -1123,6 +1123,16 @@ class KvCacheCreator:
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
+        compression_config = getattr(
+            self._llm_args, "kv_cache_compression_config", None
+        )
+        boundary_compression_quant = None
+        if (
+            compression_config is not None
+            and compression_config.algorithm == "quantization_for_boundary"
+            and not model_engine.is_draft_model
+        ):
+            boundary_compression_quant = compression_config.quant
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -1142,6 +1152,7 @@ class KvCacheCreator:
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
+            boundary_compression_quant=boundary_compression_quant,
         )
 
         if not self._skip_est:
@@ -1858,7 +1869,8 @@ def _create_kv_cache_manager(
         num_kv_heads: Optional[Union[int, List[int]]] = None,
         head_dim: Optional[int] = None,
         kv_cache_type=None,
-        is_disagg: bool = False) -> KVCacheManager:
+        is_disagg: bool = False,
+        boundary_compression_quant: Optional[str] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -1989,6 +2001,9 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+        manager_extra_kwargs[
+            "boundary_compression_quant"
+        ] = boundary_compression_quant
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
@@ -2332,10 +2347,10 @@ def create_kv_cache_compression_manager(
             QuantizationForBoundaryCompression
 
         logger.warning(
-            "quantization_for_boundary is a fail-closed GPU/Host migration "
-            "scaffold. Tier-specific compact Host slots and a production "
-            "standalone NVFP4 Page restore operation are not implemented; "
-            "do not enable it for serving yet.")
+            "quantization_for_boundary is an experimental SM100 GPU/Host "
+            "offload path. It keeps runtime KV in FP16/BF16 and Host KV in "
+            "compressed-only NVFP4; validate accuracy, peak workspace, and "
+            "latency before production use.")
         return QuantizationForBoundaryCompression(
             kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,

@@ -768,11 +768,38 @@ class KVCacheManagerV2(BaseResourceManager):
         is_disagg: bool = False,
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
+        boundary_compression_quant: Optional[str] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
         self.is_disagg = is_disagg
+        self.boundary_compression_quant = boundary_compression_quant
+
+        if boundary_compression_quant is not None:
+            if type(self) is not KVCacheManagerV2:
+                raise ValueError(
+                    "NVFP4 Host boundary compression initially supports only "
+                    "the standard KVCacheManagerV2"
+                )
+            if boundary_compression_quant != "nvfp4":
+                raise ValueError(
+                    "KVCacheManagerV2 Host boundary compression currently "
+                    "supports only quant='nvfp4'"
+                )
+            if dtype not in (DataType.HALF, DataType.BF16):
+                raise ValueError(
+                    "NVFP4 Host boundary compression requires FP16/BF16 "
+                    "active runtime KV"
+                )
+            if is_draft:
+                raise ValueError(
+                    "NVFP4 Host boundary compression does not support a draft KV cache"
+                )
+            if is_disagg:
+                raise ValueError(
+                    "NVFP4 Host boundary compression P0 does not cover disaggregated transfer"
+                )
 
         assert kv_connector_manager is None, (
             "kv_connector_manager is not supported for KVCacheManagerV2"
@@ -1037,6 +1064,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
             )
 
+        if self.boundary_compression_quant is not None:
+            if len(cache_tiers) != 2 or not isinstance(
+                cache_tiers[1], HostCacheTierConfig
+            ):
+                raise ValueError(
+                    "NVFP4 Host boundary compression requires exactly GPU and Host tiers"
+                )
+
         self.vocab_size = vocab_size
 
         config = self._build_base_config(
@@ -1051,6 +1086,8 @@ class KVCacheManagerV2(BaseResourceManager):
         try:
             self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
         except (CuError, KVCacheOutOfMemoryError):
+            if self.boundary_compression_quant is not None:
+                raise
             if len(cache_tiers) > 1:
                 logger.warning(
                     "Failed to initialize KV cache manager with host cache "
@@ -1467,6 +1504,18 @@ class KVCacheManagerV2(BaseResourceManager):
         cache_tiers: List[CacheTierConfig],
         tokens_per_block: int,
     ) -> List[int]:
+        if self.boundary_compression_quant is not None:
+            storage = self.impl._storage
+            return [
+                min(
+                    storage.num_slots(
+                        pool_group,
+                        CacheLevel(cache_level),
+                    )
+                    for pool_group in range(storage.num_pool_groups)
+                )
+                for cache_level in range(storage.num_cache_levels)
+            ]
         bytes_per_block = self.get_cache_bytes_per_token() * tokens_per_block
         if bytes_per_block <= 0:
             return []
@@ -1820,6 +1869,10 @@ class KVCacheManagerV2(BaseResourceManager):
         extra_buffers_per_layer = (
             self._extra_buffers_per_layer(tokens_per_block=tokens_per_block) or {}
         )
+        if self.boundary_compression_quant is not None and extra_buffers_per_layer:
+            raise ValueError(
+                "NVFP4 Host boundary compression P0 supports only standard K/V buffers"
+            )
 
         layer_configs: List[AttentionLayerConfig] = []
         for layer_id in typed_range(LayerId(self.num_local_layers)):
@@ -1828,6 +1881,17 @@ class KVCacheManagerV2(BaseResourceManager):
                     role=role,
                     size=self.get_layer_bytes_per_token(local_layer_idx=layer_id, data_role=role)
                     * tokens_per_block,
+                    host_size=(
+                        self._get_nvfp4_boundary_host_buffer_size(
+                            self.get_layer_bytes_per_token(
+                                local_layer_idx=layer_id,
+                                data_role=role,
+                            )
+                            * tokens_per_block
+                        )
+                        if self.boundary_compression_quant == "nvfp4"
+                        else None
+                    ),
                 )
                 for role in buffer_type
             ]
@@ -1864,6 +1928,22 @@ class KVCacheManagerV2(BaseResourceManager):
             ),
             initial_pool_ratio=kv_cache_config.pool_ratio,
         )
+
+    @staticmethod
+    def _get_nvfp4_boundary_host_buffer_size(raw_size: int) -> int:
+        """Fixed packed bytes for one FP16/BF16 K or V Page buffer."""
+        if raw_size % 2 != 0:
+            raise ValueError("FP16/BF16 KV buffer size must be divisible by 2")
+        num_elements = raw_size // 2
+        if num_elements % 16 != 0:
+            raise ValueError(
+                "NVFP4 Host boundary compression requires element count divisible by 16"
+            )
+        packed_size = num_elements // 2
+        block_scale_size = num_elements // 16
+        inverse_global_scale_size = 4
+        record_size = packed_size + block_scale_size + inverse_global_scale_size
+        return ((record_size + 15) // 16) * 16
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""

@@ -147,6 +147,7 @@ class BufferConfig:
     role: DataRole
     size: int
     tokens_per_block_override: int | None = None
+    host_size: int | None = None
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
@@ -415,9 +416,12 @@ class AggregatedPageDesc:
 @dataclass(slots=True, frozen=True)
 class CoalescedBuffer:
     single_buffer_size: int
+    host_single_buffer_size: int
     buffer_ids: Sequence[BufferId]
     @property
     def size(self) -> int: ...
+    @property
+    def host_size(self) -> int: ...
     @property
     def num_buffers(self) -> int: ...
 
@@ -428,12 +432,16 @@ class SlotDescVariant:
     def layer_group_id(self) -> LayerGroupId: ...
     @property
     def slot_size_list(self) -> Sequence[int]: ...
+    @property
+    def host_slot_size_list(self) -> Sequence[int]: ...
 
 @dataclass(slots=True, frozen=True)
 class SlotDesc:
     variants: Sequence[SlotDescVariant]
     @property
     def slot_size_list(self) -> Sequence[int]: ...
+    @property
+    def host_slot_size_list(self) -> Sequence[int]: ...
 
 @dataclass(slots=True, frozen=True)
 class PoolGroupDesc:

@@ -259,6 +259,7 @@ def dequant_nvfp4_2d_triton(
     weight_scale: torch.Tensor,
     weight_scale_2: torch.Tensor,
     *,
+    out: torch.Tensor | None = None,
     target_dtype: torch.dtype = torch.bfloat16,
     sf_vec_size: int = 16,
     block_n: int = 32,
@@ -279,6 +280,9 @@ def dequant_nvfp4_2d_triton(
             * a 2-D buffer of shape ``[pad_rows, pad_cols]``.
         weight_scale_2: per-tensor FP32 scale (any shape with a single
             element; only ``data_ptr()`` is consumed by the kernel).
+        out: optional caller-owned contiguous ``[N, K]`` destination. This is
+            used by KVCM V2 boundary decompression to write directly into an
+            already-admitted runtime Page.
         target_dtype: BF16 or FP16.
         sf_vec_size: NVFP4 per-block size (16).
         block_n, block_k: Triton tile shape. ``block_k`` must be a multiple
@@ -308,7 +312,23 @@ def dequant_nvfp4_2d_triton(
     elif weight_scale.dim() != 2:
         raise ValueError(f"weight_scale must be 1D or 2D, got shape {tuple(weight_scale.shape)}")
 
-    out = torch.empty(N, K, dtype=target_dtype, device=device)
+    if out is None:
+        out = torch.empty(N, K, dtype=target_dtype, device=device)
+    else:
+        if out.shape != (N, K):
+            raise ValueError(
+                f"out must have shape {(N, K)}, got {tuple(out.shape)}"
+            )
+        if out.dtype != target_dtype:
+            raise TypeError(
+                f"out dtype must be {target_dtype}, got {out.dtype}"
+            )
+        if out.device != device:
+            raise ValueError(
+                f"out device must be {device}, got {out.device}"
+            )
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
     e2m1_table = _get_e2m1_codebook(device)
 
     # The kernel reads the per-tensor scale via a single pointer load; flatten
