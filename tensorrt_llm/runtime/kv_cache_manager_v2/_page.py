@@ -241,7 +241,6 @@ class CommittedPage(Page):
     """
 
     block: rawref.ref["Block"]
-    valid_token_count: int
     planned_drop_count: int
     __rawref__: rawref.ref["CommittedPage"]
 
@@ -258,7 +257,6 @@ class CommittedPage(Page):
         priority: Priority,
     ):
         self.block = rawref.ref(block)
-        self.valid_token_count = len(block.tokens)
         self.planned_drop_count = 0
         self.__rawref__ = rawref.NULL
         Page.__init__(

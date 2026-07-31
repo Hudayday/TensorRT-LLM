@@ -79,6 +79,15 @@ class CopyTask(NamedTuple):
     src: Address
 
 
+def zero_gpu_memory(address: MemAddress, num_bytes: int, stream: CudaStream) -> None:
+    """Asynchronously clear a contiguous GPU allocation."""
+    if num_bytes < 0:
+        raise ValueError("GPU memset byte count must be non-negative")
+    if num_bytes == 0:
+        return
+    _unwrap(drv.cuMemsetD8Async(address, 0, num_bytes, stream))
+
+
 def _copy_gpu_to_gpu(tasks: Sequence[CopyTask], num_bytes: int, stream: CudaStream):
     _unwrap(
         drv.CUresult(

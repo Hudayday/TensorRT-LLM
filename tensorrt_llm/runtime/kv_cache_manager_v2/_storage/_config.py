@@ -45,8 +45,12 @@ class CoalescedBuffer:
     """Each coalesced buffer has multiple buffers with the same size and life cycle."""
 
     single_buffer_size: int  # identical for all buffers in the same coalesced buffer
-    host_single_buffer_size: int
     buffer_ids: HomoTuple[BufferId]
+    host_single_buffer_size: int | None = None
+
+    @property
+    def effective_host_single_buffer_size(self) -> int:
+        return value_or(self.host_single_buffer_size, self.single_buffer_size)
 
     @property
     def size(self) -> int:
@@ -54,7 +58,7 @@ class CoalescedBuffer:
 
     @property
     def host_size(self) -> int:
-        return self.host_single_buffer_size * len(self.buffer_ids)
+        return self.effective_host_single_buffer_size * len(self.buffer_ids)
 
     @property
     def num_buffers(self) -> int:
@@ -212,9 +216,7 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
     # Group buffers first by life cycle, then by their GPU/Host physical
     # sizes. Buffers may share one physical pool only when both tier layouts
     # agree.
-    buffer_groups = defaultdict[
-        LifeCycleId, defaultdict[tuple[int, int], list[BufferId]]
-    ](
+    buffer_groups = defaultdict[LifeCycleId, defaultdict[tuple[int, int], list[BufferId]]](
         lambda: defaultdict[tuple[int, int], list[BufferId]](list[BufferId])
     )
     life_cycle_registry = LifeCycleRegistry(config)
@@ -238,7 +240,11 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
     slot_groups: list[SlotDescVariant] = []
     for life_cycle_id, size_to_buffers in buffer_groups.items():
         slots = [
-            CoalescedBuffer(size, host_size, tuple(buffer_ids))
+            CoalescedBuffer(
+                single_buffer_size=size,
+                buffer_ids=tuple(buffer_ids),
+                host_single_buffer_size=host_size,
+            )
             for (size, host_size), buffer_ids in size_to_buffers.items()
         ]
         slots.sort(key=lambda p: p.size, reverse=True)
@@ -248,9 +254,7 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
     # Merge life-cycle variants only when both physical tier layouts match.
     pool_groups_by_slot_size_list = defaultdict[
         tuple[HomoTuple[int], HomoTuple[int]], list[SlotDescVariant]
-    ](
-        list[SlotDescVariant]
-    )
+    ](list[SlotDescVariant])
     for slot_group in slot_groups:
         key = (
             tuple(slot_group.slot_size_list),

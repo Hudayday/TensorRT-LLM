@@ -32,7 +32,6 @@ import torch
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary import (
     QuantizationForBoundaryCompression,
 )
-from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -142,8 +141,18 @@ class TestBaseABC:
         assert m.on_generation_step_begin(MagicMock()) is None
         assert m.on_generation_step_end(MagicMock()) is None
         assert m.on_request_finish(MagicMock()) is None
-        assert m.on_offload_compress(future_arg=1) is None
-        assert m.on_onboard_decompress(future_arg=1) is None
+        boundary_args = {
+            "pool_group_index": 0,
+            "src_pages": (),
+            "dst_slots": (),
+            "src_addresses": (),
+            "dst_addresses": (),
+            "src_slot_sizes": (),
+            "dst_slot_sizes": (),
+            "stream": 0,
+        }
+        assert m.on_offload_compress(**boundary_args) is None
+        assert m.on_onboard_decompress(**boundary_args) is None
 
     def test_hooks_accept_extra_kwargs(self, fake_kv_cache_manager):
         # **kwargs lets the framework pass new args later without breaking
@@ -285,33 +294,24 @@ class TestResourceManagerAPI:
 
 
 class TestFactory:
-    def test_returns_none_when_no_algorithm_registered(self, fake_kv_cache_manager):
-        # Framework-only: no concrete algorithm ships, so any config -> None.
+    def test_rejects_unregistered_algorithm(self, fake_kv_cache_manager):
         cfg = MagicMock()
         cfg.algorithm = "made_up_method"
-        assert create_kv_cache_compression_manager(cfg, fake_kv_cache_manager) is None
-
-    def test_warns_for_unregistered_algorithm(self, fake_kv_cache_manager):
-        cfg = MagicMock()
-        cfg.algorithm = "made_up_method"
-        with patch.object(util_mod, "logger") as mock_logger:
+        with pytest.raises(ValueError, match="not registered"):
             create_kv_cache_compression_manager(cfg, fake_kv_cache_manager)
-            mock_logger.warning.assert_called_once()
 
-    def test_factory_accepts_independent_draft_manager(self):
+    def test_unregistered_algorithm_rejects_independent_draft_manager(self):
         cfg = MagicMock()
         cfg.algorithm = "made_up_method"
         target = _v2_manager(is_draft=False)
         draft = _v2_manager(is_draft=True)
 
-        assert (
+        with pytest.raises(ValueError, match="not registered"):
             create_kv_cache_compression_manager(
                 cfg,
                 target,
                 draft_kv_cache_manager=draft,
             )
-            is None
-        )
 
     def test_builds_the_one_nvfp4_boundary_manager(self):
         from tensorrt_llm._torch.kv_cache_compression.interface import KvCacheCompressionMode
@@ -363,6 +363,21 @@ class TestFactory:
         config = KvCacheCompressionConfig(algorithm="offload")
         spec_config = SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode.DFLASH)
         validate_kv_cache_compression_with_spec(config, spec_config, None)
+        validate_kv_cache_compression_with_spec(config, None, None)
+
+    def test_boundary_compression_rejects_speculative_decoding(self):
+        from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
+        from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+        from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
+
+        config = KvCacheCompressionConfig(
+            algorithm="quantization_for_boundary",
+            quant="nvfp4",
+        )
+        spec_config = SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode.DFLASH)
+
+        with pytest.raises(ValueError, match="does not support speculative decoding"):
+            validate_kv_cache_compression_with_spec(config, spec_config, None)
         validate_kv_cache_compression_with_spec(config, None, None)
 
 
@@ -439,6 +454,29 @@ class TestNVFP4BoundaryOffload:
         with pytest.raises(ValueError, match="must remain FP16 or BF16"):
             self._manager(dtype=DataType.NVFP4)
 
+    def test_default_cpp_kvcm_backend_fails_before_building_storage(self):
+        from tensorrt_llm._torch.pyexecutor import kv_cache_manager_v2 as kv_cache_v2_module
+
+        with (
+            patch.object(kv_cache_v2_module.kv_cache_manager_v2_runtime, "_BACKEND", "cpp"),
+            pytest.raises(
+                ValueError,
+                match="TLLM_KV_CACHE_MANAGER_V2_BACKEND=python",
+            ),
+        ):
+            KVCacheManagerV2(
+                kv_cache_config=MagicMock(),
+                kv_cache_type=MagicMock(),
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=32,
+                tokens_per_block=4,
+                max_seq_len=4,
+                max_batch_size=1,
+                mapping=MagicMock(),
+                boundary_compression_quant="nvfp4",
+            )
+
     def test_rejects_draft_cache_and_second_manager(self):
         target = _v2_manager()
         draft = _v2_manager(is_draft=True)
@@ -453,16 +491,16 @@ class TestNVFP4BoundaryOffload:
         with pytest.raises(ValueError, match="already bound"):
             QuantizationForBoundaryCompression(target, quant="nvfp4")
 
-    def test_partial_page_zeroes_unused_rows_before_scale_and_quantization(self):
+    def test_fresh_partial_page_compresses_zero_initialized_physical_payload(self):
         manager, _ = self._manager()
         raw = torch.arange(1, 129, dtype=torch.bfloat16).reshape(4, 32)
-        raw[3].fill_(4096)
+        raw[3].zero_()
         packed = torch.zeros((4, 16), dtype=torch.uint8)
         linear_scales = torch.zeros(8, dtype=torch.uint8)
 
         with patch.object(torch.ops.trtllm, "fp4_quantize", create=True) as quantize:
             quantize.return_value = packed, linear_scales
-            compressed = manager.compress_tensor(raw, valid_token_count=3)
+            compressed = manager.compress_tensor(raw)
 
         compressed_packed, compressed_scales, inverse_global_scale = compressed
         assert compressed_packed is packed
@@ -474,57 +512,98 @@ class TestNVFP4BoundaryOffload:
             torch.tensor([96.0 / (448.0 * 6.0)]),
         )
         args = quantize.call_args.args
-        assert args[0] is not raw
-        torch.testing.assert_close(args[0][:3], raw[:3])
-        assert torch.count_nonzero(args[0][3]) == 0
-        assert torch.all(raw[3] == 4096)
+        assert args[0].data_ptr() == raw.data_ptr()
+        torch.testing.assert_close(args[0], raw)
         assert args[2:] == (16, False, False)
 
-    def test_hnd_partial_page_zeroes_tail_for_every_head(self):
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_payload_fails_before_quantization(self, value):
         manager, _ = self._manager()
-        raw = torch.arange(1, 257, dtype=torch.bfloat16).reshape(2, 4, 32)
-        raw[:, 3].fill_(4096)
-        packed = torch.zeros((8, 16), dtype=torch.uint8)
-        linear_scales = torch.zeros(16, dtype=torch.uint8)
+        raw = torch.ones((4, 32), dtype=torch.bfloat16)
+        raw[1, 3] = value
+
+        with patch.object(torch.ops.trtllm, "fp4_quantize", create=True) as quantize:
+            with pytest.raises(ValueError, match="non-finite KV"):
+                manager.compress_tensor(raw)
+
+        quantize.assert_not_called()
+
+    def test_tiny_bf16_payload_uses_a_finite_fp32_global_scale(self):
+        manager, _ = self._manager()
+        raw = torch.full(
+            (1, 32),
+            torch.finfo(torch.bfloat16).tiny,
+            dtype=torch.bfloat16,
+        )
+        packed = torch.zeros((1, 16), dtype=torch.uint8)
+        linear_scales = torch.zeros(2, dtype=torch.uint8)
 
         with patch.object(torch.ops.trtllm, "fp4_quantize", create=True) as quantize:
             quantize.return_value = packed, linear_scales
-            manager.compress_tensor(raw, valid_token_count=3)
+            _, _, inverse_scale = manager.compress_tensor(raw)
 
-        quant_input = quantize.call_args.args[0].view(2, 4, 32)
-        torch.testing.assert_close(quant_input[:, :3], raw[:, :3])
-        assert torch.count_nonzero(quant_input[:, 3]) == 0
-        assert torch.all(raw[:, 3] == 4096)
+        global_scale = quantize.call_args.args[1]
+        assert torch.isfinite(global_scale).all()
+        assert torch.isfinite(inverse_scale).all()
+        assert (global_scale > 0).all()
+        assert (inverse_scale > 0).all()
+        torch.testing.assert_close(
+            global_scale,
+            torch.reciprocal(inverse_scale),
+        )
+
+    def test_zero_payload_uses_identity_global_scale(self):
+        manager, _ = self._manager()
+        raw = torch.zeros((1, 32), dtype=torch.float16)
+        packed = torch.zeros((1, 16), dtype=torch.uint8)
+        linear_scales = torch.zeros(2, dtype=torch.uint8)
+
+        with patch.object(torch.ops.trtllm, "fp4_quantize", create=True) as quantize:
+            quantize.return_value = packed, linear_scales
+            _, _, inverse_scale = manager.compress_tensor(raw)
+
+        torch.testing.assert_close(
+            quantize.call_args.args[1],
+            torch.ones((1,), dtype=torch.float32),
+        )
+        torch.testing.assert_close(
+            inverse_scale,
+            torch.ones((1,), dtype=torch.float32),
+        )
+
+    def test_rejects_rank_that_is_not_a_layout_neutral_matrix(self):
+        manager, _ = self._manager()
+        raw = torch.arange(1, 257, dtype=torch.bfloat16).reshape(2, 4, 32)
+        with pytest.raises(ValueError, match="physical rows"):
+            manager.compress_tensor(raw)
 
     def test_rejects_unaligned_feature_width_before_quantization(self):
         manager, _ = self._manager()
         raw = torch.ones((4, 15), dtype=torch.bfloat16)
         with patch.object(torch.ops.trtllm, "fp4_quantize", create=True) as quantize:
             with pytest.raises(ValueError, match="divisible by 16"):
-                manager.compress_tensor(raw, valid_token_count=4)
+                manager.compress_tensor(raw)
         quantize.assert_not_called()
-
-    def test_requires_explicit_valid_token_count_for_normalized_page(self):
-        manager, _ = self._manager()
-        raw = torch.ones((4, 16), dtype=torch.bfloat16)
-        with pytest.raises(ValueError, match="valid_token_count"):
-            manager.compress_tensor(raw, valid_token_count=0)
-        with pytest.raises(ValueError, match="valid_token_count"):
-            manager.compress_tensor(raw, valid_token_count=5)
-        with pytest.raises(ValueError, match="expects NHD"):
-            manager.compress_tensor(
-                raw.reshape(1, 2, 2, 16), valid_token_count=2
-            )
 
     def test_compact_record_size_contains_payload_scales_and_global_scale(self):
         manager, _ = self._manager()
         raw_size = 4 * 32 * 2
         host_size = manager._record_size(raw_size)
-        packed_size, scale_size, inverse_scale_offset = (
-            manager._record_sections(raw_size, host_size)
+        packed_size, scale_size, inverse_scale_offset = manager._record_sections(
+            raw_size, host_size
         )
         assert packed_size == 64
         assert scale_size == 8
         assert inverse_scale_offset == 72
         assert host_size == 80
         assert host_size < raw_size
+
+    def test_record_aligns_an_otherwise_unaligned_global_scale(self):
+        manager, _ = self._manager()
+        # 16 FP16 elements: 8 packed bytes + 1 scale byte. The FP32 scalar
+        # starts at byte 12 and the whole record occupies one uint4 grain.
+        host_size = manager._record_size(32)
+        packed_size, scale_size, inverse_scale_offset = manager._record_sections(32, host_size)
+
+        assert (packed_size, scale_size, inverse_scale_offset) == (8, 1, 12)
+        assert host_size == 16

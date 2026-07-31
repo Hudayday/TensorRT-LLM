@@ -67,6 +67,8 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+    from tensorrt_llm.runtime.kv_cache_manager_v2._page import Page
+    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import Slot
 
     from .kv_cache_manager_v2 import KVCacheManagerV2
 
@@ -2532,7 +2534,18 @@ class KVCacheCompressionManager(BaseResourceManager):
     # migration transaction; subclasses enqueue only the transform.      #
     # ================================================================== #
 
-    def on_offload_compress(self, **kwargs) -> None:
+    def on_offload_compress(
+        self,
+        *,
+        pool_group_index: int,
+        src_pages: Sequence["Page"],
+        dst_slots: Sequence["Slot"],
+        src_addresses: Sequence[Sequence[int]],
+        dst_addresses: Sequence[Sequence[int]],
+        src_slot_sizes: Sequence[int],
+        dst_slot_sizes: Sequence[int],
+        stream: int,
+    ) -> None:
         """Enqueue GPU→Host compression for one KVCM V2 migration batch.
 
         ``StorageManager`` owns source leases, compact destination admission,
@@ -2540,7 +2553,18 @@ class KVCacheCompressionManager(BaseResourceManager):
         hook must not change Page ownership or attention state.
         """
 
-    def on_onboard_decompress(self, **kwargs) -> None:
+    def on_onboard_decompress(
+        self,
+        *,
+        pool_group_index: int,
+        src_pages: Sequence["Page"],
+        dst_slots: Sequence["Slot"],
+        src_addresses: Sequence[Sequence[int]],
+        dst_addresses: Sequence[Sequence[int]],
+        src_slot_sizes: Sequence[int],
+        dst_slot_sizes: Sequence[int],
+        stream: int,
+    ) -> None:
         """Enqueue Host→GPU decompression before KVCM V2 publishes Pages.
 
         The destination is an already-admitted runtime-format GPU Page.

@@ -421,8 +421,10 @@ class AggregatedPageDesc:
 @dataclass(slots=True, frozen=True)
 class CoalescedBuffer:
     single_buffer_size: int
-    host_single_buffer_size: int
     buffer_ids: Sequence[BufferId]
+    host_single_buffer_size: int | None = None
+    @property
+    def effective_host_single_buffer_size(self) -> int: ...
     @property
     def size(self) -> int: ...
     @property

@@ -14,11 +14,13 @@
 
 import gc
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+import tensorrt_llm.runtime.kv_cache_manager_v2 as kv_cache_manager_v2_runtime
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     KVCacheManagerV2,
@@ -43,6 +45,7 @@ def _create_kv_cache_manager_v2(
     kv_cache_type=CacheType.SELF,
     mapping=None,
     vocab_size: int = 32000,
+    boundary_compression_quant=None,
 ):
     if mapping is None:
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
@@ -62,6 +65,7 @@ def _create_kv_cache_manager_v2(
         mapping=mapping,
         dtype=dtype,
         vocab_size=vocab_size,
+        boundary_compression_quant=boundary_compression_quant,
     )
 
 
@@ -159,6 +163,21 @@ class TestPerLayerHeadDimBasic(unittest.TestCase):
                 mapping=mapping,
                 dtype=DataType.NVFP4,
                 vocab_size=32000,
+            )
+
+    def test_boundary_nvfp4_requires_each_head_dim_divisible_by_16(self):
+        # Boundary compression is an explicit Python-backend P0.  Patch only
+        # the backend guard here so this validation test remains import-light
+        # when the default test process uses the C++ KVCM V2 backend.
+        with (
+            patch.object(kv_cache_manager_v2_runtime, "_BACKEND", "python"),
+            self.assertRaisesRegex(ValueError, "head_dim to be divisible by 16"),
+        ):
+            _create_kv_cache_manager_v2(
+                num_layers=2,
+                num_kv_heads=4,
+                head_dim=[64, 24],
+                boundary_compression_quant="nvfp4",
             )
 
     def test_uniform_head_dim_list(self):

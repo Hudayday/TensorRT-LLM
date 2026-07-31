@@ -1120,15 +1120,12 @@ class KvCacheCreator:
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
-        compression_config = getattr(
-            self._llm_args, "kv_cache_compression_config", None
-        )
+        compression_config = getattr(self._llm_args,
+                                     "kv_cache_compression_config", None)
         boundary_compression_quant = None
-        if (
-            compression_config is not None
-            and compression_config.algorithm == "quantization_for_boundary"
-            and not model_engine.is_draft_model
-        ):
+        if (compression_config is not None
+                and compression_config.algorithm == "quantization_for_boundary"
+                and not model_engine.is_draft_model):
             boundary_compression_quant = compression_config.quant
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
@@ -1999,8 +1996,7 @@ def _create_kv_cache_manager(
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
         manager_extra_kwargs[
-            "boundary_compression_quant"
-        ] = boundary_compression_quant
+            "boundary_compression_quant"] = boundary_compression_quant
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
@@ -2313,8 +2309,14 @@ def validate_kv_cache_compression_with_spec(
     draft_kv_cache_manager: Optional[KVCacheManagerV2],
 ) -> None:
     """Reject speculative setups the compression method cannot run with."""
-    if (spec_config is None
-            or not config.kv_cache_compression_mode.is_eviction_method()):
+    if spec_config is None:
+        return
+    if config.algorithm == "quantization_for_boundary":
+        raise ValueError(
+            "KV-cache compression algorithm 'quantization_for_boundary' "
+            "does not support speculative decoding in its initial P0 scope"
+        )
+    if not config.kv_cache_compression_mode.is_eviction_method():
         return
     # Evicting methods co-compact the draft KV, so the draft must be a
     # standard paged cache in the same forward (one-model speculation).
@@ -2354,12 +2356,9 @@ def create_kv_cache_compression_manager(
             quant=config.quant,
         )
 
-    logger.warning(
-        "KV-cache compression algorithm '%s' is not registered; running without "
-        "a compression manager.",
-        config.algorithm,
+    raise ValueError(
+        f"KV-cache compression algorithm {config.algorithm!r} is not registered"
     )
-    return None
 
 
 def compute_max_num_sequences(mapping: Mapping,

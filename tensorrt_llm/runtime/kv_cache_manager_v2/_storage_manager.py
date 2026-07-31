@@ -19,6 +19,7 @@ import warnings
 from collections import deque
 from dataclasses import dataclass
 from fractions import Fraction
+from itertools import chain
 from typing import TYPE_CHECKING, Callable, Iterator, Sequence, cast
 
 from . import rawref
@@ -41,7 +42,7 @@ from ._config import (
     KVCacheDesc,
     SwaScratchReuseConfig,
 )
-from ._copy_engine import CopyTask, batched_copy
+from ._copy_engine import CopyTask, batched_copy, zero_gpu_memory
 from ._event_manager import KVCacheEventDiff
 from ._eviction_controller import EvictablePage, PerLevelEvictionController
 from ._exceptions import LogicError, OutOfPagesError
@@ -51,7 +52,7 @@ from ._life_cycle_registry import (
     LifeCycleRegistry,
     compute_scratch_range,
 )
-from ._page import CommittedPage, Page, SsmCommittedPage, UncommittedPage
+from ._page import CommittedPage, Page
 from ._storage import CacheLevelStorage
 from ._storage._config import BufferAttr, BufferId, LayerAttr, SlotDesc, StorageConfig
 from ._storage._core import (
@@ -264,9 +265,7 @@ class StorageManager:
         assert all(pg < self.num_pool_groups for pg in self._life_cycle_grouping)
         assert self.num_pool_groups == PoolGroupIndex(len(set(self._life_cycle_grouping)))
         gpu_slot_size_lists = typed_map(self._slot_desc_list, lambda pg: pg.slot_size_list)
-        host_slot_size_lists = typed_map(
-            self._slot_desc_list, lambda pg: pg.host_slot_size_list
-        )
+        host_slot_size_lists = typed_map(self._slot_desc_list, lambda pg: pg.host_slot_size_list)
 
         gpu_quota = config.cache_tiers[GPU_LEVEL].quota
         gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
@@ -381,7 +380,62 @@ class StorageManager:
         migration_recorder: MigrationRecorder | None = None,
         drop_recorder: DropRecorder | None = None,
     ) -> TypedIndexList[LifeCycleId, list[Slot]]:
-        return self.new_slots(GPU_LEVEL, num_slots, migration_recorder, drop_recorder)
+        slots = self.new_slots(GPU_LEVEL, num_slots, migration_recorder, drop_recorder)
+        try:
+            self._initialize_runtime_gpu_slots(slots)
+        except Exception:
+            for life_cycle, slot_list in typed_enumerate(slots):
+                for slot in slot_list:
+                    self.release_slot(life_cycle, GPU_LEVEL, slot)
+            raise
+        return slots
+
+    def _initialize_runtime_gpu_slots(
+        self,
+        slots: TypedIndexList[LifeCycleId, list[Slot]],
+    ) -> None:
+        """Clear newly allocated runtime Pages for deterministic fresh tails.
+
+        Attention may write only the valid prefix of a fresh partial Page.
+        Clearing the recycled slot prevents older data from surviving that
+        allocation. A later partial-reuse copy-on-write can still copy an old
+        physical suffix, so this is initialization hygiene rather than a
+        universal guarantee about every compressed Page.
+        """
+        if self._offload_compression_hook is None:
+            return
+        all_slots = tuple(chain.from_iterable(slots))
+        if not all_slots:
+            return
+
+        prior_events = {slot.ready_event for slot in all_slots}
+        with TemporaryCudaStream(prior_events) as stream:
+            try:
+                for life_cycle, slot_list in typed_enumerate(slots):
+                    pool_group_index = self.get_pool_group_index(life_cycle)
+                    for slot in slot_list:
+                        for pool_index, num_bytes in typed_enumerate(
+                            self.slot_size(pool_group_index, GPU_LEVEL)
+                        ):
+                            address = cast(
+                                MemAddress,
+                                self.slot_address(
+                                    GPU_LEVEL,
+                                    pool_group_index,
+                                    slot.slot_id,
+                                    pool_index,
+                                ),
+                            )
+                            zero_gpu_memory(address, num_bytes, stream.get())
+            except Exception:
+                abort_event = stream.record_event()
+                for slot in all_slots:
+                    slot.ready_event = abort_event
+                raise
+
+        finish_event = stream.take_finish_event()
+        for slot in all_slots:
+            slot.ready_event = finish_event
 
     def new_slots(
         self,
@@ -516,12 +570,31 @@ class StorageManager:
             return
         next_lvl = CacheLevel(level + 1)
         goals = filled_array2d(self.num_cache_levels, self.num_pool_groups, 0)
-        self._prepare_free_slots(
-            goals,
-            next_lvl,
-            cast(TypedIndexList[PoolGroupIndex, list[Page]], evicted),
-            drop_recorder=drop_recorder,
-        )
+        # ``controller.evict`` has already detached every victim from the
+        # source-level LRU.  Keep an immutable ownership snapshot because the
+        # recursive admission path mutates/clears ``evicted`` in place.  If a
+        # transform or lower-level admission fails, Pages that never committed
+        # a migration must re-enter the source LRU; otherwise ``force_evict``
+        # would leave resident Pages permanently invisible to future pressure.
+        eviction_victims = tuple(tuple(pages) for pages in evicted)
+        try:
+            self._prepare_free_slots(
+                goals,
+                next_lvl,
+                cast(TypedIndexList[PoolGroupIndex, list[Page]], evicted),
+                drop_recorder=drop_recorder,
+            )
+        except Exception:
+            source_controller = self._levels[level].controller
+            for pages in eviction_victims:
+                for page in reversed(pages):
+                    if (
+                        page.cache_level == level
+                        and page.node_ref is None
+                        and self.is_evictable(page)
+                    ):
+                        source_controller.schedule_for_eviction(page, evict_first=True)
+            raise
 
     def _prepare_free_slots(
         self,
@@ -561,79 +634,113 @@ class StorageManager:
                     "Impossible to meet the goal ({goal} free slots) for group {pg_idx}"
                 )
         evicted = ctrl.evict(num_to_evict)
-        accepted_pages = make_typed(lambda _: list[Page](), self.num_pool_groups)
         is_last_level = self.is_last_level(lvl_id)
-        if is_last_level:
+        # Keep strong references only for non-terminal eviction.  These Pages
+        # have already been removed from this level's LRU, but they still own
+        # their original slots until a lower-tier migration commits.  If any
+        # later admission or transform fails, every Page that is still at this
+        # level must be put back into the LRU.  Otherwise repeated compression
+        # failures would silently drain the evictable set and eventually make
+        # a cache with freeable Pages look permanently full.
+        #
+        # Do not retain terminal-level victims: dropping the last backing is
+        # intentionally implemented by releasing the final strong reference.
+        eviction_victims = tuple(tuple(pages) for pages in evicted) if not is_last_level else ()
+        accepted_pages = make_typed(lambda _: list[Page](), self.num_pool_groups)
+        try:
+            if is_last_level:
+                for pg_idx in typed_range(self.num_pool_groups):
+                    old_free_cnt = storage.get_num_free_slots(pg_idx)
+                    num_evicted = len(evicted[pg_idx])
+                    assert NDEBUG or all(p.status == PageStatus.DROPPABLE for p in evicted[pg_idx])
+                    if not NDEBUG:
+                        dbg_rawrefs = [rawref.ref(p) for p in evicted[pg_idx]]
+                    # Record the drop event before releasing — these pages are
+                    # leaving the cache hierarchy entirely without being
+                    # onboarded back to GPU.
+                    if drop_recorder is not None and num_evicted > 0:
+                        drop_recorder(evicted[pg_idx], lvl_id)
+                    evicted[pg_idx].clear()
+                    if not NDEBUG:
+                        assert all(p() is None for p in dbg_rawrefs)  # pyright: ignore
+                    new_free_cnt = storage.get_num_free_slots(pg_idx)
+                    # GC of some pages may trigger removal of radix tree blocks
+                    # and some other pages.
+                    assert new_free_cnt >= num_evicted + old_free_cnt
+                    assert len(held_pages[pg_idx]) <= new_free_cnt
+                    fallen_pages[pg_idx].extend(held_pages[pg_idx])
+                    held_pages[pg_idx].clear()
+                    goal = goals[lvl_id, pg_idx]
+                    num_accepted = min(new_free_cnt - goal, len(fallen_pages[pg_idx]))
+                    assert num_accepted >= 0
+                    accepted_pages[pg_idx] = (
+                        fallen_pages[pg_idx][-num_accepted:] if num_accepted > 0 else []
+                    )
+                    fallen_pages[pg_idx].clear()
+            else:
+                assert all(len(g) == 0 for g in held_pages)
+                for pg_idx in typed_range(self.num_pool_groups):
+                    old_free_cnt = storage.get_num_free_slots(pg_idx)
+                    e = evicted[pg_idx]
+                    num_evicted = len(e)
+                    fallen_pages[pg_idx][:0] = cast(list[Page], e)
+                    e.clear()
+                    num_accepted = min(
+                        old_free_cnt + num_evicted - goals[lvl_id, pg_idx],
+                        len(fallen_pages[pg_idx]),
+                    )
+                    assert num_accepted >= 0
+                    if num_accepted > 0:
+                        accepted_pages[pg_idx] = fallen_pages[pg_idx][-num_accepted:]
+                        del fallen_pages[pg_idx][-num_accepted:]
+                self._prepare_free_slots(
+                    goals,
+                    CacheLevel(lvl_id + 1),
+                    fallen_pages,
+                    migration_recorder,
+                    drop_recorder,
+                )
+            assert all(len(f) == 0 for f in fallen_pages)
+            # Migrate only after every destination level has completed
+            # admission.  A representation-changing hook participates here,
+            # but StorageManager remains the transaction owner.
             for pg_idx in typed_range(self.num_pool_groups):
-                old_free_cnt = storage.get_num_free_slots(pg_idx)
-                num_evicted = len(evicted[pg_idx])
-                assert NDEBUG or all(p.status == PageStatus.DROPPABLE for p in evicted[pg_idx])
-                if not NDEBUG:
-                    dbg_rawrefs = [rawref.ref(p) for p in evicted[pg_idx]]
-                # Record the drop event before releasing — these pages are leaving the
-                # cache hierarchy entirely without being onboarded back to GPU.
-                if drop_recorder is not None and num_evicted > 0:
-                    drop_recorder(evicted[pg_idx], lvl_id)
-                evicted[pg_idx].clear()
-                if not NDEBUG:
-                    assert all(p() is None for p in dbg_rawrefs)  # pyright: ignore
-                new_free_cnt = storage.get_num_free_slots(pg_idx)
-                # GC of some pages may trigger removal of radix tree blocks and some other pages.
-                assert new_free_cnt >= num_evicted + old_free_cnt
-                assert len(held_pages[pg_idx]) <= new_free_cnt
-                fallen_pages[pg_idx].extend(held_pages[pg_idx])
-                held_pages[pg_idx].clear()
-                goal = goals[lvl_id, pg_idx]
-                num_accepted = min(new_free_cnt - goal, len(fallen_pages[pg_idx]))
-                assert num_accepted >= 0
-                accepted_pages[pg_idx] = (
-                    fallen_pages[pg_idx][-num_accepted:] if num_accepted > 0 else []
+                partitioned = partition(
+                    accepted_pages[pg_idx],
+                    lambda p: (
+                        p.cache_level,
+                        self.get_pool_group_index(p.life_cycle),
+                    ),
                 )
-                fallen_pages[pg_idx].clear()
-        else:
-            assert all(len(g) == 0 for g in held_pages)
-            for pg_idx in typed_range(self.num_pool_groups):
-                old_free_cnt = storage.get_num_free_slots(pg_idx)
-                e = evicted[pg_idx]
-                num_evicted = len(e)
-                fallen_pages[pg_idx][:0] = cast(list[Page], e)
-                e.clear()
-                num_accepted = min(
-                    old_free_cnt + num_evicted - goals[lvl_id, pg_idx], len(fallen_pages[pg_idx])
-                )
-                assert num_accepted >= 0
-                if num_accepted > 0:
-                    accepted_pages[pg_idx] = fallen_pages[pg_idx][-num_accepted:]
-                    del fallen_pages[pg_idx][-num_accepted:]
-            self._prepare_free_slots(
-                goals,
-                CacheLevel(lvl_id + 1),
-                fallen_pages,
-                migration_recorder,
-                drop_recorder,
-            )
-        assert all(len(f) == 0 for f in fallen_pages)
-        # migrate pages
-        for pg_idx in typed_range(self.num_pool_groups):
-            partitioned = partition(
-                accepted_pages[pg_idx],
-                lambda p: (p.cache_level, self.get_pool_group_index(p.life_cycle)),
-            )
-            accepted_pages[pg_idx].clear()
-            for (src_lvl, pg_idx), pages in partitioned.items():
-                dst_lvl = lvl_id
-                self._batched_migrate(
-                    pg_idx,
-                    dst_lvl,
-                    src_lvl,
-                    pages,
-                    update_src=True,
-                    migration_recorder=migration_recorder,
-                )
-                for p in pages:
-                    if is_last_level and p.status == PageStatus.HELD:
-                        continue
-                    self._levels[dst_lvl].controller.schedule_for_eviction(p)
+                accepted_pages[pg_idx].clear()
+                for (src_lvl, pg_idx), pages in partitioned.items():
+                    dst_lvl = lvl_id
+                    self._batched_migrate(
+                        pg_idx,
+                        dst_lvl,
+                        src_lvl,
+                        pages,
+                        update_src=True,
+                        migration_recorder=migration_recorder,
+                    )
+                    for p in pages:
+                        if is_last_level and p.status == PageStatus.HELD:
+                            continue
+                        self._levels[dst_lvl].controller.schedule_for_eviction(p)
+        except Exception:
+            # ``ctrl.evict`` has already detached these Pages from the LRU.
+            # Restore only victims whose migration never committed; Pages that
+            # reached a lower level are owned and scheduled by that level.
+            # Reverse insertion preserves the original oldest-first LRU order.
+            for pages in eviction_victims:
+                for page in reversed(pages):
+                    if (
+                        page.cache_level == lvl_id
+                        and page.node_ref is None
+                        and self.is_evictable(page)
+                    ):
+                        ctrl.schedule_for_eviction(page, evict_first=True)
+            raise
         return
 
     def _batched_migrate(
@@ -645,8 +752,19 @@ class StorageManager:
         update_src: bool,
         migration_recorder: MigrationRecorder | None = None,
         defrag: bool = False,  # we are doing defragmentation
+        source_ready_events: Sequence[CachedCudaEvent] = (),
     ) -> Sequence[Slot] | None:
-        "Free slots must be prepared before calling this function."
+        """Migrate a Page batch after the destination slots are admitted.
+
+        ``source_ready_events`` carries producer fences that are not yet part
+        of ``Page.ready_event``.  The current user of a live Page can still
+        have a write pending when it takes a reuse snapshot; the migration
+        stream must wait for that write before reading the Page.
+
+        StorageManager owns slot allocation, mapping publication, source
+        release, and rollback.  A boundary hook may enqueue a representation
+        transform, but it never changes those ownership decisions.
+        """
         assert defrag or dst_level != src_level, (
             "dst_level and src_level must be different unless performing defragmentation"
         )
@@ -659,7 +777,7 @@ class StorageManager:
         dst_slots = dst_pool_group.allocate_multiple(num_slots)
         try:
             assert len(dst_slots) == num_slots
-            prior_events: set[CachedCudaEvent] = set()
+            prior_events: set[CachedCudaEvent] = set(source_ready_events)
             src_slot_addresses: list[tuple[Address, ...]] = []
             dst_slot_addresses: list[tuple[Address, ...]] = []
             tasks_per_pool: TypedIndexList[PoolIndex, list[CopyTask]] = make_typed(
@@ -713,9 +831,6 @@ class StorageManager:
                             dst_addresses=tuple(dst_slot_addresses),
                             src_slot_sizes=tuple(self.slot_size(pool_group_index, src_level)),
                             dst_slot_sizes=tuple(self.slot_size(pool_group_index, dst_level)),
-                            valid_token_counts=tuple(
-                                self._valid_token_count(page) for page in src_pages
-                            ),
                             stream=stream.get(),
                         )
                 except Exception:
@@ -731,6 +846,15 @@ class StorageManager:
                         dst.ready_event = abort_event
                     raise
             finish_event = stream.take_finish_event()
+
+            # The copy/transform is now in flight. Publish its completion
+            # fence before any callback or Page ownership change: either can
+            # raise, but cleanup must never recycle source or destination
+            # backing while the migration stream may still touch it.
+            for src, dst in zip(src_pages, dst_slots):
+                src.ready_event = finish_event
+                dst.ready_event = finish_event
+
             emit_cache_level_updates = (
                 update_src
                 and not defrag
@@ -741,10 +865,6 @@ class StorageManager:
             if migration_recorder is not None and not defrag:
                 migration_recorder(src_pages, dst_slots, src_level, dst_level)
             for src, dst in zip(src_pages, dst_slots):
-                dst.ready_event = finish_event
-                src.ready_event = (
-                    finish_event  # compulsory for the next owner getting this slot from the pool.
-                )
                 if update_src:
                     scheduled_for_eviction = src.scheduled_for_eviction
                     if scheduled_for_eviction:
@@ -752,35 +872,42 @@ class StorageManager:
                     src_pool_group.release(src)
                     src.set_slot(dst)
                     src.cache_level = dst_level
-                    if emit_cache_level_updates:
-                        self._emit_cache_level_updated_event(
-                            src, src_level, dst_level, emitted_update_keys
-                        )
                     if scheduled_for_eviction:
                         self.schedule_for_eviction(src)
+
+            # Event publication is an observer of the already-completed Page
+            # ownership transaction. Keep it outside the per-Page commit loop
+            # so an observer exception cannot leave a half-migrated batch or
+            # cause rollback to release a destination already owned by a Page.
+            if emit_cache_level_updates:
+                for src in src_pages:
+                    try:
+                        self._emit_cache_level_updated_event(
+                            src,
+                            src_level,
+                            dst_level,
+                            emitted_update_keys,
+                        )
+                    except Exception as error:
+                        # Cache events observe an already-committed ownership
+                        # transaction.  They must not make a successful Page
+                        # migration look failed: callers still need to attach
+                        # the Page to the destination eviction controller.
+                        warnings.warn(
+                            "Ignoring KV-cache level event failure after "
+                            f"migration commit: {error}",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
             return None if update_src else dst_slots
         except Exception:
             for s in dst_slots:
-                dst_pool_group.release(s)
+                # A preceding Page may already own this destination if an
+                # observer failed during per-Page publication. Roll back only
+                # destinations whose ownership is still held by this method.
+                if s.has_valid_slot:
+                    dst_pool_group.release(s)
             raise
-
-    @staticmethod
-    def _valid_token_count(page: Page) -> int:
-        """Return KVCM-owned valid rows without consulting attention state."""
-        if isinstance(page, SsmCommittedPage):
-            return page.num_tokens_in_block
-        if isinstance(page, CommittedPage):
-            return page.valid_token_count
-        if isinstance(page, UncommittedPage):
-            kv_cache = page.kv_cache()
-            if kv_cache is None:
-                raise RuntimeError("Uncommitted Page lost its owning KV cache")
-            block_start = int(page.ordinal) * kv_cache.tokens_per_block
-            return min(
-                kv_cache.tokens_per_block,
-                max(0, kv_cache.history_length - block_start),
-            )
-        raise TypeError(f"Unsupported Page type: {type(page).__name__}")
 
     def _emit_cache_level_updated_event(
         self,

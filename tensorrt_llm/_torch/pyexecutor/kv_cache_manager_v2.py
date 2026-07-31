@@ -24,8 +24,10 @@ import numpy as np
 import torch
 from strenum import StrEnum
 
+import tensorrt_llm.runtime.kv_cache_manager_v2 as kv_cache_manager_v2_runtime
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.kv_cache_compression.interface import nvfp4_boundary_record_layout
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -777,6 +779,28 @@ class KVCacheManagerV2(BaseResourceManager):
         self.boundary_compression_quant = boundary_compression_quant
 
         if boundary_compression_quant is not None:
+            # The C++ translation became the default KVCM V2 backend after the
+            # initial P0 prototype was written.  Its BufferConfig and
+            # StorageManager do not yet expose tier-specific slot geometry or
+            # representation-changing migration hooks.  Fail before building
+            # a misleading raw Host layout or invoking a missing binding.
+            #
+            # This first end-to-end proof therefore requires the maintained
+            # Python backend to be selected before the worker imports TRT-LLM:
+            #
+            #   TLLM_KV_CACHE_MANAGER_V2_BACKEND=python
+            #
+            # A native C++ port is a separate implementation step; silently
+            # falling back here would make different ranks construct different
+            # cache-manager types after module import.
+            if kv_cache_manager_v2_runtime._BACKEND != "python":
+                raise ValueError(
+                    "NVFP4 Host boundary compression P0 currently requires "
+                    "TLLM_KV_CACHE_MANAGER_V2_BACKEND=python to be set before "
+                    "the TRT-LLM worker starts; the default C++ KVCM V2 backend "
+                    "does not yet implement tier-specific slot sizes or "
+                    "boundary migration hooks"
+                )
             if type(self) is not KVCacheManagerV2:
                 raise ValueError(
                     "NVFP4 Host boundary compression initially supports only "
@@ -789,8 +813,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             if dtype not in (DataType.HALF, DataType.BF16):
                 raise ValueError(
-                    "NVFP4 Host boundary compression requires FP16/BF16 "
-                    "active runtime KV"
+                    "NVFP4 Host boundary compression requires FP16/BF16 active runtime KV"
                 )
             if is_draft:
                 raise ValueError(
@@ -957,6 +980,18 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"Per-layer head_dim: {len(self.head_dim_per_layer)} layers, "
                     f"unique values={set(self.head_dim_per_layer)}"
                 )
+        if self.boundary_compression_quant == "nvfp4":
+            invalid_head_dims = [
+                (layer_idx, head_dim)
+                for layer_idx, head_dim in enumerate(self.head_dim_per_layer)
+                if head_dim % 16 != 0
+            ]
+            if invalid_head_dims:
+                raise ValueError(
+                    "NVFP4 Host boundary compression requires every local "
+                    "head_dim to be divisible by 16; "
+                    f"invalid layers={invalid_head_dims}"
+                )
 
         self.is_vswa = len(set(self.max_attention_window_vec)) > 1
 
@@ -1065,9 +1100,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
         if self.boundary_compression_quant is not None:
-            if len(cache_tiers) != 2 or not isinstance(
-                cache_tiers[1], HostCacheTierConfig
-            ):
+            if len(cache_tiers) != 2 or not isinstance(cache_tiers[1], HostCacheTierConfig):
                 raise ValueError(
                     "NVFP4 Host boundary compression requires exactly GPU and Host tiers"
                 )
@@ -1952,18 +1985,7 @@ class KVCacheManagerV2(BaseResourceManager):
     @staticmethod
     def _get_nvfp4_boundary_host_buffer_size(raw_size: int) -> int:
         """Fixed packed bytes for one FP16/BF16 K or V Page buffer."""
-        if raw_size % 2 != 0:
-            raise ValueError("FP16/BF16 KV buffer size must be divisible by 2")
-        num_elements = raw_size // 2
-        if num_elements % 16 != 0:
-            raise ValueError(
-                "NVFP4 Host boundary compression requires element count divisible by 16"
-            )
-        packed_size = num_elements // 2
-        block_scale_size = num_elements // 16
-        inverse_global_scale_size = 4
-        record_size = packed_size + block_scale_size + inverse_global_scale_size
-        return ((record_size + 15) // 16) * 16
+        return nvfp4_boundary_record_layout(raw_size)[3]
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
@@ -3557,6 +3579,13 @@ class KVCacheManagerV2(BaseResourceManager):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
+        # Boundary hooks may retain manager-lifetime GPU staging referenced by
+        # an in-flight migration stream. Fence and release that staging before
+        # the Python V2 implementation destroys its GPU/Host storage. The
+        # compression manager's shutdown is intentionally idempotent because
+        # PyExecutor also shuts down every registered resource manager.
+        if self._boundary_compression_manager is not None:
+            self._boundary_compression_manager.shutdown()
         self.impl.shutdown()
         if self.conversation_manager is not None:
             self.conversation_manager.clear()

@@ -316,17 +316,11 @@ def dequant_nvfp4_2d_triton(
         out = torch.empty(N, K, dtype=target_dtype, device=device)
     else:
         if out.shape != (N, K):
-            raise ValueError(
-                f"out must have shape {(N, K)}, got {tuple(out.shape)}"
-            )
+            raise ValueError(f"out must have shape {(N, K)}, got {tuple(out.shape)}")
         if out.dtype != target_dtype:
-            raise TypeError(
-                f"out dtype must be {target_dtype}, got {out.dtype}"
-            )
+            raise TypeError(f"out dtype must be {target_dtype}, got {out.dtype}")
         if out.device != device:
-            raise ValueError(
-                f"out device must be {device}, got {out.device}"
-            )
+            raise ValueError(f"out device must be {device}, got {out.device}")
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
     e2m1_table = _get_e2m1_codebook(device)

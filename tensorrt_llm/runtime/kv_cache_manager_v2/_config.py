@@ -104,10 +104,11 @@ class BufferConfig:
     """
 
     def __post_init__(self) -> None:
-        assert self.size > 0, "Buffer size must be positive"
-        assert self.host_size is None or self.host_size > 0, (
-            "Host buffer size must be positive"
-        )
+        # Do not add a validation on ``size`` here: main's hybrid builders use
+        # zero-byte temporary attention buffers and replace them before final
+        # storage construction.  ``host_size`` is the new boundary-storage
+        # contract and, when present, must always describe a real allocation.
+        assert self.host_size is None or self.host_size > 0, "Host buffer size must be positive"
 
 
 class LayerType(IntEnum):

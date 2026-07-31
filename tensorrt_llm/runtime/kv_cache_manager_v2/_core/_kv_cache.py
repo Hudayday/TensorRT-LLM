@@ -564,9 +564,7 @@ class _KVCache:
             if life_cycle_key is None:
                 continue
             pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
-            page_size = sum(
-                self.manager._storage.slot_size(pg_idx, cache_level)
-            )
+            page_size = sum(self.manager._storage.slot_size(pg_idx, cache_level))
             iteration_stats = KVCacheIterationStatsDelta()
             iteration_stats.iter_host_dropped_blocks = 1
             iteration_stats.iter_host_dropped_bytes = page_size
@@ -1464,13 +1462,26 @@ class _KVCache:
                     requirements = filled_list(0, storage.num_pool_groups)
                     requirements[pg_idx] = 1
                     storage.prepare_free_slots(lvl, requirements)
-                    migrated = storage._batched_migrate(
-                        pg_idx,
-                        lvl,
-                        src_page.cache_level,
-                        [src_page],
-                        update_src=False,
-                    )
+                    try:
+                        migrated = storage._batched_migrate(
+                            pg_idx,
+                            lvl,
+                            src_page.cache_level,
+                            [src_page],
+                            update_src=False,
+                            # ``finish_event`` is recorded on this request's
+                            # runtime stream and covers the KV writes that
+                            # produced the snapshot.  A cross-tier migration
+                            # uses a worker stream, so Page.ready_event alone
+                            # is insufficient until the live lock is released.
+                            source_ready_events=(self.finish_event,),
+                        )
+                    finally:
+                        # A cross-tier snapshot reads an active runtime Page
+                        # on StorageManager's worker stream without moving its
+                        # source slot. Rejoin that read fence to the runtime
+                        # stream before attention can write the Page again.
+                        src_page.ready_event.wait_in_stream(self.cuda_stream)
                     assert migrated is not None and len(migrated) == 1
                     new_slot = migrated[0]
             except OutOfPagesError:
@@ -1481,9 +1492,7 @@ class _KVCache:
                 slot_size = storage.slot_size(pg_idx, lvl)
                 for p in typed_range(storage.num_pools(pg_idx)):
                     dst = storage.slot_address(lvl, pg_idx, new_slot.slot_id, p)
-                    src = storage.slot_address(
-                        src_page.cache_level, pg_idx, src_page.slot_id, p
-                    )
+                    src = storage.slot_address(src_page.cache_level, pg_idx, src_page.slot_id, p)
                     batched_copy(
                         storage.cache_tiers[lvl],
                         storage.cache_tiers[src_page.cache_level],
