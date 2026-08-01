@@ -910,6 +910,11 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "`fp4` requires Blackwell+ (SM>=100) at runtime and "
         "index_head_dim=128.",
     )
+    index_share_for_mtp_iteration: Optional[bool] = Field(
+        default=None,
+        description=
+        "Reuse the indexer Top-K across MTP draft steps instead of recomputing "
+        "it each step. Defaults to the model's HF config value.")
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -1038,6 +1043,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             indexer_k_dtype=self.indexer_k_dtype,
             is_full_indexer_layer=self._is_full_indexer_layer(
                 pretrained_config, kwargs.get("layer_idx")),
+            mtp_index_share=bool(_value("index_share_for_mtp_iteration",
+                                        False)),
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -4524,15 +4531,27 @@ class BaseLlmArgs(StrictBaseModel):
         status="deprecated",
         telemetry=TelemetryField.categorical('pytorch', '_autodeploy'))
 
-    return_perf_metrics: bool = Field(default=False,
-                                      description="Return perf metrics.",
-                                      status="prototype")
+    return_perf_metrics: bool = Field(
+        default=False,
+        description=
+        "Allow serving responses to include per-request performance metrics when "
+        "the request sets X-TRTLLM-return-metrics: 1.",
+        status="prototype")
+
+    perf_metrics_output_dir: Optional[str] = Field(
+        default=None,
+        description="Directory for per-process performance metrics JSONL "
+        "files. Setting this enables collection even when "
+        "return_perf_metrics is false.",
+        status="prototype",
+        telemetry=False)
 
     perf_metrics_max_requests: NonNegativeInt = Field(
         default=0,
         description=
-        "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
-        status="prototype")
+        "Deprecated compatibility field. Completed per-request metrics are no "
+        "longer retained in memory.",
+        status="deprecated")
 
     prometheus_metrics_config: Optional[PrometheusMetricsConfig] = Field(
         default=None,
