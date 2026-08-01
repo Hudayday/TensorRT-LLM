@@ -75,6 +75,7 @@ class _FakeSlot:
 class _FakePage(_FakeSlot):
     def __init__(self, slot_id: int) -> None:
         super().__init__(slot_id)
+        self.life_cycle = 0
         self.cache_level = _SRC_LEVEL
         self.node_ref = None
 
@@ -229,6 +230,7 @@ def test_observer_failure_cannot_abort_a_committed_migration() -> None:
     pages = [_FakePage(0), _FakePage(1)]
     manager = _FakeStorageManager(len(pages))
     manager._event_manager = object()
+    manager._offload_compression_hook = lambda **kwargs: None
     finish_event = _FakeTemporaryCudaStream.finish_event
 
     def fail_observer(*args, **kwargs) -> None:

@@ -76,7 +76,11 @@ class SlotDescVariant:
     coalesced_buffers: TypedIndexList[PoolIndex, CoalescedBuffer]
 
     def __post_init__(self) -> None:
-        assert is_sorted(self.coalesced_buffers, key=lambda s: s.size, reverse=True)
+        assert is_sorted(
+            self.coalesced_buffers,
+            key=lambda s: (s.size, s.host_size),
+            reverse=True,
+        )
 
     @property
     def layer_group_id(self) -> LayerGroupId:
@@ -247,7 +251,11 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
             )
             for (size, host_size), buffer_ids in size_to_buffers.items()
         ]
-        slots.sort(key=lambda p: p.size, reverse=True)
+        # A deterministic order across both tier layouts is required before
+        # variants can be compared and merged into one PoolGroup. Sorting only
+        # by GPU size makes equal-size buffers depend on layer declaration
+        # order and can split otherwise identical GPU/Host layouts.
+        slots.sort(key=lambda p: (p.size, p.host_size), reverse=True)
         slot_groups.append(
             SlotDescVariant(life_cycle_id, cast(TypedIndexList[PoolIndex, CoalescedBuffer], slots))
         )

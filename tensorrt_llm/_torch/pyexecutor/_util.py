@@ -1120,8 +1120,7 @@ class KvCacheCreator:
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
-        compression_config = getattr(self._llm_args,
-                                     "kv_cache_compression_config", None)
+        compression_config = self._llm_args.kv_cache_compression_config
         boundary_compression_quant = None
         if (compression_config is not None
                 and compression_config.algorithm == "quantization_for_boundary"
@@ -1992,9 +1991,20 @@ def _create_kv_cache_manager(
         per_layer_num_kv_heads = _build_per_layer_num_kv_heads(
             num_key_value_heads, num_hidden_layers, spec_config,
             draft_config_for_kv)
+    if boundary_compression_quant is not None:
+        if kv_cache_manager_cls is not KVCacheManagerV2:
+            raise ValueError(
+                "NVFP4 Host boundary compression P0 requires the standard "
+                "KVCacheManagerV2")
+        if spec_config is not None:
+            raise ValueError(
+                "NVFP4 Host boundary compression P0 does not support "
+                "speculative decoding")
+
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+    if boundary_compression_quant is not None:
         manager_extra_kwargs[
             "boundary_compression_quant"] = boundary_compression_quant
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
@@ -2314,8 +2324,7 @@ def validate_kv_cache_compression_with_spec(
     if config.algorithm == "quantization_for_boundary":
         raise ValueError(
             "KV-cache compression algorithm 'quantization_for_boundary' "
-            "does not support speculative decoding in its initial P0 scope"
-        )
+            "does not support speculative decoding in its initial P0 scope")
     if not config.kv_cache_compression_mode.is_eviction_method():
         return
     # Evicting methods co-compact the draft KV, so the draft must be a
@@ -2333,13 +2342,12 @@ def create_kv_cache_compression_manager(
     config: KvCacheCompressionConfig,
     kv_cache_manager: KVCacheManagerV2,
     draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
-) -> Optional[KVCacheCompressionManager]:
-    """Build the KV-cache compression manager for ``config.algorithm``, or return
-    None if no algorithm matches.
+) -> KVCacheCompressionManager:
+    """Build the registered KV-cache compression manager for ``config.algorithm``.
 
-    Called from ``create_py_executor`` and registered as a resource manager,
-    like the KV cache manager itself. Speculative-decoding compatibility is
-    checked by the caller via ``validate_kv_cache_compression_with_spec``.
+    Called from ``create_py_executor``. Managers that need scheduler callbacks
+    are registered as resources; storage-boundary-only managers bind directly
+    to KVCM V2. Speculative-decoding compatibility is checked by the caller.
     """
     if config.algorithm == "quantization_for_boundary":
         from ..kv_cache_compression.quantization_for_boundary import \
@@ -2599,11 +2607,10 @@ def create_py_executor_instance(
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
-    # Register the compression manager (if one is configured) with the other
-    # managers, before building ResourceManager, so it is part of the manager
-    # set from the start. Reads its own config, not the sparse-attention one.
-    kv_cache_compression_config = getattr(llm_args,
-                                          "kv_cache_compression_config", None)
+    # Build the configured manager. Boundary-only managers are retained and
+    # shut down by KVCM V2; only managers that consume scheduler callbacks are
+    # registered with ResourceManager.
+    kv_cache_compression_config = llm_args.kv_cache_compression_config
     if kv_cache_compression_config is not None:
         draft_kv_cache_manager = resources.get(
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
@@ -2615,7 +2622,7 @@ def create_py_executor_instance(
             kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
         )
-        if compression_manager is not None:
+        if compression_manager.uses_scheduler_lifecycle:
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
                 compression_manager)
 

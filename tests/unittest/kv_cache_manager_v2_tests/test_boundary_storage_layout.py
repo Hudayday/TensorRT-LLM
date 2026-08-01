@@ -21,6 +21,7 @@ from unittest import SkipTest
 from unittest.mock import patch
 
 if find_spec("kv_cache_manager_v2") is not None:
+    import kv_cache_manager_v2._core._kv_cache as kv_cache_module
     import kv_cache_manager_v2._storage_manager as storage_manager_module
     from kv_cache_manager_v2 import (
         AttentionLayerConfig,
@@ -41,6 +42,7 @@ if find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2._storage._config import create_storage_config
     from kv_cache_manager_v2._storage_manager import StorageManager
 else:
+    import tensorrt_llm.runtime.kv_cache_manager_v2._core._kv_cache as kv_cache_module
     import tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager as storage_manager_module
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
         AttentionLayerConfig,
@@ -168,6 +170,35 @@ def test_life_cycles_merge_only_when_gpu_and_host_layouts_both_match() -> None:
     assert {tuple(slot.host_slot_size_list) for slot in storage.slot_desc_list} == {(80,), (96,)}
 
 
+def test_equal_gpu_sizes_use_host_size_for_canonical_pool_order() -> None:
+    storage = create_storage_config(
+        _config(
+            [
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[
+                        BufferConfig(role="key", size=256, host_size=80),
+                        BufferConfig(role="value", size=256, host_size=96),
+                    ],
+                    sliding_window_size=None,
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(1),
+                    buffers=[
+                        BufferConfig(role="key", size=256, host_size=96),
+                        BufferConfig(role="value", size=256, host_size=80),
+                    ],
+                    sliding_window_size=64,
+                ),
+            ]
+        )
+    )
+
+    assert len(storage.slot_desc_list) == 1
+    assert tuple(storage.slot_desc_list[0].slot_size_list) == (256, 256)
+    assert tuple(storage.slot_desc_list[0].host_slot_size_list) == (96, 80)
+
+
 def test_boundary_runtime_slot_initialization_clears_every_pool_and_sets_fence() -> None:
     old_events = (object(), object())
     slots = [
@@ -256,11 +287,9 @@ def test_zero_gpu_memory_clears_recycled_payload() -> None:
 def test_cross_tier_snapshot_rejoins_runtime_stream_on_success_and_failure() -> None:
     runtime_stream = object()
 
-    for migration_error, expected_error in (
-        (None, AssertionError),
-        (RuntimeError("transform failed"), RuntimeError),
-    ):
+    for migration_error in (None, RuntimeError("transform failed")):
         wait_calls = []
+        scheduled_pages = []
 
         class FinishEvent:
             def wait_in_stream(self, stream):
@@ -271,6 +300,12 @@ def test_cross_tier_snapshot_rejoins_runtime_stream_on_success_and_failure() -> 
             cache_level=0,
             ready_event=SimpleNamespace(wait_in_stream=lambda _: None),
         )
+        migrated_slot = object()
+
+        class FakeCommittedPage:
+            def __init__(self, storage, tree_block, life_cycle, level, slot, priority):
+                del storage, tree_block, life_cycle, level, priority
+                self.slot = slot
 
         class StorageHarness:
             num_cache_levels = 2
@@ -278,6 +313,10 @@ def test_cross_tier_snapshot_rejoins_runtime_stream_on_success_and_failure() -> 
 
             def get_pool_group_index(self, life_cycle):
                 return 0
+
+            def slot_size(self, pool_group_index, level):
+                del pool_group_index
+                return [16] if level == 0 else [8]
 
             def new_slots_for_pool_group(self, level, pool_group_index, count):
                 raise OutOfPagesError("force the cross-tier path")
@@ -289,35 +328,59 @@ def test_cross_tier_snapshot_rejoins_runtime_stream_on_success_and_failure() -> 
                 src_page.ready_event = finish_event
                 if migration_error is not None:
                     raise migration_error
-                # Returning normally proves the finally block runs on success;
-                # the invalid cardinality stops before Page publication.
-                return []
+                return [migrated_slot]
 
-        life_cycles = SimpleNamespace(ssm_life_cycle_id=None)
+            def schedule_for_eviction(self, page):
+                scheduled_pages.append(page)
+
+        class LifeCycles:
+            ssm_life_cycle_id = None
+
+            def __getitem__(self, life_cycle):
+                return life_cycle
+
         fake_cache = SimpleNamespace(
             manager=SimpleNamespace(
-                _life_cycles=life_cycles,
+                _life_cycles=LifeCycles(),
                 _storage=StorageHarness(),
             ),
             cuda_stream=runtime_stream,
+            _get_priority=lambda ordinal, life_cycle: 0,
             # A real _KVCache records this fence before taking a reusable
             # snapshot.  The harness supplies it explicitly so the test
             # exercises the cross-stream hand-off rather than failing on an
             # incomplete fake object.
             finish_event=object(),
         )
-        tree_block = SimpleNamespace(storage=[None])
+        tree_block = SimpleNamespace(storage=[None], ordinal=0)
 
-        try:
-            _KVCache._copy_page_to_tree_block(
-                fake_cache,
-                tree_block,
-                0,
-                src_page,
-            )
-        except expected_error:
-            pass
-        else:
-            raise AssertionError(f"Expected {expected_error.__name__}")
+        with (
+            patch.object(kv_cache_module, "CommittedPage", FakeCommittedPage),
+            patch.object(kv_cache_module.rawref, "ref", side_effect=lambda page: lambda: page),
+        ):
+            if migration_error is None:
+                committed = _KVCache._copy_page_to_tree_block(
+                    fake_cache,
+                    tree_block,
+                    0,
+                    src_page,
+                )
+                assert committed is scheduled_pages[0]
+                assert committed.slot is migrated_slot
+                assert tree_block.storage[0]() is committed
+            else:
+                try:
+                    _KVCache._copy_page_to_tree_block(
+                        fake_cache,
+                        tree_block,
+                        0,
+                        src_page,
+                    )
+                except RuntimeError as error:
+                    assert error is migration_error
+                else:
+                    raise AssertionError("Expected the migration failure")
+                assert not scheduled_pages
+                assert tree_block.storage == [None]
 
         assert wait_calls == [runtime_stream]

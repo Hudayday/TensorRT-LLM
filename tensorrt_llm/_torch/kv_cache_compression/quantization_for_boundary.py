@@ -24,8 +24,6 @@ from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_t
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import CacheTier, MemAddress
 from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
-from tensorrt_llm.runtime.kv_cache_manager_v2._page import Page
-from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import Slot
 
 from ..pyexecutor.resource_manager import DataType, KVCacheCompressionManager
 from .interface import (
@@ -35,6 +33,7 @@ from .interface import (
 )
 
 _NVFP4_GLOBAL_SCALE_DENOMINATOR = 448.0 * 6.0
+_FP16_BF16_ELEMENT_BYTES = 2
 _SUPPORTED_ROLES = {"key", "value"}
 
 
@@ -61,6 +60,7 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
     """
 
     supports_block_reuse = True
+    uses_scheduler_lifecycle = False
 
     def __init__(
         self,
@@ -83,7 +83,6 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
                 "KVCM V2 must receive the boundary quantization before storage construction"
             )
 
-        self.quant = quant
         self._torch_dtype = binding_to_torch_dtype(kv_cache_manager.dtype)
         # A production KVCacheManagerV2 always owns the stream that also owns
         # its Page addresses.  Import-light unit harnesses intentionally omit
@@ -104,27 +103,21 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
             with torch.cuda.device(self._device):
                 self._record_staging_ready.record(execution_stream)
                 self._record_staging_ready.synchronize()
-        self._record_staging_in_flight = False
         self._record_staging_lock = threading.Lock()
         kv_cache_manager.bind_boundary_compression_hooks(self)
 
     def shutdown(self) -> None:
         """Release persistent staging only after its last stream use finishes."""
         with self._record_staging_lock:
-            if self._record_staging_in_flight:
-                assert self._record_staging_ready is not None
+            if self._record_staging_ready is not None:
                 self._record_staging_ready.synchronize()
             self._record_staging = None
-            self._record_staging_in_flight = False
 
     def _migration_device(self) -> torch.device:
-        """Return the CUDA device that owns KVCM's addresses and stream.
-
-        Production managers always expose their execution stream.  The lazy
-        fallback keeps import-light unit harnesses usable and is resolved only
-        when a real data hook executes.
-        """
-        return self._device or torch.device("cuda", torch.cuda.current_device())
+        """Return the CUDA device that owns KVCM's addresses and stream."""
+        if self._device is None:
+            raise RuntimeError("KVCM V2 did not provide a CUDA migration device")
+        return self._device
 
     def _validate_execution_device(self) -> None:
         """Fail at manager binding instead of at the first pressure event.
@@ -145,19 +138,13 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
             raise RuntimeError("TensorRT-LLM fp4_quantize operator is unavailable")
 
     @staticmethod
-    def _record_size(raw_size: int) -> int:
-        return nvfp4_boundary_record_layout(raw_size)[3]
-
-    @staticmethod
-    def _record_sections(raw_size: int, host_size: int) -> tuple[int, int, int]:
-        packed_size, scale_size, inverse_scale_offset, expected = nvfp4_boundary_record_layout(
-            raw_size
-        )
-        if host_size != expected:
+    def _validated_record_layout(raw_size: int, host_size: int) -> tuple[int, int, int, int]:
+        layout = nvfp4_boundary_record_layout(raw_size)
+        if host_size != layout[3]:
             raise ValueError(
-                f"NVFP4 Host record size mismatch: expected {expected}, got {host_size}"
+                f"NVFP4 Host record size mismatch: expected {layout[3]}, got {host_size}"
             )
-        return packed_size, scale_size, inverse_scale_offset
+        return layout
 
     def _allocate_record_staging(self) -> torch.Tensor | None:
         """Allocate the one reusable GPU record used by both boundaries.
@@ -193,7 +180,7 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
         for pool_group in self.kv_cache_manager.impl.pool_group_descs:
             for variant in pool_group.slot_desc.variants:
                 for coalesced in variant.coalesced_buffers:
-                    self._record_sections(
+                    self._validated_record_layout(
                         coalesced.single_buffer_size,
                         coalesced.effective_host_single_buffer_size,
                     )
@@ -225,7 +212,7 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
             num_heads * self.kv_cache_manager.tokens_per_block,
             head_dim,
         )
-        expected_size = math.prod(shape) * torch.tensor([], dtype=self._torch_dtype).element_size()
+        expected_size = math.prod(shape) * _FP16_BF16_ELEMENT_BYTES
         if expected_size != raw_size:
             raise ValueError(
                 "KVCM V2 Page geometry does not match its buffer size: "
@@ -243,10 +230,10 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
                 shape,
             )
         )
-        if raw.device != self._migration_device():
+        device = self._migration_device()
+        if raw.device != device:
             raise RuntimeError(
-                "KVCM V2 raw Page address is on a different CUDA device "
-                f"({raw.device} != {self._migration_device()})"
+                f"KVCM V2 raw Page address is on a different CUDA device ({raw.device} != {device})"
             )
         return raw
 
@@ -282,11 +269,10 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
             if major < 10:
                 raise RuntimeError("NVFP4 boundary compression requires SM100 or newer")
 
-        quant_matrix = raw_payload
         # ``vector_norm(inf)`` performs the absolute-maximum reduction without
         # materializing a full-size ``abs()`` tensor.
         amax = torch.linalg.vector_norm(
-            quant_matrix,
+            raw_payload,
             ord=float("inf"),
             dtype=torch.float32,
         )
@@ -324,13 +310,13 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
         global_scale = global_scale.reshape(1)
         inverse_global_scale = inverse_global_scale.reshape(1)
         packed, block_scales = torch.ops.trtllm.fp4_quantize(
-            quant_matrix,
+            raw_payload,
             global_scale,
             NVFP4_BOUNDARY_BLOCK_SIZE,
             False,
             False,
         )
-        row_count = quant_matrix.shape[0]
+        row_count = raw_payload.shape[0]
         expected_packed_shape = (row_count, feature_count // 2)
         expected_scale_elements = row_count * feature_count // NVFP4_BOUNDARY_BLOCK_SIZE
         if (
@@ -411,16 +397,13 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
         self,
         *,
         pool_group_index: int,
-        src_pages: Sequence[Page],
-        dst_slots: Sequence[Slot],
+        src_life_cycles: Sequence[int],
         src_addresses: Sequence[Sequence[int]],
         dst_addresses: Sequence[Sequence[int]],
-        src_slot_sizes: Sequence[int],
-        dst_slot_sizes: Sequence[int],
         stream: int,
     ) -> None:
         """GPU→Host migration hook invoked by KVCM V2 ``StorageManager``."""
-        if not (len(src_pages) == len(dst_slots) == len(src_addresses) == len(dst_addresses)):
+        if not (len(src_life_cycles) == len(src_addresses) == len(dst_addresses)):
             raise ValueError("Boundary migration batch fields have inconsistent lengths")
 
         try:
@@ -433,25 +416,22 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
                 device = self._migration_device()
                 external_stream = torch.cuda.ExternalStream(stream, device=device)
                 with torch.cuda.device(device), torch.cuda.stream(external_stream):
-                    if self._record_staging_in_flight:
-                        assert self._record_staging_ready is not None
-                        external_stream.wait_event(self._record_staging_ready)
+                    assert self._record_staging_ready is not None
+                    external_stream.wait_event(self._record_staging_ready)
                     try:
-                        for page, page_src, page_dst in zip(
-                            src_pages,
+                        for life_cycle, page_src, page_dst in zip(
+                            src_life_cycles,
                             src_addresses,
                             dst_addresses,
                         ):
-                            variant = self._variant(pool_group_index, page.life_cycle)
-                            if len(variant.coalesced_buffers) != len(page_src):
+                            variant = self._variant(pool_group_index, life_cycle)
+                            if not (
+                                len(variant.coalesced_buffers) == len(page_src) == len(page_dst)
+                            ):
                                 raise ValueError(
                                     "Pool count does not match the selected slot variant"
                                 )
                             for pool_index, coalesced in enumerate(variant.coalesced_buffers):
-                                if src_slot_sizes[pool_index] != coalesced.size:
-                                    raise ValueError("GPU slot size does not match its manifest")
-                                if dst_slot_sizes[pool_index] != coalesced.host_size:
-                                    raise ValueError("Host slot size does not match its manifest")
                                 raw_offset = 0
                                 host_offset = 0
                                 for buffer_id in coalesced.buffer_ids:
@@ -469,12 +449,12 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
                                         packed_size,
                                         scale_size,
                                         inverse_scale_offset,
-                                    ) = self._record_sections(
+                                        record_size,
+                                    ) = self._validated_record_layout(
                                         coalesced.single_buffer_size,
                                         coalesced.effective_host_single_buffer_size,
                                     )
                                     dst_base = int(page_dst[pool_index]) + host_offset
-                                    record_size = coalesced.effective_host_single_buffer_size
                                     # KVCM's copy engine accepts only 16-byte
                                     # grains. Build one self-contained record
                                     # containing packed values, per-block
@@ -509,7 +489,6 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
                     finally:
                         assert self._record_staging_ready is not None
                         self._record_staging_ready.record(external_stream)
-                        self._record_staging_in_flight = True
         except torch.OutOfMemoryError as error:
             # Scheduler admission handles cache pressure through this KVCM
             # exception. A raw torch OOM would bypass its retry/rollback path.
@@ -519,16 +498,13 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
         self,
         *,
         pool_group_index: int,
-        src_pages: Sequence[Page],
-        dst_slots: Sequence[Slot],
+        src_life_cycles: Sequence[int],
         src_addresses: Sequence[Sequence[int]],
         dst_addresses: Sequence[Sequence[int]],
-        src_slot_sizes: Sequence[int],
-        dst_slot_sizes: Sequence[int],
         stream: int,
     ) -> None:
         """Host→GPU migration hook invoked before KVCM V2 publishes the Page."""
-        if not (len(src_pages) == len(dst_slots) == len(src_addresses) == len(dst_addresses)):
+        if not (len(src_life_cycles) == len(src_addresses) == len(dst_addresses)):
             raise ValueError("Boundary migration batch fields have inconsistent lengths")
 
         try:
@@ -536,25 +512,22 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
                 device = self._migration_device()
                 external_stream = torch.cuda.ExternalStream(stream, device=device)
                 with torch.cuda.device(device), torch.cuda.stream(external_stream):
-                    if self._record_staging_in_flight:
-                        assert self._record_staging_ready is not None
-                        external_stream.wait_event(self._record_staging_ready)
+                    assert self._record_staging_ready is not None
+                    external_stream.wait_event(self._record_staging_ready)
                     try:
-                        for page, page_src, page_dst in zip(
-                            src_pages,
+                        for life_cycle, page_src, page_dst in zip(
+                            src_life_cycles,
                             src_addresses,
                             dst_addresses,
                         ):
-                            variant = self._variant(pool_group_index, page.life_cycle)
-                            if len(variant.coalesced_buffers) != len(page_src):
+                            variant = self._variant(pool_group_index, life_cycle)
+                            if not (
+                                len(variant.coalesced_buffers) == len(page_src) == len(page_dst)
+                            ):
                                 raise ValueError(
                                     "Pool count does not match the selected slot variant"
                                 )
                             for pool_index, coalesced in enumerate(variant.coalesced_buffers):
-                                if src_slot_sizes[pool_index] != coalesced.host_size:
-                                    raise ValueError("Host slot size does not match its manifest")
-                                if dst_slot_sizes[pool_index] != coalesced.size:
-                                    raise ValueError("GPU slot size does not match its manifest")
                                 raw_offset = 0
                                 host_offset = 0
                                 for buffer_id in coalesced.buffer_ids:
@@ -567,11 +540,11 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
                                         packed_size,
                                         scale_size,
                                         inverse_scale_offset,
-                                    ) = self._record_sections(
+                                        record_size,
+                                    ) = self._validated_record_layout(
                                         coalesced.single_buffer_size,
                                         coalesced.effective_host_single_buffer_size,
                                     )
-                                    record_size = coalesced.effective_host_single_buffer_size
                                     record = self._record_view(record_size)
                                     src_base = int(page_src[pool_index]) + host_offset
                                     self._copy_host_to_record(
@@ -611,7 +584,6 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
                     finally:
                         assert self._record_staging_ready is not None
                         self._record_staging_ready.record(external_stream)
-                        self._record_staging_in_flight = True
         except torch.OutOfMemoryError as error:
             raise OutOfPagesError(
                 "NVFP4 boundary decompression workspace is unavailable"

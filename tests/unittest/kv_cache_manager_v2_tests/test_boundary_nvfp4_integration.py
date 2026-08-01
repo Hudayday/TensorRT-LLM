@@ -404,8 +404,8 @@ def test_real_pressure_path_requeues_failed_victim_and_prefetches(p0_manager) ->
         replacement = None
 
         # A hit may skip directly from Host to runtime GPU. Prefetch allocates
-        # the raw destination, decompresses, atomically publishes cache_level
-        # plus slot_id, and releases the compressed Host backing.
+        # the raw destination, decompresses, commits cache_level plus slot_id
+        # before exposing the Page, and releases the compressed Host backing.
         storage.prefetch(
             GPU_LEVEL,
             [[[], [page]]],

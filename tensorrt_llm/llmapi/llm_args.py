@@ -3546,19 +3546,16 @@ SparseAttentionConfig: TypeAlias = Annotated[
 
 
 class KvCacheCompressionConfig(StrictBaseModel):
-    """Config for KV-cache compression: a compression manager runs a KV-reduction
-    algorithm (e.g. periodic token eviction) alongside KVCacheManagerV2.
+    """Configure a KV-cache compression manager independently of Attention.
 
-    Kept separate from SparseAttentionConfig by design -- compression changes
-    which KV is stored, not the attention computation. The manager is registered
-    as a resource manager in create_py_executor (_util.py), like the KV cache
-    manager itself. Concrete algorithms subclass this and add their parameters.
+    Managers that need scheduler cadence use the existing ResourceManager
+    lifecycle. Storage-boundary-only managers bind their data hooks directly
+    to KVCacheManagerV2 instead.
     """
     algorithm: str = Field(
         description=
-        "Name of the KV-cache compression algorithm to run; selects which "
-        "compression manager is built. Concrete algorithm configs subclass this "
-        "and set the value.")
+        "Name of the KV-cache compression algorithm to run; selects the "
+        "compression manager implementation.")
     quant: Optional[Literal["nvfp4"]] = Field(
         default=None,
         description=

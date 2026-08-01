@@ -67,8 +67,6 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
-    from tensorrt_llm.runtime.kv_cache_manager_v2._page import Page
-    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import Slot
 
     from .kv_cache_manager_v2 import KVCacheManagerV2
 
@@ -2454,6 +2452,8 @@ class KVCacheCompressionManager(BaseResourceManager):
     """Whether this manager can make target and logical KV lengths diverge."""
     supports_block_reuse: ClassVar[bool] = False
     """Whether this manager preserves the block-reuse identity contract."""
+    uses_scheduler_lifecycle: ClassVar[bool] = True
+    """Whether PyExecutor should invoke this manager once per scheduler step."""
 
     def __init__(
         self,
@@ -2538,38 +2538,33 @@ class KVCacheCompressionManager(BaseResourceManager):
         self,
         *,
         pool_group_index: int,
-        src_pages: Sequence["Page"],
-        dst_slots: Sequence["Slot"],
+        src_life_cycles: Sequence[int],
         src_addresses: Sequence[Sequence[int]],
         dst_addresses: Sequence[Sequence[int]],
-        src_slot_sizes: Sequence[int],
-        dst_slot_sizes: Sequence[int],
         stream: int,
     ) -> None:
         """Enqueue GPU→Host compression for one KVCM V2 migration batch.
 
         ``StorageManager`` owns source leases, compact destination admission,
         completion events, publication, source release, and rollback. The
-        hook must not change Page ownership or attention state.
+        hook receives only immutable layout identity and addresses; it cannot
+        change Page ownership or attention state.
         """
 
     def on_onboard_decompress(
         self,
         *,
         pool_group_index: int,
-        src_pages: Sequence["Page"],
-        dst_slots: Sequence["Slot"],
+        src_life_cycles: Sequence[int],
         src_addresses: Sequence[Sequence[int]],
         dst_addresses: Sequence[Sequence[int]],
-        src_slot_sizes: Sequence[int],
-        dst_slot_sizes: Sequence[int],
         stream: int,
     ) -> None:
         """Enqueue Host→GPU decompression before KVCM V2 publishes Pages.
 
         The destination is an already-admitted runtime-format GPU Page.
         ``StorageManager`` keeps the compressed Host source authoritative until
-        this work completes successfully.
+        this work completes successfully; the hook receives no Page owner.
         """
 
     # ================================================================== #

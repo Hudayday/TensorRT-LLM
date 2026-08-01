@@ -1455,8 +1455,14 @@ class _KVCache:
         storage = self.manager._storage
         pg_idx = storage.get_pool_group_index(lc_idx)
         for lvl in typed_range(src_page.cache_level, storage.num_cache_levels):
+            changes_representation = storage.slot_size(pg_idx, lvl) != storage.slot_size(
+                pg_idx, src_page.cache_level
+            )
             try:
-                if lvl == src_page.cache_level:
+                if not changes_representation:
+                    # Preserve the established same-representation snapshot
+                    # path. P0 enters StorageManager's migration transaction
+                    # only when the destination has compact tier geometry.
                     new_slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1)[0]
                 else:
                     requirements = filled_list(0, storage.num_pool_groups)
@@ -1486,7 +1492,7 @@ class _KVCache:
                     new_slot = migrated[0]
             except OutOfPagesError:
                 continue
-            if lvl == src_page.cache_level:
+            if not changes_representation:
                 cuda_stream = self.cuda_stream
                 new_slot.ready_event.wait_in_stream(cuda_stream)
                 slot_size = storage.slot_size(pg_idx, lvl)

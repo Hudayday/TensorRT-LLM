@@ -5,10 +5,10 @@
 ``BaseResourceManager``-based single-manager design.
 
 Covers:
-- :class:`KVCacheCompressionManager` contract: the five request/step hooks
-  and two storage-boundary hooks
-  default to no-op, zero resource counts, and it inherits
-  :class:`BaseResourceManager` (so PyExecutor auto-drives it once registered).
+- :class:`KVCacheCompressionManager` contract: five request/step hooks and two
+  storage-boundary hooks default to no-op, with zero resource counts. Managers
+  that opt into scheduler cadence inherit the existing ResourceManager path;
+  the P0 boundary manager is driven only by KVCM V2 storage migration.
 - The resource-manager API -> lifecycle-hook translation, gated on PyExecutor's
   own signals: ``prepare_resources`` fires ``on_request_init`` on each
   request's first prefill chunk (``is_first_context_chunk``);
@@ -29,6 +29,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from tensorrt_llm._torch.kv_cache_compression.interface import nvfp4_boundary_record_layout
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary import (
     QuantizationForBoundaryCompression,
 )
@@ -143,12 +144,9 @@ class TestBaseABC:
         assert m.on_request_finish(MagicMock()) is None
         boundary_args = {
             "pool_group_index": 0,
-            "src_pages": (),
-            "dst_slots": (),
+            "src_life_cycles": (),
             "src_addresses": (),
             "dst_addresses": (),
-            "src_slot_sizes": (),
-            "dst_slot_sizes": (),
             "stream": 0,
         }
         assert m.on_offload_compress(**boundary_args) is None
@@ -212,7 +210,7 @@ class TestBaseABC:
 
 
 class TestResourceManagerAPI:
-    def test_target_update_receives_metadata_before_final_compression(self):
+    def test_only_kv_manager_receives_attention_metadata(self):
         calls = []
         metadata = MagicMock(name="attention_metadata")
         draft = MagicMock(name="draft_kv_cache_manager")
@@ -327,7 +325,7 @@ class TestFactory:
         manager = create_kv_cache_compression_manager(config, target)
 
         assert type(manager) is QuantizationForBoundaryCompression
-        assert manager.quant == "nvfp4"
+        assert manager.uses_scheduler_lifecycle is False
         assert manager.kv_cache_manager is target
         assert target._boundary_compression_manager is manager
         target.impl.bind_boundary_compression_hooks.assert_called_once_with(
@@ -586,11 +584,9 @@ class TestNVFP4BoundaryOffload:
         quantize.assert_not_called()
 
     def test_compact_record_size_contains_payload_scales_and_global_scale(self):
-        manager, _ = self._manager()
         raw_size = 4 * 32 * 2
-        host_size = manager._record_size(raw_size)
-        packed_size, scale_size, inverse_scale_offset = manager._record_sections(
-            raw_size, host_size
+        packed_size, scale_size, inverse_scale_offset, host_size = nvfp4_boundary_record_layout(
+            raw_size
         )
         assert packed_size == 64
         assert scale_size == 8
@@ -599,11 +595,9 @@ class TestNVFP4BoundaryOffload:
         assert host_size < raw_size
 
     def test_record_aligns_an_otherwise_unaligned_global_scale(self):
-        manager, _ = self._manager()
         # 16 FP16 elements: 8 packed bytes + 1 scale byte. The FP32 scalar
         # starts at byte 12 and the whole record occupies one uint4 grain.
-        host_size = manager._record_size(32)
-        packed_size, scale_size, inverse_scale_offset = manager._record_sections(32, host_size)
+        packed_size, scale_size, inverse_scale_offset, host_size = nvfp4_boundary_record_layout(32)
 
         assert (packed_size, scale_size, inverse_scale_offset) == (8, 1, 12)
         assert host_size == 16

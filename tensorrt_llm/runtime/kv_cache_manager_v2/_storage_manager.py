@@ -308,6 +308,14 @@ class StorageManager:
             )
 
         num_levels = CacheLevel(len(config.cache_tiers))
+        slot_size_lists_by_level = [
+            (
+                host_slot_size_lists
+                if tier_config.tier == CacheTier.HOST_MEM
+                else gpu_slot_size_lists
+            )
+            for tier_config in config.cache_tiers
+        ]
         self._levels = cast(
             TypedIndexList,
             [
@@ -315,18 +323,10 @@ class StorageManager:
                     self._life_cycle_grouping,
                     i,
                     config.cache_tiers[i],
-                    (
-                        host_slot_size_lists
-                        if config.cache_tiers[i].tier == CacheTier.HOST_MEM
-                        else gpu_slot_size_lists
-                    ),
+                    slot_size_lists_by_level[i],
                     self._compute_slot_count_for_level(
                         config.cache_tiers[i],
-                        (
-                            host_slot_size_lists
-                            if config.cache_tiers[i].tier == CacheTier.HOST_MEM
-                            else gpu_slot_size_lists
-                        ),
+                        slot_size_lists_by_level[i],
                         init_ratio,
                     ),
                 )
@@ -764,6 +764,10 @@ class StorageManager:
         StorageManager owns slot allocation, mapping publication, source
         release, and rollback.  A boundary hook may enqueue a representation
         transform, but it never changes those ownership decisions.
+
+        Rollback covers Python validation and CUDA submission failures raised
+        before publication. A later asynchronous device fault invalidates the
+        CUDA context and is fail-stop; it is not recoverable Page rollback.
         """
         assert defrag or dst_level != src_level, (
             "dst_level and src_level must be different unless performing defragmentation"
@@ -778,42 +782,47 @@ class StorageManager:
         try:
             assert len(dst_slots) == num_slots
             prior_events: set[CachedCudaEvent] = set(source_ready_events)
-            src_slot_addresses: list[tuple[Address, ...]] = []
-            dst_slot_addresses: list[tuple[Address, ...]] = []
-            tasks_per_pool: TypedIndexList[PoolIndex, list[CopyTask]] = make_typed(
-                lambda _: list[CopyTask](), num_pools
-            )
             for src, dst in zip(src_pages, dst_slots):
                 assert defrag or not update_src or src.node_ref is None
                 prior_events.update((dst.ready_event, src.ready_event))
-                dst_addresses = dst_pool_group.slot_address(dst.slot_id)
-                src_addresses = src_pool_group.slot_address(src.slot_id)
-                dst_slot_addresses.append(tuple(dst_addresses))
-                src_slot_addresses.append(tuple(src_addresses))
-                for pool_idx in typed_range(num_pools):
-                    tasks_per_pool[pool_idx].append(
-                        CopyTask(dst_addresses[pool_idx], src_addresses[pool_idx])
-                    )
             dst_tier = self._levels[dst_level].cache_tier
             src_tier = self._levels[src_level].cache_tier
+            migration_hook = _select_boundary_migration_hook(
+                self._offload_compression_hook,
+                self._onboard_decompression_hook,
+                src_tier,
+                dst_tier,
+                defrag,
+            )
+            if migration_hook is None:
+                slot_sizes = self.slot_size(pool_group_index, src_level)
+                if slot_sizes != self.slot_size(pool_group_index, dst_level):
+                    raise RuntimeError(
+                        "KVCM V2 cannot copy between cache tiers with "
+                        "different physical slot sizes until boundary "
+                        "compression hooks are bound"
+                    )
+                tasks_per_pool: TypedIndexList[PoolIndex, list[CopyTask]] = make_typed(
+                    lambda _: list[CopyTask](), num_pools
+                )
+                for src, dst in zip(src_pages, dst_slots):
+                    dst_addresses = dst_pool_group.slot_address(dst.slot_id)
+                    src_addresses = src_pool_group.slot_address(src.slot_id)
+                    for pool_idx in typed_range(num_pools):
+                        tasks_per_pool[pool_idx].append(
+                            CopyTask(dst_addresses[pool_idx], src_addresses[pool_idx])
+                        )
+            else:
+                src_slot_addresses = [
+                    tuple(src_pool_group.slot_address(src.slot_id)) for src in src_pages
+                ]
+                dst_slot_addresses = [
+                    tuple(dst_pool_group.slot_address(dst.slot_id)) for dst in dst_slots
+                ]
+
             with TemporaryCudaStream(prior_events) as stream:
                 try:
-                    migration_hook = _select_boundary_migration_hook(
-                        self._offload_compression_hook,
-                        self._onboard_decompression_hook,
-                        src_tier,
-                        dst_tier,
-                        defrag,
-                    )
                     if migration_hook is None:
-                        slot_sizes = self.slot_size(pool_group_index, src_level)
-                        dst_slot_sizes = self.slot_size(pool_group_index, dst_level)
-                        if slot_sizes != dst_slot_sizes:
-                            raise RuntimeError(
-                                "KVCM V2 cannot copy between cache tiers with "
-                                "different physical slot sizes until boundary "
-                                "compression hooks are bound"
-                            )
                         for pool_idx, tasks in typed_enumerate(tasks_per_pool):
                             batched_copy(
                                 dst_tier,
@@ -825,12 +834,9 @@ class StorageManager:
                     else:
                         migration_hook(
                             pool_group_index=pool_group_index,
-                            src_pages=src_pages,
-                            dst_slots=dst_slots,
+                            src_life_cycles=tuple(page.life_cycle for page in src_pages),
                             src_addresses=tuple(src_slot_addresses),
                             dst_addresses=tuple(dst_slot_addresses),
-                            src_slot_sizes=tuple(self.slot_size(pool_group_index, src_level)),
-                            dst_slot_sizes=tuple(self.slot_size(pool_group_index, dst_level)),
                             stream=stream.get(),
                         )
                 except Exception:
@@ -872,14 +878,28 @@ class StorageManager:
                     src_pool_group.release(src)
                     src.set_slot(dst)
                     src.cache_level = dst_level
+                    if emit_cache_level_updates and migration_hook is None:
+                        # Preserve main's observer timing and exception
+                        # behavior for the native representation-preserving
+                        # copy path. Boundary transforms use the all-Pages
+                        # commit below because their source representation is
+                        # no longer interchangeable with the destination.
+                        self._emit_cache_level_updated_event(
+                            src,
+                            src_level,
+                            dst_level,
+                            emitted_update_keys,
+                        )
                     if scheduled_for_eviction:
                         self.schedule_for_eviction(src)
 
-            # Event publication is an observer of the already-completed Page
-            # ownership transaction. Keep it outside the per-Page commit loop
-            # so an observer exception cannot leave a half-migrated batch or
-            # cause rollback to release a destination already owned by a Page.
-            if emit_cache_level_updates:
+            # A boundary transform commits every Page before notifying
+            # observers. Its Host and GPU representations have different
+            # sizes, so an observer failure must not expose a half-published
+            # batch or turn a successful transform into rollback. This policy
+            # is deliberately scoped to the new boundary path; native copies
+            # retain their established behavior above.
+            if emit_cache_level_updates and migration_hook is not None:
                 for src in src_pages:
                     try:
                         self._emit_cache_level_updated_event(

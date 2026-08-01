@@ -3581,11 +3581,10 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_cache_map.clear()
         # Boundary hooks may retain manager-lifetime GPU staging referenced by
         # an in-flight migration stream. Fence and release that staging before
-        # the Python V2 implementation destroys its GPU/Host storage. The
-        # compression manager's shutdown is intentionally idempotent because
-        # PyExecutor also shuts down every registered resource manager.
+        # the Python V2 implementation destroys its GPU/Host storage.
         if self._boundary_compression_manager is not None:
             self._boundary_compression_manager.shutdown()
+            self._boundary_compression_manager = None
         self.impl.shutdown()
         if self.conversation_manager is not None:
             self.conversation_manager.clear()

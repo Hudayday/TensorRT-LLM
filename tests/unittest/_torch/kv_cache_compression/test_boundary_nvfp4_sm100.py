@@ -29,6 +29,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.kv_cache_compression.interface import nvfp4_boundary_record_layout
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary import (
     QuantizationForBoundaryCompression,
 )
@@ -115,12 +116,15 @@ def test_linear_nvfp4_round_trip_matches_independent_oracle(dtype, shape):
     assert inverse_global_scale.shape == (1,)
     assert torch.isfinite(inverse_global_scale).all()
 
+    output = torch.empty_like(raw)
     actual = dequant_nvfp4_2d_triton(
         packed,
         scale_bytes,
         inverse_global_scale,
+        out=output,
         target_dtype=dtype,
     )
+    assert actual is output
     expected = _torch_nvfp4_decode_oracle(
         packed,
         scale_bytes,
@@ -128,6 +132,38 @@ def test_linear_nvfp4_round_trip_matches_independent_oracle(dtype, shape):
         dtype,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@requires_sm100
+def test_linear_nvfp4_caller_owned_output_rejects_incompatible_tensors():
+    device = torch.device("cuda", torch.cuda.current_device())
+    raw = torch.ones((3, 32), dtype=torch.float16, device=device)
+    packed, scales, inverse = QuantizationForBoundaryCompression.compress_tensor(raw)
+
+    with pytest.raises(ValueError, match="out must have shape"):
+        dequant_nvfp4_2d_triton(
+            packed,
+            scales,
+            inverse,
+            out=torch.empty((2, 32), dtype=raw.dtype, device=device),
+            target_dtype=raw.dtype,
+        )
+    with pytest.raises(TypeError, match="out dtype"):
+        dequant_nvfp4_2d_triton(
+            packed,
+            scales,
+            inverse,
+            out=torch.empty(raw.shape, dtype=torch.bfloat16, device=device),
+            target_dtype=raw.dtype,
+        )
+    with pytest.raises(ValueError, match="out must be contiguous"):
+        dequant_nvfp4_2d_triton(
+            packed,
+            scales,
+            inverse,
+            out=torch.empty((32, 3), dtype=raw.dtype, device=device).T,
+            target_dtype=raw.dtype,
+        )
 
 
 @requires_sm100
@@ -195,7 +231,7 @@ def _one_buffer_manager(
     head_dim: int,
 ) -> QuantizationForBoundaryCompression:
     raw_size = tokens_per_block * head_dim * torch.empty((), dtype=dtype).element_size()
-    record_size = QuantizationForBoundaryCompression._record_size(raw_size)
+    record_size = nvfp4_boundary_record_layout(raw_size)[3]
     buffer_id = SimpleNamespace(layer_id=0, role="key")
     coalesced = SimpleNamespace(
         single_buffer_size=raw_size,
@@ -223,7 +259,7 @@ def _one_buffer_manager(
     manager._device = device
     manager._record_staging = torch.empty(record_size, dtype=torch.uint8, device=device)
     manager._record_staging_ready = torch.cuda.Event(blocking=False)
-    manager._record_staging_in_flight = False
+    manager._record_staging_ready.record(torch.cuda.current_stream(device))
     manager._record_staging_lock = threading.Lock()
     return manager
 
@@ -264,17 +300,13 @@ def test_host_record_alone_restores_page_with_unaligned_payload_sections(dtype):
     torch.cuda.synchronize(device)
 
     raw_size = raw.numel() * raw.element_size()
-    record_size = manager._record_size(raw_size)
+    record_size = nvfp4_boundary_record_layout(raw_size)[3]
     assert record_size % 16 == 0
     host = HostMem(record_size)
     stream = torch.cuda.Stream(device=device)
-    page = SimpleNamespace(life_cycle=0)
     common = dict(
         pool_group_index=0,
-        src_pages=(page,),
-        dst_slots=(SimpleNamespace(),),
-        src_slot_sizes=(raw_size,),
-        dst_slot_sizes=(record_size,),
+        src_life_cycles=(0,),
         stream=stream.cuda_stream,
     )
 
@@ -286,10 +318,10 @@ def test_host_record_alone_restores_page_with_unaligned_payload_sections(dtype):
         )
         stream.synchronize()
 
-        packed_size, scale_size, inverse_offset = manager._record_sections(
-            raw_size,
-            record_size,
+        packed_size, scale_size, inverse_offset, expected_record_size = (
+            nvfp4_boundary_record_layout(raw_size)
         )
+        assert expected_record_size == record_size
         host_bytes = ctypes.string_at(host.address, record_size)
         assert not any(host_bytes[packed_size + scale_size : inverse_offset])
         assert not any(host_bytes[inverse_offset + 4 :])
@@ -302,12 +334,9 @@ def test_host_record_alone_restores_page_with_unaligned_payload_sections(dtype):
         restored = torch.empty_like(raw)
         manager.on_onboard_decompress(
             pool_group_index=0,
-            src_pages=(page,),
-            dst_slots=(SimpleNamespace(),),
+            src_life_cycles=(0,),
             src_addresses=((host.address,),),
             dst_addresses=((restored.data_ptr(),),),
-            src_slot_sizes=(record_size,),
-            dst_slot_sizes=(raw_size,),
             stream=stream.cuda_stream,
         )
         stream.synchronize()
