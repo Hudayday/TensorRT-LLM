@@ -85,7 +85,10 @@ def _torch_nvfp4_decode_oracle(
 
 
 @requires_sm100
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.bfloat16, torch.float8_e4m3fn],
+)
 @pytest.mark.parametrize("shape", [(1, 16), (3, 80), (32, 64), (129, 128)])
 def test_linear_nvfp4_round_trip_matches_independent_oracle(dtype, shape):
     rows, feature_count = shape
@@ -132,6 +135,93 @@ def test_linear_nvfp4_round_trip_matches_independent_oracle(dtype, shape):
         dtype,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@requires_sm100
+def test_fp8_round_trip_uses_direct_representation_scale():
+    device = torch.device("cuda", torch.cuda.current_device())
+    raw = (
+        torch.linspace(-448, 448, 256, dtype=torch.float32, device=device)
+        .reshape(8, 32)
+        .to(torch.float8_e4m3fn)
+    )
+
+    packed, scales, inverse = QuantizationForBoundaryCompression.compress_tensor(raw)
+    restored = dequant_nvfp4_2d_triton(
+        packed,
+        scales,
+        inverse,
+        target_dtype=torch.float8_e4m3fn,
+    )
+    expected = _torch_nvfp4_decode_oracle(
+        packed,
+        scales,
+        torch.tensor([1.0 / 6.0], dtype=torch.float32, device=device),
+        torch.float8_e4m3fn,
+    )
+
+    assert restored.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(
+        inverse,
+        torch.tensor([1.0 / 6.0], dtype=torch.float32, device=device),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(restored, expected, rtol=0, atol=0)
+
+
+@requires_sm100
+def test_fp8_exact_e2m1_values_restore_the_original_representation():
+    """Lock the 6 / 1/6 contract independently of the production decoder.
+
+    With 6 as each 16-value block maximum, every input below is exactly an
+    E2M1 codebook value.  Direct FP8 -> NVFP4 -> FP8 must therefore reproduce
+    the original E4M3FN bit pattern, not an Attention-dequantized value.
+    """
+    device = torch.device("cuda", torch.cuda.current_device())
+    values = torch.tensor(
+        [
+            -6.0,
+            -4.0,
+            -3.0,
+            -2.0,
+            -1.5,
+            -1.0,
+            -0.5,
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            0.0,
+        ],
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    ).repeat(4, 1)
+
+    packed, scales, inverse = QuantizationForBoundaryCompression.compress_tensor(values)
+    restored = dequant_nvfp4_2d_triton(
+        packed,
+        scales,
+        inverse,
+        target_dtype=torch.float8_e4m3fn,
+    )
+
+    assert torch.equal(restored.view(torch.uint8), values.view(torch.uint8))
+
+
+@requires_sm100
+@pytest.mark.parametrize("nan_bits", [0x7F, 0xFF])
+def test_fp8_nan_codes_fail_before_the_quantization_kernel(nan_bits):
+    device = torch.device("cuda", torch.cuda.current_device())
+    raw = torch.ones((4, 32), dtype=torch.float8_e4m3fn, device=device)
+    raw.view(torch.uint8)[1, 3] = nan_bits
+
+    with pytest.raises(ValueError, match="non-finite KV"):
+        QuantizationForBoundaryCompression.compress_tensor(raw)
 
 
 @requires_sm100
@@ -198,17 +288,22 @@ def test_bf16_extreme_global_scales_remain_finite_and_paired(value_kind):
 
 
 @requires_sm100
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.bfloat16, torch.float8_e4m3fn],
+)
 def test_fresh_partial_physical_page_keeps_zero_tail_without_attention_metadata(dtype):
     device = torch.device("cuda", torch.cuda.current_device())
     tokens, heads, head_dim = 4, 2, 80
+    # Float8 has no ``normal_`` kernel; create values in FP32 and cast so all
+    # runtime dtypes exercise the same physical Page contents.
     physical = torch.randn(
         tokens,
         heads,
         head_dim,
-        dtype=dtype,
+        dtype=torch.float32,
         device=device,
-    )
+    ).to(dtype)
     physical[-1].zero_()
     raw = physical.reshape(tokens * heads, head_dim)
 
@@ -230,8 +325,9 @@ def _one_buffer_manager(
     tokens_per_block: int,
     head_dim: int,
 ) -> QuantizationForBoundaryCompression:
-    raw_size = tokens_per_block * head_dim * torch.empty((), dtype=dtype).element_size()
-    record_size = nvfp4_boundary_record_layout(raw_size)[3]
+    num_elements = tokens_per_block * head_dim
+    raw_size = num_elements * torch.empty((), dtype=dtype).element_size()
+    record_size = nvfp4_boundary_record_layout(num_elements)[3]
     buffer_id = SimpleNamespace(layer_id=0, role="key")
     coalesced = SimpleNamespace(
         single_buffer_size=raw_size,
@@ -256,6 +352,7 @@ def _one_buffer_manager(
     manager = object.__new__(QuantizationForBoundaryCompression)
     manager.kv_cache_manager = kv_cache_manager
     manager._torch_dtype = dtype
+    manager._runtime_element_bytes = torch.empty((), dtype=dtype).element_size()
     manager._device = device
     manager._record_staging = torch.empty(record_size, dtype=torch.uint8, device=device)
     manager._record_staging_ready = torch.cuda.Event(blocking=False)
@@ -265,7 +362,10 @@ def _one_buffer_manager(
 
 
 @requires_sm100
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.bfloat16, torch.float8_e4m3fn],
+)
 def test_host_record_alone_restores_page_with_unaligned_payload_sections(dtype):
     """Exercise the real 16-byte-grain KVCM copy path in both directions.
 
@@ -299,8 +399,8 @@ def test_host_record_alone_restores_page_with_unaligned_payload_sections(dtype):
     # so establish the source lease explicitly before using another stream.
     torch.cuda.synchronize(device)
 
-    raw_size = raw.numel() * raw.element_size()
-    record_size = nvfp4_boundary_record_layout(raw_size)[3]
+    num_elements = raw.numel()
+    record_size = nvfp4_boundary_record_layout(num_elements)[3]
     assert record_size % 16 == 0
     host = HostMem(record_size)
     stream = torch.cuda.Stream(device=device)
@@ -319,7 +419,7 @@ def test_host_record_alone_restores_page_with_unaligned_payload_sections(dtype):
         stream.synchronize()
 
         packed_size, scale_size, inverse_offset, expected_record_size = (
-            nvfp4_boundary_record_layout(raw_size)
+            nvfp4_boundary_record_layout(num_elements)
         )
         assert expected_record_size == record_size
         host_bytes = ctypes.string_at(host.address, record_size)
@@ -329,7 +429,7 @@ def test_host_record_alone_restores_page_with_unaligned_payload_sections(dtype):
         # Destroy the only full-precision source before recall.  A successful
         # restore therefore proves that Host owns a complete compressed record,
         # rather than an auxiliary scale sidecar or a dual raw/compressed copy.
-        raw.fill_(float("nan"))
+        raw.view(torch.uint8).fill_(0x7F)
         torch.cuda.synchronize(device)
         restored = torch.empty_like(raw)
         manager.on_onboard_decompress(

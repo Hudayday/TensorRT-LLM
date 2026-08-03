@@ -89,13 +89,17 @@ def _direct_nvfp4_oracle(raw: torch.Tensor) -> torch.Tensor:
     make both the implementation and its oracle pass in the same way.
     """
     matrix = raw.reshape(-1, raw.shape[-1]).contiguous()
-    amax = torch.linalg.vector_norm(
-        matrix,
-        ord=float("inf"),
-        dtype=torch.float32,
-    )
-    inverse_global_scale = amax / _NVFP4_GLOBAL_SCALE_DENOMINATOR
-    global_scale = torch.reciprocal(inverse_global_scale)
+    if matrix.dtype == torch.float8_e4m3fn:
+        global_scale = torch.tensor([6.0], dtype=torch.float32, device=matrix.device)
+        inverse_global_scale = torch.reciprocal(global_scale)
+    else:
+        amax = torch.linalg.vector_norm(
+            matrix,
+            ord=float("inf"),
+            dtype=torch.float32,
+        )
+        inverse_global_scale = amax / _NVFP4_GLOBAL_SCALE_DENOMINATOR
+        global_scale = torch.reciprocal(inverse_global_scale)
     packed, block_scales = torch.ops.trtllm.fp4_quantize(
         matrix,
         global_scale,
@@ -115,14 +119,18 @@ def _direct_nvfp4_oracle(raw: torch.Tensor) -> torch.Tensor:
     return restored.view_as(raw)
 
 
-@pytest.fixture(params=(DataType.HALF, DataType.BF16), ids=("fp16", "bf16"))
+@pytest.fixture(
+    params=(DataType.HALF, DataType.BF16, DataType.FP8),
+    ids=("fp16", "bf16", "fp8_e4m3"),
+)
 def p0_manager(request):
     """Build the smallest real two-tier manager supported by the P0 proof."""
     _require_p0_runtime()
     init_cuda_once()
 
-    # KVCacheManagerV2 owns the layout declaration.  Runtime GPU Pages remain
-    # FP16/BF16 while the Host tier receives the compact NVFP4 record geometry.
+    # KVCacheManagerV2 owns the runtime layout declaration.  FP16, BF16, and
+    # FP8 GPU Pages retain their standard Slot size while the Host tier gets
+    # the compact NVFP4 record geometry derived from logical element count.
     manager = KVCacheManagerV2(
         KvCacheConfig(
             enable_block_reuse=True,
@@ -166,11 +174,11 @@ def test_real_storage_manager_compact_offload_round_trip(p0_manager) -> None:
     page = None
     recycled = None
 
-    # One FP16/BF16 K Page and one V Page are coalesced into the same physical
-    # Pool slot: 2 * (4 tokens * 1 head * 32 elements * 2 bytes) = 512 bytes.
-    # Each independent NVFP4 Host record is 80 bytes including its block
-    # scales, inverse global scale, and alignment, so the Host slot is 160 B.
-    assert tuple(storage.slot_size(pool_group, GPU_LEVEL)) == (512,)
+    # KVCM's original dtype owns GPU bytes: FP16/BF16 use 512 B for the
+    # coalesced K+V Slot, while FP8 uses 256 B.  The same logical Page shape
+    # produces two 80 B NVFP4 records in Host memory for every source dtype.
+    expected_gpu_slot_size = 256 if manager.dtype == DataType.FP8 else 512
+    assert tuple(storage.slot_size(pool_group, GPU_LEVEL)) == (expected_gpu_slot_size,)
     assert tuple(storage.slot_size(pool_group, CACHE_LEVEL1)) == (160,)
 
     gpu_free_initial = storage.get_statistics(GPU_LEVEL)[pool_group].free
@@ -366,7 +374,13 @@ def test_real_pressure_path_requeues_failed_victim_and_prefetches(p0_manager) ->
         source_slot_id = page.slot_id
         buffers = manager.get_buffers(0, kv_layout="NHD")
         assert buffers is not None
-        buffers[source_slot_id].normal_()
+        buffers[source_slot_id].copy_(
+            torch.randn(
+                buffers[source_slot_id].shape,
+                dtype=torch.float32,
+                device="cuda",
+            ).to(buffers[source_slot_id].dtype)
+        )
         torch.cuda.current_stream().synchronize()
 
         # The only GPU slot is occupied by a HELD Page from a suspended
@@ -468,7 +482,7 @@ def test_storage_manager_workspace_oom_rolls_back_and_retries(p0_manager) -> Non
         values = torch.arange(raw_page.numel(), dtype=torch.float32, device="cuda").view_as(
             raw_page
         )
-        raw_page.copy_((((values * 5) % 53) - 26).to(raw_page.dtype) / 9)
+        raw_page.copy_(((((values * 5) % 53) - 26) / 9).to(raw_page.dtype))
         torch.cuda.current_stream().synchronize()
         source = raw_page.clone()
         oracle = torch.stack((_direct_nvfp4_oracle(source[0]), _direct_nvfp4_oracle(source[1])))

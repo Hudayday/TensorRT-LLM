@@ -18,6 +18,8 @@ import threading
 from collections.abc import Sequence
 
 import torch
+import triton
+import triton.language as tl
 
 from tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4 import dequant_nvfp4_2d_triton
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
@@ -25,25 +27,71 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._common import CacheTier, MemAddre
 from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
 
-from ..pyexecutor.resource_manager import DataType, KVCacheCompressionManager
+from ..pyexecutor.resource_manager import KVCacheCompressionManager
 from .interface import (
     NVFP4_BOUNDARY_BLOCK_SIZE,
     NVFP4_BOUNDARY_RECORD_ALIGNMENT,
     nvfp4_boundary_record_layout,
+    nvfp4_boundary_supports_runtime_dtype,
 )
 
 _NVFP4_GLOBAL_SCALE_DENOMINATOR = 448.0 * 6.0
-_FP16_BF16_ELEMENT_BYTES = 2
+_NVFP4_FP8_REPRESENTATION_GLOBAL_SCALE = 6.0
 _SUPPORTED_ROLES = {"key", "value"}
+
+
+@triton.jit
+def _fp8_e4m3_nan_flag_kernel(
+    bits_ptr,
+    flag_ptr,
+    num_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Set one device flag if an E4M3FN input contains either NaN code.
+
+    Reading the Float8 tensor through its uint8 view preserves the exact bit
+    representation.  Each program reduces its tile locally and atomically
+    publishes only one int32, avoiding Page-sized uint8/bool temporaries on
+    the memory-pressure path that triggered the offload.
+    """
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    bits = tl.load(bits_ptr + offsets, mask=offsets < num_elements, other=0)
+    tile_has_nan = tl.max(((bits & 0x7F) == 0x7F).to(tl.int32), axis=0)
+    tl.atomic_max(flag_ptr, tile_has_nan)
+
+
+def _fp8_e4m3_contains_nan(value: torch.Tensor) -> bool:
+    """Return whether ``value`` contains an E4M3FN NaN encoding.
+
+    Production migration always reaches the CUDA branch.  The CPU fallback is
+    retained only for import-light unit tests that mock the quantization op.
+    """
+    bits = value.view(torch.uint8)
+    if not bits.is_cuda:
+        return bool(torch.any((bits & 0x7F) == 0x7F).item())
+
+    flag = torch.zeros((1,), dtype=torch.int32, device=bits.device)
+    block_size = 256
+    _fp8_e4m3_nan_flag_kernel[(triton.cdiv(bits.numel(), block_size),)](
+        bits,
+        flag,
+        bits.numel(),
+        BLOCK_SIZE=block_size,
+    )
+    # This scalar read is the same intentional synchronous transaction gate
+    # used by the FP16/BF16 amax path: KVCM must know whether it may publish.
+    return bool(flag.item())
 
 
 class QuantizationForBoundaryCompression(KVCacheCompressionManager):
     """Compress GPU KV while KVCM V2 offloads it to the Host tier.
 
-    The active GPU cache keeps its configured runtime representation (FP16 or
-    BF16 in the initial proof). The stable Host copy is compressed-only. On
-    recall, KVCM V2 allocates the normal GPU Page first and this same manager
-    restores the Host record into that Page before KVCM publishes it.
+    The active GPU cache keeps its configured runtime representation.  A
+    runtime dtype is admitted only when TensorRT-LLM has direct transforms to
+    and from NVFP4; the initial set is FP16, BF16, and FP8 E4M3.  The stable
+    Host copy is compressed-only. On recall, KVCM V2 allocates the normal GPU
+    Page first and this same manager restores the Host record into that Page
+    before KVCM publishes it.
 
     ``StorageManager`` remains responsible for page selection, destination
     admission, CUDA-event ordering, publication, source release, and rollback.
@@ -76,14 +124,20 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
             raise ValueError("QuantizationForBoundaryCompression only supports quant='nvfp4'")
         if kv_cache_manager.is_draft:
             raise ValueError("NVFP4 Host offload must bind to the target KV cache")
-        if kv_cache_manager.dtype not in (DataType.HALF, DataType.BF16):
-            raise ValueError("Active runtime KV must remain FP16 or BF16")
+        if not nvfp4_boundary_supports_runtime_dtype(kv_cache_manager.dtype):
+            raise ValueError(
+                "Active runtime KV dtype has no validated direct two-way NVFP4 conversion"
+            )
         if kv_cache_manager.boundary_compression_quant != quant:
             raise ValueError(
                 "KVCM V2 must receive the boundary quantization before storage construction"
             )
 
         self._torch_dtype = binding_to_torch_dtype(kv_cache_manager.dtype)
+        # This value validates the existing KVCM runtime Slot.  It does not
+        # participate in Host allocation: Host NVFP4 size depends only on the
+        # logical element count and is declared separately in BufferConfig.
+        self._runtime_element_bytes = torch.empty((), dtype=self._torch_dtype).element_size()
         # A production KVCacheManagerV2 always owns the stream that also owns
         # its Page addresses.  Import-light unit harnesses intentionally omit
         # it and exercise only pure layout/config behavior.
@@ -138,8 +192,8 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
             raise RuntimeError("TensorRT-LLM fp4_quantize operator is unavailable")
 
     @staticmethod
-    def _validated_record_layout(raw_size: int, host_size: int) -> tuple[int, int, int, int]:
-        layout = nvfp4_boundary_record_layout(raw_size)
+    def _validated_record_layout(num_elements: int, host_size: int) -> tuple[int, int, int, int]:
+        layout = nvfp4_boundary_record_layout(num_elements)
         if host_size != layout[3]:
             raise ValueError(
                 f"NVFP4 Host record size mismatch: expected {layout[3]}, got {host_size}"
@@ -180,16 +234,25 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
         for pool_group in self.kv_cache_manager.impl.pool_group_descs:
             for variant in pool_group.slot_desc.variants:
                 for coalesced in variant.coalesced_buffers:
-                    self._validated_record_layout(
-                        coalesced.single_buffer_size,
-                        coalesced.effective_host_single_buffer_size,
-                    )
                     for buffer_id in coalesced.buffer_ids:
                         if str(buffer_id.role) not in _SUPPORTED_ROLES:
                             raise ValueError(
                                 "NVFP4 Host boundary compression P0 supports "
                                 f"only K/V buffers, got role={buffer_id.role!r}"
                             )
+                        shape = self._buffer_matrix_shape(
+                            buffer_id,
+                            coalesced.single_buffer_size,
+                        )
+                        if shape[-1] % NVFP4_BOUNDARY_BLOCK_SIZE != 0:
+                            raise ValueError(
+                                "NVFP4 Page feature width must be divisible by "
+                                f"{NVFP4_BOUNDARY_BLOCK_SIZE}, got {shape[-1]}"
+                            )
+                        self._validated_record_layout(
+                            math.prod(shape),
+                            coalesced.effective_host_single_buffer_size,
+                        )
 
     def _variant(self, pool_group_index: int, life_cycle: int):
         variants = self.kv_cache_manager.impl.pool_group_descs[pool_group_index].slot_desc.variants
@@ -212,7 +275,7 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
             num_heads * self.kv_cache_manager.tokens_per_block,
             head_dim,
         )
-        expected_size = math.prod(shape) * _FP16_BF16_ELEMENT_BYTES
+        expected_size = math.prod(shape) * self._runtime_element_bytes
         if expected_size != raw_size:
             raise ValueError(
                 "KVCM V2 Page geometry does not match its buffer size: "
@@ -253,8 +316,15 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
         """
         if raw_payload.dim() != 2:
             raise ValueError("NVFP4 boundary compression expects [physical rows, head_dim]")
-        if raw_payload.dtype not in (torch.float16, torch.bfloat16):
-            raise TypeError("NVFP4 boundary compression expects FP16 or BF16 input")
+        if raw_payload.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+        ):
+            raise TypeError(
+                "NVFP4 boundary compression has no validated direct kernel "
+                f"for {raw_payload.dtype} input"
+            )
         if not raw_payload.is_contiguous():
             raise ValueError("KVCM V2 must provide a contiguous stable payload lease")
 
@@ -269,39 +339,56 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
             if major < 10:
                 raise RuntimeError("NVFP4 boundary compression requires SM100 or newer")
 
-        # ``vector_norm(inf)`` performs the absolute-maximum reduction without
-        # materializing a full-size ``abs()`` tensor.
-        amax = torch.linalg.vector_norm(
-            raw_payload,
-            ord=float("inf"),
-            dtype=torch.float32,
-        )
-        # This scalar read is an intentional POC correctness gate. A failed
-        # transform must be reported synchronously so StorageManager can roll
-        # back the destination slot instead of publishing an invalid record.
-        amax_value = float(amax.item())
-        if not math.isfinite(amax_value):
-            raise ValueError("NVFP4 boundary compression rejects non-finite KV")
-        if amax_value > 0:
-            ideal_inverse_scale = amax / _NVFP4_GLOBAL_SCALE_DENOMINATOR
-            # BF16 can represent finite values whose ideal quantization
-            # multiplier exceeds FP32. Clamp the multiplier by clamping its
-            # reciprocal upward, and persist that *actual* reciprocal in the
-            # record so decompression remains mathematically paired.
-            # Do not clamp exactly to FLT_MAX.  Its rounded FP32 reciprocal is
-            # slightly smaller than 1 / FLT_MAX, so taking the reciprocal again
-            # can overflow to ``inf`` during validation or a future reader.
-            # Half of FLT_MAX leaves one bit of exponent headroom while still
-            # mapping BF16's smallest normal value into NVFP4's useful range.
-            max_round_trip_safe_scale = torch.finfo(torch.float32).max / 2
-            global_scale = torch.clamp_max(
-                torch.reciprocal(ideal_inverse_scale),
-                max_round_trip_safe_scale,
+        if raw_payload.dtype == torch.float8_e4m3fn:
+            # E4M3FN has exactly two NaN encodings: 0x7f and 0xff.  PyTorch's
+            # generic finite reductions do not support Float8.  A small
+            # Triton reduction inspects the representation and emits only one
+            # int32 flag, preserving the fail-closed transaction contract
+            # without allocating Page-sized validation intermediates.
+            if _fp8_e4m3_contains_nan(raw_payload):
+                raise ValueError("NVFP4 boundary compression rejects non-finite KV")
+
+            # The dedicated FP8_TO_FP4 kernel first multiplies FP8 values by
+            # 6 / global_scale in registers.  Pairing 6 with a persisted 1/6
+            # therefore quantizes the numeric FP8 Page representation itself,
+            # rather than applying (or requiring) an Attention dequant scale.
+            # No FP16 Page or full-size FP16 staging tensor is introduced.
+            global_scale = torch.full(
+                (1,),
+                _NVFP4_FP8_REPRESENTATION_GLOBAL_SCALE,
+                dtype=torch.float32,
+                device=raw_payload.device,
             )
             inverse_global_scale = torch.reciprocal(global_scale)
         else:
-            inverse_global_scale = torch.ones_like(amax)
-            global_scale = torch.ones_like(amax)
+            # ``vector_norm(inf)`` performs the absolute-maximum reduction
+            # without materializing a full-size ``abs()`` tensor.
+            amax = torch.linalg.vector_norm(
+                raw_payload,
+                ord=float("inf"),
+                dtype=torch.float32,
+            )
+            # This scalar read is an intentional POC correctness gate. A
+            # failed transform must be reported synchronously so
+            # StorageManager can roll back instead of publishing bad data.
+            amax_value = float(amax.item())
+            if not math.isfinite(amax_value):
+                raise ValueError("NVFP4 boundary compression rejects non-finite KV")
+            if amax_value > 0:
+                ideal_inverse_scale = amax / _NVFP4_GLOBAL_SCALE_DENOMINATOR
+                # BF16 can represent finite values whose ideal quantization
+                # multiplier exceeds FP32. Clamp the multiplier by clamping
+                # its reciprocal upward, and persist that actual reciprocal.
+                # Half of FLT_MAX leaves one exponent bit of headroom.
+                max_round_trip_safe_scale = torch.finfo(torch.float32).max / 2
+                global_scale = torch.clamp_max(
+                    torch.reciprocal(ideal_inverse_scale),
+                    max_round_trip_safe_scale,
+                )
+                inverse_global_scale = torch.reciprocal(global_scale)
+            else:
+                inverse_global_scale = torch.ones_like(amax)
+                global_scale = torch.ones_like(amax)
 
         # Keep the per-buffer scale contract explicitly one-dimensional.  The
         # existing operator accepts a scalar too, but the persisted inverse
@@ -451,7 +538,7 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
                                         inverse_scale_offset,
                                         record_size,
                                     ) = self._validated_record_layout(
-                                        coalesced.single_buffer_size,
+                                        math.prod(shape),
                                         coalesced.effective_host_single_buffer_size,
                                     )
                                     dst_base = int(page_dst[pool_index]) + host_offset
@@ -542,7 +629,7 @@ class QuantizationForBoundaryCompression(KVCacheCompressionManager):
                                         inverse_scale_offset,
                                         record_size,
                                     ) = self._validated_record_layout(
-                                        coalesced.single_buffer_size,
+                                        math.prod(shape),
                                         coalesced.effective_host_single_buffer_size,
                                     )
                                     record = self._record_view(record_size)

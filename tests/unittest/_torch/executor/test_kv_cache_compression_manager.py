@@ -444,13 +444,17 @@ class TestNVFP4BoundaryOffload:
             target,
         )
 
-    def test_accepts_reuse_on_or_off_but_requires_raw_target_cache(self):
+    def test_accepts_every_registered_direct_runtime_dtype(self):
         manager, target = self._manager(enable_block_reuse=False)
         assert manager.kv_cache_manager is target
+        fp8_manager, fp8_target = self._manager(dtype=DataType.FP8)
+        assert fp8_manager.kv_cache_manager is fp8_target
         with pytest.raises(ValueError, match="target KV cache"):
             self._manager(is_draft=True)
-        with pytest.raises(ValueError, match="must remain FP16 or BF16"):
+        with pytest.raises(ValueError, match="direct two-way NVFP4"):
             self._manager(dtype=DataType.NVFP4)
+        with pytest.raises(ValueError, match="direct two-way NVFP4"):
+            self._manager(dtype=DataType.FLOAT)
 
     def test_default_cpp_kvcm_backend_fails_before_building_storage(self):
         from tensorrt_llm._torch.pyexecutor import kv_cache_manager_v2 as kv_cache_v2_module
@@ -569,6 +573,39 @@ class TestNVFP4BoundaryOffload:
             torch.ones((1,), dtype=torch.float32),
         )
 
+    def test_fp8_uses_representation_scale_without_fp16_staging(self):
+        manager, _ = self._manager(dtype=DataType.FP8)
+        raw = (
+            torch.linspace(-32, 32, 128, dtype=torch.float32).reshape(4, 32).to(torch.float8_e4m3fn)
+        )
+        packed = torch.zeros((4, 16), dtype=torch.uint8)
+        linear_scales = torch.zeros(8, dtype=torch.uint8)
+
+        with patch.object(torch.ops.trtllm, "fp4_quantize", create=True) as quantize:
+            quantize.return_value = packed, linear_scales
+            _, _, inverse_scale = manager.compress_tensor(raw)
+
+        assert quantize.call_args.args[0] is raw
+        torch.testing.assert_close(
+            quantize.call_args.args[1],
+            torch.tensor([6.0], dtype=torch.float32),
+        )
+        torch.testing.assert_close(
+            inverse_scale,
+            torch.tensor([1.0 / 6.0], dtype=torch.float32),
+        )
+
+    def test_fp8_nan_encoding_fails_before_quantization(self):
+        manager, _ = self._manager(dtype=DataType.FP8)
+        raw = torch.ones((4, 32), dtype=torch.float8_e4m3fn)
+        raw.view(torch.uint8)[1, 3] = 0xFF
+
+        with patch.object(torch.ops.trtllm, "fp4_quantize", create=True) as quantize:
+            with pytest.raises(ValueError, match="non-finite KV"):
+                manager.compress_tensor(raw)
+
+        quantize.assert_not_called()
+
     def test_rejects_rank_that_is_not_a_layout_neutral_matrix(self):
         manager, _ = self._manager()
         raw = torch.arange(1, 257, dtype=torch.bfloat16).reshape(2, 4, 32)
@@ -584,20 +621,30 @@ class TestNVFP4BoundaryOffload:
         quantize.assert_not_called()
 
     def test_compact_record_size_contains_payload_scales_and_global_scale(self):
-        raw_size = 4 * 32 * 2
+        num_elements = 4 * 32
         packed_size, scale_size, inverse_scale_offset, host_size = nvfp4_boundary_record_layout(
-            raw_size
+            num_elements
         )
         assert packed_size == 64
         assert scale_size == 8
         assert inverse_scale_offset == 72
         assert host_size == 80
-        assert host_size < raw_size
+        assert host_size < num_elements * 2
 
     def test_record_aligns_an_otherwise_unaligned_global_scale(self):
         # 16 FP16 elements: 8 packed bytes + 1 scale byte. The FP32 scalar
         # starts at byte 12 and the whole record occupies one uint4 grain.
-        packed_size, scale_size, inverse_scale_offset, host_size = nvfp4_boundary_record_layout(32)
+        packed_size, scale_size, inverse_scale_offset, host_size = nvfp4_boundary_record_layout(16)
 
         assert (packed_size, scale_size, inverse_scale_offset) == (8, 1, 12)
         assert host_size == 16
+
+    def test_kvcm_rejects_an_unaligned_feature_width_at_layout_admission(self):
+        # Total elements can still be divisible by 16 (16 rows * 15 columns),
+        # but the direct kernel scales along the final feature dimension.  The
+        # manager must fail at construction rather than during first offload.
+        with pytest.raises(ValueError, match="feature width must be divisible by 16"):
+            KVCacheManagerV2._get_nvfp4_boundary_host_buffer_size(
+                16 * 15,
+                feature_width=15,
+            )

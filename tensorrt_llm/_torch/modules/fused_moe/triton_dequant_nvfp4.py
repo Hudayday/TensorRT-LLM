@@ -283,7 +283,9 @@ def dequant_nvfp4_2d_triton(
         out: optional caller-owned contiguous ``[N, K]`` destination. This is
             used by KVCM V2 boundary decompression to write directly into an
             already-admitted runtime Page.
-        target_dtype: BF16 or FP16.
+        target_dtype: BF16, FP16, or FP8 E4M3FN.  The latter is used by
+            KVCM boundary restoration and is written directly; no FP16
+            intermediate tensor is allocated.
         sf_vec_size: NVFP4 per-block size (16).
         block_n, block_k: Triton tile shape. ``block_k`` must be a multiple
             of ``sf_vec_size``.
@@ -292,6 +294,12 @@ def dequant_nvfp4_2d_triton(
         ``[N, K]`` in ``target_dtype``.
     """
     assert packed_weight.dim() == 2, "packed_weight must be 2D [N, K/2]"
+    if target_dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+    ):
+        raise TypeError(f"unsupported NVFP4 dequant target dtype: {target_dtype}")
     assert sf_vec_size == 16, "NVFP4 fixed at 16-element blocks"
     assert block_k % sf_vec_size == 0, (
         f"block_k={block_k} must be a multiple of sf_vec_size={sf_vec_size}"

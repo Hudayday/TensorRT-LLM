@@ -27,7 +27,11 @@ from strenum import StrEnum
 import tensorrt_llm.runtime.kv_cache_manager_v2 as kv_cache_manager_v2_runtime
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
-from tensorrt_llm._torch.kv_cache_compression.interface import nvfp4_boundary_record_layout
+from tensorrt_llm._torch.kv_cache_compression.interface import (
+    NVFP4_BOUNDARY_BLOCK_SIZE,
+    nvfp4_boundary_record_layout,
+    nvfp4_boundary_supports_runtime_dtype,
+)
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -811,9 +815,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     "KVCacheManagerV2 Host boundary compression currently "
                     "supports only quant='nvfp4'"
                 )
-            if dtype not in (DataType.HALF, DataType.BF16):
+            if not nvfp4_boundary_supports_runtime_dtype(dtype):
                 raise ValueError(
-                    "NVFP4 Host boundary compression requires FP16/BF16 active runtime KV"
+                    "NVFP4 Host boundary compression requires a runtime KV dtype "
+                    "with validated direct NVFP4 compression and restoration"
                 )
             if is_draft:
                 raise ValueError(
@@ -1936,11 +1941,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     * tokens_per_block,
                     host_size=(
                         self._get_nvfp4_boundary_host_buffer_size(
-                            self.get_layer_bytes_per_token(
-                                local_layer_idx=layer_id,
-                                data_role=role,
-                            )
-                            * tokens_per_block
+                            self.num_kv_heads_per_layer[layer_id]
+                            * self.head_dim_per_layer[layer_id]
+                            * tokens_per_block,
+                            feature_width=self.head_dim_per_layer[layer_id],
                         )
                         if self.boundary_compression_quant == "nvfp4"
                         else None
@@ -1983,9 +1987,23 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     @staticmethod
-    def _get_nvfp4_boundary_host_buffer_size(raw_size: int) -> int:
-        """Fixed packed bytes for one FP16/BF16 K or V Page buffer."""
-        return nvfp4_boundary_record_layout(raw_size)[3]
+    def _get_nvfp4_boundary_host_buffer_size(
+        num_elements: int,
+        *,
+        feature_width: int | None = None,
+    ) -> int:
+        """Fixed NVFP4 Host bytes for one logical K or V Page buffer.
+
+        ``BufferConfig.size`` above remains the standard KVCM runtime size for
+        the selected dtype.  Only ``host_size`` comes from this boundary
+        record calculation, so the codec never redefines the source Slot.
+        """
+        if feature_width is not None and feature_width % NVFP4_BOUNDARY_BLOCK_SIZE != 0:
+            raise ValueError(
+                "NVFP4 Page feature width must be divisible by "
+                f"{NVFP4_BOUNDARY_BLOCK_SIZE}, got {feature_width}"
+            )
+        return nvfp4_boundary_record_layout(num_elements)[3]
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
