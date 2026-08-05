@@ -6,9 +6,8 @@
 ``BaseResourceManager``-based single-manager design.
 
 Covers:
-- :class:`KVCacheCompressionManager` contract: the five request/step lifecycle
-  hooks default to no-op, the two storage-boundary hooks fail closed, resource
-  counts are zero, and it inherits
+- :class:`KVCacheCompressionManager` contract: the four lifecycle hooks
+  default to no-op, zero resource counts, and it inherits
   :class:`BaseResourceManager` (so PyExecutor auto-drives it once registered).
 - The resource-manager API -> lifecycle-hook translation, gated on PyExecutor's
   own signals: ``prepare_resources`` fires ``on_request_init`` on each
@@ -59,7 +58,7 @@ class _RecordingMixin:
 
 
 class _MockCompressionManager(_RecordingMixin, KVCacheCompressionManager):
-    """Mock manager that records the request/step lifecycle hooks it uses."""
+    """Mock manager that records the four lifecycle hooks."""
 
     def on_request_init(self, request):
         self._record("on_request_init")
@@ -128,7 +127,7 @@ class TestBaseABC:
         # So PyExecutor's main loop auto-invokes prepare/update/free_resources.
         assert issubclass(KVCacheCompressionManager, BaseResourceManager)
 
-    def test_request_lifecycle_hooks_default_noop(self, fake_kv_cache_manager):
+    def test_four_hooks_default_noop(self, fake_kv_cache_manager):
         m = KVCacheCompressionManager(_compression_config(), fake_kv_cache_manager)
         assert m.on_request_init(MagicMock()) is None
         assert m.on_context_step_end([MagicMock()]) is None

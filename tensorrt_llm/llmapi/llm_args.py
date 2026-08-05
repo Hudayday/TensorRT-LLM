@@ -3592,8 +3592,10 @@ class QuantizationForBoundaryCompressionConfig(KvCacheCompressionConfig):
     not belong in this user config.
     """
 
-    algorithm: Literal[
-        "quantization_for_boundary"] = "quantization_for_boundary"
+    algorithm: Literal["quantization_for_boundary"] = Field(
+        default="quantization_for_boundary",
+        telemetry={"merge_union_literals": True},
+    )
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",
         description="Quantization format stored in the compressed cache tier.")

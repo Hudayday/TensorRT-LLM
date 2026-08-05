@@ -437,6 +437,20 @@ def test_build_capture_manifest_fails_on_divergent_kind_across_union_arms():
         build_capture_manifest(Root)
 
 
+def test_kv_compression_manifest_preserves_both_algorithm_literals():
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.usage.llmapi_config import manifest_rows
+
+    row = {item["path"]: item for item in manifest_rows(TorchLlmArgs)}[
+        "kv_cache_compression_config.algorithm"
+    ]
+    assert row["annotation"] == ("Literal['quantization_for_boundary', 'triattention']")
+    assert row["allowed_values"] == [
+        "quantization_for_boundary",
+        "triattention",
+    ]
+
+
 def test_build_capture_manifest_cycle_guard_terminates_on_self_reference():
     from typing import Optional
 

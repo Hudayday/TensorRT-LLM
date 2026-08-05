@@ -2433,21 +2433,20 @@ class BlockManager:
 class KVCacheCompressionManager(BaseResourceManager):
     """Framework-level base class for all KV-cache compression managers.
 
-    The class has two independent entry families. PyExecutor drives the
-    request/step lifecycle hooks through :class:`BaseResourceManager`.
-    Once integrated, ``KVCacheManagerV2`` drives the two storage-boundary hooks
-    from its migration transaction when a route changes the physical
-    representation.
+    Inherits :class:`BaseResourceManager` so PyExecutor's main loop
+    auto-invokes ``prepare_resources`` / ``update_resources`` /
+    ``free_resources`` each iteration without any PyExecutor code changes; the
+    base implementations below translate those callbacks into the lifecycle
+    hooks.
 
-    Concrete compression methods subclass this directly. Request/step hooks
-    default to no-op; storage-boundary hooks fail closed until a subclass
-    implements the complete transform-plus-transfer payload. The manager never
-    inherits from a cache manager because KVCM owns Pages, Slots, migration
-    ordering, publication, release, and rollback.
+    Concrete compression methods subclass this directly. The hooks default to
+    no-op; subclasses override what they need. The manager never inherits from
+    any cache manager because this layer decides *how* the physical KV is used,
+    not *what* physical KV exists. Subclasses hold ``KVCacheManagerV2`` as a tool.
 
-    Algorithms that shorten physical KV record their evicted-token count on
-    ``LlmRequest.py_num_compressed_tokens``. Boundary-only algorithms preserve
-    token history and leave that field unchanged.
+    A subclass compacts through the ``KVCacheManagerV2`` it holds and records
+    the evicted count on ``LlmRequest.py_num_compressed_tokens``; the model
+    engine subtracts that count when building ``num_cached_tokens_per_seq``.
     """
 
     def __init__(
