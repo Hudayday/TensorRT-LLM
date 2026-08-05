@@ -559,7 +559,7 @@
         "quantization_for_boundary",
         "triattention"
       ],
-      "annotation": "Literal['quantization_for_boundary']",
+      "annotation": "Literal['triattention']",
       "converter": "",
       "kind": "categorical",
       "path": "kv_cache_compression_config.algorithm"
