@@ -6,8 +6,9 @@
 ``BaseResourceManager``-based single-manager design.
 
 Covers:
-- :class:`KVCacheCompressionManager` contract: the four lifecycle hooks
-  default to no-op, zero resource counts, and it inherits
+- :class:`KVCacheCompressionManager` contract: the five request/step lifecycle
+  hooks default to no-op, the two storage-boundary hooks fail closed, resource
+  counts are zero, and it inherits
   :class:`BaseResourceManager` (so PyExecutor auto-drives it once registered).
 - The resource-manager API -> lifecycle-hook translation, gated on PyExecutor's
   own signals: ``prepare_resources`` fires ``on_request_init`` on each
@@ -22,6 +23,7 @@ sparse-attention backend); the ``create_kv_cache_compression_manager`` factory
 lives in ``_util.py`` next to ``_create_kv_cache_manager``.
 """
 
+from inspect import Parameter, signature
 from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import MagicMock, patch
@@ -57,7 +59,7 @@ class _RecordingMixin:
 
 
 class _MockCompressionManager(_RecordingMixin, KVCacheCompressionManager):
-    """Mock manager that records the four lifecycle hooks."""
+    """Mock manager that records the request/step lifecycle hooks it uses."""
 
     def on_request_init(self, request):
         self._record("on_request_init")
@@ -126,13 +128,41 @@ class TestBaseABC:
         # So PyExecutor's main loop auto-invokes prepare/update/free_resources.
         assert issubclass(KVCacheCompressionManager, BaseResourceManager)
 
-    def test_four_hooks_default_noop(self, fake_kv_cache_manager):
+    def test_request_lifecycle_hooks_default_noop(self, fake_kv_cache_manager):
         m = KVCacheCompressionManager(_compression_config(), fake_kv_cache_manager)
         assert m.on_request_init(MagicMock()) is None
         assert m.on_context_step_end([MagicMock()]) is None
         assert m.on_generation_step_begin(MagicMock()) is None
         assert m.on_generation_step_end(MagicMock()) is None
         assert m.on_request_finish(MagicMock()) is None
+
+    def test_storage_boundary_hooks_fail_closed(self, fake_kv_cache_manager):
+        m = KVCacheCompressionManager(_compression_config(), fake_kv_cache_manager)
+        batch = {
+            "pool_group_index": 2,
+            "src_life_cycles": (0, 1),
+            "src_addresses": ((0x1000,), (0x2000,)),
+            "dst_addresses": ((0x3000, 0x4000), (0x5000, 0x6000)),
+            "stream": 0x7000,
+        }
+
+        with pytest.raises(NotImplementedError, match="GPU-to-Host"):
+            m.on_offload_compress(**batch)
+        with pytest.raises(NotImplementedError, match="Host-to-GPU"):
+            m.on_onboard_decompress(**batch)
+
+    def test_storage_boundary_hooks_have_explicit_keyword_only_contract(self):
+        expected = {
+            "pool_group_index",
+            "src_life_cycles",
+            "src_addresses",
+            "dst_addresses",
+            "stream",
+        }
+        for hook_name in ("on_offload_compress", "on_onboard_decompress"):
+            parameters = signature(getattr(KVCacheCompressionManager, hook_name)).parameters
+            assert set(parameters) == {"self", *expected}
+            assert all(parameters[name].kind is Parameter.KEYWORD_ONLY for name in expected)
 
     def test_hooks_accept_extra_kwargs(self, fake_kv_cache_manager):
         # **kwargs lets the framework pass new args later without breaking

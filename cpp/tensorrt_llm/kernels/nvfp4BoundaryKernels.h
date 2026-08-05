@@ -28,11 +28,15 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-//! Runtime 16-bit type used by the boundary kernels.
-enum class Nvfp4Boundary16BitType : std::uint8_t
+//! Active GPU representation restored at the Host boundary.
+//
+//! This is an algorithm-side dispatch value, not Page metadata. KVCM owns the
+//! runtime layout and supplies one homogeneous layer cohort per call.
+enum class Nvfp4BoundaryRuntimeType : std::uint8_t
 {
     kFloat16,
     kBfloat16,
+    kFp8E4m3,
 };
 
 //! One GPU-to-Host Page transform.
@@ -95,21 +99,20 @@ struct Nvfp4BoundaryKernelParams
     float fp8ScaleQuantOrig[2];
 };
 
-//! Fuse FP16/BF16 -> native-layout NVFP4 with direct stores to mapped Host memory.
-void invokeNvfp4BoundaryOffloadFrom16Bit(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,
-    Nvfp4BoundaryKernelParams const& params, Nvfp4Boundary16BitType inputType, cudaStream_t stream);
+//! Compress a homogeneous GPU Page cohort and transfer it directly to mapped Host memory.
+//
+//! The caller owns Page selection, source/destination lifetime, the CUDA
+//! stream, completion fencing, publication, release, and rollback. This
+//! function submits only the complete NVFP4 transform-plus-transfer payload.
+void invokeNvfp4BoundaryOffloadCompress(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,
+    Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryRuntimeType runtimeType, cudaStream_t stream);
 
-//! Fuse mapped-Host native-layout NVFP4 loads with FP16/BF16 restoration on GPU.
-void invokeNvfp4BoundaryOnboardTo16Bit(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks,
-    Nvfp4BoundaryKernelParams const& params, Nvfp4Boundary16BitType outputType, cudaStream_t stream);
-
-//! Fuse FP8 E4M3 -> native-layout NVFP4 with direct stores to mapped Host memory.
-void invokeNvfp4BoundaryOffloadFromFp8(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,
-    Nvfp4BoundaryKernelParams const& params, cudaStream_t stream);
-
-//! Fuse mapped-Host native-layout NVFP4 loads with FP8 E4M3 restoration on GPU.
-void invokeNvfp4BoundaryOnboardToFp8(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks,
-    Nvfp4BoundaryKernelParams const& params, cudaStream_t stream);
+//! Transfer a homogeneous mapped-Host cohort and restore the active GPU representation.
+//
+//! For a non-empty batch, successful return means work was enqueued on
+//! ``stream``; it does not publish the destination or synchronize the stream.
+void invokeNvfp4BoundaryOnboardDecompress(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks,
+    Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryRuntimeType runtimeType, cudaStream_t stream);
 
 } // namespace kernels
 

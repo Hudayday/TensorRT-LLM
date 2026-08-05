@@ -424,62 +424,60 @@ void launchOnboardToFp8(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks, 
 
 } // namespace
 
-void invokeNvfp4BoundaryOffloadFrom16Bit(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,
-    Nvfp4BoundaryKernelParams const& params, Nvfp4Boundary16BitType inputType, cudaStream_t stream)
+void invokeNvfp4BoundaryOffloadCompress(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,
+    Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryRuntimeType runtimeType, cudaStream_t stream)
 {
     if (tasks.empty())
     {
         return;
     }
-    validateParams(params, false);
-    validateTasks(tasks, 16);
-    switch (inputType)
+    switch (runtimeType)
     {
-    case Nvfp4Boundary16BitType::kFloat16: launchOffloadFrom16Bit<half>(tasks, params, stream); break;
-    case Nvfp4Boundary16BitType::kBfloat16: launchOffloadFrom16Bit<__nv_bfloat16>(tasks, params, stream); break;
-    default: TLLM_THROW("Unsupported 16-bit boundary input type");
+    case Nvfp4BoundaryRuntimeType::kFloat16:
+        validateParams(params, false);
+        validateTasks(tasks, 16);
+        launchOffloadFrom16Bit<half>(tasks, params, stream);
+        break;
+    case Nvfp4BoundaryRuntimeType::kBfloat16:
+        validateParams(params, false);
+        validateTasks(tasks, 16);
+        launchOffloadFrom16Bit<__nv_bfloat16>(tasks, params, stream);
+        break;
+    case Nvfp4BoundaryRuntimeType::kFp8E4m3:
+        validateParams(params, true);
+        validateTasks(tasks, 8);
+        launchOffloadFromFp8(tasks, params, stream);
+        break;
+    default: TLLM_THROW("Unsupported NVFP4 boundary runtime type");
     }
 }
 
-void invokeNvfp4BoundaryOnboardTo16Bit(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks,
-    Nvfp4BoundaryKernelParams const& params, Nvfp4Boundary16BitType outputType, cudaStream_t stream)
+void invokeNvfp4BoundaryOnboardDecompress(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks,
+    Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryRuntimeType runtimeType, cudaStream_t stream)
 {
     if (tasks.empty())
     {
         return;
     }
-    validateParams(params, false);
-    validateTasks(tasks, 16);
-    switch (outputType)
+    switch (runtimeType)
     {
-    case Nvfp4Boundary16BitType::kFloat16: launchOnboardTo16Bit<half>(tasks, params, stream); break;
-    case Nvfp4Boundary16BitType::kBfloat16: launchOnboardTo16Bit<__nv_bfloat16>(tasks, params, stream); break;
-    default: TLLM_THROW("Unsupported 16-bit boundary output type");
+    case Nvfp4BoundaryRuntimeType::kFloat16:
+        validateParams(params, false);
+        validateTasks(tasks, 16);
+        launchOnboardTo16Bit<half>(tasks, params, stream);
+        break;
+    case Nvfp4BoundaryRuntimeType::kBfloat16:
+        validateParams(params, false);
+        validateTasks(tasks, 16);
+        launchOnboardTo16Bit<__nv_bfloat16>(tasks, params, stream);
+        break;
+    case Nvfp4BoundaryRuntimeType::kFp8E4m3:
+        validateParams(params, true);
+        validateTasks(tasks, 8);
+        launchOnboardToFp8(tasks, params, stream);
+        break;
+    default: TLLM_THROW("Unsupported NVFP4 boundary runtime type");
     }
-}
-
-void invokeNvfp4BoundaryOffloadFromFp8(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,
-    Nvfp4BoundaryKernelParams const& params, cudaStream_t stream)
-{
-    if (tasks.empty())
-    {
-        return;
-    }
-    validateParams(params, true);
-    validateTasks(tasks, 8);
-    launchOffloadFromFp8(tasks, params, stream);
-}
-
-void invokeNvfp4BoundaryOnboardToFp8(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks,
-    Nvfp4BoundaryKernelParams const& params, cudaStream_t stream)
-{
-    if (tasks.empty())
-    {
-        return;
-    }
-    validateParams(params, true);
-    validateTasks(tasks, 8);
-    launchOnboardToFp8(tasks, params, stream);
 }
 
 } // namespace kernels

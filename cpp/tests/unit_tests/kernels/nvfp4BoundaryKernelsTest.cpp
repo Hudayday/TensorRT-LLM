@@ -39,10 +39,10 @@ namespace
 
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::HostMem;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::MemAddress;
-using tensorrt_llm::kernels::Nvfp4Boundary16BitType;
 using tensorrt_llm::kernels::Nvfp4BoundaryKernelParams;
 using tensorrt_llm::kernels::Nvfp4BoundaryOffloadPageTask;
 using tensorrt_llm::kernels::Nvfp4BoundaryOnboardPageTask;
+using tensorrt_llm::kernels::Nvfp4BoundaryRuntimeType;
 
 constexpr std::size_t kGuardBytes = 64;
 constexpr std::uint8_t kCanary = 0xA5;
@@ -461,7 +461,7 @@ std::vector<std::uint8_t> decompressReference(ReferenceNvfp4 const& compressed, 
     return raw;
 }
 
-void runFourPathRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultGeometry,
+void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultGeometry,
     std::size_t numPages = kDefaultNumPages, InputPattern inputPattern = InputPattern::kDense)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
@@ -489,16 +489,16 @@ void runFourPathRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         pages.push_back(std::move(buffers));
     }
 
-    if (kind == RawKind::kFp8)
+    auto runtimeType = Nvfp4BoundaryRuntimeType::kFp8E4m3;
+    if (kind == RawKind::kFloat16)
     {
-        tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadFromFp8(offloadTasks, params, stream);
+        runtimeType = Nvfp4BoundaryRuntimeType::kFloat16;
     }
-    else
+    else if (kind == RawKind::kBfloat16)
     {
-        auto const type
-            = kind == RawKind::kFloat16 ? Nvfp4Boundary16BitType::kFloat16 : Nvfp4Boundary16BitType::kBfloat16;
-        tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadFrom16Bit(offloadTasks, params, type, stream);
+        runtimeType = Nvfp4BoundaryRuntimeType::kBfloat16;
     }
+    tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(offloadTasks, params, runtimeType, stream);
 
     cudaEvent_t offloadComplete{};
     ASSERT_EQ(cudaEventCreateWithFlags(&offloadComplete, cudaEventDisableTiming), cudaSuccess);
@@ -524,16 +524,7 @@ void runFourPathRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         onboardTasks.push_back({page->packedK.bytes(), page->packedV.bytes(), page->scaleK.bytes(),
             page->scaleV.bytes(), page->rawOutputK.data(), page->rawOutputV.data()});
     }
-    if (kind == RawKind::kFp8)
-    {
-        tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardToFp8(onboardTasks, params, stream);
-    }
-    else
-    {
-        auto const type
-            = kind == RawKind::kFloat16 ? Nvfp4Boundary16BitType::kFloat16 : Nvfp4Boundary16BitType::kBfloat16;
-        tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardTo16Bit(onboardTasks, params, type, stream);
-    }
+    tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(onboardTasks, params, runtimeType, stream);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     for (std::size_t page = 0; page < numPages; ++page)
@@ -559,34 +550,34 @@ class Nvfp4Boundary16BitTest : public testing::TestWithParam<RawKind>
 
 TEST_P(Nvfp4Boundary16BitTest, BatchesDisjointPagesAndMatchesNativeLayout)
 {
-    runFourPathRoundTrip(GetParam());
+    runBoundaryRoundTrip(GetParam());
 }
 
 INSTANTIATE_TEST_SUITE_P(RuntimeType, Nvfp4Boundary16BitTest, testing::Values(RawKind::kFloat16, RawKind::kBfloat16));
 
 TEST(Nvfp4BoundaryFp8Test, BatchesDisjointPagesWithIndependentSourceAndTargetScales)
 {
-    runFourPathRoundTrip(RawKind::kFp8);
+    runBoundaryRoundTrip(RawKind::kFp8);
 }
 
 TEST(Nvfp4BoundaryGeometryTest, SupportsMinimumNativeGeometryAndWarpTail)
 {
-    runFourPathRoundTrip(RawKind::kFloat16, kMinimumNativeGeometry, 1);
+    runBoundaryRoundTrip(RawKind::kFloat16, kMinimumNativeGeometry, 1);
 }
 
 TEST(Nvfp4BoundaryGeometryTest, SupportsSecondCtaWithPartialThreadTail)
 {
-    runFourPathRoundTrip(RawKind::kFloat16, kSecondCtaTailGeometry, 1);
+    runBoundaryRoundTrip(RawKind::kFloat16, kSecondCtaTailGeometry, 1);
 }
 
 TEST(Nvfp4BoundaryGeometryTest, SupportsModelLikeBfloat16Page)
 {
-    runFourPathRoundTrip(RawKind::kBfloat16, kModelLikeGeometry, 1);
+    runBoundaryRoundTrip(RawKind::kBfloat16, kModelLikeGeometry, 1);
 }
 
 TEST(Nvfp4BoundaryGeometryTest, SupportsModelLikeFp8Page)
 {
-    runFourPathRoundTrip(RawKind::kFp8, kModelLikeGeometry, 1);
+    runBoundaryRoundTrip(RawKind::kFp8, kModelLikeGeometry, 1);
 }
 
 class Nvfp4BoundaryInputPatternTest : public testing::TestWithParam<RawKind>
@@ -595,12 +586,12 @@ class Nvfp4BoundaryInputPatternTest : public testing::TestWithParam<RawKind>
 
 TEST_P(Nvfp4BoundaryInputPatternTest, HandlesAllZeroScaleGroups)
 {
-    runFourPathRoundTrip(GetParam(), kDefaultGeometry, 1, InputPattern::kAllZero);
+    runBoundaryRoundTrip(GetParam(), kDefaultGeometry, 1, InputPattern::kAllZero);
 }
 
 TEST_P(Nvfp4BoundaryInputPatternTest, ReducesAmaxAcrossBothWarpLanes)
 {
-    runFourPathRoundTrip(GetParam(), kDefaultGeometry, 1, InputPattern::kSparseOutlier);
+    runBoundaryRoundTrip(GetParam(), kDefaultGeometry, 1, InputPattern::kSparseOutlier);
 }
 
 INSTANTIATE_TEST_SUITE_P(AllRuntimeTypes, Nvfp4BoundaryInputPatternTest,
@@ -608,31 +599,30 @@ INSTANTIATE_TEST_SUITE_P(AllRuntimeTypes, Nvfp4BoundaryInputPatternTest,
 
 TEST(Nvfp4BoundaryRoundingTest, QuantizesValuesSafelyAwayFromE2m1Ties)
 {
-    runFourPathRoundTrip(RawKind::kFloat16, kDefaultGeometry, 1, InputPattern::kRoundingMargins);
+    runBoundaryRoundTrip(RawKind::kFloat16, kDefaultGeometry, 1, InputPattern::kRoundingMargins);
 }
 
 TEST(Nvfp4BoundaryBatchingTest, AcceptsExactlyOneFullThirtyTwoPageDescriptorChunk)
 {
-    runFourPathRoundTrip(RawKind::kFloat16, kMinimumNativeGeometry, 32);
+    runBoundaryRoundTrip(RawKind::kFloat16, kMinimumNativeGeometry, 32);
 }
 
 TEST(Nvfp4BoundaryBatchingTest, Float16CrossesTheThirtyTwoPageDescriptorChunkBoundary)
 {
-    runFourPathRoundTrip(RawKind::kFloat16, kMinimumNativeGeometry, kCrossLaunchNumPages);
+    runBoundaryRoundTrip(RawKind::kFloat16, kMinimumNativeGeometry, kCrossLaunchNumPages);
 }
 
 TEST(Nvfp4BoundaryBatchingTest, Fp8CrossesTheThirtyTwoPageDescriptorChunkBoundary)
 {
-    runFourPathRoundTrip(RawKind::kFp8, kMinimumNativeGeometry, kCrossLaunchNumPages);
+    runBoundaryRoundTrip(RawKind::kFp8, kMinimumNativeGeometry, kCrossLaunchNumPages);
 }
 
 TEST(Nvfp4BoundaryValidationTest, EmptyBatchIsAnAsyncNoOp)
 {
     Nvfp4BoundaryKernelParams params{};
-    tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadFromFp8({}, params, nullptr);
-    tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardToFp8({}, params, nullptr);
-    tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadFrom16Bit({}, params, Nvfp4Boundary16BitType::kFloat16, nullptr);
-    tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardTo16Bit({}, params, Nvfp4Boundary16BitType::kFloat16, nullptr);
+    tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress({}, params, Nvfp4BoundaryRuntimeType::kFp8E4m3, nullptr);
+    tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(
+        {}, params, Nvfp4BoundaryRuntimeType::kFloat16, nullptr);
 }
 
 TEST(Nvfp4BoundaryValidationTest, RejectsInvalidGeometryAndScalesBeforeLaunch)
@@ -649,11 +639,14 @@ TEST(Nvfp4BoundaryValidationTest, RejectsInvalidGeometryAndScalesBeforeLaunch)
         buffers.packedK.bytes(), buffers.packedV.bytes(), buffers.scaleK.bytes(), buffers.scaleV.bytes()}};
     auto const invoke16Bit = [&](Nvfp4BoundaryKernelParams const& params)
     {
-        tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadFrom16Bit(
-            tasks, params, Nvfp4Boundary16BitType::kFloat16, nullptr);
+        tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
+            tasks, params, Nvfp4BoundaryRuntimeType::kFloat16, nullptr);
     };
     auto const invokeFp8 = [&](Nvfp4BoundaryKernelParams const& params)
-    { tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadFromFp8(tasks, params, nullptr); };
+    {
+        tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
+            tasks, params, Nvfp4BoundaryRuntimeType::kFp8E4m3, nullptr);
+    };
 
     Nvfp4BoundaryKernelParams invalid = makeParams();
     invalid.numKvHeads = 0;
@@ -712,32 +705,35 @@ TEST(Nvfp4BoundaryValidationTest, RejectsNullMisalignedAndUnsupportedDescriptors
 
     auto invalidOffload = validOffload;
     invalidOffload.rawK = nullptr;
-    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadFrom16Bit(
-        {invalidOffload}, params, Nvfp4Boundary16BitType::kFloat16, nullptr));
+    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
+        {invalidOffload}, params, Nvfp4BoundaryRuntimeType::kFloat16, nullptr));
     invalidOffload = validOffload;
     invalidOffload.rawK = static_cast<std::uint8_t const*>(validOffload.rawK) + 1;
-    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadFrom16Bit(
-        {invalidOffload}, params, Nvfp4Boundary16BitType::kFloat16, nullptr));
+    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
+        {invalidOffload}, params, Nvfp4BoundaryRuntimeType::kFloat16, nullptr));
     invalidOffload = validOffload;
     invalidOffload.packedV += 1;
-    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadFromFp8({invalidOffload}, params, nullptr));
+    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
+        {invalidOffload}, params, Nvfp4BoundaryRuntimeType::kFp8E4m3, nullptr));
     invalidOffload = validOffload;
     invalidOffload.blockScaleK = nullptr;
-    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadFromFp8({invalidOffload}, params, nullptr));
+    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
+        {invalidOffload}, params, Nvfp4BoundaryRuntimeType::kFp8E4m3, nullptr));
 
     auto invalidOnboard = validOnboard;
     invalidOnboard.packedK = nullptr;
-    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardTo16Bit(
-        {invalidOnboard}, params, Nvfp4Boundary16BitType::kFloat16, nullptr));
+    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(
+        {invalidOnboard}, params, Nvfp4BoundaryRuntimeType::kFloat16, nullptr));
     invalidOnboard = validOnboard;
     invalidOnboard.rawV = static_cast<std::uint8_t*>(validOnboard.rawV) + 1;
-    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardToFp8({invalidOnboard}, params, nullptr));
+    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(
+        {invalidOnboard}, params, Nvfp4BoundaryRuntimeType::kFp8E4m3, nullptr));
 
-    auto const unsupportedType = static_cast<Nvfp4Boundary16BitType>(255);
+    auto const unsupportedType = static_cast<Nvfp4BoundaryRuntimeType>(255);
     EXPECT_ANY_THROW(
-        tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadFrom16Bit({validOffload}, params, unsupportedType, nullptr));
+        tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress({validOffload}, params, unsupportedType, nullptr));
     EXPECT_ANY_THROW(
-        tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardTo16Bit({validOnboard}, params, unsupportedType, nullptr));
+        tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress({validOnboard}, params, unsupportedType, nullptr));
 }
 
 } // namespace

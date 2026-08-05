@@ -2433,20 +2433,21 @@ class BlockManager:
 class KVCacheCompressionManager(BaseResourceManager):
     """Framework-level base class for all KV-cache compression managers.
 
-    Inherits :class:`BaseResourceManager` so PyExecutor's main loop
-    auto-invokes ``prepare_resources`` / ``update_resources`` /
-    ``free_resources`` each iteration without any PyExecutor code changes; the
-    base implementations below translate those callbacks into the lifecycle
-    hooks.
+    The class has two independent entry families. PyExecutor drives the
+    request/step lifecycle hooks through :class:`BaseResourceManager`.
+    Once integrated, ``KVCacheManagerV2`` drives the two storage-boundary hooks
+    from its migration transaction when a route changes the physical
+    representation.
 
-    Concrete compression methods subclass this directly. The hooks default to
-    no-op; subclasses override what they need. The manager never inherits from
-    any cache manager because this layer decides *how* the physical KV is used,
-    not *what* physical KV exists. Subclasses hold ``KVCacheManagerV2`` as a tool.
+    Concrete compression methods subclass this directly. Request/step hooks
+    default to no-op; storage-boundary hooks fail closed until a subclass
+    implements the complete transform-plus-transfer payload. The manager never
+    inherits from a cache manager because KVCM owns Pages, Slots, migration
+    ordering, publication, release, and rollback.
 
-    A subclass compacts through the ``KVCacheManagerV2`` it holds and records
-    the evicted count on ``LlmRequest.py_num_compressed_tokens``; the model
-    engine subtracts that count when building ``num_cached_tokens_per_seq``.
+    Algorithms that shorten physical KV record their evicted-token count on
+    ``LlmRequest.py_num_compressed_tokens``. Boundary-only algorithms preserve
+    token history and leave that field unchanged.
     """
 
     def __init__(
@@ -2518,6 +2519,53 @@ class KVCacheCompressionManager(BaseResourceManager):
         ``on_request_init``. Underlying KV blocks are still freed by the
         ``KVCacheManagerV2``; subclasses must not free them here.
         """
+
+    # ================================================================== #
+    # Storage-boundary hooks. Once integrated, KVCM V2 calls one of these  #
+    # from its migration transaction; they are not ResourceManager hooks. #
+    # ================================================================== #
+
+    def on_offload_compress(
+        self,
+        *,
+        pool_group_index: int,
+        src_life_cycles: Sequence[int],
+        src_addresses: Sequence[Sequence[int]],
+        dst_addresses: Sequence[Sequence[int]],
+        stream: int,
+    ) -> None:
+        """Enqueue compression plus GPU-to-Host transfer for a Page batch.
+
+        KVCM supplies one source and destination physical-Pool address row per
+        Page after selecting the Pages, admitting destination Slots, and
+        waiting on prior ready events. The concrete manager resolves logical
+        K/V roles using its immutable tier layouts and submits all work to
+        ``stream``. It must not publish a Page, release a Slot, or synchronize
+        the stream.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement GPU-to-Host "
+            "KV-cache compression")
+
+    def on_onboard_decompress(
+        self,
+        *,
+        pool_group_index: int,
+        src_life_cycles: Sequence[int],
+        src_addresses: Sequence[Sequence[int]],
+        dst_addresses: Sequence[Sequence[int]],
+        stream: int,
+    ) -> None:
+        """Enqueue Host-to-GPU transfer plus runtime-format restoration.
+
+        The destination rows describe already-admitted GPU runtime Slots. The
+        compressed Host source remains authoritative until KVCM fences this
+        stream and publishes the destination. The manager receives no Page,
+        PageStatus, Attention object, or Attention metadata.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement Host-to-GPU "
+            "KV-cache decompression")
 
     # ================================================================== #
     # BaseResourceManager interface — PyExecutor auto-invokes these each  #
