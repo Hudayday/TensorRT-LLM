@@ -170,11 +170,9 @@ def _load_native_bindings():
     tries to submit work without the binding.
     """
 
-    from tensorrt_llm.bindings.internal.batch_manager import (  # type: ignore
-        kv_cache_manager_v2_utils,
-    )
+    from tensorrt_llm.bindings.internal import kv_cache_compression  # type: ignore
 
-    return kv_cache_manager_v2_utils
+    return kv_cache_compression
 
 
 class QuantizationForBoundaryCompression(KVCacheCompressionManager):

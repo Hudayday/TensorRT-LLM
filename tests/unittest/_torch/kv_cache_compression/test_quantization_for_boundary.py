@@ -8,6 +8,7 @@ six native addresses correctly and keeps launches batched across disjoint
 Pages.  Native calls are recorded so the tests do not require a GPU.
 """
 
+import importlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -17,6 +18,7 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary import (
     BoundaryBufferLayout,
     Nvfp4BoundaryLayerLayout,
     QuantizationForBoundaryCompression,
+    _load_native_bindings,
 )
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm.llmapi.llm_args import QuantizationForBoundaryCompressionConfig
@@ -82,6 +84,22 @@ def _native():
 
 def _manager(*layouts):
     return QuantizationForBoundaryCompression(_config(), _v2_manager(), layer_layouts=layouts)
+
+
+def test_native_binding_is_owned_by_kv_cache_compression_module():
+    native = _load_native_bindings()
+    old_owner = importlib.import_module(
+        "tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils"
+    )
+
+    assert native.__name__ == "tensorrt_llm.bindings.internal.kv_cache_compression"
+    for symbol in (
+        "Nvfp4BoundaryRuntimeType",
+        "nvfp4_boundary_offload_compress",
+        "nvfp4_boundary_onboard_decompress",
+    ):
+        assert hasattr(native, symbol)
+        assert not hasattr(old_owner, symbol)
 
 
 def test_layout_rejects_values_that_cannot_cross_the_native_abi():

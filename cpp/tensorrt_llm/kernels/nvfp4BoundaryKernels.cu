@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/cudaAsyncOps.cuh"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
 #include <algorithm>
@@ -38,7 +39,16 @@ namespace kernels
 namespace
 {
 
-constexpr std::uint32_t kThreadsPerBlock = 256;
+// BATCHEDCOPY REUSE: match KVCM V2's Host-copy CTA and four-stage pipeline.
+// Original implementation:
+// https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/batch_manager/kvCacheManagerV2Utils.cu
+// Both boundary directions touch CUDA-mapped Host memory, so the first async
+// implementation also keeps batchedCopy's one-split low-bandwidth policy.
+// Split-count tuning is a separate measured optimization, not part of the
+// correctness port.
+constexpr std::uint32_t kThreadsPerBlock = 128;
+constexpr std::uint32_t kAsyncStages = 4;
+constexpr std::uint32_t kHostMemorySplits = 1;
 constexpr std::uint32_t kTasksPerLaunch = 32;
 constexpr std::uint32_t kElementsPerLane = 8;
 constexpr std::uint32_t kElementsPerBlockScale = 16;
@@ -47,19 +57,50 @@ static_assert(kThreadsPerBlock % 2 == 0, "An NVFP4 scale group is shared by two 
 static_assert(std::is_trivially_copyable_v<Nvfp4BoundaryOffloadPageTask>);
 static_assert(std::is_trivially_copyable_v<Nvfp4BoundaryOnboardPageTask>);
 
-//! Reuse boundary for this first prototype:
+//! Reuse boundary for the fused implementation:
 //!
 //! * Quantization math is reused directly from `quantization.cuh`.
-//! * The task-array idea mirrors KVCM V2's `batchedCopy<N>` so one launch can
-//!   cover non-contiguous Pages.  The implementation below does not copy its
-//!   four-stage `cp.async`/shared-memory pipeline yet.
-//! * A future optimized variant can adapt that pipeline around the transform:
-//!   async source load -> quant/dequant in registers -> direct destination
-//!   store.  It cannot call `batchedCopy<N>` itself because source and
-//!   destination layouts and byte counts differ.
+//! * The task-array batching, split/iteration indexing, four-stage shared ring,
+//!   and commit/wait order are adapted from KVCM V2's `batchedCopy<N>`.
+//! * `cp_async_commit_group()` and `cp_async_wait_group<N>()` are reused from
+//!   TensorRT-LLM's shared `cudaAsyncOps.cuh` primitives.
+//! * The source load width is adapted to each numerical work unit: 16 bytes
+//!   for FP16/BF16 offload, 8 bytes for FP8 offload, and 4 packed bytes for
+//!   onboard. The transformed destination therefore cannot call the original
+//!   identity-copy kernel, whose source and destination have equal layouts.
 //!
-//! Keeping that distinction explicit prevents a functional prototype from
-//! being mistaken for a measured port of the production copy kernel.
+//! No compact GPU staging is introduced: shared memory is CTA-local pipeline
+//! storage, then the kernel writes the final destination directly.
+
+//! Issue one global-to-shared asynchronous load.
+//!
+//! BATCHEDCOPY REUSE: the 16-byte branch is the same `cp.async.cg` instruction
+//! used by `kvCacheManagerV2Utils.cu::batchedCopy<N>`. BOUNDARY ADAPTATION:
+//! FP8 and packed E2M1 naturally use 8-byte and 4-byte work units, so those
+//! branches reuse the existing generic `ldgsts<Bytes>` (`cp.async.ca`) helper
+//! instead of changing the quant/dequant thread mapping merely to force 16 B.
+//! Original async helpers:
+//! https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/cudaAsyncOps.cuh
+template <std::uint32_t Bytes, typename T>
+__device__ __forceinline__ void copyAsyncGlobalToShared(T* shared, T const* global, bool valid)
+{
+    static_assert(Bytes == 4 || Bytes == 8 || Bytes == 16, "cp.async supports 4, 8, or 16-byte copies");
+    static_assert(sizeof(T) == Bytes, "The async-copy width must match the staged value");
+    if constexpr (Bytes == 16)
+    {
+        if (valid)
+        {
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                         :
+                         : "l"(__cvta_generic_to_shared(shared)), "l"(global)
+                         : "memory");
+        }
+    }
+    else
+    {
+        ldgsts<Bytes>(reinterpret_cast<int*>(shared), reinterpret_cast<int const*>(global), valid);
+    }
+}
 
 template <typename T>
 __device__ T const* selectRawInput(Nvfp4BoundaryOffloadPageTask const& task, std::uint32_t role)
@@ -96,6 +137,8 @@ __device__ T* selectRawOutput(Nvfp4BoundaryOnboardPageTask const& task, std::uin
 //! K scales are linear. V scales use the token-4 order consumed by the native
 //! TRTLLM-gen NVFP4 KV path. `row` is the flattened [head, token] index; a
 //! normal tokens-per-Page value divisible by four therefore never mixes heads.
+//! Original native KV writer (`quantizeAndWriteFP4KVCache`):
+//! https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/unfusedAttentionKernels/unfusedAttentionKernels_2_template.h
 __device__ std::uint32_t scaleOffset(
     std::uint32_t role, std::uint32_t row, std::uint32_t scaleInRow, std::uint32_t scalesPerRow)
 {
@@ -106,10 +149,16 @@ __device__ std::uint32_t scaleOffset(
     return (row / 4) * (4 * scalesPerRow) + scaleInRow * 4 + row % 4;
 }
 
-//! Convert one lane's eight packed E2M1 values to float. This is the same SM100
-//! conversion sequence used by ARCQuant and fused MoE communication, kept local
-//! here because those implementations expose no reusable public device helper.
-__device__ void e2m1ToFloat8(std::uint32_t packed, float2 (&values)[4])
+//! Unpack one lane's eight E2M1 values into four float2 values.
+//!
+//! The word "eight" describes the number of scalar values; this helper does
+//! not produce the FP8 E4M3 dtype. The SM100 E2M1->FP16x2 PTX sequence is
+//! adapted from ARCQuant/fused-MoE, then FP16x2 is widened to float2 so the two
+//! onboard kernels can independently target FP16/BF16 or FP8.
+//! Original dequant helpers:
+//! https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/arcquantFP4.cu
+//! https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/fusedMoeCommKernels.cu
+__device__ void unpackE2m1ToFloat(std::uint32_t packed, float2 (&values)[4])
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     std::uint32_t fp16Pairs[4];
@@ -155,213 +204,390 @@ __device__ void store16BitValues(T* output, std::uint32_t elementOffset, float2 
 
 //! FP16/BF16 GPU Page -> Host NVFP4: fused quantization plus D2H.
 //!
-//! The generic contiguous path is
-//! `invokeFP4Quantization -> quantize_with_block_size ->
-//! cvt_warp_fp16_to_fp4`. This boundary kernel does not call or copy the first
-//! two layers; it directly calls their existing innermost device primitive,
-//! `cvt_warp_fp16_to_fp4`, from `quantization.cuh`. It also adapts the
-//! K-linear/V-token-4 scale order from `quantizeAndWriteFP4KVCache`.
+//! Exact fused call/data flow:
 //!
-//! The new Page shell batches disjoint Slots and routes K/V buffers. Its
-//! packed-data store below and the scale store inside
-//! `cvt_warp_fp16_to_fp4` target CUDA-mapped Host addresses, so those GPU
-//! global stores are the D2H transfer. There is no call to KVCM V2
-//! `batchedCopy<N>`, compact GPU staging buffer, or separate copy kernel in the
-//! current implementation.
+//! `invokeNvfp4BoundaryOffloadCompress`
+//!   -> `launchOffloadFrom16Bit`                         [BOUNDARY NEW]
+//!   -> `offloadFrom16BitKernel`
+//!      -> 4-stage `cp.async` GPU raw -> shared          [BATCHEDCOPY ADAPTATION]
+//!      -> `cvt_warp_fp16_to_fp4`                        [NVFP4 DIRECT REUSE]
+//!      -> native K/V scale offset + mapped-Host stores  [BOUNDARY ADAPTATION]
 //!
-//! Provenance: DIRECT REUSE = `PackedVec` + `cvt_warp_fp16_to_fp4`;
-//! ADAPTED CONTRACT = native-KV K/V scale offsets; NEW = Page-task routing,
-//! launch geometry, and mapped-Host stores.
+//! The generic quantization hierarchy is `invokeFP4Quantization ->
+//! quantize_with_block_size -> cvt_warp_fp16_to_fp4`. This Page-specialized
+//! kernel calls only the proven innermost primitive. Its async ring and
+//! load/commit/wait order come from KVCM V2 `batchedCopy<N>`; unlike the
+//! identity copy, quantization changes one 16-byte raw input into a 4-byte
+//! packed output plus one scale shared by two lanes, so the final mapped-Host
+//! stores are boundary-specific and remain in this same kernel.
+//! Original quant hierarchy and leaf primitive:
+//! https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/quantization.cu
+//! https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/quantization.cuh
+//! Original D2H/H2D pipeline:
+//! https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/batch_manager/kvCacheManagerV2Utils.cu
 template <std::uint32_t N, typename T>
 __global__ void offloadFrom16BitKernel(std::array<Nvfp4BoundaryOffloadPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    // NEW: grid.z selects one disjoint Page task; grid.y selects K or V.
-    std::uint32_t const halfGroup = blockIdx.x * blockDim.x + threadIdx.x;
-    if (halfGroup >= halfGroupsPerRole)
-    {
-        return;
-    }
-
+    // BOUNDARY ADAPTATION: grid.z selects one disjoint Page and grid.y selects
+    // K or V. grid.x remains a split dimension so the low-bandwidth policy can
+    // later be tuned without changing the Page-task ABI.
     std::uint32_t const role = blockIdx.y;
     auto const& task = tasks[blockIdx.z];
-    std::uint32_t const laneInScale = halfGroup & 1U;
-    std::uint32_t const scaleGroup = halfGroup >> 1U;
-    std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
-    std::uint32_t const row = scaleGroup / scalesPerRow;
-    std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
-    std::uint32_t const elementOffset = row * static_cast<std::uint32_t>(params.headDim)
-        + scaleInRow * kElementsPerBlockScale + laneInScale * kElementsPerLane;
 
-    // REUSED: native KV scale placement and the production FP16/BF16->E2M1
-    // quantization primitive. NEW: the outputs are mapped Host Pool addresses.
-    PackedVec<T> input = reinterpret_cast<PackedVec<T> const*>(selectRawInput<T>(task, role) + elementOffset)[0];
-    std::uint8_t* scale
-        = laneInScale == 0 ? selectScaleOutput(task, role) + scaleOffset(role, row, scaleInRow, scalesPerRow) : nullptr;
-    std::uint32_t const packed
-        = cvt_warp_fp16_to_fp4<T, kElementsPerBlockScale, false>(input, params.nvfp4ScaleOrigQuant[role], scale);
-    reinterpret_cast<std::uint32_t*>(selectPackedOutput(task, role))[halfGroup] = packed;
+    // BATCHEDCOPY ADAPTATION: this is the same split/iteration arithmetic and
+    // four-stage ring used by batchedCopy<N>. PackedVec<T> is exactly 16 B, so
+    // each issued load uses batchedCopy's cp.async.cg width.
+    __shared__ __align__(16) PackedVec<T> rawStages[kAsyncStages][kThreadsPerBlock];
+    std::uint32_t const totalIterations = (halfGroupsPerRole + kThreadsPerBlock - 1U) / kThreadsPerBlock;
+    std::uint32_t const maxIterationsPerCta = (totalIterations + gridDim.x - 1U) / gridDim.x;
+    std::uint32_t const firstHalfGroup = kThreadsPerBlock * maxIterationsPerCta * blockIdx.x + threadIdx.x;
+    std::uint32_t const endHalfGroup
+        = std::min(firstHalfGroup + kThreadsPerBlock * maxIterationsPerCta, halfGroupsPerRole);
+
+    for (std::uint32_t iteration = 0; iteration < maxIterationsPerCta + kAsyncStages; ++iteration)
+    {
+        std::uint32_t const stage = iteration % kAsyncStages;
+        if (iteration >= kAsyncStages)
+        {
+            std::uint32_t const transformIteration = iteration - kAsyncStages;
+            std::uint32_t const halfGroup = firstHalfGroup + kThreadsPerBlock * transformIteration;
+
+            // BATCHEDCOPY REUSE: wait until the oldest of four async groups is
+            // visible in shared memory before consuming that ring stage.
+            cp_async_wait_group<kAsyncStages - 1>();
+            if (halfGroup < endHalfGroup)
+            {
+                std::uint32_t const laneInScale = halfGroup & 1U;
+                std::uint32_t const scaleGroup = halfGroup >> 1U;
+                std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
+                std::uint32_t const row = scaleGroup / scalesPerRow;
+                std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
+
+                // NVFP4 DIRECT REUSE: the production primitive performs the
+                // two-lane amax reduction, E4M3 block-scale generation, and
+                // E2M1 packing. BOUNDARY ADAPTATION: its scale pointer and the
+                // packed output point directly into native-layout Host Pools.
+                PackedVec<T> input = rawStages[stage][threadIdx.x];
+                std::uint8_t* scale = laneInScale == 0
+                    ? selectScaleOutput(task, role) + scaleOffset(role, row, scaleInRow, scalesPerRow)
+                    : nullptr;
+                std::uint32_t const packed = cvt_warp_fp16_to_fp4<T, kElementsPerBlockScale, false>(
+                    input, params.nvfp4ScaleOrigQuant[role], scale);
+                // FUSED D2H FINISH: this global store targets CUDA-mapped Host
+                // memory, so there is no second copy kernel or GPU Page-sized
+                // staging allocation after quantization.
+                reinterpret_cast<std::uint32_t*>(selectPackedOutput(task, role))[halfGroup] = packed;
+            }
+        }
+
+        std::uint32_t const loadHalfGroup = firstHalfGroup + kThreadsPerBlock * iteration;
+        bool const valid = loadHalfGroup < endHalfGroup;
+        auto const* rawInput = reinterpret_cast<PackedVec<T> const*>(selectRawInput<T>(task, role));
+        // Avoid out-of-range pointer arithmetic on inactive tail lanes; the
+        // predicated async helper does not dereference this fallback address.
+        auto const* source = valid ? rawInput + loadHalfGroup : rawInput;
+        // FUSED D2H SOURCE PIPELINE: adapt batchedCopy's GPU-global -> shared
+        // cp.async stage. The actual device-to-Host crossing happens after
+        // quantization at the mapped-Host packed/scale stores above.
+        copyAsyncGlobalToShared<sizeof(PackedVec<T>)>(&rawStages[stage][threadIdx.x], source, valid);
+        cp_async_commit_group();
+    }
 #endif
 }
 
 //! FP8 E4M3 GPU Page -> Host NVFP4: fused source restoration, NVFP4
 //! quantization, and D2H.
 //!
-//! This boundary kernel is new. It restores FP8 in registers, then directly
-//! reuses the innermost `PackedVec`/`cvt_warp_fp16_to_fp4` device primitive
-//! from `quantization.cuh`; it calls neither `invokeFP4Quantization` nor
-//! `quantize_with_block_size`, and it does not call the differently shaped
-//! `cvt_warp_fp8_to_fp4` helper. Its adapter keeps the source-FP8 and
-//! target-NVFP4 scales explicit, batches disjoint Pages, routes K/V, and
-//! performs D2H through mapped-Host global stores. It does not call or contain
-//! KVCM V2's `batchedCopy<N>` pipeline.
+//! Exact fused call/data flow:
 //!
-//! Provenance: DIRECT REUSE = `cvt_warp_fp16_to_fp4`; NEW = register-only FP8
-//! restoration with an independent source inverse scale, Page/native-KV
-//! routing, launch geometry, and mapped-Host stores.
+//! `invokeNvfp4BoundaryOffloadCompress`
+//!   -> `launchOffloadFromFp8`                            [BOUNDARY NEW]
+//!   -> `offloadFromFp8Kernel`
+//!      -> 4-stage `cp.async` GPU FP8 -> shared           [BATCHEDCOPY ADAPTATION]
+//!      -> FP8 restore in registers                       [BOUNDARY ADAPTATION]
+//!      -> `cvt_warp_fp16_to_fp4`                         [NVFP4 DIRECT REUSE]
+//!      -> native K/V scale offset + mapped-Host stores   [BOUNDARY ADAPTATION]
+//!
+//! The source-FP8 inverse scale and target-NVFP4 scale remain independent.
+//! Therefore this kernel deliberately does not call the differently shaped
+//! `cvt_warp_fp8_to_fp4` helper. BATCHEDCOPY ADAPTATION: the same four-stage
+//! ring is used, but each lane loads its natural eight-FP8-value (8-byte)
+//! work unit with `cp.async.ca`, not batchedCopy's 16-byte identity grain.
+//! Original FP8 and FP16/BF16 NVFP4 primitives:
+//! https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/quantization.cuh
+//! Original D2H/H2D pipeline:
+//! https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/batch_manager/kvCacheManagerV2Utils.cu
 template <std::uint32_t N>
 __global__ void offloadFromFp8Kernel(std::array<Nvfp4BoundaryOffloadPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    // NEW: grid.z selects one disjoint Page task; grid.y selects K or V.
-    std::uint32_t const halfGroup = blockIdx.x * blockDim.x + threadIdx.x;
-    if (halfGroup >= halfGroupsPerRole)
-    {
-        return;
-    }
-
+    // BOUNDARY ADAPTATION: select one disjoint Page and one K/V role while
+    // retaining batchedCopy's split dimension.
     std::uint32_t const role = blockIdx.y;
     auto const& task = tasks[blockIdx.z];
-    std::uint32_t const laneInScale = halfGroup & 1U;
-    std::uint32_t const scaleGroup = halfGroup >> 1U;
-    std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
-    std::uint32_t const row = scaleGroup / scalesPerRow;
-    std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
-    std::uint32_t const elementOffset = row * static_cast<std::uint32_t>(params.headDim)
-        + scaleInRow * kElementsPerBlockScale + laneInScale * kElementsPerLane;
 
-    // NEW: restore the source FP8 values with their own inverse scale before
-    // applying the independent target-NVFP4 global scale in the reused core.
-    auto const* input = selectRawInput<__nv_fp8_e4m3>(task, role) + elementOffset;
-    PackedVec<half> restored;
-#pragma unroll
-    for (std::uint32_t i = 0; i < 4; ++i)
+    // BATCHEDCOPY ADAPTATION: identical split/iteration/ring sequencing, with
+    // an 8-byte source grain selected by the FP8 numerical work unit.
+    __shared__ __align__(8) std::uint64_t rawStages[kAsyncStages][kThreadsPerBlock];
+    std::uint32_t const totalIterations = (halfGroupsPerRole + kThreadsPerBlock - 1U) / kThreadsPerBlock;
+    std::uint32_t const maxIterationsPerCta = (totalIterations + gridDim.x - 1U) / gridDim.x;
+    std::uint32_t const firstHalfGroup = kThreadsPerBlock * maxIterationsPerCta * blockIdx.x + threadIdx.x;
+    std::uint32_t const endHalfGroup
+        = std::min(firstHalfGroup + kThreadsPerBlock * maxIterationsPerCta, halfGroupsPerRole);
+
+    for (std::uint32_t iteration = 0; iteration < maxIterationsPerCta + kAsyncStages; ++iteration)
     {
-        float const lo = static_cast<float>(input[2 * i]) * params.fp8ScaleQuantOrig[role];
-        float const hi = static_cast<float>(input[2 * i + 1]) * params.fp8ScaleQuantOrig[role];
-        restored.elts[i] = __floats2half2_rn(lo, hi);
-    }
+        std::uint32_t const stage = iteration % kAsyncStages;
+        if (iteration >= kAsyncStages)
+        {
+            std::uint32_t const transformIteration = iteration - kAsyncStages;
+            std::uint32_t const halfGroup = firstHalfGroup + kThreadsPerBlock * transformIteration;
+            cp_async_wait_group<kAsyncStages - 1>();
+            if (halfGroup < endHalfGroup)
+            {
+                std::uint32_t const laneInScale = halfGroup & 1U;
+                std::uint32_t const scaleGroup = halfGroup >> 1U;
+                std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
+                std::uint32_t const row = scaleGroup / scalesPerRow;
+                std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
 
-    // REUSED: production FP16->E2M1 quantization and native KV scale order.
-    // NEW: packed data and scales land directly in mapped Host Pool addresses.
-    std::uint8_t* scale
-        = laneInScale == 0 ? selectScaleOutput(task, role) + scaleOffset(role, row, scaleInRow, scalesPerRow) : nullptr;
-    std::uint32_t const packed
-        = cvt_warp_fp16_to_fp4<half, kElementsPerBlockScale, false>(restored, params.nvfp4ScaleOrigQuant[role], scale);
-    reinterpret_cast<std::uint32_t*>(selectPackedOutput(task, role))[halfGroup] = packed;
+                // BOUNDARY ADAPTATION: restore eight source FP8 values with
+                // their independent inverse scale. The staged uint64_t avoids
+                // imposing the generic FP8->FP4 helper's different scale ABI.
+                std::uint64_t const fp8Bytes = rawStages[stage][threadIdx.x];
+                PackedVec<half> restored;
+#pragma unroll
+                for (std::uint32_t i = 0; i < 4; ++i)
+                {
+                    __nv_fp8_e4m3 lo;
+                    __nv_fp8_e4m3 hi;
+                    lo.__x = static_cast<std::uint8_t>(fp8Bytes >> (16U * i));
+                    hi.__x = static_cast<std::uint8_t>(fp8Bytes >> (16U * i + 8U));
+                    float const loValue = static_cast<float>(lo) * params.fp8ScaleQuantOrig[role];
+                    float const hiValue = static_cast<float>(hi) * params.fp8ScaleQuantOrig[role];
+                    restored.elts[i] = __floats2half2_rn(loValue, hiValue);
+                }
+
+                // NVFP4 DIRECT REUSE: production two-lane block quantization.
+                // BOUNDARY ADAPTATION: native scale address and mapped-Host
+                // packed destination remain separate logical Pool roles.
+                std::uint8_t* scale = laneInScale == 0
+                    ? selectScaleOutput(task, role) + scaleOffset(role, row, scaleInRow, scalesPerRow)
+                    : nullptr;
+                std::uint32_t const packed = cvt_warp_fp16_to_fp4<half, kElementsPerBlockScale, false>(
+                    restored, params.nvfp4ScaleOrigQuant[role], scale);
+                // FUSED D2H FINISH: write the packed result directly to the
+                // CUDA-mapped Host NVFP4 data Pool. The scale primitive above
+                // writes the separate mapped Host scale Pool at the same
+                // boundary; neither output uses a compact GPU staging Page.
+                reinterpret_cast<std::uint32_t*>(selectPackedOutput(task, role))[halfGroup] = packed;
+            }
+        }
+
+        std::uint32_t const loadHalfGroup = firstHalfGroup + kThreadsPerBlock * iteration;
+        bool const valid = loadHalfGroup < endHalfGroup;
+        auto const* rawInput = reinterpret_cast<std::uint64_t const*>(selectRawInput<__nv_fp8_e4m3>(task, role));
+        auto const* source = valid ? rawInput + loadHalfGroup : rawInput;
+        // FUSED D2H SOURCE PIPELINE: asynchronously stage eight runtime FP8
+        // values from GPU global memory. Their mapped-Host D2H store occurs
+        // only after source-scale restoration and NVFP4 quantization above.
+        copyAsyncGlobalToShared<sizeof(std::uint64_t)>(&rawStages[stage][threadIdx.x], source, valid);
+        cp_async_commit_group();
+    }
 #endif
 }
 
 //! Host NVFP4 -> FP16/BF16 GPU Page: fused H2D plus dequantization.
 //!
-//! This boundary kernel is new. Its local `e2m1ToFloat8` helper adapts the
-//! `cvt.rn.f16x2.e2m1x2` sequence in ARCQuant's
-//! `e2m1_uint32_to_float8` (also used by fused MoE); it is not a call to a MoE
-//! kernel. The packed/scale pointer dereferences are GPU global loads whose
-//! addresses map to pinned Host memory; those transactions perform H2D. Native
-//! K/V scale math then restores directly into caller-owned FP16/BF16 GPU
-//! Slots. The current kernel does not yet contain `batchedCopy<N>`'s
-//! `cp.async`/shared-memory source-load pipeline.
+//! Exact fused call/data flow:
 //!
-//! Provenance: ADAPTED DONOR = ARCQuant/FusedMoE E2M1 PTX and inverse-scale
-//! flow; NEW = native-KV scale lookup, Page-task routing, mapped-Host loads,
-//! launch geometry, and caller-owned raw-Slot stores.
+//! `invokeNvfp4BoundaryOnboardDecompress`
+//!   -> `launchOnboardTo16Bit`                           [BOUNDARY NEW]
+//!   -> `onboardTo16BitKernel`
+//!      -> 4-stage `cp.async` Host packed -> shared      [BATCHEDCOPY ADAPTATION]
+//!      -> native K/V scale load                         [BOUNDARY ADAPTATION]
+//!      -> `unpackE2m1ToFloat` conversion                 [ARCQUANT/MOE ADAPTATION]
+//!      -> scale + direct FP16/BF16 GPU store            [BOUNDARY ADAPTATION]
+//!
+//! `unpackE2m1ToFloat` adapts the `cvt.rn.f16x2.e2m1x2` sequence from
+//! ARCQuant/fused-MoE; it does not call a MoE kernel. BATCHEDCOPY ADAPTATION:
+//! four packed bytes are each lane's natural input, so `cp.async.ca` pipelines
+//! the mapped-Host packed payload. The much smaller one-byte scale payload
+//! keeps its native scalar lookup because K and V use different ordering and
+//! the public task contract guarantees only byte alignment for scales.
+//! Original dequant PTX:
+//! https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/arcquantFP4.cu
+//! https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/fusedMoeCommKernels.cu
+//! Original H2D/D2H pipeline:
+//! https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/batch_manager/kvCacheManagerV2Utils.cu
 template <std::uint32_t N, typename T>
 __global__ void onboardTo16BitKernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    // NEW: grid.z selects one disjoint Page task; grid.y selects K or V.
-    std::uint32_t const halfGroup = blockIdx.x * blockDim.x + threadIdx.x;
-    if (halfGroup >= halfGroupsPerRole)
-    {
-        return;
-    }
-
+    // BOUNDARY ADAPTATION: select one disjoint Page and one K/V role while
+    // retaining batchedCopy's split dimension.
     std::uint32_t const role = blockIdx.y;
     auto const& task = tasks[blockIdx.z];
-    std::uint32_t const scaleGroup = halfGroup >> 1U;
-    std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
-    std::uint32_t const row = scaleGroup / scalesPerRow;
-    std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
-    std::uint32_t const elementOffset = halfGroup * kElementsPerLane;
 
-    // REUSED: native KV scale placement and the SM100 E2M1 conversion math.
-    // NEW: read mapped Host Pools and write the KVCM-owned raw GPU Slot directly.
-    std::uint32_t const packed = reinterpret_cast<std::uint32_t const*>(selectPackedInput(task, role))[halfGroup];
-    __nv_fp8_e4m3 blockScale;
-    blockScale.__x = selectScaleInput(task, role)[scaleOffset(role, row, scaleInRow, scalesPerRow)];
-    float const dequantScale = static_cast<float>(blockScale) * params.nvfp4ScaleQuantOrig[role];
+    // BATCHEDCOPY ADAPTATION: identical split/iteration/ring sequencing. Each
+    // lane pipelines one 4-byte E2M1 word from CUDA-mapped Host memory.
+    __shared__ __align__(4) std::uint32_t packedStages[kAsyncStages][kThreadsPerBlock];
+    std::uint32_t const totalIterations = (halfGroupsPerRole + kThreadsPerBlock - 1U) / kThreadsPerBlock;
+    std::uint32_t const maxIterationsPerCta = (totalIterations + gridDim.x - 1U) / gridDim.x;
+    std::uint32_t const firstHalfGroup = kThreadsPerBlock * maxIterationsPerCta * blockIdx.x + threadIdx.x;
+    std::uint32_t const endHalfGroup
+        = std::min(firstHalfGroup + kThreadsPerBlock * maxIterationsPerCta, halfGroupsPerRole);
 
-    float2 values[4];
-    e2m1ToFloat8(packed, values);
-    store16BitValues(selectRawOutput<T>(task, role), elementOffset, values, dequantScale);
+    for (std::uint32_t iteration = 0; iteration < maxIterationsPerCta + kAsyncStages; ++iteration)
+    {
+        std::uint32_t const stage = iteration % kAsyncStages;
+        if (iteration >= kAsyncStages)
+        {
+            std::uint32_t const transformIteration = iteration - kAsyncStages;
+            std::uint32_t const halfGroup = firstHalfGroup + kThreadsPerBlock * transformIteration;
+            cp_async_wait_group<kAsyncStages - 1>();
+            if (halfGroup < endHalfGroup)
+            {
+                std::uint32_t const scaleGroup = halfGroup >> 1U;
+                std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
+                std::uint32_t const row = scaleGroup / scalesPerRow;
+                std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
+                std::uint32_t const elementOffset = halfGroup * kElementsPerLane;
+
+                // BATCHEDCOPY REUSE: packed data is ready in the shared ring.
+                // BOUNDARY ADAPTATION: scaleOffset preserves linear K and
+                // token-4 V layout; the scalar mapped-Host scale read is 1/9
+                // of the compact payload and does not widen the scale ABI.
+                std::uint32_t const packed = packedStages[stage][threadIdx.x];
+                __nv_fp8_e4m3 blockScale;
+                blockScale.__x = selectScaleInput(task, role)[scaleOffset(role, row, scaleInRow, scalesPerRow)];
+                float const dequantScale = static_cast<float>(blockScale) * params.nvfp4ScaleQuantOrig[role];
+
+                // ARCQUANT/MOE ADAPTATION: convert E2M1 pairs with the proven
+                // SM100 PTX sequence. BOUNDARY ADAPTATION: apply the native KV
+                // scale and write the caller-owned raw GPU Slot directly.
+                float2 values[4];
+                // NVFP4 DEQUANT: E2M1 bytes already moved Host -> shared by
+                // copyAsyncGlobalToShared below are expanded to FP32 registers.
+                unpackE2m1ToFloat(packed, values);
+                // FUSED H2D FINISH: apply the block/global scale and store the
+                // restored FP16/BF16 values into the final GPU raw Slot. This
+                // is not another copy: the H2D source movement was the
+                // cp.async mapped-Host load; this store completes that same
+                // one-kernel H2D+dequant path.
+                store16BitValues(selectRawOutput<T>(task, role), elementOffset, values, dequantScale);
+            }
+        }
+
+        std::uint32_t const loadHalfGroup = firstHalfGroup + kThreadsPerBlock * iteration;
+        bool const valid = loadHalfGroup < endHalfGroup;
+        auto const* packedInput = reinterpret_cast<std::uint32_t const*>(selectPackedInput(task, role));
+        auto const* source = valid ? packedInput + loadHalfGroup : packedInput;
+        // FUSED H2D START: adapt batchedCopy's async global -> shared load to
+        // read one compact E2M1 word directly from CUDA-mapped Host memory.
+        copyAsyncGlobalToShared<sizeof(std::uint32_t)>(&packedStages[stage][threadIdx.x], source, valid);
+        cp_async_commit_group();
+    }
 #endif
 }
 
 //! Host NVFP4 -> FP8 E4M3 GPU Page: fused H2D, NVFP4 dequantization, and FP8
 //! requantization.
 //!
-//! This boundary kernel is new. It uses the same local SM100 E2M1 conversion
-//! adapted from ARCQuant/fused MoE, then directly reuses
-//! `fp32_vec_to_e4m3` from `quantization.cuh`. GPU global loads from the mapped
-//! Host packed/scale addresses perform H2D; new scale composition and Page/K/V
-//! routing write the caller-owned FP8 GPU Slot without a staging buffer or
-//! separate copy kernel. The current kernel borrows the disjoint-task batch
-//! shape, not `batchedCopy<N>`'s `cp.async` implementation.
+//! Exact fused call/data flow:
 //!
-//! Provenance: DIRECT REUSE = `fp32_vec_to_e4m3`; ADAPTED DONOR =
-//! ARCQuant/FusedMoE E2M1 PTX; NEW = NVFP4-to-FP8 scale composition,
-//! Page/native-KV routing, mapped-Host loads, and launch geometry.
+//! `invokeNvfp4BoundaryOnboardDecompress`
+//!   -> `launchOnboardToFp8`                            [BOUNDARY NEW]
+//!   -> `onboardToFp8Kernel`
+//!      -> 4-stage `cp.async` Host packed -> shared     [BATCHEDCOPY ADAPTATION]
+//!      -> native K/V scale load                        [BOUNDARY ADAPTATION]
+//!      -> `unpackE2m1ToFloat` conversion                [ARCQUANT/MOE ADAPTATION]
+//!      -> scale + `fp32_vec_to_e4m3` + GPU store       [NVFP4/BOUNDARY ADAPTATION]
+//!
+//! The mapped-Host source-load pipeline is identical to the FP16/BF16 onboard
+//! path. The numerical tail additionally composes the NVFP4 inverse scale with
+//! the destination FP8 quantization scale, then directly reuses
+//! `fp32_vec_to_e4m3` from `quantization.cuh`.
+//! Original dequant PTX and FP8 output primitive:
+//! https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/fusedMoeCommKernels.cu
+//! https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/quantization.cuh
+//! Original H2D/D2H pipeline:
+//! https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/batch_manager/kvCacheManagerV2Utils.cu
 template <std::uint32_t N>
 __global__ void onboardToFp8Kernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    // NEW: grid.z selects one disjoint Page task; grid.y selects K or V.
-    std::uint32_t const halfGroup = blockIdx.x * blockDim.x + threadIdx.x;
-    if (halfGroup >= halfGroupsPerRole)
-    {
-        return;
-    }
-
+    // BOUNDARY ADAPTATION: select one disjoint Page and one K/V role while
+    // retaining batchedCopy's split dimension.
     std::uint32_t const role = blockIdx.y;
     auto const& task = tasks[blockIdx.z];
-    std::uint32_t const scaleGroup = halfGroup >> 1U;
-    std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
-    std::uint32_t const row = scaleGroup / scalesPerRow;
-    std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
 
-    // REUSED: native KV scale placement, SM100 E2M1 conversion, and the
-    // production FP32->E4M3 packer. NEW: mapped-Host input and two-scale
-    // composition write directly into the KVCM-owned FP8 GPU Slot.
-    std::uint32_t const packed = reinterpret_cast<std::uint32_t const*>(selectPackedInput(task, role))[halfGroup];
-    __nv_fp8_e4m3 blockScale;
-    blockScale.__x = selectScaleInput(task, role)[scaleOffset(role, row, scaleInRow, scalesPerRow)];
-    float const dequantScale
-        = static_cast<float>(blockScale) * params.nvfp4ScaleQuantOrig[role] * params.fp8ScaleOrigQuant[role];
+    // BATCHEDCOPY ADAPTATION: four-stage ring over 4-byte packed E2M1 words.
+    __shared__ __align__(4) std::uint32_t packedStages[kAsyncStages][kThreadsPerBlock];
+    std::uint32_t const totalIterations = (halfGroupsPerRole + kThreadsPerBlock - 1U) / kThreadsPerBlock;
+    std::uint32_t const maxIterationsPerCta = (totalIterations + gridDim.x - 1U) / gridDim.x;
+    std::uint32_t const firstHalfGroup = kThreadsPerBlock * maxIterationsPerCta * blockIdx.x + threadIdx.x;
+    std::uint32_t const endHalfGroup
+        = std::min(firstHalfGroup + kThreadsPerBlock * maxIterationsPerCta, halfGroupsPerRole);
 
-    float2 values[4];
-    e2m1ToFloat8(packed, values);
-#pragma unroll
-    for (std::uint32_t i = 0; i < 4; ++i)
+    for (std::uint32_t iteration = 0; iteration < maxIterationsPerCta + kAsyncStages; ++iteration)
     {
-        values[i].x *= dequantScale;
-        values[i].y *= dequantScale;
+        std::uint32_t const stage = iteration % kAsyncStages;
+        if (iteration >= kAsyncStages)
+        {
+            std::uint32_t const transformIteration = iteration - kAsyncStages;
+            std::uint32_t const halfGroup = firstHalfGroup + kThreadsPerBlock * transformIteration;
+            cp_async_wait_group<kAsyncStages - 1>();
+            if (halfGroup < endHalfGroup)
+            {
+                std::uint32_t const scaleGroup = halfGroup >> 1U;
+                std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
+                std::uint32_t const row = scaleGroup / scalesPerRow;
+                std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
+
+                // BATCHEDCOPY REUSE: consume packed bytes from the ready ring.
+                // BOUNDARY ADAPTATION: look up the separate native scale Pool
+                // and compose source-NVFP4 with destination-FP8 scales.
+                std::uint32_t const packed = packedStages[stage][threadIdx.x];
+                __nv_fp8_e4m3 blockScale;
+                blockScale.__x = selectScaleInput(task, role)[scaleOffset(role, row, scaleInRow, scalesPerRow)];
+                float const dequantScale = static_cast<float>(blockScale) * params.nvfp4ScaleQuantOrig[role]
+                    * params.fp8ScaleOrigQuant[role];
+
+                // ARCQUANT/MOE ADAPTATION + NVFP4 DIRECT REUSE: expand E2M1,
+                // apply the composed scale, then reuse the production E4M3
+                // packer. The final 8-byte store targets the raw GPU Slot.
+                float2 values[4];
+                // NVFP4 DEQUANT: expand the Host E2M1 word, which the async
+                // stage below already moved into shared memory.
+                unpackE2m1ToFloat(packed, values);
+#pragma unroll
+                for (std::uint32_t i = 0; i < 4; ++i)
+                {
+                    values[i].x *= dequantScale;
+                    values[i].y *= dequantScale;
+                }
+                // FP8 REQUANT + FUSED H2D FINISH: reuse TRT-LLM's E4M3 packer
+                // and store directly into the final GPU FP8 Slot.
+                reinterpret_cast<std::uint64_t*>(selectRawOutput<__nv_fp8_e4m3>(task, role))[halfGroup]
+                    = fp32_vec_to_e4m3(values);
+            }
+        }
+
+        std::uint32_t const loadHalfGroup = firstHalfGroup + kThreadsPerBlock * iteration;
+        bool const valid = loadHalfGroup < endHalfGroup;
+        auto const* packedInput = reinterpret_cast<std::uint32_t const*>(selectPackedInput(task, role));
+        auto const* source = valid ? packedInput + loadHalfGroup : packedInput;
+        // FUSED H2D START: mapped Host NVFP4 data -> CTA shared ring via the
+        // adapted batchedCopy async-load mechanism.
+        copyAsyncGlobalToShared<sizeof(std::uint32_t)>(&packedStages[stage][threadIdx.x], source, valid);
+        cp_async_commit_group();
     }
-    reinterpret_cast<std::uint64_t*>(selectRawOutput<__nv_fp8_e4m3>(task, role))[halfGroup] = fp32_vec_to_e4m3(values);
 #endif
 }
 
@@ -437,12 +663,6 @@ std::uint32_t halfGroupsPerRole(Nvfp4BoundaryKernelParams const& params)
         * static_cast<std::uint32_t>(params.headDim / kElementsPerLane);
 }
 
-std::uint32_t blocksForHalfGroups(std::uint32_t halfGroups)
-{
-    return static_cast<std::uint32_t>(
-        (static_cast<std::uint64_t>(halfGroups) + kThreadsPerBlock - 1) / kThreadsPerBlock);
-}
-
 template <typename T>
 void launchOffloadFrom16Bit(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,
     Nvfp4BoundaryKernelParams const& params, cudaStream_t stream)
@@ -455,7 +675,9 @@ void launchOffloadFrom16Bit(std::vector<Nvfp4BoundaryOffloadPageTask> const& tas
             = static_cast<std::uint32_t>(std::min<std::size_t>(kTasksPerLaunch, tasks.size() - offset));
         std::array<Nvfp4BoundaryOffloadPageTask, kTasksPerLaunch> batch{};
         std::copy_n(tasks.data() + offset, count, batch.begin());
-        dim3 const grid(blocksForHalfGroups(halfGroups), 2, count);
+        // BATCHEDCOPY REUSE: Host transfers use one low-bandwidth split per
+        // Page/role; the kernel itself pipelines all source tiles in that CTA.
+        dim3 const grid(kHostMemorySplits, 2, count);
         offloadFrom16BitKernel<kTasksPerLaunch, T><<<grid, block, 0, stream>>>(batch, params, halfGroups);
         TLLM_CUDA_CHECK(cudaGetLastError());
     }
@@ -472,7 +694,7 @@ void launchOffloadFromFp8(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks
             = static_cast<std::uint32_t>(std::min<std::size_t>(kTasksPerLaunch, tasks.size() - offset));
         std::array<Nvfp4BoundaryOffloadPageTask, kTasksPerLaunch> batch{};
         std::copy_n(tasks.data() + offset, count, batch.begin());
-        dim3 const grid(blocksForHalfGroups(halfGroups), 2, count);
+        dim3 const grid(kHostMemorySplits, 2, count);
         offloadFromFp8Kernel<kTasksPerLaunch><<<grid, block, 0, stream>>>(batch, params, halfGroups);
         TLLM_CUDA_CHECK(cudaGetLastError());
     }
@@ -490,7 +712,7 @@ void launchOnboardTo16Bit(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks
             = static_cast<std::uint32_t>(std::min<std::size_t>(kTasksPerLaunch, tasks.size() - offset));
         std::array<Nvfp4BoundaryOnboardPageTask, kTasksPerLaunch> batch{};
         std::copy_n(tasks.data() + offset, count, batch.begin());
-        dim3 const grid(blocksForHalfGroups(halfGroups), 2, count);
+        dim3 const grid(kHostMemorySplits, 2, count);
         onboardTo16BitKernel<kTasksPerLaunch, T><<<grid, block, 0, stream>>>(batch, params, halfGroups);
         TLLM_CUDA_CHECK(cudaGetLastError());
     }
@@ -507,7 +729,7 @@ void launchOnboardToFp8(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks, 
             = static_cast<std::uint32_t>(std::min<std::size_t>(kTasksPerLaunch, tasks.size() - offset));
         std::array<Nvfp4BoundaryOnboardPageTask, kTasksPerLaunch> batch{};
         std::copy_n(tasks.data() + offset, count, batch.begin());
-        dim3 const grid(blocksForHalfGroups(halfGroups), 2, count);
+        dim3 const grid(kHostMemorySplits, 2, count);
         onboardToFp8Kernel<kTasksPerLaunch><<<grid, block, 0, stream>>>(batch, params, halfGroups);
         TLLM_CUDA_CHECK(cudaGetLastError());
     }
