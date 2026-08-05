@@ -139,11 +139,20 @@ __device__ void store16BitValues(T* output, std::uint32_t elementOffset, float2 
     reinterpret_cast<PackedVec<T>*>(output + elementOffset)[0] = packedOutput;
 }
 
+//! FP16/BF16 GPU Page -> Host NVFP4: fused quantization plus D2H.
+//!
+//! This boundary kernel is new. It directly reuses `PackedVec` and
+//! `cvt_warp_fp16_to_fp4` from `quantization.cuh`, and adapts the
+//! K-linear/V-token-4 scale order from `quantizeAndWriteFP4KVCache`. Its new
+//! Page layer batches disjoint Slots, routes K/V buffers, and writes packed
+//! data and scales directly to mapped Host memory; those stores perform D2H,
+//! so there is no compact GPU staging buffer or separate copy kernel.
 template <std::uint32_t N, typename T>
 __global__ void offloadFrom16BitKernel(std::array<Nvfp4BoundaryOffloadPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    // NEW: grid.z selects one disjoint Page task; grid.y selects K or V.
     std::uint32_t const halfGroup = blockIdx.x * blockDim.x + threadIdx.x;
     if (halfGroup >= halfGroupsPerRole)
     {
@@ -160,6 +169,8 @@ __global__ void offloadFrom16BitKernel(std::array<Nvfp4BoundaryOffloadPageTask, 
     std::uint32_t const elementOffset = row * static_cast<std::uint32_t>(params.headDim)
         + scaleInRow * kElementsPerBlockScale + laneInScale * kElementsPerLane;
 
+    // REUSED: native KV scale placement and the production FP16/BF16->E2M1
+    // quantization primitive. NEW: the outputs are mapped Host Pool addresses.
     PackedVec<T> input = reinterpret_cast<PackedVec<T> const*>(selectRawInput<T>(task, role) + elementOffset)[0];
     std::uint8_t* scale
         = laneInScale == 0 ? selectScaleOutput(task, role) + scaleOffset(role, row, scaleInRow, scalesPerRow) : nullptr;
@@ -169,11 +180,20 @@ __global__ void offloadFrom16BitKernel(std::array<Nvfp4BoundaryOffloadPageTask, 
 #endif
 }
 
+//! FP8 E4M3 GPU Page -> Host NVFP4: fused source restoration, NVFP4
+//! quantization, and D2H.
+//!
+//! This boundary kernel is new. It restores FP8 in registers, then directly
+//! reuses `PackedVec` and `cvt_warp_fp16_to_fp4` from `quantization.cuh`; it
+//! does not call the differently shaped `cvt_warp_fp8_to_fp4` helper. Its new
+//! adapter keeps the source-FP8 and target-NVFP4 scales explicit, batches
+//! disjoint Pages, routes K/V, and performs D2H through mapped-Host stores.
 template <std::uint32_t N>
 __global__ void offloadFromFp8Kernel(std::array<Nvfp4BoundaryOffloadPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    // NEW: grid.z selects one disjoint Page task; grid.y selects K or V.
     std::uint32_t const halfGroup = blockIdx.x * blockDim.x + threadIdx.x;
     if (halfGroup >= halfGroupsPerRole)
     {
@@ -190,6 +210,8 @@ __global__ void offloadFromFp8Kernel(std::array<Nvfp4BoundaryOffloadPageTask, N>
     std::uint32_t const elementOffset = row * static_cast<std::uint32_t>(params.headDim)
         + scaleInRow * kElementsPerBlockScale + laneInScale * kElementsPerLane;
 
+    // NEW: restore the source FP8 values with their own inverse scale before
+    // applying the independent target-NVFP4 global scale in the reused core.
     auto const* input = selectRawInput<__nv_fp8_e4m3>(task, role) + elementOffset;
     PackedVec<half> restored;
 #pragma unroll
@@ -200,6 +222,8 @@ __global__ void offloadFromFp8Kernel(std::array<Nvfp4BoundaryOffloadPageTask, N>
         restored.elts[i] = __floats2half2_rn(lo, hi);
     }
 
+    // REUSED: production FP16->E2M1 quantization and native KV scale order.
+    // NEW: packed data and scales land directly in mapped Host Pool addresses.
     std::uint8_t* scale
         = laneInScale == 0 ? selectScaleOutput(task, role) + scaleOffset(role, row, scaleInRow, scalesPerRow) : nullptr;
     std::uint32_t const packed
@@ -208,11 +232,19 @@ __global__ void offloadFromFp8Kernel(std::array<Nvfp4BoundaryOffloadPageTask, N>
 #endif
 }
 
+//! Host NVFP4 -> FP16/BF16 GPU Page: fused H2D plus dequantization.
+//!
+//! This boundary kernel is new. Its local `e2m1ToFloat8` helper adapts the
+//! `cvt.rn.f16x2.e2m1x2` sequence in ARCQuant's
+//! `e2m1_uint32_to_float8` (also used by fused MoE); it is not a call to a MoE
+//! kernel. New mapped-Host loads perform H2D, after which native K/V scale math
+//! restores directly into caller-owned FP16/BF16 GPU Slots.
 template <std::uint32_t N, typename T>
 __global__ void onboardTo16BitKernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    // NEW: grid.z selects one disjoint Page task; grid.y selects K or V.
     std::uint32_t const halfGroup = blockIdx.x * blockDim.x + threadIdx.x;
     if (halfGroup >= halfGroupsPerRole)
     {
@@ -227,6 +259,8 @@ __global__ void onboardTo16BitKernel(std::array<Nvfp4BoundaryOnboardPageTask, N>
     std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
     std::uint32_t const elementOffset = halfGroup * kElementsPerLane;
 
+    // REUSED: native KV scale placement and the SM100 E2M1 conversion math.
+    // NEW: read mapped Host Pools and write the KVCM-owned raw GPU Slot directly.
     std::uint32_t const packed = reinterpret_cast<std::uint32_t const*>(selectPackedInput(task, role))[halfGroup];
     __nv_fp8_e4m3 blockScale;
     blockScale.__x = selectScaleInput(task, role)[scaleOffset(role, row, scaleInRow, scalesPerRow)];
@@ -238,11 +272,20 @@ __global__ void onboardTo16BitKernel(std::array<Nvfp4BoundaryOnboardPageTask, N>
 #endif
 }
 
+//! Host NVFP4 -> FP8 E4M3 GPU Page: fused H2D, NVFP4 dequantization, and FP8
+//! requantization.
+//!
+//! This boundary kernel is new. It uses the same local SM100 E2M1 conversion
+//! adapted from ARCQuant/fused MoE, then directly reuses
+//! `fp32_vec_to_e4m3` from `quantization.cuh`. New mapped-Host loads perform
+//! H2D; new scale composition and Page/K/V routing write the caller-owned FP8
+//! GPU Slot without a staging buffer or separate copy kernel.
 template <std::uint32_t N>
 __global__ void onboardToFp8Kernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    // NEW: grid.z selects one disjoint Page task; grid.y selects K or V.
     std::uint32_t const halfGroup = blockIdx.x * blockDim.x + threadIdx.x;
     if (halfGroup >= halfGroupsPerRole)
     {
@@ -256,6 +299,9 @@ __global__ void onboardToFp8Kernel(std::array<Nvfp4BoundaryOnboardPageTask, N> c
     std::uint32_t const row = scaleGroup / scalesPerRow;
     std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
 
+    // REUSED: native KV scale placement, SM100 E2M1 conversion, and the
+    // production FP32->E4M3 packer. NEW: mapped-Host input and two-scale
+    // composition write directly into the KVCM-owned FP8 GPU Slot.
     std::uint32_t const packed = reinterpret_cast<std::uint32_t const*>(selectPackedInput(task, role))[halfGroup];
     __nv_fp8_e4m3 blockScale;
     blockScale.__x = selectScaleInput(task, role)[scaleOffset(role, row, scaleInRow, scalesPerRow)];

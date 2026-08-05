@@ -299,23 +299,6 @@ def _field_is_selected(annotation: Any, metadata: dict[str, Any] | None) -> bool
     return False
 
 
-def _collapsed_annotation(rows: list[dict[str, Any]]) -> Any:
-    """Merge an explicitly opted-in Literal discriminator family."""
-    if not any(row["metadata"].get("merge_union_literals") for row in rows):
-        return rows[0]["annotation"]
-
-    annotations = [_unwrap_annotated(row["annotation"]) for row in rows]
-    if not all(_is_literal(annotation) for annotation in annotations):
-        raise ValueError("merge_union_literals requires Literal annotations")
-
-    values: list[Any] = []
-    for annotation in annotations:
-        for value in get_args(annotation):
-            if not any(type(value) is type(current) and value == current for current in values):
-                values.append(value)
-    return Literal[tuple(values)]
-
-
 def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
     """Walk real type objects and emit the complete capturable manifest.
 
@@ -356,7 +339,6 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
 
     rows.sort(key=lambda r: (r["key"], r["defining"]))
     first: dict[str, dict] = {}
-    union_rows: dict[str, list[dict[str, Any]]] = {}
     union_allowed: dict[str, list[str]] = {}
     for r in rows:
         if r["key"] not in first:
@@ -366,7 +348,6 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
                 f"telemetry manifest: key '{r['key']}' has conflicting kinds "
                 f"across union arms: {first[r['key']]['kind']} vs {r['kind']}"
             )
-        union_rows.setdefault(r["key"], []).append(r)
         seen = union_allowed.setdefault(r["key"], [])
         for v in r["allowed"]:
             if v not in seen:
@@ -375,7 +356,7 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
     entries = [
         _ManifestEntry(
             path=key,
-            annotation=_collapsed_annotation(union_rows[key]),
+            annotation=r["annotation"],
             kind=r["kind"],
             converter=r["converter"],
             allowed_values=tuple(union_allowed[key]),
