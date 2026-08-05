@@ -3581,17 +3581,20 @@ class KvCacheCompressionConfig(StrictBaseModel):
         return False
 
 
-class QuantizationForBoundaryCompressionConfig(KvCacheCompressionConfig):
-    """Compress KV only while it resides in a non-runtime storage tier.
+class QuantizationCompressionConfig(KvCacheCompressionConfig):
+    """Compress KV with the quantization format selected by ``quant``.
 
     This is the small initialization contract shared with KVCacheManagerV2.
-    ``quant`` selects the compact layout and transform implementation; P0
+    The selected format determines the compressed layout and kernel dispatch;
+    NVFP4 is the first supported format, not part of the manager contract. P0
     targets Host memory, while the active GPU level keeps the runtime-selected
     KV dtype. KVCM uses these fields to construct per-level Slots/Pools. Page
-    addresses and per-layer calibration are runtime/model-loader inputs and do
-    not belong in this user config.
+    addresses and per-layer calibration are runtime/model-loader inputs, not
+    user configuration.
     """
 
+    # The discriminator names this storage-boundary lifecycle family; `quant`
+    # independently selects its format-specific layout and implementation.
     algorithm: Literal[
         "quantization_for_boundary"] = "quantization_for_boundary"
     quant: Literal["nvfp4"] = Field(
@@ -3665,8 +3668,7 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
 
 KvCacheCompressionConfigType: TypeAlias = Annotated[
-    Union[QuantizationForBoundaryCompressionConfig,
-          TriAttentionKvCacheCompressionConfig],
+    Union[QuantizationCompressionConfig, TriAttentionKvCacheCompressionConfig],
     Field(discriminator="algorithm"),
 ]
 

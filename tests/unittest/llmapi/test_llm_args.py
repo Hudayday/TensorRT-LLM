@@ -3054,9 +3054,8 @@ kv_cache_compression_config:
 
 
 @pytest.mark.cpu_only
-def test_boundary_quantization_config_is_a_small_storage_init_contract():
-    from tensorrt_llm.llmapi.llm_args import \
-        QuantizationForBoundaryCompressionConfig
+def test_quantization_compression_config_is_a_small_storage_init_contract():
+    from tensorrt_llm.llmapi.llm_args import QuantizationCompressionConfig
 
     config_dict = yaml.safe_load("""
 kv_cache_compression_config:
@@ -3068,7 +3067,7 @@ kv_cache_compression_config:
     config = TorchLlmArgs(model="/tmp/dummy_model",
                           **config_dict).kv_cache_compression_config
 
-    assert isinstance(config, QuantizationForBoundaryCompressionConfig)
+    assert isinstance(config, QuantizationCompressionConfig)
     assert config.quant == "nvfp4"
     assert config.target_cache_tier == "host"
     assert not config.changes_physical_kv_length
@@ -3077,7 +3076,7 @@ kv_cache_compression_config:
 
 
 @pytest.mark.cpu_only
-def test_boundary_quantization_config_rejects_unimplemented_format_or_tier():
+def test_quantization_compression_config_rejects_unimplemented_format_or_tier():
     with pytest.raises(ValidationError):
         TorchLlmArgs(
             model="/tmp/dummy_model",

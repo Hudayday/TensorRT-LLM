@@ -2478,7 +2478,9 @@ def create_kv_cache_compression_manager(
     here. Feature compatibility is checked before resource-manager construction.
     """
     if config.algorithm == "quantization_for_boundary":
-        if not is_sm_100f():
+        # Architecture admission belongs to the selected quantization format,
+        # not to the generic QuantizationCompression manager.
+        if getattr(config, "quant", None) == "nvfp4" and not is_sm_100f():
             raise RuntimeError(
                 "NVFP4 boundary compression requires an SM100-family device "
                 "(SM100 or SM103).")
@@ -2487,13 +2489,13 @@ def create_kv_cache_compression_manager(
             # Never guess the future Host Pool coalescing here: KVCM must hand
             # over its authoritative per-level layout after initialization.
             raise RuntimeError(
-                "QuantizationForBoundaryCompression requires the KVCM V2 "
+                "QuantizationCompression requires the KVCM V2 "
                 "per-level boundary layout handoff; current main does not "
                 "provide it yet")
         from ..kv_cache_compression.quantization_for_boundary import \
-            QuantizationForBoundaryCompression
+            QuantizationCompression
 
-        return QuantizationForBoundaryCompression(
+        return QuantizationCompression(
             config,
             kv_cache_manager,
             layer_layouts=boundary_layer_layouts,

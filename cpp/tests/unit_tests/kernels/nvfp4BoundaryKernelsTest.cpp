@@ -47,7 +47,7 @@ using tensorrt_llm::kernels::Nvfp4BoundaryRuntimeType;
 constexpr std::size_t kGuardBytes = 64;
 constexpr std::uint8_t kCanary = 0xA5;
 constexpr std::size_t kDefaultNumPages = 3;
-constexpr std::size_t kCrossLaunchNumPages = 33;
+constexpr std::size_t kCrossLaunchNumPages = 257;
 
 struct PageGeometry
 {
@@ -462,10 +462,11 @@ std::vector<std::uint8_t> decompressReference(ReferenceNvfp4 const& compressed, 
 }
 
 void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultGeometry,
-    std::size_t numPages = kDefaultNumPages, InputPattern inputPattern = InputPattern::kDense)
+    std::size_t numPages = kDefaultNumPages, InputPattern inputPattern = InputPattern::kDense,
+    bool synchronizeBetweenDirections = true)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    if (tensorrt_llm::common::getSMVersion() < 100)
+    if (!tensorrt_llm::common::isSM100Family())
     {
         GTEST_SKIP() << "NVFP4 boundary kernels require an SM100-family GPU";
     }
@@ -498,23 +499,36 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
     {
         runtimeType = Nvfp4BoundaryRuntimeType::kBfloat16;
     }
-    tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(offloadTasks, params, runtimeType, stream);
-
-    cudaEvent_t offloadComplete{};
-    ASSERT_EQ(cudaEventCreateWithFlags(&offloadComplete, cudaEventDisableTiming), cudaSuccess);
-    ASSERT_EQ(cudaEventRecord(offloadComplete, stream), cudaSuccess);
-    ASSERT_EQ(cudaEventSynchronize(offloadComplete), cudaSuccess);
-    ASSERT_EQ(cudaEventDestroy(offloadComplete), cudaSuccess);
-
     std::vector<std::array<ReferenceNvfp4, 2>> references(numPages);
     for (std::size_t page = 0; page < numPages; ++page)
     {
         references[page][0] = compressReference(pages[page]->rawHost[0], kind, 0, params, geometry);
         references[page][1] = compressReference(pages[page]->rawHost[1], kind, 1, params, geometry);
-        EXPECT_EQ(pages[page]->packedK.payload(), references[page][0].packed);
-        EXPECT_EQ(pages[page]->packedV.payload(), references[page][1].packed);
-        EXPECT_EQ(pages[page]->scaleK.payload(), references[page][0].scales);
-        EXPECT_EQ(pages[page]->scaleV.payload(), references[page][1].scales);
+    }
+
+    auto const verifyCompressedPages = [&]
+    {
+        for (std::size_t page = 0; page < numPages; ++page)
+        {
+            EXPECT_EQ(pages[page]->packedK.payload(), references[page][0].packed);
+            EXPECT_EQ(pages[page]->packedV.payload(), references[page][1].packed);
+            EXPECT_EQ(pages[page]->scaleK.payload(), references[page][0].scales);
+            EXPECT_EQ(pages[page]->scaleV.payload(), references[page][1].scales);
+        }
+    };
+
+    tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(offloadTasks, params, runtimeType, stream);
+
+    if (synchronizeBetweenDirections)
+    {
+        // Model StorageManager's normal event-gated publish: the Host Slot is
+        // inspected only after the offload completion event has fired.
+        cudaEvent_t offloadComplete{};
+        ASSERT_EQ(cudaEventCreateWithFlags(&offloadComplete, cudaEventDisableTiming), cudaSuccess);
+        ASSERT_EQ(cudaEventRecord(offloadComplete, stream), cudaSuccess);
+        ASSERT_EQ(cudaEventSynchronize(offloadComplete), cudaSuccess);
+        ASSERT_EQ(cudaEventDestroy(offloadComplete), cudaSuccess);
+        verifyCompressedPages();
     }
 
     std::vector<Nvfp4BoundaryOnboardPageTask> onboardTasks;
@@ -526,6 +540,15 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
     }
     tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(onboardTasks, params, runtimeType, stream);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    if (!synchronizeBetweenDirections)
+    {
+        // PDL stress path: offload and onboard were enqueued back-to-back on
+        // one stream with no Host wait, event, or payload read between them.
+        // The final synchronization is the first point where Host NVFP4 bytes
+        // are observed.
+        verifyCompressedPages();
+    }
 
     for (std::size_t page = 0; page < numPages; ++page)
     {
@@ -602,19 +625,44 @@ TEST(Nvfp4BoundaryRoundingTest, QuantizesValuesSafelyAwayFromE2m1Ties)
     runBoundaryRoundTrip(RawKind::kFloat16, kDefaultGeometry, 1, InputPattern::kRoundingMargins);
 }
 
-TEST(Nvfp4BoundaryBatchingTest, AcceptsExactlyOneFullThirtyTwoPageDescriptorChunk)
+TEST(Nvfp4BoundaryBatchingTest, AcceptsMinimumThirtyTwoPageDescriptorSpecialization)
 {
     runBoundaryRoundTrip(RawKind::kFloat16, kMinimumNativeGeometry, 32);
 }
 
-TEST(Nvfp4BoundaryBatchingTest, Float16CrossesTheThirtyTwoPageDescriptorChunkBoundary)
+TEST(Nvfp4BoundaryBatchingTest, SelectsSixtyFourPageDescriptorSpecialization)
 {
-    runBoundaryRoundTrip(RawKind::kFloat16, kMinimumNativeGeometry, kCrossLaunchNumPages);
+    runBoundaryRoundTrip(RawKind::kFloat16, kMinimumNativeGeometry, 33);
 }
 
-TEST(Nvfp4BoundaryBatchingTest, Fp8CrossesTheThirtyTwoPageDescriptorChunkBoundary)
+TEST(Nvfp4BoundaryBatchingTest, Bfloat16SelectsOneHundredTwentyEightPageDescriptorSpecialization)
+{
+    runBoundaryRoundTrip(RawKind::kBfloat16, kMinimumNativeGeometry, 65);
+}
+
+TEST(Nvfp4BoundaryBatchingTest, Fp8SelectsTwoHundredFiftySixPageDescriptorSpecialization)
+{
+    runBoundaryRoundTrip(RawKind::kFp8, kMinimumNativeGeometry, 129);
+}
+
+TEST(Nvfp4BoundaryBatchingTest, Bfloat16CrossesTheTwoHundredFiftySixPageChunkBoundary)
+{
+    runBoundaryRoundTrip(RawKind::kBfloat16, kMinimumNativeGeometry, kCrossLaunchNumPages);
+}
+
+TEST(Nvfp4BoundaryBatchingTest, Fp8CrossesTheTwoHundredFiftySixPageChunkBoundary)
 {
     runBoundaryRoundTrip(RawKind::kFp8, kMinimumNativeGeometry, kCrossLaunchNumPages);
+}
+
+TEST(Nvfp4BoundaryPdlTest, ChainsBfloat16OffloadAndOnboardWithoutIntermediateHostSync)
+{
+    runBoundaryRoundTrip(RawKind::kBfloat16, kMinimumNativeGeometry, 65, InputPattern::kDense, false);
+}
+
+TEST(Nvfp4BoundaryPdlTest, ChainsFp8OffloadAndOnboardWithoutIntermediateHostSync)
+{
+    runBoundaryRoundTrip(RawKind::kFp8, kMinimumNativeGeometry, 65, InputPattern::kDense, false);
 }
 
 TEST(Nvfp4BoundaryValidationTest, EmptyBatchIsAnAsyncNoOp)
@@ -628,7 +676,7 @@ TEST(Nvfp4BoundaryValidationTest, EmptyBatchIsAnAsyncNoOp)
 TEST(Nvfp4BoundaryValidationTest, RejectsInvalidGeometryAndScalesBeforeLaunch)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    if (tensorrt_llm::common::getSMVersion() < 100)
+    if (!tensorrt_llm::common::isSM100Family())
     {
         GTEST_SKIP() << "NVFP4 boundary kernels require an SM100-family GPU";
     }
@@ -690,7 +738,7 @@ TEST(Nvfp4BoundaryValidationTest, RejectsInvalidGeometryAndScalesBeforeLaunch)
 TEST(Nvfp4BoundaryValidationTest, RejectsNullMisalignedAndUnsupportedDescriptors)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    if (tensorrt_llm::common::getSMVersion() < 100)
+    if (!tensorrt_llm::common::isSM100Family())
     {
         GTEST_SKIP() << "NVFP4 boundary kernels require an SM100-family GPU";
     }

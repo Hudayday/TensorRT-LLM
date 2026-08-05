@@ -26,8 +26,6 @@
 #include <nanobind/stl/vector.h>
 #include <torch/extension.h>
 
-#include <cstdint>
-
 namespace tr = tensorrt_llm::runtime;
 namespace nb = nanobind;
 

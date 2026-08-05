@@ -29,7 +29,7 @@ namespace kernels
 {
 
 //! Active GPU representation restored at the Host boundary.
-//
+//!
 //! This is an algorithm-side dispatch value, not Page metadata. KVCM owns the
 //! runtime layout and supplies one homogeneous layer cohort per call.
 enum class Nvfp4BoundaryRuntimeType : std::uint8_t
@@ -45,8 +45,9 @@ enum class Nvfp4BoundaryRuntimeType : std::uint8_t
 //! roles into physical Pools, but the kernel never assumes adjacency between
 //! K, V, their scales, or different Pages. The packed and scale addresses must
 //! be device-visible aliases of CUDA-registered mapped Host memory. The raw
-//! inputs and mapped-Host outputs must remain valid and non-overwritable until
-//! work submitted to the caller's stream completes.
+//! inputs and packed mapped-Host outputs must be 16-byte aligned and remain
+//! valid and non-overwritable until work submitted to the caller's stream
+//! completes. Scale buffers retain their native byte alignment.
 struct Nvfp4BoundaryOffloadPageTask
 {
     void const* rawK;
@@ -59,9 +60,9 @@ struct Nvfp4BoundaryOffloadPageTask
 
 //! One Host-to-GPU Page transform.
 //!
-//! The packed and scale inputs must remain mapped and immutable until the
-//! caller-observed stream completion event fires. The raw GPU outputs must stay
-//! reserved for the same interval.
+//! The packed mapped-Host inputs and raw GPU outputs must be 16-byte aligned.
+//! Packed and scale inputs remain immutable until the caller-observed stream
+//! completion event fires; raw GPU outputs stay reserved for the same interval.
 struct Nvfp4BoundaryOnboardPageTask
 {
     std::uint8_t const* packedK;
@@ -79,7 +80,9 @@ struct Nvfp4BoundaryOnboardPageTask
 //! half that many bytes in the same HND order. Each block-scale pointer has one
 //! E4M3 byte per 16 elements. K scales are linear `[H, P, D / 16]`; V scales
 //! use the native token-4 order over flattened `(head, token)` rows. Therefore
-//! `tokensPerPage` must be divisible by four and `headDim` by 16.
+//! `tokensPerPage` must be divisible by four and `headDim` by 16. Those
+//! constraints also make every raw/packed payload an exact number of 16-byte
+//! transfer grains, so the fused kernels need no partial-grain fallback.
 //!
 //! `*OrigQuant` multiplies an original-domain value before storing the named
 //! quantized representation. `*QuantOrig` restores a stored quantized value to
@@ -99,16 +102,18 @@ struct Nvfp4BoundaryKernelParams
     float fp8ScaleQuantOrig[2];
 };
 
-//! Compress a homogeneous GPU Page cohort and transfer it directly to mapped Host memory.
-//
+//! Compress a homogeneous GPU Page cohort and transfer it directly to mapped
+//! Host memory.
+//!
 //! The caller owns Page selection, source/destination lifetime, the CUDA
 //! stream, completion fencing, publication, release, and rollback. This
 //! function submits only the complete NVFP4 transform-plus-transfer payload.
 void invokeNvfp4BoundaryOffloadCompress(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,
     Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryRuntimeType runtimeType, cudaStream_t stream);
 
-//! Transfer a homogeneous mapped-Host cohort and restore the active GPU representation.
-//
+//! Transfer a homogeneous mapped-Host cohort and restore the active GPU
+//! representation.
+//!
 //! For a non-empty batch, successful return means work was enqueued on
 //! ``stream``; it does not publish the destination or synchronize the stream.
 void invokeNvfp4BoundaryOnboardDecompress(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks,
