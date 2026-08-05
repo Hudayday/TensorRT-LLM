@@ -374,6 +374,7 @@ def main() -> int:
         repo / "cpp" / "micro_benchmarks" / "CMakeLists.txt",
         repo / "cpp" / "tensorrt_llm" / "kernels" / "nvfp4BoundaryKernels.cu",
         repo / "cpp" / "tensorrt_llm" / "kernels" / "nvfp4BoundaryKernels.h",
+        repo / "cpp" / "tensorrt_llm" / "kernels" / "nvfp4BoundaryKernelsInternal.h",
         repo / "cpp" / "tensorrt_llm" / "batch_manager" / "kvCacheManagerV2Utils.cu",
         repo / "cpp" / "tensorrt_llm" / "batch_manager" / "kvCacheManagerV2Utils.h",
     )

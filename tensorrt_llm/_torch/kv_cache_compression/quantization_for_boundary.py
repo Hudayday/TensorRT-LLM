@@ -373,14 +373,19 @@ class QuantizationCompression(KVCacheCompressionManager):
                 # All four native paths reuse batchedCopy's 16-byte
                 # cp.async.cg grain. KVCM must therefore hand off 16-byte
                 # aligned raw and packed Pool addresses for every runtime dtype.
+                # Offload also flushes scale bytes to mapped Host memory as
+                # aligned uint4 grains. Onboard deliberately retains the
+                # native byte-tail fallback for an unaligned external scale
+                # record, so its scale source requires only byte alignment.
                 raw_alignment = 16
+                scale_alignment = 16 if offload else 1
                 for name, address, alignment in (
                     ("raw K", task[0], raw_alignment),
                     ("raw V", task[1], raw_alignment),
                     ("packed K", task[2], 16),
                     ("packed V", task[3], 16),
-                    ("K block scale", task[4], 1),
-                    ("V block scale", task[5], 1),
+                    ("K block scale", task[4], scale_alignment),
+                    ("V block scale", task[5], scale_alignment),
                 ):
                     if address > _UINTPTR_MAX or address % alignment:
                         raise ValueError(

@@ -32,12 +32,13 @@
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/kernels/nvfp4BoundaryKernels.h"
+#include "tensorrt_llm/kernels/nvfp4BoundaryKernelsInternal.h"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -53,6 +54,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -72,12 +74,26 @@ using kernels::Nvfp4BoundaryKernelParams;
 using kernels::Nvfp4BoundaryOffloadPageTask;
 using kernels::Nvfp4BoundaryOnboardPageTask;
 using kernels::Nvfp4BoundaryRuntimeType;
+using kernels::detail::Nvfp4BoundaryTransferPipeline;
 
 constexpr std::int32_t kNumKvHeads = 8;
 constexpr std::int32_t kTokensPerPage = 64;
 constexpr std::int32_t kHeadDim = 128;
 constexpr std::size_t kCopyAlignment = sizeof(uint4);
 constexpr std::uint8_t kUntouchedByte = 0xA5;
+#if defined(TRTLLM_NVFP4_BOUNDARY_MAX_TASKS_PER_LAUNCH)
+// Keep expected-launch reporting aligned with diagnostic 32/64/128/256/512
+// builds of the production boundary launcher.
+constexpr std::size_t kBoundaryDescriptorCapacityAssumption = TRTLLM_NVFP4_BOUNDARY_MAX_TASKS_PER_LAUNCH;
+#else
+constexpr std::size_t kBoundaryDescriptorCapacityAssumption = 256;
+#endif
+constexpr std::size_t kKvcmCopyDescriptorCapacity = 256;
+
+static_assert(kBoundaryDescriptorCapacityAssumption == 32 || kBoundaryDescriptorCapacityAssumption == 64
+        || kBoundaryDescriptorCapacityAssumption == 128 || kBoundaryDescriptorCapacityAssumption == 256
+        || kBoundaryDescriptorCapacityAssumption == 512,
+    "Boundary launch-capacity reporting supports powers of two from 32 through 512");
 
 enum class RawKind
 {
@@ -105,6 +121,13 @@ enum class Variant
     kStagedDma,
 };
 
+struct SchedulerShape
+{
+    std::uint32_t requests{};
+    std::uint32_t pagesPerRequest{};
+    std::uint32_t localLayers{};
+};
+
 struct Options
 {
     std::size_t pages{32};
@@ -116,6 +139,18 @@ struct Options
     int iterations{100};
     int samples{15};
     std::uint64_t seed{20260805};
+    std::optional<Variant> profileVariant;
+    Nvfp4BoundaryTransferPipeline fusedPipeline{Nvfp4BoundaryTransferPipeline::kAuto};
+    std::optional<SchedulerShape> schedulerShape;
+    std::optional<std::size_t> physicalRecordWindow;
+};
+
+struct ExpectedLaunchCounts
+{
+    std::size_t transformKernels{};
+    std::size_t smCopyKernels{};
+    std::size_t dmaBatchCalls{};
+    std::size_t totalKernels{};
 };
 
 struct PoolLayout
@@ -205,6 +240,107 @@ std::size_t checkedProduct(std::size_t lhs, std::size_t rhs, std::string_view na
     return lhs * rhs;
 }
 
+std::size_t requests(Options const& options)
+{
+    return options.schedulerShape.has_value() ? options.schedulerShape->requests : 1;
+}
+
+std::size_t pagesPerRequest(Options const& options)
+{
+    return options.schedulerShape.has_value() ? options.schedulerShape->pagesPerRequest : options.pages;
+}
+
+std::size_t localLayers(Options const& options)
+{
+    return options.schedulerShape.has_value() ? options.schedulerShape->localLayers : 1;
+}
+
+std::size_t logicalRecordCount(Options const& options)
+{
+    return checkedProduct(checkedProduct(requests(options), pagesPerRequest(options), "request-local Page records"),
+        localLayers(options), "Page-layer records");
+}
+
+std::size_t physicalRecordCount(Options const& options)
+{
+    // Replay bounds only storage allocation and address uniqueness. Logical
+    // tasks, transforms, and Host traffic remain R*P*L.
+    return options.physicalRecordWindow.value_or(logicalRecordCount(options));
+}
+
+bool boundedAddressReplay(Options const& options)
+{
+    return options.physicalRecordWindow.has_value();
+}
+
+std::size_t migrationHookCallsPerIteration(Options const& options)
+{
+    // Axis C assumes one homogeneous source-level/PoolGroup migration group
+    // per request. A real StorageManager event may split one request into more
+    // groups; native transform calls and measured launches remain authoritative.
+    return requests(options);
+}
+
+std::size_t nativeTransformCallsPerIteration(Options const& options)
+{
+    return checkedProduct(requests(options), localLayers(options), "native transform calls per iteration");
+}
+
+std::size_t tasksPerNativeCall(Options const& options)
+{
+    return pagesPerRequest(options);
+}
+
+std::size_t descriptorChunksPerCall(Options const& options)
+{
+    // Production emits one kernel for every full maximum-capacity batch and
+    // one kernel for the remaining tail. Its recursive 32-or-larger power-of-
+    // two selection changes the tail specialization, not the launch count.
+    return tasksPerNativeCall(options) / kBoundaryDescriptorCapacityAssumption
+        + static_cast<std::size_t>(tasksPerNativeCall(options) % kBoundaryDescriptorCapacityAssumption != 0);
+}
+
+std::size_t kvcmCopyChunksPerCall(Options const& options)
+{
+    return tasksPerNativeCall(options) / kKvcmCopyDescriptorCapacity
+        + static_cast<std::size_t>(tasksPerNativeCall(options) % kKvcmCopyDescriptorCapacity != 0);
+}
+
+ExpectedLaunchCounts expectedLaunchCounts(Options const& options, Variant variant)
+{
+    ExpectedLaunchCounts result{};
+    std::size_t const nativeCalls = nativeTransformCallsPerIteration(options);
+    std::size_t const chunks = checkedProduct(nativeCalls, descriptorChunksPerCall(options), "descriptor chunks");
+    result.transformKernels = chunks;
+    if (variant == Variant::kStagedSm)
+    {
+        // K, V, K scale, and V scale are four independent compact Pools.
+        std::size_t const copyChunks
+            = checkedProduct(nativeCalls, kvcmCopyChunksPerCall(options), "SM copy chunks");
+        result.smCopyKernels = checkedProduct(4, copyChunks, "SM copy kernel launches");
+    }
+    else if (variant == Variant::kStagedDma)
+    {
+        // cudaMemcpyBatchAsync is one API call per native layer/cohort call;
+        // it is reported separately and is not mislabeled as a CUDA kernel.
+        result.dmaBatchCalls = nativeCalls;
+    }
+    result.totalKernels = result.transformKernels + result.smCopyKernels;
+    return result;
+}
+
+std::string_view benchmarkShape(Options const& options)
+{
+    return options.schedulerShape.has_value() ? "request_local" : "flat";
+}
+
+std::size_t reportedPages(Options const& options)
+{
+    // Keep the legacy flat meaning, but do not report only P for a scheduler
+    // iteration that actually touches R*P*L distinct Page-layer records.
+    return options.schedulerShape.has_value() ? logicalRecordCount(options) : options.pages;
+}
+
 std::string_view toString(RawKind value)
 {
     switch (value)
@@ -235,6 +371,51 @@ std::string_view toString(Variant value)
     case Variant::kStagedDma: return "staged_dma";
     }
     fail("invalid variant");
+}
+
+Variant parseVariant(std::string const& value)
+{
+    if (value == "fused")
+    {
+        return Variant::kFused;
+    }
+    if (value == "staged_sm")
+    {
+        return Variant::kStagedSm;
+    }
+    if (value == "staged_dma")
+    {
+        return Variant::kStagedDma;
+    }
+    fail("--profile-variant must be fused, staged_sm, or staged_dma");
+}
+
+std::string_view toString(Nvfp4BoundaryTransferPipeline value)
+{
+    switch (value)
+    {
+    case Nvfp4BoundaryTransferPipeline::kAuto: return "auto";
+    case Nvfp4BoundaryTransferPipeline::kWholePage: return "whole_page";
+    case Nvfp4BoundaryTransferPipeline::kCompressedOutputTiled: return "compressed_output_tiled";
+    }
+    fail("invalid offload pipeline");
+}
+
+Nvfp4BoundaryTransferPipeline parseTransferPipeline(std::string const& value)
+{
+    if (value == "auto")
+    {
+        return Nvfp4BoundaryTransferPipeline::kAuto;
+    }
+    if (value == "whole_page")
+    {
+        return Nvfp4BoundaryTransferPipeline::kWholePage;
+    }
+    if (value == "compressed_output_tiled")
+    {
+        return Nvfp4BoundaryTransferPipeline::kCompressedOutputTiled;
+    }
+    fail("--fused-pipeline must be auto, whole_page, or compressed_output_tiled");
 }
 
 Nvfp4BoundaryRuntimeType runtimeType(RawKind value)
@@ -308,7 +489,18 @@ void printHelp(char const* executable)
 {
     std::cout << "Usage: " << executable << " [options]\n\n"
               << "One process runs one fixed H=8, P=64, D=128 benchmark cell.\n"
-              << "  --pages N                       Page cohort size (default: 32)\n"
+              << "  --pages N                       Flat one-call Page cohort (default: 32)\n"
+              << "  --requests N                    Request-local scheduler shape\n"
+              << "  --pages-per-request N           Pages in each request-local hook call\n"
+              << "  --local-layers N                Local layers visited per iteration\n"
+              << "                                  Supply all three together; they cannot be\n"
+              << "                                  combined with an explicit --pages\n"
+              << "  --physical-record-window N      Request-local mode only: allocate N physical\n"
+              << "                                  Page-layer records and replay sequential calls\n"
+              << "                                  cyclically; requires pages/request <= N <= R*P*L\n"
+              << "                                  This measures call topology and Host transfers,\n"
+              << "                                  not unique-Page capacity or device bandwidth;\n"
+              << "                                  use unique-address Axis B for bandwidth evidence\n"
               << "  --dtype fp16|bf16|fp8_e4m3     Runtime GPU dtype (default: bf16)\n"
               << "  --direction offload|onboard    Boundary direction (default: offload)\n"
               << "  --address-mode contiguous|permuted\n"
@@ -317,6 +509,11 @@ void printHelp(char const* executable)
               << "  --warmup N                     Warm-up iterations per variant (default: 10)\n"
               << "  --iterations N                 Timed iterations per sample (default: 100)\n"
               << "  --samples N                    Repeated samples (default: 15)\n"
+              << "  --profile-variant NAME         Capture only fused, staged_sm, or staged_dma\n"
+              << "                                  between cudaProfilerStart/Stop; --iterations\n"
+              << "                                  controls the captured steady-state repeats\n"
+              << "  --fused-pipeline NAME          auto, whole_page, or compressed_output_tiled\n"
+              << "                                  (default: auto; ignored by staged paths)\n"
               << "  --seed N                       Input/permutation seed (default: 20260805)\n"
               << "  --help                         Show this text\n\n"
               << "Run PDL modes in separate processes with TRTLLM_ENABLE_PDL=0 or 1.\n";
@@ -325,6 +522,20 @@ void printHelp(char const* executable)
 Options parseOptions(int argc, char** argv)
 {
     Options result;
+    bool pagesSpecified = false;
+    std::optional<std::uint32_t> schedulerRequests;
+    std::optional<std::uint32_t> schedulerPagesPerRequest;
+    std::optional<std::uint32_t> schedulerLocalLayers;
+    std::optional<std::size_t> physicalRecordWindow;
+    auto parseSchedulerDimension = [](std::string const& value, std::string_view name)
+    {
+        std::uint64_t const parsed = parseUnsigned(value, name);
+        if (parsed == 0 || parsed > std::numeric_limits<std::uint32_t>::max())
+        {
+            fail(std::string(name) + " must be in [1, UINT32_MAX]");
+        }
+        return static_cast<std::uint32_t>(parsed);
+    };
     for (int index = 1; index < argc; ++index)
     {
         std::string const argument = argv[index];
@@ -336,6 +547,39 @@ Options parseOptions(int argc, char** argv)
         if (auto value = optionValue(index, argc, argv, argument, "--pages"); !value.empty())
         {
             result.pages = parseUnsigned(value, "--pages");
+            pagesSpecified = true;
+        }
+        else if (auto value = optionValue(index, argc, argv, argument, "--requests"); !value.empty())
+        {
+            if (schedulerRequests.has_value())
+            {
+                fail("--requests may be supplied only once");
+            }
+            schedulerRequests = parseSchedulerDimension(value, "--requests");
+        }
+        else if (auto value = optionValue(index, argc, argv, argument, "--pages-per-request"); !value.empty())
+        {
+            if (schedulerPagesPerRequest.has_value())
+            {
+                fail("--pages-per-request may be supplied only once");
+            }
+            schedulerPagesPerRequest = parseSchedulerDimension(value, "--pages-per-request");
+        }
+        else if (auto value = optionValue(index, argc, argv, argument, "--local-layers"); !value.empty())
+        {
+            if (schedulerLocalLayers.has_value())
+            {
+                fail("--local-layers may be supplied only once");
+            }
+            schedulerLocalLayers = parseSchedulerDimension(value, "--local-layers");
+        }
+        else if (auto value = optionValue(index, argc, argv, argument, "--physical-record-window"); !value.empty())
+        {
+            if (physicalRecordWindow.has_value())
+            {
+                fail("--physical-record-window may be supplied only once");
+            }
+            physicalRecordWindow = parseUnsigned(value, "--physical-record-window");
         }
         else if (auto value = optionValue(index, argc, argv, argument, "--dtype"); !value.empty())
         {
@@ -382,6 +626,14 @@ Options parseOptions(int argc, char** argv)
         {
             result.samples = parseInt(value, "--samples");
         }
+        else if (auto value = optionValue(index, argc, argv, argument, "--profile-variant"); !value.empty())
+        {
+            result.profileVariant = parseVariant(value);
+        }
+        else if (auto value = optionValue(index, argc, argv, argument, "--fused-pipeline"); !value.empty())
+        {
+            result.fusedPipeline = parseTransferPipeline(value);
+        }
         else if (auto value = optionValue(index, argc, argv, argument, "--seed"); !value.empty())
         {
             result.seed = parseUnsigned(value, "--seed");
@@ -389,6 +641,47 @@ Options parseOptions(int argc, char** argv)
         else
         {
             fail("unknown option: " + argument);
+        }
+    }
+
+    std::size_t const schedulerDimensions = static_cast<std::size_t>(schedulerRequests.has_value())
+        + static_cast<std::size_t>(schedulerPagesPerRequest.has_value())
+        + static_cast<std::size_t>(schedulerLocalLayers.has_value());
+    if (schedulerDimensions != 0 && schedulerDimensions != 3)
+    {
+        fail("--requests, --pages-per-request, and --local-layers must be supplied together");
+    }
+    if (physicalRecordWindow.has_value() && schedulerDimensions != 3)
+    {
+        fail("--physical-record-window requires the request-local scheduler shape");
+    }
+    if (schedulerDimensions == 3)
+    {
+        if (pagesSpecified)
+        {
+            fail("request-local scheduler shape cannot be combined with an explicit --pages");
+        }
+        result.schedulerShape
+            = SchedulerShape{*schedulerRequests, *schedulerPagesPerRequest, *schedulerLocalLayers};
+        // Preserve the legacy `pages` column as the descriptor cohort size.
+        // Total Page-layer work is reported separately by logicalRecordCount().
+        result.pages = *schedulerPagesPerRequest;
+        std::size_t const records = logicalRecordCount(result);
+        if (records > std::numeric_limits<std::uint32_t>::max())
+        {
+            fail("request-local Page-layer records exceed UINT32_MAX");
+        }
+        if (physicalRecordWindow.has_value())
+        {
+            if (*physicalRecordWindow < result.schedulerShape->pagesPerRequest)
+            {
+                fail("--physical-record-window must be at least --pages-per-request");
+            }
+            if (*physicalRecordWindow > records)
+            {
+                fail("--physical-record-window cannot exceed logical Page-layer records");
+            }
+            result.physicalRecordWindow = *physicalRecordWindow;
         }
     }
     if (result.pages == 0 || result.pages > std::numeric_limits<std::uint32_t>::max())
@@ -608,6 +901,27 @@ struct RawDevicePools
     DevicePool v;
 };
 
+// One object is one native homogeneous transform/cohort call: one request at
+// one local layer, carrying only that request's Pages. A scheduler migration
+// hook is request-local and lowers into one such call per local layer. All
+// descriptors are built once; the timed path submits each request's layers in
+// order on one owner stream without per-call synchronization.
+struct NativeTransformCall
+{
+    std::uint32_t layer{};
+    std::uint32_t request{};
+    std::vector<Nvfp4BoundaryOffloadPageTask> offloadFused;
+    std::vector<Nvfp4BoundaryOffloadPageTask> offloadStaging;
+    std::vector<Nvfp4BoundaryOnboardPageTask> onboardFused;
+    std::vector<Nvfp4BoundaryOnboardPageTask> onboardSm;
+    std::vector<Nvfp4BoundaryOnboardPageTask> onboardDma;
+    std::array<std::vector<MMTask>, 4> smOffload;
+    std::array<std::vector<MMTask>, 4> smOnboard;
+    std::vector<void*> dmaDestinations;
+    std::vector<void const*> dmaSources;
+    std::vector<std::size_t> dmaSizes;
+};
+
 std::vector<std::size_t> makeSlotOrder(std::size_t pages, AddressMode mode, std::uint64_t seed)
 {
     std::vector<std::size_t> result(pages);
@@ -692,8 +1006,8 @@ std::vector<std::uint8_t> makeRawPool(Options const& options, PoolLayout const& 
         0.0F, 0.5F, -1.0F, 1.5F, -2.0F, 3.0F, -4.0F, 6.0F, -0.5F, 1.0F, -1.5F, 2.0F, -3.0F, 4.0F, -6.0F, 0.5F};
     constexpr std::array<float, 4> blockScales{0.25F, 0.5F, 1.0F, 2.0F};
     std::size_t const elements = static_cast<std::size_t>(kNumKvHeads) * kTokensPerPage * kHeadDim;
-    std::vector<std::uint8_t> result(options.pages * layout.rawStride, kUntouchedByte);
-    for (std::size_t page = 0; page < options.pages; ++page)
+    std::vector<std::uint8_t> result(checkedProduct(slots.size(), layout.rawStride, "raw input Pool"), kUntouchedByte);
+    for (std::size_t page = 0; page < slots.size(); ++page)
     {
         auto* output = result.data() + slots[page] * layout.rawStride;
         for (std::size_t index = 0; index < elements; ++index)
@@ -754,15 +1068,16 @@ public:
         : mOptions(options)
         , mLayout(makeLayout(options.dtype))
         , mParams(makeParams())
-        , mSlots(makeSlotOrder(options.pages, options.addressMode, options.seed))
-        , mRawInput(options.pages, mLayout)
-        , mRawFused(options.pages, mLayout)
-        , mRawSm(options.pages, mLayout)
-        , mRawDma(options.pages, mLayout)
-        , mHostFused(options.pages, mLayout)
-        , mHostSm(options.pages, mLayout)
-        , mHostDma(options.pages, mLayout)
-        , mStaging(options.pages, mLayout)
+        , mPhysicalRecords(physicalRecordCount(options))
+        , mSlots(makeSlotOrder(mPhysicalRecords, options.addressMode, options.seed))
+        , mRawInput(mPhysicalRecords, mLayout)
+        , mRawFused(mPhysicalRecords, mLayout)
+        , mRawSm(mPhysicalRecords, mLayout)
+        , mRawDma(mPhysicalRecords, mLayout)
+        , mHostFused(mPhysicalRecords, mLayout)
+        , mHostSm(mPhysicalRecords, mLayout)
+        , mHostDma(mPhysicalRecords, mLayout)
+        , mStaging(mPhysicalRecords, mLayout)
     {
         mRawInput.k.copyFrom(makeRawPool(options, mLayout, mSlots, mParams, 0));
         mRawInput.v.copyFrom(makeRawPool(options, mLayout, mSlots, mParams, 1));
@@ -866,113 +1181,162 @@ public:
         return {variant, sample, static_cast<double>(elapsedMs) * 1000.0 / iterations, cpuUs, 1.0};
     }
 
+    void profile(Variant variant)
+    {
+        if (variant == Variant::kStagedDma && !mDmaAvailable)
+        {
+            fail("cannot profile staged_dma: " + mDmaUnavailableReason);
+        }
+
+        // Nsight Systems starts collection only after correctness and warmup.
+        // Synchronizing before and after the captured loop makes the report one
+        // exact steady-state pipeline rather than a mixture of setup and teardown.
+        checkCuda(cudaStreamSynchronize(mStream), "pre-profile synchronization");
+        checkCuda(cudaProfilerStart(), "cudaProfilerStart");
+        for (int iteration = 0; iteration < mOptions.iterations; ++iteration)
+        {
+            enqueue(variant);
+        }
+        checkCuda(cudaStreamSynchronize(mStream), "profile synchronization");
+        checkCuda(cudaProfilerStop(), "cudaProfilerStop");
+    }
+
 private:
     void buildTasks()
     {
-        mOffloadFused.reserve(mOptions.pages);
-        mOffloadStaging.reserve(mOptions.pages);
-        mOnboardFused.reserve(mOptions.pages);
-        mOnboardSm.reserve(mOptions.pages);
-        mOnboardDma.reserve(mOptions.pages);
-        for (std::size_t page = 0; page < mOptions.pages; ++page)
+        std::size_t const requestCount = requests(mOptions);
+        std::size_t const pageCount = pagesPerRequest(mOptions);
+        mNativeCalls.reserve(nativeTransformCallsPerIteration(mOptions));
+        std::size_t const layerCount = localLayers(mOptions);
+        for (std::size_t request = 0; request < requestCount; ++request)
         {
-            std::size_t const physical = mSlots[page];
-            auto* rawInputK = slot(mRawInput.k, physical, mLayout.rawStride);
-            auto* rawInputV = slot(mRawInput.v, physical, mLayout.rawStride);
-            mOffloadFused.push_back({rawInputK, rawInputV, slot(mHostFused.packedK, physical, mLayout.packedStride),
-                slot(mHostFused.packedV, physical, mLayout.packedStride),
-                slot(mHostFused.scaleK, physical, mLayout.scaleStride),
-                slot(mHostFused.scaleV, physical, mLayout.scaleStride)});
-            mOffloadStaging.push_back({rawInputK, rawInputV, slot(mStaging.packedK, physical, mLayout.packedStride),
-                slot(mStaging.packedV, physical, mLayout.packedStride),
-                slot(mStaging.scaleK, physical, mLayout.scaleStride),
-                slot(mStaging.scaleV, physical, mLayout.scaleStride)});
-
-            mOnboardFused.push_back({slot(mHostFused.packedK, physical, mLayout.packedStride),
-                slot(mHostFused.packedV, physical, mLayout.packedStride),
-                slot(mHostFused.scaleK, physical, mLayout.scaleStride),
-                slot(mHostFused.scaleV, physical, mLayout.scaleStride), slot(mRawFused.k, physical, mLayout.rawStride),
-                slot(mRawFused.v, physical, mLayout.rawStride)});
-            mOnboardSm.push_back({slot(mStaging.packedK, physical, mLayout.packedStride),
-                slot(mStaging.packedV, physical, mLayout.packedStride),
-                slot(mStaging.scaleK, physical, mLayout.scaleStride),
-                slot(mStaging.scaleV, physical, mLayout.scaleStride), slot(mRawSm.k, physical, mLayout.rawStride),
-                slot(mRawSm.v, physical, mLayout.rawStride)});
-            mOnboardDma.push_back({slot(mStaging.packedK, physical, mLayout.packedStride),
-                slot(mStaging.packedV, physical, mLayout.packedStride),
-                slot(mStaging.scaleK, physical, mLayout.scaleStride),
-                slot(mStaging.scaleV, physical, mLayout.scaleStride), slot(mRawDma.k, physical, mLayout.rawStride),
-                slot(mRawDma.v, physical, mLayout.rawStride)});
-        }
-
-        buildSmTasks(mHostSm, mSmOffload, Direction::kOffload);
-        buildSmTasks(mHostFused, mSmOnboard, Direction::kOnboard);
-        buildDmaTasks();
-    }
-
-    void buildSmTasks(CompactHostPools const& host, std::array<std::vector<MMTask>, 4>& tasks, Direction direction)
-    {
-        for (auto& poolTasks : tasks)
-        {
-            poolTasks.reserve(mOptions.pages);
-        }
-        for (std::size_t page = 0; page < mOptions.pages; ++page)
-        {
-            std::size_t const physical = mSlots[page];
-            auto append = [&](std::size_t pool, void* hostPointer, void* devicePointer)
+            for (std::size_t layer = 0; layer < layerCount; ++layer)
             {
-                void* destination = direction == Direction::kOffload ? hostPointer : devicePointer;
-                void* source = direction == Direction::kOffload ? devicePointer : hostPointer;
-                tasks[pool].push_back({address(destination), address(source)});
-            };
-            append(0, slot(host.packedK, physical, mLayout.packedStride),
-                slot(mStaging.packedK, physical, mLayout.packedStride));
-            append(1, slot(host.packedV, physical, mLayout.packedStride),
-                slot(mStaging.packedV, physical, mLayout.packedStride));
-            append(2, slot(host.scaleK, physical, mLayout.scaleStride),
-                slot(mStaging.scaleK, physical, mLayout.scaleStride));
-            append(3, slot(host.scaleV, physical, mLayout.scaleStride),
-                slot(mStaging.scaleV, physical, mLayout.scaleStride));
-        }
-    }
+                NativeTransformCall call{};
+                call.layer = static_cast<std::uint32_t>(layer);
+                call.request = static_cast<std::uint32_t>(request);
+                call.offloadFused.reserve(pageCount);
+                call.offloadStaging.reserve(pageCount);
+                call.onboardFused.reserve(pageCount);
+                call.onboardSm.reserve(pageCount);
+                call.onboardDma.reserve(pageCount);
+                for (auto& tasks : call.smOffload)
+                {
+                    tasks.reserve(pageCount);
+                }
+                for (auto& tasks : call.smOnboard)
+                {
+                    tasks.reserve(pageCount);
+                }
+                call.dmaDestinations.reserve(4 * pageCount);
+                call.dmaSources.reserve(4 * pageCount);
+                call.dmaSizes.reserve(4 * pageCount);
 
-    void appendDmaPool(void* destination, void const* source, std::size_t stride)
-    {
-        mDmaDestinations.push_back(destination);
-        mDmaSources.push_back(source);
-        mDmaSizes.push_back(stride);
-    }
-
-    void buildDmaTasks()
-    {
-        mDmaDestinations.reserve(4 * mOptions.pages);
-        mDmaSources.reserve(4 * mOptions.pages);
-        mDmaSizes.reserve(4 * mOptions.pages);
-        for (std::size_t page = 0; page < mOptions.pages; ++page)
-        {
-            std::size_t const physical = mSlots[page];
-            if (mOptions.direction == Direction::kOffload)
-            {
-                appendDmaPool(slot(mHostDma.packedK, physical, mLayout.packedStride),
-                    slot(mStaging.packedK, physical, mLayout.packedStride), mLayout.packedStride);
-                appendDmaPool(slot(mHostDma.packedV, physical, mLayout.packedStride),
-                    slot(mStaging.packedV, physical, mLayout.packedStride), mLayout.packedStride);
-                appendDmaPool(slot(mHostDma.scaleK, physical, mLayout.scaleStride),
-                    slot(mStaging.scaleK, physical, mLayout.scaleStride), mLayout.scaleStride);
-                appendDmaPool(slot(mHostDma.scaleV, physical, mLayout.scaleStride),
-                    slot(mStaging.scaleV, physical, mLayout.scaleStride), mLayout.scaleStride);
+                for (std::size_t page = 0; page < pageCount; ++page)
+                {
+                    // Lower in request-major, then layer-minor order. Bounded
+                    // replay maps sequential native calls cyclically over N
+                    // physical records. N >= pageCount guarantees that one call
+                    // never aliases its own source/destination Slots; reuse occurs
+                    // only across calls ordered on the same owner stream. Device
+                    // raw data can therefore benefit from cache reuse: this mode
+                    // measures execution topology and repeated Host transfers;
+                    // unique-address Axis B remains the bandwidth evidence.
+                    std::size_t const record = (request * layerCount + layer) * pageCount + page;
+                    std::size_t const physical = mSlots[record % mPhysicalRecords];
+                    appendPageTasks(call, physical);
+                }
+                mNativeCalls.push_back(std::move(call));
             }
-            else
-            {
-                appendDmaPool(slot(mStaging.packedK, physical, mLayout.packedStride),
-                    slot(mHostFused.packedK, physical, mLayout.packedStride), mLayout.packedStride);
-                appendDmaPool(slot(mStaging.packedV, physical, mLayout.packedStride),
-                    slot(mHostFused.packedV, physical, mLayout.packedStride), mLayout.packedStride);
-                appendDmaPool(slot(mStaging.scaleK, physical, mLayout.scaleStride),
-                    slot(mHostFused.scaleK, physical, mLayout.scaleStride), mLayout.scaleStride);
-                appendDmaPool(slot(mStaging.scaleV, physical, mLayout.scaleStride),
-                    slot(mHostFused.scaleV, physical, mLayout.scaleStride), mLayout.scaleStride);
-            }
+        }
+        if (mNativeCalls.size() != nativeTransformCallsPerIteration(mOptions))
+        {
+            fail("internal native transform call count mismatch");
+        }
+    }
+
+    void appendPageTasks(NativeTransformCall& call, std::size_t physical)
+    {
+        auto* rawInputK = slot(mRawInput.k, physical, mLayout.rawStride);
+        auto* rawInputV = slot(mRawInput.v, physical, mLayout.rawStride);
+        call.offloadFused.push_back({rawInputK, rawInputV,
+            slot(mHostFused.packedK, physical, mLayout.packedStride),
+            slot(mHostFused.packedV, physical, mLayout.packedStride),
+            slot(mHostFused.scaleK, physical, mLayout.scaleStride),
+            slot(mHostFused.scaleV, physical, mLayout.scaleStride)});
+        call.offloadStaging.push_back({rawInputK, rawInputV,
+            slot(mStaging.packedK, physical, mLayout.packedStride),
+            slot(mStaging.packedV, physical, mLayout.packedStride),
+            slot(mStaging.scaleK, physical, mLayout.scaleStride),
+            slot(mStaging.scaleV, physical, mLayout.scaleStride)});
+
+        call.onboardFused.push_back({slot(mHostFused.packedK, physical, mLayout.packedStride),
+            slot(mHostFused.packedV, physical, mLayout.packedStride),
+            slot(mHostFused.scaleK, physical, mLayout.scaleStride),
+            slot(mHostFused.scaleV, physical, mLayout.scaleStride),
+            slot(mRawFused.k, physical, mLayout.rawStride), slot(mRawFused.v, physical, mLayout.rawStride)});
+        call.onboardSm.push_back({slot(mStaging.packedK, physical, mLayout.packedStride),
+            slot(mStaging.packedV, physical, mLayout.packedStride),
+            slot(mStaging.scaleK, physical, mLayout.scaleStride),
+            slot(mStaging.scaleV, physical, mLayout.scaleStride), slot(mRawSm.k, physical, mLayout.rawStride),
+            slot(mRawSm.v, physical, mLayout.rawStride)});
+        call.onboardDma.push_back({slot(mStaging.packedK, physical, mLayout.packedStride),
+            slot(mStaging.packedV, physical, mLayout.packedStride),
+            slot(mStaging.scaleK, physical, mLayout.scaleStride),
+            slot(mStaging.scaleV, physical, mLayout.scaleStride), slot(mRawDma.k, physical, mLayout.rawStride),
+            slot(mRawDma.v, physical, mLayout.rawStride)});
+
+        auto appendSm = [&](std::array<std::vector<MMTask>, 4>& tasks, std::size_t pool, void* hostPointer,
+                            void* devicePointer, Direction direction)
+        {
+            void* destination = direction == Direction::kOffload ? hostPointer : devicePointer;
+            void* source = direction == Direction::kOffload ? devicePointer : hostPointer;
+            tasks[pool].push_back({address(destination), address(source)});
+        };
+        appendSm(call.smOffload, 0, slot(mHostSm.packedK, physical, mLayout.packedStride),
+            slot(mStaging.packedK, physical, mLayout.packedStride), Direction::kOffload);
+        appendSm(call.smOffload, 1, slot(mHostSm.packedV, physical, mLayout.packedStride),
+            slot(mStaging.packedV, physical, mLayout.packedStride), Direction::kOffload);
+        appendSm(call.smOffload, 2, slot(mHostSm.scaleK, physical, mLayout.scaleStride),
+            slot(mStaging.scaleK, physical, mLayout.scaleStride), Direction::kOffload);
+        appendSm(call.smOffload, 3, slot(mHostSm.scaleV, physical, mLayout.scaleStride),
+            slot(mStaging.scaleV, physical, mLayout.scaleStride), Direction::kOffload);
+        appendSm(call.smOnboard, 0, slot(mHostFused.packedK, physical, mLayout.packedStride),
+            slot(mStaging.packedK, physical, mLayout.packedStride), Direction::kOnboard);
+        appendSm(call.smOnboard, 1, slot(mHostFused.packedV, physical, mLayout.packedStride),
+            slot(mStaging.packedV, physical, mLayout.packedStride), Direction::kOnboard);
+        appendSm(call.smOnboard, 2, slot(mHostFused.scaleK, physical, mLayout.scaleStride),
+            slot(mStaging.scaleK, physical, mLayout.scaleStride), Direction::kOnboard);
+        appendSm(call.smOnboard, 3, slot(mHostFused.scaleV, physical, mLayout.scaleStride),
+            slot(mStaging.scaleV, physical, mLayout.scaleStride), Direction::kOnboard);
+
+        auto appendDma = [&](void* destination, void const* source, std::size_t stride)
+        {
+            call.dmaDestinations.push_back(destination);
+            call.dmaSources.push_back(source);
+            call.dmaSizes.push_back(stride);
+        };
+        if (mOptions.direction == Direction::kOffload)
+        {
+            appendDma(slot(mHostDma.packedK, physical, mLayout.packedStride),
+                slot(mStaging.packedK, physical, mLayout.packedStride), mLayout.packedStride);
+            appendDma(slot(mHostDma.packedV, physical, mLayout.packedStride),
+                slot(mStaging.packedV, physical, mLayout.packedStride), mLayout.packedStride);
+            appendDma(slot(mHostDma.scaleK, physical, mLayout.scaleStride),
+                slot(mStaging.scaleK, physical, mLayout.scaleStride), mLayout.scaleStride);
+            appendDma(slot(mHostDma.scaleV, physical, mLayout.scaleStride),
+                slot(mStaging.scaleV, physical, mLayout.scaleStride), mLayout.scaleStride);
+        }
+        else
+        {
+            appendDma(slot(mStaging.packedK, physical, mLayout.packedStride),
+                slot(mHostFused.packedK, physical, mLayout.packedStride), mLayout.packedStride);
+            appendDma(slot(mStaging.packedV, physical, mLayout.packedStride),
+                slot(mHostFused.packedV, physical, mLayout.packedStride), mLayout.packedStride);
+            appendDma(slot(mStaging.scaleK, physical, mLayout.scaleStride),
+                slot(mHostFused.scaleK, physical, mLayout.scaleStride), mLayout.scaleStride);
+            appendDma(slot(mStaging.scaleV, physical, mLayout.scaleStride),
+                slot(mHostFused.scaleV, physical, mLayout.scaleStride), mLayout.scaleStride);
         }
     }
 
@@ -982,7 +1346,11 @@ private:
         // once with the fused offload path before correctness or timing.
         if (mOptions.direction == Direction::kOnboard)
         {
-            kernels::invokeNvfp4BoundaryOffloadCompress(mOffloadFused, mParams, runtimeType(mOptions.dtype), mStream);
+            for (NativeTransformCall const& call : mNativeCalls)
+            {
+                kernels::invokeNvfp4BoundaryOffloadCompress(
+                    call.offloadFused, mParams, runtimeType(mOptions.dtype), mStream);
+            }
             checkCuda(cudaStreamSynchronize(mStream), "canonical NVFP4 preparation");
         }
     }
@@ -1006,9 +1374,9 @@ private:
         }
     }
 
-    void copyCompactWithSm(Direction direction)
+    void copyCompactWithSm(NativeTransformCall const& call, Direction direction)
     {
-        auto const& tasks = direction == Direction::kOffload ? mSmOffload : mSmOnboard;
+        auto const& tasks = direction == Direction::kOffload ? call.smOffload : call.smOnboard;
         CUstream const stream = reinterpret_cast<CUstream>(static_cast<cudaStream_t>(mStream));
         auto copyPool = [&](std::vector<MMTask> const& poolTasks, std::size_t bytes, std::string_view name)
         {
@@ -1026,7 +1394,7 @@ private:
         copyPool(tasks[3], mLayout.scaleStride, "batchedCopy scale V");
     }
 
-    cudaError_t copyCompactWithDma()
+    cudaError_t copyCompactWithDma(NativeTransformCall const& call)
     {
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
         // Match the CUDA-13 call shape already used by TRT-LLM's
@@ -1036,33 +1404,45 @@ private:
         attributes[0].srcAccessOrder = cudaMemcpySrcAccessOrderStream;
         attributes[0].flags = 1U;
         std::size_t attributeIndices[1]{0};
-        return cudaMemcpyBatchAsync(mDmaDestinations.data(), mDmaSources.data(), mDmaSizes.data(), mDmaSizes.size(),
-            attributes, attributeIndices, 1, mStream);
+        return cudaMemcpyBatchAsync(call.dmaDestinations.data(), call.dmaSources.data(), call.dmaSizes.data(),
+            call.dmaSizes.size(), attributes, attributeIndices, 1, mStream);
 #else
+        static_cast<void>(call);
         return cudaErrorNotSupported;
 #endif
     }
 
     void enqueue(Variant variant)
     {
+        // One enqueue is one scheduler iteration. Each request-local migration
+        // hook lowers into one native call per layer; all calls share the owner
+        // stream without per-call synchronization.
+        for (NativeTransformCall const& call : mNativeCalls)
+        {
+            enqueueCall(call, variant);
+        }
+    }
+
+    void enqueueCall(NativeTransformCall const& call, Variant variant)
+    {
         if (mOptions.direction == Direction::kOffload)
         {
             if (variant == Variant::kFused)
             {
-                kernels::invokeNvfp4BoundaryOffloadCompress(
-                    mOffloadFused, mParams, runtimeType(mOptions.dtype), mStream);
+                kernels::detail::invokeNvfp4BoundaryOffloadCompressWithPipeline(call.offloadFused, mParams,
+                    runtimeType(mOptions.dtype), mOptions.fusedPipeline, mStream);
             }
             else
             {
                 kernels::invokeNvfp4BoundaryOffloadCompress(
-                    mOffloadStaging, mParams, runtimeType(mOptions.dtype), mStream);
+                    call.offloadStaging, mParams, runtimeType(mOptions.dtype), mStream);
                 if (variant == Variant::kStagedSm)
                 {
-                    copyCompactWithSm(Direction::kOffload);
+                    copyCompactWithSm(call, Direction::kOffload);
                 }
                 else
                 {
-                    checkCuda(copyCompactWithDma(), "cudaMemcpyBatchAsync offload");
+                    checkCuda(copyCompactWithDma(call), "cudaMemcpyBatchAsync offload");
                 }
             }
         }
@@ -1070,22 +1450,22 @@ private:
         {
             if (variant == Variant::kFused)
             {
-                kernels::invokeNvfp4BoundaryOnboardDecompress(
-                    mOnboardFused, mParams, runtimeType(mOptions.dtype), mStream);
+                kernels::detail::invokeNvfp4BoundaryOnboardDecompressWithPipeline(call.onboardFused, mParams,
+                    runtimeType(mOptions.dtype), mOptions.fusedPipeline, mStream);
             }
             else
             {
                 if (variant == Variant::kStagedSm)
                 {
-                    copyCompactWithSm(Direction::kOnboard);
+                    copyCompactWithSm(call, Direction::kOnboard);
                     kernels::invokeNvfp4BoundaryOnboardDecompress(
-                        mOnboardSm, mParams, runtimeType(mOptions.dtype), mStream);
+                        call.onboardSm, mParams, runtimeType(mOptions.dtype), mStream);
                 }
                 else
                 {
-                    checkCuda(copyCompactWithDma(), "cudaMemcpyBatchAsync onboard");
+                    checkCuda(copyCompactWithDma(call), "cudaMemcpyBatchAsync onboard");
                     kernels::invokeNvfp4BoundaryOnboardDecompress(
-                        mOnboardDma, mParams, runtimeType(mOptions.dtype), mStream);
+                        call.onboardDma, mParams, runtimeType(mOptions.dtype), mStream);
                 }
             }
         }
@@ -1107,10 +1487,6 @@ private:
             return;
         }
         checkCuda(status, "cudaMemcpyBatchAsync correctness probe");
-        if (mOptions.direction == Direction::kOnboard)
-        {
-            kernels::invokeNvfp4BoundaryOnboardDecompress(mOnboardDma, mParams, runtimeType(mOptions.dtype), mStream);
-        }
         cudaError_t const completion = cudaStreamSynchronize(mStream);
         if (completion == cudaErrorNotSupported)
         {
@@ -1124,11 +1500,25 @@ private:
 
     cudaError_t copyCompactWithDmaProbe()
     {
-        if (mOptions.direction == Direction::kOffload)
+        for (NativeTransformCall const& call : mNativeCalls)
         {
-            kernels::invokeNvfp4BoundaryOffloadCompress(mOffloadStaging, mParams, runtimeType(mOptions.dtype), mStream);
+            if (mOptions.direction == Direction::kOffload)
+            {
+                kernels::invokeNvfp4BoundaryOffloadCompress(
+                    call.offloadStaging, mParams, runtimeType(mOptions.dtype), mStream);
+            }
+            cudaError_t const status = copyCompactWithDma(call);
+            if (status != cudaSuccess)
+            {
+                return status;
+            }
+            if (mOptions.direction == Direction::kOnboard)
+            {
+                kernels::invokeNvfp4BoundaryOnboardDecompress(
+                    call.onboardDma, mParams, runtimeType(mOptions.dtype), mStream);
+            }
         }
-        return copyCompactWithDma();
+        return cudaSuccess;
     }
 
     static void comparePool(DevicePool const& expected, DevicePool const& actual, std::string_view expectedName,
@@ -1166,6 +1556,7 @@ private:
     Options const& mOptions;
     PoolLayout mLayout;
     Nvfp4BoundaryKernelParams mParams;
+    std::size_t mPhysicalRecords{};
     std::vector<std::size_t> mSlots;
     CudaStream mStream;
     CudaEvent mStart;
@@ -1180,16 +1571,7 @@ private:
     CompactHostPools mHostDma;
     CompactDevicePools mStaging;
 
-    std::vector<Nvfp4BoundaryOffloadPageTask> mOffloadFused;
-    std::vector<Nvfp4BoundaryOffloadPageTask> mOffloadStaging;
-    std::vector<Nvfp4BoundaryOnboardPageTask> mOnboardFused;
-    std::vector<Nvfp4BoundaryOnboardPageTask> mOnboardSm;
-    std::vector<Nvfp4BoundaryOnboardPageTask> mOnboardDma;
-    std::array<std::vector<MMTask>, 4> mSmOffload;
-    std::array<std::vector<MMTask>, 4> mSmOnboard;
-    std::vector<void*> mDmaDestinations;
-    std::vector<void const*> mDmaSources;
-    std::vector<std::size_t> mDmaSizes;
+    std::vector<NativeTransformCall> mNativeCalls;
     bool mDmaAvailable{true};
     std::string mDmaUnavailableReason;
 };
@@ -1258,12 +1640,21 @@ public:
             }
             mOutput = &mFile;
         }
-        *mOutput << "row_kind,status,note,variant,sample,direction,dtype,address_mode,pages,num_kv_heads,"
+        *mOutput << "row_kind,status,note,variant,fused_pipeline,sample,direction,dtype,address_mode,pages,num_kv_heads,"
                     "tokens_per_page,head_dim,pdl,warmup,iterations,seed,gpu_us,cpu_enqueue_us,min_gpu_us,"
                     "median_gpu_us,p95_gpu_us,pages_per_s,effective_raw_gbps,effective_compact_gbps,"
                     "staged_over_fused,"
                     "raw_bytes_per_page,compact_bytes_per_page,gpu_staging_bytes,cudart_version,driver_version,"
-                    "device_name\n";
+                    "device_name,benchmark_shape,requests,pages_per_request,local_layers,"
+                    "logical_page_layer_records,physical_page_layer_records,bounded_address_replay,"
+                    "physical_record_window,assumed_migration_hook_calls_per_iteration,"
+                    "native_transform_calls_per_iteration,tasks_per_native_call,"
+                    "descriptor_capacity_assumption,descriptor_chunks_per_native_call,"
+                    "kvcm_copy_descriptor_capacity,kvcm_copy_chunks_per_native_call,"
+                    "expected_transform_kernel_launches_per_iteration,"
+                    "expected_sm_copy_kernel_launches_per_iteration,expected_dma_batch_calls_per_iteration,"
+                    "expected_total_kernel_launches_per_iteration,gpu_critical_path_us,page_layer_records_per_s,"
+                    "assumed_migration_hook_calls_per_s,native_transform_calls_per_s\n";
         mOutput->setf(std::ios::fixed);
         *mOutput << std::setprecision(6);
     }
@@ -1271,51 +1662,67 @@ public:
     void sample(Options const& options, PoolLayout const& layout, TimingSample const& sample, bool pdl,
         int runtimeVersion, int driverVersion, std::string const& deviceName)
     {
-        double const pps = pagesPerSecond(options.pages, sample.gpuUs);
-        double const rawGbps = gigabytesPerSecond(layout.rawBoundaryBytesPerPage(), options.pages, sample.gpuUs);
+        std::size_t const records = logicalRecordCount(options);
+        double const pps = pagesPerSecond(records, sample.gpuUs);
+        double const rawGbps = gigabytesPerSecond(layout.rawBoundaryBytesPerPage(), records, sample.gpuUs);
         double const compactGbps
-            = gigabytesPerSecond(layout.compactBoundaryBytesPerPage(), options.pages, sample.gpuUs);
-        std::size_t const stagingBytes
-            = sample.variant == Variant::kFused ? 0 : options.pages * layout.compactStagingBytesPerPage();
-        *mOutput << "sample,ok,," << toString(sample.variant) << ',' << sample.sample << ','
+            = gigabytesPerSecond(layout.compactBoundaryBytesPerPage(), records, sample.gpuUs);
+        std::size_t const stagingBytes = sample.variant == Variant::kFused
+            ? 0
+            : checkedProduct(physicalRecordCount(options), layout.compactStagingBytesPerPage(), "GPU staging bytes");
+        *mOutput << "sample,ok,," << toString(sample.variant) << ',' << toString(options.fusedPipeline) << ','
+                 << sample.sample << ','
                  << toString(options.direction) << ',' << toString(options.dtype) << ','
-                 << toString(options.addressMode) << ',' << options.pages << ',' << kNumKvHeads << ',' << kTokensPerPage
+                 << toString(options.addressMode) << ',' << reportedPages(options) << ',' << kNumKvHeads << ','
+                 << kTokensPerPage
                  << ',' << kHeadDim << ',' << (pdl ? 1 : 0) << ',' << options.warmup << ',' << options.iterations << ','
                  << options.seed << ',' << sample.gpuUs << ',' << sample.cpuEnqueueUs << ",,,," << pps << ',' << rawGbps
                  << ',' << compactGbps << ',' << sample.speedupOverFused << ',' << layout.rawBoundaryBytesPerPage()
                  << ',' << layout.compactBoundaryBytesPerPage() << ',' << stagingBytes << ',' << runtimeVersion << ','
-                 << driverVersion << ',' << csvEscape(deviceName) << '\n';
+                 << driverVersion << ',' << csvEscape(deviceName);
+        appendShapeColumns(options, sample.variant, sample.gpuUs);
+        *mOutput << '\n';
     }
 
     void summary(Options const& options, PoolLayout const& layout, Variant variant, Summary const& gpu,
         Summary const& cpu, double speedup, bool pdl, int runtimeVersion, int driverVersion,
         std::string const& deviceName)
     {
-        double const pps = pagesPerSecond(options.pages, gpu.median);
-        double const rawGbps = gigabytesPerSecond(layout.rawBoundaryBytesPerPage(), options.pages, gpu.median);
-        double const compactGbps = gigabytesPerSecond(layout.compactBoundaryBytesPerPage(), options.pages, gpu.median);
-        std::size_t const stagingBytes
-            = variant == Variant::kFused ? 0 : options.pages * layout.compactStagingBytesPerPage();
-        *mOutput << "summary,ok,," << toString(variant) << ",," << toString(options.direction) << ','
-                 << toString(options.dtype) << ',' << toString(options.addressMode) << ',' << options.pages << ','
+        std::size_t const records = logicalRecordCount(options);
+        double const pps = pagesPerSecond(records, gpu.median);
+        double const rawGbps = gigabytesPerSecond(layout.rawBoundaryBytesPerPage(), records, gpu.median);
+        double const compactGbps = gigabytesPerSecond(layout.compactBoundaryBytesPerPage(), records, gpu.median);
+        std::size_t const stagingBytes = variant == Variant::kFused
+            ? 0
+            : checkedProduct(physicalRecordCount(options), layout.compactStagingBytesPerPage(), "GPU staging bytes");
+        *mOutput << "summary,ok,," << toString(variant) << ',' << toString(options.fusedPipeline) << ",,"
+                 << toString(options.direction) << ','
+                 << toString(options.dtype) << ',' << toString(options.addressMode) << ',' << reportedPages(options) << ','
                  << kNumKvHeads << ',' << kTokensPerPage << ',' << kHeadDim << ',' << (pdl ? 1 : 0) << ','
                  << options.warmup << ',' << options.iterations << ',' << options.seed << ",," << cpu.median << ','
                  << gpu.minimum << ',' << gpu.median << ',' << gpu.p95 << ',' << pps << ',' << rawGbps << ','
                  << compactGbps << ',' << speedup << ',' << layout.rawBoundaryBytesPerPage() << ','
                  << layout.compactBoundaryBytesPerPage() << ',' << stagingBytes << ',' << runtimeVersion << ','
-                 << driverVersion << ',' << csvEscape(deviceName) << '\n';
+                 << driverVersion << ',' << csvEscape(deviceName);
+        appendShapeColumns(options, variant, gpu.median);
+        *mOutput << '\n';
     }
 
     void unsupported(Options const& options, PoolLayout const& layout, Variant variant, std::string const& reason,
         bool pdl, int runtimeVersion, int driverVersion, std::string const& deviceName)
     {
-        *mOutput << "summary,unsupported," << csvEscape(reason) << ',' << toString(variant) << ",,"
+        *mOutput << "summary,unsupported," << csvEscape(reason) << ',' << toString(variant) << ','
+                 << toString(options.fusedPipeline) << ",,"
                  << toString(options.direction) << ',' << toString(options.dtype) << ','
-                 << toString(options.addressMode) << ',' << options.pages << ',' << kNumKvHeads << ',' << kTokensPerPage
+                 << toString(options.addressMode) << ',' << reportedPages(options) << ',' << kNumKvHeads << ','
+                 << kTokensPerPage
                  << ',' << kHeadDim << ',' << (pdl ? 1 : 0) << ',' << options.warmup << ',' << options.iterations << ','
                  << options.seed << ",,,,,,,,,," << layout.rawBoundaryBytesPerPage() << ','
-                 << layout.compactBoundaryBytesPerPage() << ',' << options.pages * layout.compactStagingBytesPerPage()
-                 << ',' << runtimeVersion << ',' << driverVersion << ',' << csvEscape(deviceName) << '\n';
+                 << layout.compactBoundaryBytesPerPage() << ','
+                 << checkedProduct(physicalRecordCount(options), layout.compactStagingBytesPerPage(), "GPU staging bytes")
+                 << ',' << runtimeVersion << ',' << driverVersion << ',' << csvEscape(deviceName);
+        appendShapeColumns(options, variant, std::nullopt);
+        *mOutput << '\n';
     }
 
     void finish()
@@ -1328,6 +1735,31 @@ public:
     }
 
 private:
+    void appendShapeColumns(Options const& options, Variant variant, std::optional<double> gpuUs)
+    {
+        ExpectedLaunchCounts const expected = expectedLaunchCounts(options, variant);
+        *mOutput << ',' << benchmarkShape(options) << ',' << requests(options) << ',' << pagesPerRequest(options) << ','
+                 << localLayers(options) << ',' << logicalRecordCount(options) << ','
+                 << physicalRecordCount(options) << ',' << (boundedAddressReplay(options) ? 1 : 0) << ','
+                 << options.physicalRecordWindow.value_or(0) << ','
+                 << migrationHookCallsPerIteration(options) << ',' << nativeTransformCallsPerIteration(options) << ','
+                 << tasksPerNativeCall(options) << ','
+                 << kBoundaryDescriptorCapacityAssumption << ',' << descriptorChunksPerCall(options) << ','
+                 << kKvcmCopyDescriptorCapacity << ',' << kvcmCopyChunksPerCall(options) << ','
+                 << expected.transformKernels << ',' << expected.smCopyKernels << ',' << expected.dmaBatchCalls << ','
+                 << expected.totalKernels << ',';
+        if (gpuUs.has_value())
+        {
+            *mOutput << *gpuUs << ',' << pagesPerSecond(logicalRecordCount(options), *gpuUs) << ','
+                     << pagesPerSecond(migrationHookCallsPerIteration(options), *gpuUs) << ','
+                     << pagesPerSecond(nativeTransformCallsPerIteration(options), *gpuUs);
+        }
+        else
+        {
+            *mOutput << ",,,";
+        }
+    }
+
     std::ofstream mFile;
     std::ostream* mOutput{};
 };
@@ -1371,6 +1803,12 @@ int run(Options const& options)
         std::cerr << "staged_dma unsupported: " << fixture.dmaUnavailableReason() << '\n';
     }
     fixture.warmup();
+
+    if (options.profileVariant.has_value())
+    {
+        fixture.profile(*options.profileVariant);
+        return EXIT_SUCCESS;
+    }
 
     std::vector<TimingSample> samples;
     samples.reserve(static_cast<std::size_t>(options.samples) * (fixture.dmaAvailable() ? 3 : 2));

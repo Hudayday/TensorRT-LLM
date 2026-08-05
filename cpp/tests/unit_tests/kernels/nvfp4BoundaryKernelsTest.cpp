@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/nvfp4BoundaryKernels.h"
+#include "tensorrt_llm/kernels/nvfp4BoundaryKernelsInternal.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
@@ -43,6 +43,7 @@ using tensorrt_llm::kernels::Nvfp4BoundaryKernelParams;
 using tensorrt_llm::kernels::Nvfp4BoundaryOffloadPageTask;
 using tensorrt_llm::kernels::Nvfp4BoundaryOnboardPageTask;
 using tensorrt_llm::kernels::Nvfp4BoundaryRuntimeType;
+using tensorrt_llm::kernels::detail::Nvfp4BoundaryTransferPipeline;
 
 constexpr std::size_t kGuardBytes = 64;
 constexpr std::uint8_t kCanary = 0xA5;
@@ -60,6 +61,7 @@ constexpr PageGeometry kDefaultGeometry{2, 8, 32};
 constexpr PageGeometry kMinimumNativeGeometry{1, 4, 16};
 constexpr PageGeometry kSecondCtaTailGeometry{2, 20, 64};
 constexpr PageGeometry kModelLikeGeometry{8, 64, 128};
+constexpr PageGeometry kLargeGeometry{64, 64, 128};
 
 enum class RawKind
 {
@@ -463,7 +465,9 @@ std::vector<std::uint8_t> decompressReference(ReferenceNvfp4 const& compressed, 
 
 void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultGeometry,
     std::size_t numPages = kDefaultNumPages, InputPattern inputPattern = InputPattern::kDense,
-    bool synchronizeBetweenDirections = true)
+    bool synchronizeBetweenDirections = true,
+    Nvfp4BoundaryTransferPipeline offloadPipeline = Nvfp4BoundaryTransferPipeline::kAuto,
+    Nvfp4BoundaryTransferPipeline onboardPipeline = Nvfp4BoundaryTransferPipeline::kAuto)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
     if (!tensorrt_llm::common::isSM100Family())
@@ -517,7 +521,8 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         }
     };
 
-    tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(offloadTasks, params, runtimeType, stream);
+    tensorrt_llm::kernels::detail::invokeNvfp4BoundaryOffloadCompressWithPipeline(
+        offloadTasks, params, runtimeType, offloadPipeline, stream);
 
     if (synchronizeBetweenDirections)
     {
@@ -538,7 +543,8 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         onboardTasks.push_back({page->packedK.bytes(), page->packedV.bytes(), page->scaleK.bytes(),
             page->scaleV.bytes(), page->rawOutputK.data(), page->rawOutputV.data()});
     }
-    tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(onboardTasks, params, runtimeType, stream);
+    tensorrt_llm::kernels::detail::invokeNvfp4BoundaryOnboardDecompressWithPipeline(
+        onboardTasks, params, runtimeType, onboardPipeline, stream);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     if (!synchronizeBetweenDirections)
@@ -602,6 +608,48 @@ TEST(Nvfp4BoundaryGeometryTest, SupportsModelLikeFp8Page)
 {
     runBoundaryRoundTrip(RawKind::kFp8, kModelLikeGeometry, 1);
 }
+
+TEST(Nvfp4BoundaryGeometryTest, BoundsAutoStagingForLargeBfloat16Page)
+{
+    runBoundaryRoundTrip(RawKind::kBfloat16, kLargeGeometry, 1);
+}
+
+TEST(Nvfp4BoundaryGeometryTest, BoundsAutoStagingForLargeFp8Page)
+{
+    runBoundaryRoundTrip(RawKind::kFp8, kLargeGeometry, 1);
+}
+
+class Nvfp4BoundaryTiledOffloadTest : public testing::TestWithParam<RawKind>
+{
+};
+
+TEST_P(Nvfp4BoundaryTiledOffloadTest, MatchesCpuOracleAndNativeLayout)
+{
+    runBoundaryRoundTrip(GetParam(), kModelLikeGeometry, 3, InputPattern::kDense, true,
+        Nvfp4BoundaryTransferPipeline::kCompressedOutputTiled);
+}
+
+INSTANTIATE_TEST_SUITE_P(AllRuntimeTypes, Nvfp4BoundaryTiledOffloadTest,
+    testing::Values(RawKind::kFloat16, RawKind::kBfloat16, RawKind::kFp8));
+
+class Nvfp4BoundaryOnboardPhaseTest : public testing::TestWithParam<RawKind>
+{
+};
+
+TEST_P(Nvfp4BoundaryOnboardPhaseTest, WholePageMatchesCpuOracle)
+{
+    runBoundaryRoundTrip(GetParam(), kModelLikeGeometry, 3, InputPattern::kDense, true,
+        Nvfp4BoundaryTransferPipeline::kAuto, Nvfp4BoundaryTransferPipeline::kWholePage);
+}
+
+TEST_P(Nvfp4BoundaryOnboardPhaseTest, CompressedOutputTilesMatchCpuOracle)
+{
+    runBoundaryRoundTrip(GetParam(), kModelLikeGeometry, 3, InputPattern::kDense, true,
+        Nvfp4BoundaryTransferPipeline::kAuto, Nvfp4BoundaryTransferPipeline::kCompressedOutputTiled);
+}
+
+INSTANTIATE_TEST_SUITE_P(AllRuntimeTypes, Nvfp4BoundaryOnboardPhaseTest,
+    testing::Values(RawKind::kFloat16, RawKind::kBfloat16, RawKind::kFp8));
 
 class Nvfp4BoundaryInputPatternTest : public testing::TestWithParam<RawKind>
 {
@@ -712,6 +760,9 @@ TEST(Nvfp4BoundaryValidationTest, RejectsInvalidGeometryAndScalesBeforeLaunch)
     invalid.headDim = 24;
     EXPECT_ANY_THROW(invoke16Bit(invalid));
     invalid = makeParams();
+    invalid.headDim = 262144;
+    EXPECT_ANY_THROW(invoke16Bit(invalid));
+    invalid = makeParams();
     invalid.numKvHeads = std::numeric_limits<std::int32_t>::max();
     EXPECT_ANY_THROW(invoke16Bit(invalid));
 
@@ -767,6 +818,10 @@ TEST(Nvfp4BoundaryValidationTest, RejectsNullMisalignedAndUnsupportedDescriptors
     invalidOffload.blockScaleK = nullptr;
     EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
         {invalidOffload}, params, Nvfp4BoundaryRuntimeType::kFp8E4m3, nullptr));
+    invalidOffload = validOffload;
+    invalidOffload.blockScaleK += 1;
+    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
+        {invalidOffload}, params, Nvfp4BoundaryRuntimeType::kFloat16, nullptr));
 
     auto invalidOnboard = validOnboard;
     invalidOnboard.packedK = nullptr;
@@ -776,6 +831,24 @@ TEST(Nvfp4BoundaryValidationTest, RejectsNullMisalignedAndUnsupportedDescriptors
     invalidOnboard.rawV = static_cast<std::uint8_t*>(validOnboard.rawV) + 1;
     EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(
         {invalidOnboard}, params, Nvfp4BoundaryRuntimeType::kFp8E4m3, nullptr));
+
+    // Onboard accepts a byte-aligned external scale tail even though offload's
+    // dense mapped-Host scale stores require 16-byte destination alignment.
+    // Compare it against the aligned path as well as checking the launch.
+    MappedHostRegion byteAlignedScale(scaleBytes(kDefaultGeometry) + 1);
+    DeviceRegion byteAlignedRawK(rawBytes(RawKind::kFloat16, kDefaultGeometry));
+    DeviceRegion byteAlignedRawV(rawBytes(RawKind::kFloat16, kDefaultGeometry));
+    auto byteAlignedOnboard = validOnboard;
+    byteAlignedOnboard.blockScaleK = byteAlignedScale.bytes() + 1;
+    byteAlignedOnboard.rawK = byteAlignedRawK.data();
+    byteAlignedOnboard.rawV = byteAlignedRawV.data();
+    EXPECT_NO_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(
+        {validOnboard}, params, Nvfp4BoundaryRuntimeType::kFloat16, nullptr));
+    EXPECT_NO_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(
+        {byteAlignedOnboard}, params, Nvfp4BoundaryRuntimeType::kFloat16, nullptr));
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    EXPECT_EQ(buffers.rawOutputK.copyToHost(), byteAlignedRawK.copyToHost());
+    EXPECT_EQ(buffers.rawOutputV.copyToHost(), byteAlignedRawV.copyToHost());
 
     auto const unsupportedType = static_cast<Nvfp4BoundaryRuntimeType>(255);
     EXPECT_ANY_THROW(

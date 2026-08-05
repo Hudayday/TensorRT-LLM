@@ -346,6 +346,56 @@ def test_later_cohort_alignment_is_validated_before_any_kernel_launch():
     native.nvfp4_boundary_offload_compress.assert_not_called()
 
 
+def test_later_cohort_offload_scale_alignment_is_validated_before_launch():
+    first = _layout(layer_id=0, runtime_dtype="float16")
+    second_fields = vars(
+        _layout(layer_id=1,
+                runtime_dtype="fp8_e4m3",
+                raw_offset=0x200,
+                compact_offset=0x80)).copy()
+    # Packed addresses stay 16-byte aligned. Only the second cohort's K-scale
+    # destination violates the dense uint4 Host-flush contract.
+    second_fields["block_scale_k"] = BoundaryBufferLayout(1, 0x81)
+    manager = _manager(first, Nvfp4BoundaryLayerLayout(**second_fields))
+    native = _native()
+
+    with patch(
+            "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
+            return_value=native,
+    ):
+        with pytest.raises(ValueError, match="K block scale address"):
+            manager.on_offload_compress(
+                pool_group_index=2,
+                src_life_cycles=(3, ),
+                src_addresses=((0x1000, ), ),
+                dst_addresses=((0x3000, 0x4000), ),
+                stream=0,
+            )
+
+    native.nvfp4_boundary_offload_compress.assert_not_called()
+
+
+def test_onboard_keeps_byte_aligned_scale_tail_fallback():
+    fields = vars(_layout()).copy()
+    fields["block_scale_k"] = BoundaryBufferLayout(1, 1)
+    manager = _manager(Nvfp4BoundaryLayerLayout(**fields))
+    native = _native()
+
+    with patch(
+            "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
+            return_value=native,
+    ):
+        manager.on_onboard_decompress(
+            pool_group_index=2,
+            src_life_cycles=(3, ),
+            src_addresses=((0x3000, 0x4000), ),
+            dst_addresses=((0x1000, ), ),
+            stream=0,
+        )
+
+    native.nvfp4_boundary_onboard_decompress.assert_called_once()
+
+
 def test_short_pool_row_fails_before_native_submission():
     manager = _manager(_layout())
     native = _native()

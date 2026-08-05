@@ -45,9 +45,10 @@ enum class Nvfp4BoundaryRuntimeType : std::uint8_t
 //! roles into physical Pools, but the kernel never assumes adjacency between
 //! K, V, their scales, or different Pages. The packed and scale addresses must
 //! be device-visible aliases of CUDA-registered mapped Host memory. The raw
-//! inputs and packed mapped-Host outputs must be 16-byte aligned and remain
-//! valid and non-overwritable until work submitted to the caller's stream
-//! completes. Scale buffers retain their native byte alignment.
+//! inputs, packed mapped-Host outputs, and mapped-Host scale outputs must be
+//! 16-byte aligned and remain valid and non-overwritable until work submitted
+//! to the caller's stream completes. The scale alignment is required by the
+//! dense uint4 Host-store path.
 struct Nvfp4BoundaryOffloadPageTask
 {
     void const* rawK;
@@ -61,8 +62,10 @@ struct Nvfp4BoundaryOffloadPageTask
 //! One Host-to-GPU Page transform.
 //!
 //! The packed mapped-Host inputs and raw GPU outputs must be 16-byte aligned.
-//! Packed and scale inputs remain immutable until the caller-observed stream
-//! completion event fires; raw GPU outputs stay reserved for the same interval.
+//! Scale inputs may be byte-aligned because onboard retains a scalar tail load
+//! for external records. Packed and scale inputs remain immutable until the
+//! caller-observed stream completion event fires; raw GPU outputs stay reserved
+//! for the same interval.
 struct Nvfp4BoundaryOnboardPageTask
 {
     std::uint8_t const* packedK;
