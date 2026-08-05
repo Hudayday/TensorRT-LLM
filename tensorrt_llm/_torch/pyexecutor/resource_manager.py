@@ -2541,7 +2541,8 @@ class KVCacheCompressionManager(BaseResourceManager):
         waiting on prior ready events. The concrete manager resolves logical
         K/V roles using its immutable tier layouts and submits all work to
         ``stream``. It must not publish a Page, release a Slot, or synchronize
-        the stream.
+        the stream on success. If it raises, the caller must fence ``stream``
+        before recycling either Slot because a prefix may already be queued.
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not implement GPU-to-Host "
@@ -2561,7 +2562,8 @@ class KVCacheCompressionManager(BaseResourceManager):
         The destination rows describe already-admitted GPU runtime Slots. The
         compressed Host source remains authoritative until KVCM fences this
         stream and publishes the destination. The manager receives no Page,
-        PageStatus, Attention object, or Attention metadata.
+        PageStatus, Attention object, or Attention metadata. If the hook raises,
+        the caller must fence ``stream`` before rolling back reserved Slots.
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not implement Host-to-GPU "

@@ -422,6 +422,24 @@ void launchOnboardToFp8(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks, 
     }
 }
 
+//! Preserve StorageManager's rollback contract when a multi-chunk launch
+//! fails synchronously. Validation happens before this helper. On success it
+//! remains fully asynchronous; only the exceptional path drains work already
+//! submitted to the owner stream before destination Slots may be recycled.
+template <typename Launch>
+void launchAndDrainOnFailure(cudaStream_t stream, Launch const& launch)
+{
+    try
+    {
+        launch();
+    }
+    catch (...)
+    {
+        static_cast<void>(cudaStreamSynchronize(stream));
+        throw;
+    }
+}
+
 } // namespace
 
 void invokeNvfp4BoundaryOffloadCompress(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,
@@ -436,17 +454,17 @@ void invokeNvfp4BoundaryOffloadCompress(std::vector<Nvfp4BoundaryOffloadPageTask
     case Nvfp4BoundaryRuntimeType::kFloat16:
         validateParams(params, false);
         validateTasks(tasks, 16);
-        launchOffloadFrom16Bit<half>(tasks, params, stream);
+        launchAndDrainOnFailure(stream, [&] { launchOffloadFrom16Bit<half>(tasks, params, stream); });
         break;
     case Nvfp4BoundaryRuntimeType::kBfloat16:
         validateParams(params, false);
         validateTasks(tasks, 16);
-        launchOffloadFrom16Bit<__nv_bfloat16>(tasks, params, stream);
+        launchAndDrainOnFailure(stream, [&] { launchOffloadFrom16Bit<__nv_bfloat16>(tasks, params, stream); });
         break;
     case Nvfp4BoundaryRuntimeType::kFp8E4m3:
         validateParams(params, true);
         validateTasks(tasks, 8);
-        launchOffloadFromFp8(tasks, params, stream);
+        launchAndDrainOnFailure(stream, [&] { launchOffloadFromFp8(tasks, params, stream); });
         break;
     default: TLLM_THROW("Unsupported NVFP4 boundary runtime type");
     }
@@ -464,17 +482,17 @@ void invokeNvfp4BoundaryOnboardDecompress(std::vector<Nvfp4BoundaryOnboardPageTa
     case Nvfp4BoundaryRuntimeType::kFloat16:
         validateParams(params, false);
         validateTasks(tasks, 16);
-        launchOnboardTo16Bit<half>(tasks, params, stream);
+        launchAndDrainOnFailure(stream, [&] { launchOnboardTo16Bit<half>(tasks, params, stream); });
         break;
     case Nvfp4BoundaryRuntimeType::kBfloat16:
         validateParams(params, false);
         validateTasks(tasks, 16);
-        launchOnboardTo16Bit<__nv_bfloat16>(tasks, params, stream);
+        launchAndDrainOnFailure(stream, [&] { launchOnboardTo16Bit<__nv_bfloat16>(tasks, params, stream); });
         break;
     case Nvfp4BoundaryRuntimeType::kFp8E4m3:
         validateParams(params, true);
         validateTasks(tasks, 8);
-        launchOnboardToFp8(tasks, params, stream);
+        launchAndDrainOnFailure(stream, [&] { launchOnboardToFp8(tasks, params, stream); });
         break;
     default: TLLM_THROW("Unsupported NVFP4 boundary runtime type");
     }

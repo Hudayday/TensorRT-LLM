@@ -15,7 +15,7 @@
 import copy
 import dataclasses
 import os
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Sequence, Union
 
 import torch
 
@@ -2467,6 +2467,8 @@ def create_kv_cache_compression_manager(
     config: KvCacheCompressionConfig,
     kv_cache_manager: KVCacheManagerV2,
     draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+    *,
+    boundary_layer_layouts: Optional[Sequence[object]] = None,
 ) -> Optional[KVCacheCompressionManager]:
     """Build the KV-cache compression manager for ``config.algorithm``, or return
     None if no algorithm matches.
@@ -2475,6 +2477,29 @@ def create_kv_cache_compression_manager(
     like the KV cache manager itself. Concrete algorithms add a dispatch branch
     here. Feature compatibility is checked before resource-manager construction.
     """
+    if config.algorithm == "quantization_for_boundary":
+        if not is_sm_100f():
+            raise RuntimeError(
+                "NVFP4 boundary compression requires an SM100-family device "
+                "(SM100 or SM103).")
+        if boundary_layer_layouts is None:
+            # Current main still has one level-independent BufferAttr map.
+            # Never guess the future Host Pool coalescing here: KVCM must hand
+            # over its authoritative per-level layout after initialization.
+            raise RuntimeError(
+                "QuantizationForBoundaryCompression requires the KVCM V2 "
+                "per-level boundary layout handoff; current main does not "
+                "provide it yet")
+        from ..kv_cache_compression.quantization_for_boundary import \
+            QuantizationForBoundaryCompression
+
+        return QuantizationForBoundaryCompression(
+            config,
+            kv_cache_manager,
+            layer_layouts=boundary_layer_layouts,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+        )
+
     if config.algorithm == "triattention":
         if not is_sm_100f():
             raise RuntimeError(

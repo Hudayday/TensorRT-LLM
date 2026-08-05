@@ -3581,6 +3581,33 @@ class KvCacheCompressionConfig(StrictBaseModel):
         return False
 
 
+class QuantizationForBoundaryCompressionConfig(KvCacheCompressionConfig):
+    """Compress KV only while it resides in a non-runtime storage tier.
+
+    This is the small initialization contract shared with KVCacheManagerV2.
+    ``quant`` selects the compact layout and transform implementation; P0
+    targets Host memory, while the active GPU level keeps the runtime-selected
+    KV dtype. KVCM uses these fields to construct per-level Slots/Pools. Page
+    addresses and per-layer calibration are runtime/model-loader inputs and do
+    not belong in this user config.
+    """
+
+    algorithm: Literal[
+        "quantization_for_boundary"] = "quantization_for_boundary"
+    quant: Literal["nvfp4"] = Field(
+        default="nvfp4",
+        description="Quantization format stored in the compressed cache tier.")
+    target_cache_tier: Literal["host"] = Field(
+        default="host",
+        description=
+        "Cache tier that uses the compressed layout. P0 supports Host memory only."
+    )
+
+    def supports_block_reuse(self) -> bool:
+        # Compression changes representation and residency, not token identity.
+        return True
+
+
 class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
     """TriAttention KV-cache compression: periodic decode-time eviction.
 
@@ -3638,7 +3665,8 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
 
 KvCacheCompressionConfigType: TypeAlias = Annotated[
-    Union[TriAttentionKvCacheCompressionConfig],
+    Union[QuantizationForBoundaryCompressionConfig,
+          TriAttentionKvCacheCompressionConfig],
     Field(discriminator="algorithm"),
 ]
 
