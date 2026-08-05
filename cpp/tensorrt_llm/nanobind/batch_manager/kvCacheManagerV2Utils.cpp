@@ -174,9 +174,15 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
         "Copy data from device to device using CUDA kernels");
 
-    // Prototype/Python-parity bridge for boundary compression.  The product
-    // C++ StorageManager will call the same native functions directly; it must
-    // not callback through Python from _batchedMigrate().
+    // Prototype/Python-parity bridge for boundary compression.  The Python
+    // Compression Manager lowers KVCM-owned addresses to plain tuples and
+    // crosses into the native launchers here.  This binding neither selects
+    // the compression algorithm nor owns Page residency/migration.
+    //
+    // The product C++ StorageManager/Compression Manager path will call the
+    // same native launchers directly; it must not route _batchedMigrate()
+    // through Python or nanobind.  Placement in the existing KVCM V2 utils
+    // module is prototype plumbing, not product-side manager registration.
     //
     // Every tuple uses one canonical order in both directions:
     //   raw K, raw V, packed K, packed V, K block scales, V block scales.

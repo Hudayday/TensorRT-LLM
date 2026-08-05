@@ -47,6 +47,20 @@ static_assert(kThreadsPerBlock % 2 == 0, "An NVFP4 scale group is shared by two 
 static_assert(std::is_trivially_copyable_v<Nvfp4BoundaryOffloadPageTask>);
 static_assert(std::is_trivially_copyable_v<Nvfp4BoundaryOnboardPageTask>);
 
+//! Reuse boundary for this first prototype:
+//!
+//! * Quantization math is reused directly from `quantization.cuh`.
+//! * The task-array idea mirrors KVCM V2's `batchedCopy<N>` so one launch can
+//!   cover non-contiguous Pages.  The implementation below does not copy its
+//!   four-stage `cp.async`/shared-memory pipeline yet.
+//! * A future optimized variant can adapt that pipeline around the transform:
+//!   async source load -> quant/dequant in registers -> direct destination
+//!   store.  It cannot call `batchedCopy<N>` itself because source and
+//!   destination layouts and byte counts differ.
+//!
+//! Keeping that distinction explicit prevents a functional prototype from
+//! being mistaken for a measured port of the production copy kernel.
+
 template <typename T>
 __device__ T const* selectRawInput(Nvfp4BoundaryOffloadPageTask const& task, std::uint32_t role)
 {
@@ -141,12 +155,23 @@ __device__ void store16BitValues(T* output, std::uint32_t elementOffset, float2 
 
 //! FP16/BF16 GPU Page -> Host NVFP4: fused quantization plus D2H.
 //!
-//! This boundary kernel is new. It directly reuses `PackedVec` and
-//! `cvt_warp_fp16_to_fp4` from `quantization.cuh`, and adapts the
-//! K-linear/V-token-4 scale order from `quantizeAndWriteFP4KVCache`. Its new
-//! Page layer batches disjoint Slots, routes K/V buffers, and writes packed
-//! data and scales directly to mapped Host memory; those stores perform D2H,
-//! so there is no compact GPU staging buffer or separate copy kernel.
+//! The generic contiguous path is
+//! `invokeFP4Quantization -> quantize_with_block_size ->
+//! cvt_warp_fp16_to_fp4`. This boundary kernel does not call or copy the first
+//! two layers; it directly calls their existing innermost device primitive,
+//! `cvt_warp_fp16_to_fp4`, from `quantization.cuh`. It also adapts the
+//! K-linear/V-token-4 scale order from `quantizeAndWriteFP4KVCache`.
+//!
+//! The new Page shell batches disjoint Slots and routes K/V buffers. Its
+//! packed-data store below and the scale store inside
+//! `cvt_warp_fp16_to_fp4` target CUDA-mapped Host addresses, so those GPU
+//! global stores are the D2H transfer. There is no call to KVCM V2
+//! `batchedCopy<N>`, compact GPU staging buffer, or separate copy kernel in the
+//! current implementation.
+//!
+//! Provenance: DIRECT REUSE = `PackedVec` + `cvt_warp_fp16_to_fp4`;
+//! ADAPTED CONTRACT = native-KV K/V scale offsets; NEW = Page-task routing,
+//! launch geometry, and mapped-Host stores.
 template <std::uint32_t N, typename T>
 __global__ void offloadFrom16BitKernel(std::array<Nvfp4BoundaryOffloadPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
@@ -184,10 +209,17 @@ __global__ void offloadFrom16BitKernel(std::array<Nvfp4BoundaryOffloadPageTask, 
 //! quantization, and D2H.
 //!
 //! This boundary kernel is new. It restores FP8 in registers, then directly
-//! reuses `PackedVec` and `cvt_warp_fp16_to_fp4` from `quantization.cuh`; it
-//! does not call the differently shaped `cvt_warp_fp8_to_fp4` helper. Its new
-//! adapter keeps the source-FP8 and target-NVFP4 scales explicit, batches
-//! disjoint Pages, routes K/V, and performs D2H through mapped-Host stores.
+//! reuses the innermost `PackedVec`/`cvt_warp_fp16_to_fp4` device primitive
+//! from `quantization.cuh`; it calls neither `invokeFP4Quantization` nor
+//! `quantize_with_block_size`, and it does not call the differently shaped
+//! `cvt_warp_fp8_to_fp4` helper. Its adapter keeps the source-FP8 and
+//! target-NVFP4 scales explicit, batches disjoint Pages, routes K/V, and
+//! performs D2H through mapped-Host global stores. It does not call or contain
+//! KVCM V2's `batchedCopy<N>` pipeline.
+//!
+//! Provenance: DIRECT REUSE = `cvt_warp_fp16_to_fp4`; NEW = register-only FP8
+//! restoration with an independent source inverse scale, Page/native-KV
+//! routing, launch geometry, and mapped-Host stores.
 template <std::uint32_t N>
 __global__ void offloadFromFp8Kernel(std::array<Nvfp4BoundaryOffloadPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
@@ -237,8 +269,15 @@ __global__ void offloadFromFp8Kernel(std::array<Nvfp4BoundaryOffloadPageTask, N>
 //! This boundary kernel is new. Its local `e2m1ToFloat8` helper adapts the
 //! `cvt.rn.f16x2.e2m1x2` sequence in ARCQuant's
 //! `e2m1_uint32_to_float8` (also used by fused MoE); it is not a call to a MoE
-//! kernel. New mapped-Host loads perform H2D, after which native K/V scale math
-//! restores directly into caller-owned FP16/BF16 GPU Slots.
+//! kernel. The packed/scale pointer dereferences are GPU global loads whose
+//! addresses map to pinned Host memory; those transactions perform H2D. Native
+//! K/V scale math then restores directly into caller-owned FP16/BF16 GPU
+//! Slots. The current kernel does not yet contain `batchedCopy<N>`'s
+//! `cp.async`/shared-memory source-load pipeline.
+//!
+//! Provenance: ADAPTED DONOR = ARCQuant/FusedMoE E2M1 PTX and inverse-scale
+//! flow; NEW = native-KV scale lookup, Page-task routing, mapped-Host loads,
+//! launch geometry, and caller-owned raw-Slot stores.
 template <std::uint32_t N, typename T>
 __global__ void onboardTo16BitKernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
@@ -277,9 +316,15 @@ __global__ void onboardTo16BitKernel(std::array<Nvfp4BoundaryOnboardPageTask, N>
 //!
 //! This boundary kernel is new. It uses the same local SM100 E2M1 conversion
 //! adapted from ARCQuant/fused MoE, then directly reuses
-//! `fp32_vec_to_e4m3` from `quantization.cuh`. New mapped-Host loads perform
-//! H2D; new scale composition and Page/K/V routing write the caller-owned FP8
-//! GPU Slot without a staging buffer or separate copy kernel.
+//! `fp32_vec_to_e4m3` from `quantization.cuh`. GPU global loads from the mapped
+//! Host packed/scale addresses perform H2D; new scale composition and Page/K/V
+//! routing write the caller-owned FP8 GPU Slot without a staging buffer or
+//! separate copy kernel. The current kernel borrows the disjoint-task batch
+//! shape, not `batchedCopy<N>`'s `cp.async` implementation.
+//!
+//! Provenance: DIRECT REUSE = `fp32_vec_to_e4m3`; ADAPTED DONOR =
+//! ARCQuant/FusedMoE E2M1 PTX; NEW = NVFP4-to-FP8 scale composition,
+//! Page/native-KV routing, mapped-Host loads, and launch geometry.
 template <std::uint32_t N>
 __global__ void onboardToFp8Kernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
