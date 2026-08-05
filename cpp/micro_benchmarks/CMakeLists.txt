@@ -49,3 +49,39 @@ endfunction()
 
 add_benchmark(mixtureOfExpertsBackendBenchmark
               mixtureOfExpertsBackendBenchmarkLauncher.cu)
+
+# Standalone NVFP4 boundary A/B. Compile the production boundary kernel and
+# KVCM V2 copy implementation directly so this target exercises the real
+# functions without linking the full TensorRT-LLM shared library. It remains
+# EXCLUDE_FROM_ALL and is built only by naming this target (or the aggregate
+# micro_benchmarks target).
+set(NVFP4_BOUNDARY_BENCHMARK_SOURCES
+    nvfp4BoundaryKernelsBenchmark.cu
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/kernels/nvfp4BoundaryKernels.cu
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kvCacheManagerV2Utils.cu
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/assert.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/cudaDriverWrapper.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/envUtils.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/logger.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/stringUtils.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/tllmException.cpp)
+
+add_executable(nvfp4BoundaryKernelsBenchmark EXCLUDE_FROM_ALL
+               ${NVFP4_BOUNDARY_BENCHMARK_SOURCES})
+target_include_directories(
+  nvfp4BoundaryKernelsBenchmark
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+target_compile_features(nvfp4BoundaryKernelsBenchmark PRIVATE cxx_std_17)
+target_compile_definitions(nvfp4BoundaryKernelsBenchmark
+                           PRIVATE TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
+target_compile_options(
+  nvfp4BoundaryKernelsBenchmark
+  PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-ffunction-sections;-fdata-sections>
+          $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffunction-sections,-fdata-sections>)
+target_link_options(nvfp4BoundaryKernelsBenchmark PRIVATE -Wl,--gc-sections)
+target_link_libraries(
+  nvfp4BoundaryKernelsBenchmark
+  PRIVATE CUDA::cudart CUDA::cuda_driver Threads::Threads ${CMAKE_DL_LIBS})
+
+add_dependencies(micro_benchmarks nvfp4BoundaryKernelsBenchmark)
