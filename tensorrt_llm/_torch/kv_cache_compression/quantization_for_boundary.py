@@ -45,7 +45,8 @@ class BoundaryBufferLayout:
         if self.pool_index >= len(slot_pool_addresses):
             raise ValueError(
                 f"Pool row has {len(slot_pool_addresses)} addresses but "
-                f"layout selects pool {self.pool_index}")
+                f"layout selects pool {self.pool_index}"
+            )
         base = slot_pool_addresses[self.pool_index]
         if not isinstance(base, int) or base <= 0:
             raise ValueError("Pool base addresses must be positive integers")
@@ -64,10 +65,12 @@ _FLOAT32_MIN_SUBNORMAL = float.fromhex("0x1p-149")
 class Nvfp4BoundaryLayerLayout:
     """Immutable layout, geometry, and calibration for one local KV layer.
 
-    One KVCM Page may contain several layers.  Therefore the manager produces
+    One KVCM Page may contain several layers. Therefore the manager produces
     one native task for each ``(Page, layer)`` pair, not one task for the whole
-    Page.  ``runtime_*`` locations belong to the active GPU layout;
-    ``packed_*`` and ``block_scale_*`` belong to the compact Host layout.
+    Page. ``runtime_*`` locations belong to the active GPU layout. The four
+    compact BufferIds must occupy one physical Host Pool in this exact order:
+    K packed, V packed, K block scales, V block scales. Native code receives
+    only the address of the first region and derives the remaining offsets.
 
     Scale pairs are ordered ``(K, V)``.  ``*_orig_quant`` converts values from
     the model/original domain to a quantized domain; ``*_quant_orig`` performs
@@ -99,30 +102,49 @@ class Nvfp4BoundaryLayerLayout:
     def __post_init__(self) -> None:
         ids = (self.pool_group_index, self.life_cycle_id, self.layer_id)
         if any(not isinstance(value, int) or value < 0 for value in ids):
-            raise ValueError(
-                "Pool-group, life-cycle, and layer ids must be non-negative")
+            raise ValueError("Pool-group, life-cycle, and layer ids must be non-negative")
         geometry = (self.num_kv_heads, self.tokens_per_page, self.head_dim)
-        if any(not isinstance(value, int) or not 0 < value <= _INT32_MAX
-               for value in geometry):
+        if any(not isinstance(value, int) or not 0 < value <= _INT32_MAX for value in geometry):
             raise ValueError("Page geometry must contain positive int32 values")
         if self.tokens_per_page % 4 != 0:
             raise ValueError("tokens_per_page must be divisible by 4")
         if self.head_dim % 16 != 0:
             raise ValueError("head_dim must be divisible by 16")
-        half_groups = self.num_kv_heads * self.tokens_per_page * (
-            self.head_dim // 8)
-        if half_groups > _UINT32_MAX // 8:
-            raise ValueError(
-                "Page geometry exceeds the native uint32 element-offset range")
+        half_groups = self.num_kv_heads * self.tokens_per_page * (self.head_dim // 8)
+        if half_groups > _UINT32_MAX // 9:
+            raise ValueError("Page geometry exceeds the native uint32 compact-offset range")
         if self.runtime_dtype not in {"float16", "bfloat16", "fp8_e4m3"}:
+            raise ValueError("runtime_dtype must be float16, bfloat16, or fp8_e4m3")
+
+        compact_layouts = (
+            self.packed_k,
+            self.packed_v,
+            self.block_scale_k,
+            self.block_scale_v,
+        )
+        if len({layout.pool_index for layout in compact_layouts}) != 1:
+            raise ValueError("NVFP4 compact BufferIds must share one physical Host Pool")
+        elements = self.num_kv_heads * self.tokens_per_page * self.head_dim
+        packed_bytes = elements // 2
+        scale_bytes = elements // 16
+        first_offset = self.packed_k.offset
+        expected_offsets = (
+            first_offset,
+            first_offset + packed_bytes,
+            first_offset + 2 * packed_bytes,
+            first_offset + 2 * packed_bytes + scale_bytes,
+        )
+        actual_offsets = tuple(layout.offset for layout in compact_layouts)
+        if actual_offsets != expected_offsets:
             raise ValueError(
-                "runtime_dtype must be float16, bfloat16, or fp8_e4m3")
+                "NVFP4 compact BufferIds must be contiguous in "
+                "[K packed, V packed, K scale, V scale] order"
+            )
 
         if self.runtime_dtype == "fp8_e4m3" and (
-                self.fp8_scale_orig_quant is None
-                or self.fp8_scale_quant_orig is None):
-            raise ValueError(
-                "FP8 runtime Pages require explicit K/V FP8 scales")
+            self.fp8_scale_orig_quant is None or self.fp8_scale_quant_orig is None
+        ):
+            raise ValueError("FP8 runtime Pages require explicit K/V FP8 scales")
         # The 16-bit kernels do not read FP8 scales. Fill neutral values only
         # to keep one compact native parameter struct for all dtype branches.
         if self.fp8_scale_orig_quant is None:
@@ -138,17 +160,14 @@ class Nvfp4BoundaryLayerLayout:
         )
         for field_name in scale_fields:
             try:
-                pair = tuple(
-                    float(value) for value in getattr(self, field_name))
+                pair = tuple(float(value) for value in getattr(self, field_name))
             except (TypeError, ValueError) as error:
-                raise ValueError(
-                    "Every K/V scale pair must be numeric") from error
+                raise ValueError("Every K/V scale pair must be numeric") from error
             if len(pair) != 2 or any(
-                    not isfinite(value) or value < _FLOAT32_MIN_SUBNORMAL
-                    or value > _FLOAT32_MAX for value in pair):
-                raise ValueError(
-                    "Every K/V scale pair must contain two finite positive values"
-                )
+                not isfinite(value) or value < _FLOAT32_MIN_SUBNORMAL or value > _FLOAT32_MAX
+                for value in pair
+            ):
+                raise ValueError("Every K/V scale pair must contain two finite positive values")
             # Normalize list-like config input once so cohort keys remain
             # immutable and hashable on the migration hot path.
             object.__setattr__(self, field_name, pair)
@@ -178,8 +197,7 @@ def _load_native_bindings():
     tries to submit work without the binding.
     """
 
-    from tensorrt_llm.bindings.internal import \
-        kv_cache_compression  # type: ignore
+    from tensorrt_llm.bindings.internal import kv_cache_compression  # type: ignore
 
     return kv_cache_compression
 
@@ -209,8 +227,7 @@ class QuantizationCompression(KVCacheCompressionManager):
         if not isinstance(quant, str) or not quant:
             raise ValueError("QuantizationCompression requires config.quant")
         if getattr(config, "target_cache_tier", None) != "host":
-            raise ValueError(
-                "QuantizationCompression P0 supports the Host tier only")
+            raise ValueError("QuantizationCompression P0 supports the Host tier only")
         if draft_kv_cache_manager is not None:
             raise ValueError(
                 "Boundary-compression prototype does not support an independent draft KV cache"
@@ -220,8 +237,7 @@ class QuantizationCompression(KVCacheCompressionManager):
 
         self._initialize_quantization_layouts(layer_layouts)
 
-    def _initialize_quantization_layouts(
-            self, layer_layouts: Sequence[object]) -> None:
+    def _initialize_quantization_layouts(self, layer_layouts: Sequence[object]) -> None:
         """Build only the immutable state owned by the selected format.
 
         Keeping this dispatch beside ``_run_quantization`` is what makes the
@@ -232,45 +248,37 @@ class QuantizationCompression(KVCacheCompressionManager):
         if self._quant == "nvfp4":
             self._init_nvfp4_layouts(layer_layouts)
             return
-        raise RuntimeError(
-            f"No quantization-compression layout for {self._quant!r}")
+        raise RuntimeError(f"No quantization-compression layout for {self._quant!r}")
 
     def _init_nvfp4_layouts(self, layer_layouts: Sequence[object]) -> None:
         """Index the format-specific native NVFP4 layout handoff."""
 
         if not layer_layouts:
-            raise ValueError(
-                "At least one NVFP4 boundary layer layout is required")
+            raise ValueError("At least one NVFP4 boundary layer layout is required")
 
         # KVCM may put several life-cycle variants in one PoolGroup.  Index by
         # both ids so the life_cycle accompanying each Page chooses the exact
         # authoritative BufferAttr variant.
-        by_owner: Dict[Tuple[int, int],
-                       List[Nvfp4BoundaryLayerLayout]] = defaultdict(list)
+        by_owner: Dict[Tuple[int, int], List[Nvfp4BoundaryLayerLayout]] = defaultdict(list)
         seen_layers = set()
         nvfp4_layouts = []
         for layout in layer_layouts:
             if not isinstance(layout, Nvfp4BoundaryLayerLayout):
-                raise TypeError(
-                    "quant='nvfp4' requires Nvfp4BoundaryLayerLayout records")
+                raise TypeError("quant='nvfp4' requires Nvfp4BoundaryLayerLayout records")
             nvfp4_layouts.append(layout)
         for layout in sorted(
-                nvfp4_layouts,
-                key=lambda item:
-            (item.pool_group_index, item.life_cycle_id, item.layer_id),
+            nvfp4_layouts,
+            key=lambda item: (item.pool_group_index, item.life_cycle_id, item.layer_id),
         ):
-            identity = (layout.pool_group_index, layout.life_cycle_id,
-                        layout.layer_id)
+            identity = (layout.pool_group_index, layout.life_cycle_id, layout.layer_id)
             if identity in seen_layers:
                 raise ValueError(
                     f"Duplicate boundary layout for pool-group/life-cycle/layer {identity}"
                 )
             seen_layers.add(identity)
-            by_owner[(layout.pool_group_index,
-                      layout.life_cycle_id)].append(layout)
+            by_owner[(layout.pool_group_index, layout.life_cycle_id)].append(layout)
         self._nvfp4_layouts_by_owner = {
-            owner: tuple(layouts)
-            for owner, layouts in by_owner.items()
+            owner: tuple(layouts) for owner, layouts in by_owner.items()
         }
 
     @staticmethod
@@ -284,7 +292,8 @@ class QuantizationCompression(KVCacheCompressionManager):
         if len(src_addresses) != num_pages or len(dst_addresses) != num_pages:
             raise ValueError(
                 "src_life_cycles, src_addresses, and dst_addresses must have "
-                "one entry for the same Page batch")
+                "one entry for the same Page batch"
+            )
         if not isinstance(stream, int) or stream < 0 or stream > _UINTPTR_MAX:
             raise ValueError("stream must be a valid CUDA stream pointer")
         for life_cycle in src_life_cycles:
@@ -313,8 +322,7 @@ class QuantizationCompression(KVCacheCompressionManager):
                 stream=stream,
             )
             return
-        raise RuntimeError(
-            f"No quantization-compression implementation for {self._quant!r}")
+        raise RuntimeError(f"No quantization-compression implementation for {self._quant!r}")
 
     def _lower_nvfp4(
         self,
@@ -329,24 +337,21 @@ class QuantizationCompression(KVCacheCompressionManager):
         """Prevalidate, lower, group, then enqueue one call per cohort.
 
         Address order passed to native code is always:
-        ``raw K, raw V, packed K, packed V, K scale, V scale``.
+        ``raw K, raw V, compact Host Page``.
         Direction only decides which Slot row supplies the raw or compact side.
         """
 
         if not isinstance(pool_group_index, int) or pool_group_index < 0:
             raise ValueError("pool_group_index must be a non-negative integer")
-        self._validate_batch(src_life_cycles, src_addresses, dst_addresses,
-                             stream)
+        self._validate_batch(src_life_cycles, src_addresses, dst_addresses, stream)
         if not src_life_cycles:
             return
 
         # Finish every deterministic validation before the first kernel launch.
         # KVCM still owns fencing/rollback for a later asynchronous CUDA fault.
-        cohorts: Dict[tuple, List[Tuple[int, int, int, int, int,
-                                        int]]] = defaultdict(list)
+        cohorts: Dict[tuple, List[Tuple[int, int, int]]] = defaultdict(list)
         for page_index, life_cycle in enumerate(src_life_cycles):
-            layouts = self._nvfp4_layouts_by_owner.get(
-                (pool_group_index, life_cycle))
+            layouts = self._nvfp4_layouts_by_owner.get((pool_group_index, life_cycle))
             if not layouts:
                 raise ValueError(
                     f"No boundary layout for PoolGroup {pool_group_index}, life cycle {life_cycle}"
@@ -354,38 +359,29 @@ class QuantizationCompression(KVCacheCompressionManager):
 
             src_row = src_addresses[page_index]
             dst_row = dst_addresses[page_index]
-            raw_row, compact_row = (src_row, dst_row) if offload else (dst_row,
-                                                                       src_row)
+            raw_row, compact_row = (src_row, dst_row) if offload else (dst_row, src_row)
             for layout in layouts:
                 task = (
                     layout.runtime_k.resolve(raw_row),
                     layout.runtime_v.resolve(raw_row),
+                    # All four compact BufferIds share this Pool. Their exact
+                    # contiguous offsets were validated once at construction,
+                    # so the native task needs only the K-packed record base.
                     layout.packed_k.resolve(compact_row),
-                    layout.packed_v.resolve(compact_row),
-                    layout.block_scale_k.resolve(compact_row),
-                    layout.block_scale_v.resolve(compact_row),
                 )
                 # Mirror the native ABI checks for the complete migration
                 # batch before submitting its first cohort. This matters when
                 # per-layer calibration produces several launches: a bad later
                 # cohort must not be discovered after an earlier one started
                 # writing into KVCM-owned destination Slots.
-                # All four native paths reuse batchedCopy's 16-byte
-                # cp.async.cg grain. KVCM must therefore hand off 16-byte
-                # aligned raw and packed Pool addresses for every runtime dtype.
-                # Offload also flushes scale bytes to mapped Host memory as
-                # aligned uint4 grains. Onboard deliberately retains the
-                # native byte-tail fallback for an unaligned external scale
-                # record, so its scale source requires only byte alignment.
-                raw_alignment = 16
-                scale_alignment = 16 if offload else 1
+                # All four native paths reuse batchedCopy's 16-byte transfer
+                # grain. The compact record base and raw Pool addresses must
+                # therefore be aligned; derived scale offsets retain a scalar
+                # path for smaller legal Page geometries.
                 for name, address, alignment in (
-                    ("raw K", task[0], raw_alignment),
-                    ("raw V", task[1], raw_alignment),
-                    ("packed K", task[2], 16),
-                    ("packed V", task[3], 16),
-                    ("K block scale", task[4], scale_alignment),
-                    ("V block scale", task[5], scale_alignment),
+                    ("raw K", task[0], 16),
+                    ("raw V", task[1], 16),
+                    ("compact Host Page", task[2], 16),
                 ):
                     if address > _UINTPTR_MAX or address % alignment:
                         raise ValueError(
@@ -399,8 +395,11 @@ class QuantizationCompression(KVCacheCompressionManager):
             "bfloat16": native.Nvfp4BoundaryRuntimeType.BFLOAT16,
             "fp8_e4m3": native.Nvfp4BoundaryRuntimeType.FP8_E4M3,
         }
-        launch = (native.nvfp4_boundary_offload_compress
-                  if offload else native.nvfp4_boundary_onboard_decompress)
+        launch = (
+            native.nvfp4_boundary_offload_compress
+            if offload
+            else native.nvfp4_boundary_onboard_decompress
+        )
         for key, tasks in cohorts.items():
             (
                 runtime_dtype,

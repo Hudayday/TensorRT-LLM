@@ -15,9 +15,9 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/nvfp4BoundaryKernelsInternal.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/nvfp4BoundaryKernelsInternal.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -217,21 +217,22 @@ struct PageBuffers
         , rawInputV(rawBytes)
         , rawOutputK(rawBytes)
         , rawOutputV(rawBytes)
-        , packedK(packedBytes)
-        , packedV(packedBytes)
-        , scaleK(scaleBytes)
-        , scaleV(scaleBytes)
+        , compactPage(2 * (packedBytes + scaleBytes))
     {
+    }
+
+    std::vector<std::uint8_t> compactRegion(std::size_t offset, std::size_t bytes) const
+    {
+        auto const payload = compactPage.payload();
+        return {payload.begin() + static_cast<std::ptrdiff_t>(offset),
+            payload.begin() + static_cast<std::ptrdiff_t>(offset + bytes)};
     }
 
     DeviceRegion rawInputK;
     DeviceRegion rawInputV;
     DeviceRegion rawOutputK;
     DeviceRegion rawOutputV;
-    MappedHostRegion packedK;
-    MappedHostRegion packedV;
-    MappedHostRegion scaleK;
-    MappedHostRegion scaleV;
+    MappedHostRegion compactPage;
     std::array<std::vector<std::uint8_t>, 2> rawHost;
 };
 
@@ -489,8 +490,7 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         buffers->rawHost[1] = makeRawPage(kind, page, 1, params, geometry, inputPattern);
         buffers->rawInputK.copyFrom(buffers->rawHost[0]);
         buffers->rawInputV.copyFrom(buffers->rawHost[1]);
-        offloadTasks.push_back({buffers->rawInputK.data(), buffers->rawInputV.data(), buffers->packedK.bytes(),
-            buffers->packedV.bytes(), buffers->scaleK.bytes(), buffers->scaleV.bytes()});
+        offloadTasks.push_back({buffers->rawInputK.data(), buffers->rawInputV.data(), buffers->compactPage.bytes()});
         pages.push_back(std::move(buffers));
     }
 
@@ -514,10 +514,12 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
     {
         for (std::size_t page = 0; page < numPages; ++page)
         {
-            EXPECT_EQ(pages[page]->packedK.payload(), references[page][0].packed);
-            EXPECT_EQ(pages[page]->packedV.payload(), references[page][1].packed);
-            EXPECT_EQ(pages[page]->scaleK.payload(), references[page][0].scales);
-            EXPECT_EQ(pages[page]->scaleV.payload(), references[page][1].scales);
+            std::size_t const packed = packedBytes(geometry);
+            std::size_t const scale = scaleBytes(geometry);
+            EXPECT_EQ(pages[page]->compactRegion(0, packed), references[page][0].packed);
+            EXPECT_EQ(pages[page]->compactRegion(packed, packed), references[page][1].packed);
+            EXPECT_EQ(pages[page]->compactRegion(2 * packed, scale), references[page][0].scales);
+            EXPECT_EQ(pages[page]->compactRegion(2 * packed + scale, scale), references[page][1].scales);
         }
     };
 
@@ -540,8 +542,7 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
     onboardTasks.reserve(numPages);
     for (auto const& page : pages)
     {
-        onboardTasks.push_back({page->packedK.bytes(), page->packedV.bytes(), page->scaleK.bytes(),
-            page->scaleV.bytes(), page->rawOutputK.data(), page->rawOutputV.data()});
+        onboardTasks.push_back({page->compactPage.bytes(), page->rawOutputK.data(), page->rawOutputV.data()});
     }
     tensorrt_llm::kernels::detail::invokeNvfp4BoundaryOnboardDecompressWithPipeline(
         onboardTasks, params, runtimeType, onboardPipeline, stream);
@@ -566,10 +567,7 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         pages[page]->rawInputV.expectCanaries();
         pages[page]->rawOutputK.expectCanaries();
         pages[page]->rawOutputV.expectCanaries();
-        pages[page]->packedK.expectCanaries();
-        pages[page]->packedV.expectCanaries();
-        pages[page]->scaleK.expectCanaries();
-        pages[page]->scaleV.expectCanaries();
+        pages[page]->compactPage.expectCanaries();
     }
 }
 
@@ -731,8 +729,8 @@ TEST(Nvfp4BoundaryValidationTest, RejectsInvalidGeometryAndScalesBeforeLaunch)
 
     PageBuffers buffers(
         rawBytes(RawKind::kFloat16, kDefaultGeometry), packedBytes(kDefaultGeometry), scaleBytes(kDefaultGeometry));
-    std::vector<Nvfp4BoundaryOffloadPageTask> const tasks{{buffers.rawInputK.data(), buffers.rawInputV.data(),
-        buffers.packedK.bytes(), buffers.packedV.bytes(), buffers.scaleK.bytes(), buffers.scaleV.bytes()}};
+    std::vector<Nvfp4BoundaryOffloadPageTask> const tasks{
+        {buffers.rawInputK.data(), buffers.rawInputV.data(), buffers.compactPage.bytes()}};
     auto const invoke16Bit = [&](Nvfp4BoundaryKernelParams const& params)
     {
         tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
@@ -797,10 +795,10 @@ TEST(Nvfp4BoundaryValidationTest, RejectsNullMisalignedAndUnsupportedDescriptors
     Nvfp4BoundaryKernelParams const params = makeParams();
     PageBuffers buffers(
         rawBytes(RawKind::kFloat16, kDefaultGeometry), packedBytes(kDefaultGeometry), scaleBytes(kDefaultGeometry));
-    Nvfp4BoundaryOffloadPageTask const validOffload{buffers.rawInputK.data(), buffers.rawInputV.data(),
-        buffers.packedK.bytes(), buffers.packedV.bytes(), buffers.scaleK.bytes(), buffers.scaleV.bytes()};
-    Nvfp4BoundaryOnboardPageTask const validOnboard{buffers.packedK.bytes(), buffers.packedV.bytes(),
-        buffers.scaleK.bytes(), buffers.scaleV.bytes(), buffers.rawOutputK.data(), buffers.rawOutputV.data()};
+    Nvfp4BoundaryOffloadPageTask const validOffload{
+        buffers.rawInputK.data(), buffers.rawInputV.data(), buffers.compactPage.bytes()};
+    Nvfp4BoundaryOnboardPageTask const validOnboard{
+        buffers.compactPage.bytes(), buffers.rawOutputK.data(), buffers.rawOutputV.data()};
 
     auto invalidOffload = validOffload;
     invalidOffload.rawK = nullptr;
@@ -811,44 +809,18 @@ TEST(Nvfp4BoundaryValidationTest, RejectsNullMisalignedAndUnsupportedDescriptors
     EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
         {invalidOffload}, params, Nvfp4BoundaryRuntimeType::kFloat16, nullptr));
     invalidOffload = validOffload;
-    invalidOffload.packedV += 1;
+    invalidOffload.compactPage += 1;
     EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
         {invalidOffload}, params, Nvfp4BoundaryRuntimeType::kFp8E4m3, nullptr));
-    invalidOffload = validOffload;
-    invalidOffload.blockScaleK = nullptr;
-    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
-        {invalidOffload}, params, Nvfp4BoundaryRuntimeType::kFp8E4m3, nullptr));
-    invalidOffload = validOffload;
-    invalidOffload.blockScaleK += 1;
-    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
-        {invalidOffload}, params, Nvfp4BoundaryRuntimeType::kFloat16, nullptr));
 
     auto invalidOnboard = validOnboard;
-    invalidOnboard.packedK = nullptr;
+    invalidOnboard.compactPage = nullptr;
     EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(
         {invalidOnboard}, params, Nvfp4BoundaryRuntimeType::kFloat16, nullptr));
     invalidOnboard = validOnboard;
     invalidOnboard.rawV = static_cast<std::uint8_t*>(validOnboard.rawV) + 1;
     EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(
         {invalidOnboard}, params, Nvfp4BoundaryRuntimeType::kFp8E4m3, nullptr));
-
-    // Onboard accepts a byte-aligned external scale tail even though offload's
-    // dense mapped-Host scale stores require 16-byte destination alignment.
-    // Compare it against the aligned path as well as checking the launch.
-    MappedHostRegion byteAlignedScale(scaleBytes(kDefaultGeometry) + 1);
-    DeviceRegion byteAlignedRawK(rawBytes(RawKind::kFloat16, kDefaultGeometry));
-    DeviceRegion byteAlignedRawV(rawBytes(RawKind::kFloat16, kDefaultGeometry));
-    auto byteAlignedOnboard = validOnboard;
-    byteAlignedOnboard.blockScaleK = byteAlignedScale.bytes() + 1;
-    byteAlignedOnboard.rawK = byteAlignedRawK.data();
-    byteAlignedOnboard.rawV = byteAlignedRawV.data();
-    EXPECT_NO_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(
-        {validOnboard}, params, Nvfp4BoundaryRuntimeType::kFloat16, nullptr));
-    EXPECT_NO_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(
-        {byteAlignedOnboard}, params, Nvfp4BoundaryRuntimeType::kFloat16, nullptr));
-    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-    EXPECT_EQ(buffers.rawOutputK.copyToHost(), byteAlignedRawK.copyToHost());
-    EXPECT_EQ(buffers.rawOutputV.copyToHost(), byteAlignedRawV.copyToHost());
 
     auto const unsupportedType = static_cast<Nvfp4BoundaryRuntimeType>(255);
     EXPECT_ANY_THROW(

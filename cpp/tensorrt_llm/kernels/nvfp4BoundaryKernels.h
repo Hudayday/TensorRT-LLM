@@ -41,37 +41,29 @@ enum class Nvfp4BoundaryRuntimeType : std::uint8_t
 
 //! One GPU-to-Host Page transform.
 //!
-//! The six addresses are intentionally independent: KVCM may coalesce logical
-//! roles into physical Pools, but the kernel never assumes adjacency between
-//! K, V, their scales, or different Pages. The packed and scale addresses must
-//! be device-visible aliases of CUDA-registered mapped Host memory. The raw
-//! inputs, packed mapped-Host outputs, and mapped-Host scale outputs must be
-//! 16-byte aligned and remain valid and non-overwritable until work submitted
-//! to the caller's stream completes. The scale alignment is required by the
-//! dense uint4 Host-store path.
+//! KVCM supplies independent GPU K/V addresses and one compact mapped-Host
+//! address. The compact address starts one contiguous record whose regions are
+//! `[K packed][V packed][K block scales][V block scales]`. Region offsets are
+//! derived from the homogeneous batch geometry; they are not repeated in every
+//! Page descriptor. The three addresses must be 16-byte aligned and remain
+//! valid and non-overwritable until work submitted to the caller's stream
+//! completes.
 struct Nvfp4BoundaryOffloadPageTask
 {
     void const* rawK;
     void const* rawV;
-    std::uint8_t* packedK;
-    std::uint8_t* packedV;
-    std::uint8_t* blockScaleK;
-    std::uint8_t* blockScaleV;
+    std::uint8_t* compactPage;
 };
 
 //! One Host-to-GPU Page transform.
 //!
-//! The packed mapped-Host inputs and raw GPU outputs must be 16-byte aligned.
-//! Scale inputs may be byte-aligned because onboard retains a scalar tail load
-//! for external records. Packed and scale inputs remain immutable until the
-//! caller-observed stream completion event fires; raw GPU outputs stay reserved
-//! for the same interval.
+//! `compactPage` uses the same contiguous record as offload. It and the raw GPU
+//! outputs must be 16-byte aligned. The compact record remains immutable until
+//! the caller-observed stream completion event fires; raw GPU outputs stay
+//! reserved for the same interval.
 struct Nvfp4BoundaryOnboardPageTask
 {
-    std::uint8_t const* packedK;
-    std::uint8_t const* packedV;
-    std::uint8_t const* blockScaleK;
-    std::uint8_t const* blockScaleV;
+    std::uint8_t const* compactPage;
     void* rawK;
     void* rawV;
 };
@@ -79,13 +71,14 @@ struct Nvfp4BoundaryOnboardPageTask
 //! Geometry and immutable per-layer scale convention shared by one Page batch.
 //!
 //! Each raw K/V pointer describes one HND Page with
-//! `numKvHeads * tokensPerPage * headDim` elements. Each packed K/V pointer has
-//! half that many bytes in the same HND order. Each block-scale pointer has one
-//! E4M3 byte per 16 elements. K scales are linear `[H, P, D / 16]`; V scales
-//! use the native token-4 order over flattened `(head, token)` rows. Therefore
-//! `tokensPerPage` must be divisible by four and `headDim` by 16. Those
-//! constraints also make every raw/packed payload an exact number of 16-byte
-//! transfer grains, so the fused kernels need no partial-grain fallback.
+//! `numKvHeads * tokensPerPage * headDim` elements. If that count is `N`, the
+//! compact record contains `N/2`, `N/2`, `N/16`, and `N/16` bytes in the order
+//! documented above, for `9N/8` bytes total. Packed K/V retain HND order. K
+//! scales are linear `[H, P, D / 16]`; V scales retain the native token-4 order
+//! over flattened `(head, token)` rows. Therefore `tokensPerPage` must be
+//! divisible by four and `headDim` by 16. Packed regions are 16-byte aligned;
+//! scale regions use vector transfers when their derived offset is aligned and
+//! retain a byte path for smaller legal geometries.
 //!
 //! `*OrigQuant` multiplies an original-domain value before storing the named
 //! quantized representation. `*QuantOrig` restores a stored quantized value to

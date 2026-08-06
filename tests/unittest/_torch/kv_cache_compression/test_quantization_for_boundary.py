@@ -4,7 +4,7 @@
 
 The CUDA byte-level contract is covered by nvfp4BoundaryKernelsTest.  These
 tests instead prove that the manager converts KVCM Slot address rows into the
-six native addresses correctly and keeps launches batched across disjoint
+three native addresses correctly and keeps launches batched across disjoint
 Pages.  Native calls are recorded so the tests do not require a GPU.
 """
 
@@ -15,8 +15,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary import (
-    BoundaryBufferLayout, Nvfp4BoundaryLayerLayout, QuantizationCompression,
-    _load_native_bindings)
+    BoundaryBufferLayout,
+    Nvfp4BoundaryLayerLayout,
+    QuantizationCompression,
+    _load_native_bindings,
+)
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm.llmapi.llm_args import QuantizationCompressionConfig
 
@@ -24,8 +27,7 @@ from tensorrt_llm.llmapi.llm_args import QuantizationCompressionConfig
 def _v2_manager():
     # The base manager deliberately verifies the real V2 type.  Constructing
     # without __init__ keeps this focused test independent of GPU allocation.
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import \
-        KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
     manager.kv_compression_manages_history = False
@@ -36,6 +38,11 @@ def _config():
     return QuantizationCompressionConfig()
 
 
+_PACKED_BYTES = 8 * 64 * 128 // 2
+_SCALE_BYTES = 8 * 64 * 128 // 16
+_COMPACT_BYTES = 2 * (_PACKED_BYTES + _SCALE_BYTES)
+
+
 def _layout(
     *,
     layer_id=0,
@@ -44,19 +51,22 @@ def _layout(
     raw_offset=0,
     compact_offset=0,
 ):
-    # Typical physical topology: runtime K/V coalesce into Pool 0; Host packed
-    # K/V coalesce into Pool 0 and K/V block scales into Pool 1.  Non-zero
-    # offsets prove that logical roles are not confused with physical Pools.
+    # Runtime K/V occupy two GPU Pools because Attention consumes them
+    # independently. All four compact BufferIds occupy one lower-tier Pool in
+    # the exact native record order. This fixture therefore proves the P0
+    # topology conversion itself: two raw Pools <-> one compact Pool.
+    # A non-zero compact offset models another layer record earlier in the
+    # same physical Slot.
     return Nvfp4BoundaryLayerLayout(
         pool_group_index=2,
         life_cycle_id=life_cycle_id,
         layer_id=layer_id,
         runtime_k=BoundaryBufferLayout(0, raw_offset),
-        runtime_v=BoundaryBufferLayout(0, raw_offset + 0x100),
+        runtime_v=BoundaryBufferLayout(1, raw_offset),
         packed_k=BoundaryBufferLayout(0, compact_offset),
-        packed_v=BoundaryBufferLayout(0, compact_offset + 0x40),
-        block_scale_k=BoundaryBufferLayout(1, compact_offset),
-        block_scale_v=BoundaryBufferLayout(1, compact_offset + 0x10),
+        packed_v=BoundaryBufferLayout(0, compact_offset + _PACKED_BYTES),
+        block_scale_k=BoundaryBufferLayout(0, compact_offset + 2 * _PACKED_BYTES),
+        block_scale_v=BoundaryBufferLayout(0, compact_offset + 2 * _PACKED_BYTES + _SCALE_BYTES),
         num_kv_heads=8,
         tokens_per_page=64,
         head_dim=128,
@@ -81,9 +91,7 @@ def _native():
 
 
 def _manager(*layouts):
-    return QuantizationCompression(_config(),
-                                   _v2_manager(),
-                                   layer_layouts=layouts)
+    return QuantizationCompression(_config(), _v2_manager(), layer_layouts=layouts)
 
 
 def test_native_binding_is_owned_by_kv_cache_compression_module():
@@ -94,9 +102,9 @@ def test_native_binding_is_owned_by_kv_cache_compression_module():
 
     assert native.__name__ == "tensorrt_llm.bindings.internal.kv_cache_compression"
     for symbol in (
-            "Nvfp4BoundaryRuntimeType",
-            "nvfp4_boundary_offload_compress",
-            "nvfp4_boundary_onboard_decompress",
+        "Nvfp4BoundaryRuntimeType",
+        "nvfp4_boundary_offload_compress",
+        "nvfp4_boundary_onboard_decompress",
     ):
         assert hasattr(native, symbol)
         assert not hasattr(old_owner, symbol)
@@ -113,15 +121,13 @@ def test_layout_rejects_values_that_cannot_cross_the_native_abi():
 
     fields = vars(_layout()).copy()
     fields.update(num_kv_heads=1 << 20, tokens_per_page=4, head_dim=1024)
-    with pytest.raises(ValueError, match="element-offset range"):
+    with pytest.raises(ValueError, match="compact-offset range"):
         Nvfp4BoundaryLayerLayout(**fields)
 
 
 def test_selected_quantization_validates_its_own_layout_records():
     with pytest.raises(TypeError, match="Nvfp4BoundaryLayerLayout"):
-        QuantizationCompression(_config(),
-                                _v2_manager(),
-                                layer_layouts=(object(), ))
+        QuantizationCompression(_config(), _v2_manager(), layer_layouts=(object(),))
 
 
 def test_unknown_quantization_fails_at_format_dispatch():
@@ -131,31 +137,29 @@ def test_unknown_quantization_fails_at_format_dispatch():
         changes_physical_kv_length=False,
     )
     with pytest.raises(RuntimeError, match="layout for 'future_quant'"):
-        QuantizationCompression(config,
-                                _v2_manager(),
-                                layer_layouts=(object(), ))
+        QuantizationCompression(config, _v2_manager(), layer_layouts=(object(),))
 
 
-def test_offload_resolves_coalesced_offsets_and_batches_disjoint_pages():
+def test_offload_resolves_one_compact_base_and_batches_disjoint_pages():
     manager = _manager(_layout())
     native = _native()
 
     with patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
-            return_value=native,
+        "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
+        return_value=native,
     ):
         manager.on_offload_compress(
             pool_group_index=2,
             src_life_cycles=(3, 3),
-            src_addresses=((0x1000, ), (0x2000, )),
-            dst_addresses=((0x3000, 0x4000), (0x5000, 0x6000)),
+            src_addresses=((0x1000, 0x2000), (0x4000, 0x5000)),
+            dst_addresses=((0x3000,), (0x6000,)),
             stream=0x7000,
         )
 
     native.nvfp4_boundary_offload_compress.assert_called_once_with(
         [
-            (0x1000, 0x1100, 0x3000, 0x3040, 0x4000, 0x4010),
-            (0x2000, 0x2100, 0x5000, 0x5040, 0x6000, 0x6010),
+            (0x1000, 0x2000, 0x3000),
+            (0x4000, 0x5000, 0x6000),
         ],
         8,
         64,
@@ -174,7 +178,7 @@ def test_factory_builds_the_concrete_manager_when_kvcm_hands_off_layout():
         manager = util_mod.create_kv_cache_compression_manager(
             _config(),
             _v2_manager(),
-            boundary_layer_layouts=(_layout(), ),
+            boundary_layer_layouts=(_layout(),),
         )
 
     assert isinstance(manager, QuantizationCompression)
@@ -182,9 +186,8 @@ def test_factory_builds_the_concrete_manager_when_kvcm_hands_off_layout():
 
 def test_factory_fails_closed_until_kvcm_hands_off_per_level_layout():
     with (
-            patch.object(util_mod, "is_sm_100f", return_value=True),
-            pytest.raises(RuntimeError,
-                          match="per-level boundary layout handoff"),
+        patch.object(util_mod, "is_sm_100f", return_value=True),
+        pytest.raises(RuntimeError, match="per-level boundary layout handoff"),
     ):
         util_mod.create_kv_cache_compression_manager(_config(), _v2_manager())
 
@@ -194,19 +197,19 @@ def test_onboard_reverses_which_row_supplies_raw_and_compact_addresses():
     native = _native()
 
     with patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
-            return_value=native,
+        "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
+        return_value=native,
     ):
         manager.on_onboard_decompress(
             pool_group_index=2,
-            src_life_cycles=(3, ),
-            src_addresses=((0x3000, 0x4000), ),
-            dst_addresses=((0x1000, ), ),
+            src_life_cycles=(3,),
+            src_addresses=((0x3000,),),
+            dst_addresses=((0x1000, 0x2000),),
             stream=0x7000,
         )
 
     native.nvfp4_boundary_onboard_decompress.assert_called_once_with(
-        [(0x1000, 0x1100, 0x3000, 0x3040, 0x4000, 0x4010)],
+        [(0x1000, 0x2000, 0x3000)],
         8,
         64,
         128,
@@ -221,53 +224,50 @@ def test_onboard_reverses_which_row_supplies_raw_and_compact_addresses():
 
 @pytest.mark.parametrize(
     ("runtime_dtype", "native_dtype"),
-    (("float16", "native-fp16"), ("bfloat16", "native-bf16"),
-     ("fp8_e4m3", "native-fp8")),
+    (("float16", "native-fp16"), ("bfloat16", "native-bf16"), ("fp8_e4m3", "native-fp8")),
 )
-def test_all_runtime_dtypes_dispatch_through_the_same_two_hooks(
-        runtime_dtype, native_dtype):
+def test_all_runtime_dtypes_dispatch_through_the_same_two_hooks(runtime_dtype, native_dtype):
     manager = _manager(_layout(runtime_dtype=runtime_dtype))
     native = _native()
 
     with patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
-            return_value=native,
+        "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
+        return_value=native,
     ):
         manager.on_offload_compress(
             pool_group_index=2,
-            src_life_cycles=(3, ),
-            src_addresses=((0x1000, ), ),
-            dst_addresses=((0x3000, 0x4000), ),
+            src_life_cycles=(3,),
+            src_addresses=((0x1000, 0x2000),),
+            dst_addresses=((0x3000,),),
             stream=0,
         )
 
-    assert native.nvfp4_boundary_offload_compress.call_args.args[
-        -2] == native_dtype
+    assert native.nvfp4_boundary_offload_compress.call_args.args[-2] == native_dtype
 
 
 def test_one_page_expands_to_each_layer_but_stays_one_homogeneous_launch():
     manager = _manager(
         _layout(layer_id=0),
-        _layout(layer_id=1, raw_offset=0x200, compact_offset=0x80),
+        _layout(layer_id=1, raw_offset=0x200, compact_offset=_COMPACT_BYTES),
     )
     native = _native()
 
     with patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
-            return_value=native,
+        "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
+        return_value=native,
     ):
         manager.on_offload_compress(
             pool_group_index=2,
-            src_life_cycles=(3, ),
-            src_addresses=((0x1000, ), ),
-            dst_addresses=((0x3000, 0x4000), ),
+            src_life_cycles=(3,),
+            src_addresses=((0x1000, 0x2000),),
+            dst_addresses=((0x3000,),),
             stream=0,
         )
 
     tasks = native.nvfp4_boundary_offload_compress.call_args.args[0]
     assert tasks == [
-        (0x1000, 0x1100, 0x3000, 0x3040, 0x4000, 0x4010),
-        (0x1200, 0x1300, 0x3080, 0x30C0, 0x4080, 0x4090),
+        (0x1000, 0x2000, 0x3000),
+        (0x1200, 0x2200, 0x3000 + _COMPACT_BYTES),
     ]
     native.nvfp4_boundary_offload_compress.assert_called_once()
 
@@ -275,22 +275,21 @@ def test_one_page_expands_to_each_layer_but_stays_one_homogeneous_launch():
 def test_heterogeneous_layers_split_by_native_kernel_contract_not_by_page():
     manager = _manager(
         _layout(layer_id=0, runtime_dtype="float16"),
-        _layout(layer_id=1,
-                runtime_dtype="fp8_e4m3",
-                raw_offset=0x200,
-                compact_offset=0x80),
+        _layout(
+            layer_id=1, runtime_dtype="fp8_e4m3", raw_offset=0x200, compact_offset=_COMPACT_BYTES
+        ),
     )
     native = _native()
 
     with patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
-            return_value=native,
+        "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
+        return_value=native,
     ):
         manager.on_offload_compress(
             pool_group_index=2,
             src_life_cycles=(3, 3),
-            src_addresses=((0x1000, ), (0x2000, )),
-            dst_addresses=((0x3000, 0x4000), (0x5000, 0x6000)),
+            src_addresses=((0x1000, 0x2000), (0x4000, 0x5000)),
+            dst_addresses=((0x3000,), (0x6000,)),
             stream=0,
         )
 
@@ -305,15 +304,15 @@ def test_complete_batch_is_validated_before_any_kernel_launch():
     native = _native()
 
     with patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
-            return_value=native,
+        "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
+        return_value=native,
     ):
         with pytest.raises(ValueError, match="life cycle 9"):
             manager.on_offload_compress(
                 pool_group_index=2,
                 src_life_cycles=(3, 9),
-                src_addresses=((0x1000, ), (0x2000, )),
-                dst_addresses=((0x3000, 0x4000), (0x5000, 0x6000)),
+                src_addresses=((0x1000, 0x2000), (0x4000, 0x5000)),
+                dst_addresses=((0x3000,), (0x6000,)),
                 stream=0,
             )
 
@@ -323,77 +322,36 @@ def test_complete_batch_is_validated_before_any_kernel_launch():
 def test_later_cohort_alignment_is_validated_before_any_kernel_launch():
     manager = _manager(
         _layout(layer_id=0, runtime_dtype="float16"),
-        _layout(layer_id=1,
-                runtime_dtype="fp8_e4m3",
-                raw_offset=1,
-                compact_offset=0x80),
+        _layout(layer_id=1, runtime_dtype="fp8_e4m3", raw_offset=1, compact_offset=_COMPACT_BYTES),
     )
     native = _native()
 
     with patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
-            return_value=native,
+        "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
+        return_value=native,
     ):
         with pytest.raises(ValueError, match="raw K address"):
             manager.on_offload_compress(
                 pool_group_index=2,
-                src_life_cycles=(3, ),
-                src_addresses=((0x1000, ), ),
-                dst_addresses=((0x3000, 0x4000), ),
+                src_life_cycles=(3,),
+                src_addresses=((0x1000, 0x2000),),
+                dst_addresses=((0x3000,),),
                 stream=0,
             )
 
     native.nvfp4_boundary_offload_compress.assert_not_called()
 
 
-def test_later_cohort_offload_scale_alignment_is_validated_before_launch():
-    first = _layout(layer_id=0, runtime_dtype="float16")
-    second_fields = vars(
-        _layout(layer_id=1,
-                runtime_dtype="fp8_e4m3",
-                raw_offset=0x200,
-                compact_offset=0x80)).copy()
-    # Packed addresses stay 16-byte aligned. Only the second cohort's K-scale
-    # destination violates the dense uint4 Host-flush contract.
-    second_fields["block_scale_k"] = BoundaryBufferLayout(1, 0x81)
-    manager = _manager(first, Nvfp4BoundaryLayerLayout(**second_fields))
-    native = _native()
-
-    with patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
-            return_value=native,
-    ):
-        with pytest.raises(ValueError, match="K block scale address"):
-            manager.on_offload_compress(
-                pool_group_index=2,
-                src_life_cycles=(3, ),
-                src_addresses=((0x1000, ), ),
-                dst_addresses=((0x3000, 0x4000), ),
-                stream=0,
-            )
-
-    native.nvfp4_boundary_offload_compress.assert_not_called()
-
-
-def test_onboard_keeps_byte_aligned_scale_tail_fallback():
+def test_layout_rejects_noncontiguous_or_multi_pool_compact_buffers():
     fields = vars(_layout()).copy()
-    fields["block_scale_k"] = BoundaryBufferLayout(1, 1)
-    manager = _manager(Nvfp4BoundaryLayerLayout(**fields))
-    native = _native()
+    fields["block_scale_k"] = BoundaryBufferLayout(1, fields["block_scale_k"].offset)
+    with pytest.raises(ValueError, match="one physical Host Pool"):
+        Nvfp4BoundaryLayerLayout(**fields)
 
-    with patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
-            return_value=native,
-    ):
-        manager.on_onboard_decompress(
-            pool_group_index=2,
-            src_life_cycles=(3, ),
-            src_addresses=((0x3000, 0x4000), ),
-            dst_addresses=((0x1000, ), ),
-            stream=0,
-        )
-
-    native.nvfp4_boundary_onboard_decompress.assert_called_once()
+    fields = vars(_layout()).copy()
+    fields["packed_v"] = BoundaryBufferLayout(0, fields["packed_v"].offset + 16)
+    with pytest.raises(ValueError, match="must be contiguous"):
+        Nvfp4BoundaryLayerLayout(**fields)
 
 
 def test_short_pool_row_fails_before_native_submission():
@@ -401,15 +359,15 @@ def test_short_pool_row_fails_before_native_submission():
     native = _native()
 
     with patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
-            return_value=native,
+        "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
+        return_value=native,
     ):
-        with pytest.raises(ValueError, match="selects pool 1"):
+        with pytest.raises(ValueError, match="selects pool 0"):
             manager.on_offload_compress(
                 pool_group_index=2,
-                src_life_cycles=(3, ),
-                src_addresses=((0x1000, ), ),
-                dst_addresses=((0x3000, ), ),
+                src_life_cycles=(3,),
+                src_addresses=((0x1000, 0x2000),),
+                dst_addresses=((),),
                 stream=0,
             )
 
@@ -420,7 +378,7 @@ def test_empty_batch_is_noop_without_loading_native_extension():
     manager = _manager(_layout())
 
     with patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings"
+        "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings"
     ) as load:
         manager.on_offload_compress(
             pool_group_index=2,

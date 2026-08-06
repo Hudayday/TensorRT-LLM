@@ -34,6 +34,9 @@ enum class Nvfp4BoundaryTransferPipeline : std::uint8_t
     kAuto,
     kWholePage,
     kCompressedOutputTiled,
+    //! Benchmark-only two-tile producer/transfer warp pipeline. Production
+    //! `kAuto` never selects this candidate until byte-exact A/B accepts it.
+    kDoubleBufferedTiled,
 };
 
 void invokeNvfp4BoundaryOffloadCompressWithPipeline(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,

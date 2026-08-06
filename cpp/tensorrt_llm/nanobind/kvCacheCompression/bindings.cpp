@@ -34,7 +34,7 @@ namespace tensorrt_llm::nanobind::kv_cache_compression
 namespace
 {
 
-using BoundaryAddressTuple = std::array<std::uintptr_t, 6>;
+using BoundaryAddressTuple = std::array<std::uintptr_t, 3>;
 using BoundaryScalePair = std::array<float, 2>;
 
 //! Build the immutable parameters shared by one homogeneous Page/layer cohort.
@@ -79,7 +79,10 @@ void initBindings(nb::module_& module)
     // through Python or nanobind.
     //
     // Every tuple uses one canonical order in both directions:
-    //   raw K, raw V, packed K, packed V, K block scales, V block scales.
+    //   raw K, raw V, compact Host Page.
+    // The compact Page contains K packed, V packed, K block scales, then V
+    // block scales. Native code derives those four region offsets from the
+    // homogeneous cohort geometry rather than repeating them per Page.
     // A tuple is one (Page, layer) task. The native launcher batches all tasks
     // in this homogeneous cohort and internally chunks only very large batches.
     module.def(
@@ -95,8 +98,7 @@ void initBindings(nb::module_& module)
             for (auto const& address : addresses)
             {
                 tasks.push_back({reinterpret_cast<void const*>(address[0]), reinterpret_cast<void const*>(address[1]),
-                    reinterpret_cast<std::uint8_t*>(address[2]), reinterpret_cast<std::uint8_t*>(address[3]),
-                    reinterpret_cast<std::uint8_t*>(address[4]), reinterpret_cast<std::uint8_t*>(address[5])});
+                    reinterpret_cast<std::uint8_t*>(address[2])});
             }
             auto const params = makeBoundaryParams(numKvHeads, tokensPerPage, headDim, nvfp4ScaleOrigQuant,
                 nvfp4ScaleQuantOrig, fp8ScaleOrigQuant, fp8ScaleQuantOrig);
@@ -121,10 +123,7 @@ void initBindings(nb::module_& module)
             tasks.reserve(addresses.size());
             for (auto const& address : addresses)
             {
-                tasks.push_back({reinterpret_cast<std::uint8_t const*>(address[2]),
-                    reinterpret_cast<std::uint8_t const*>(address[3]),
-                    reinterpret_cast<std::uint8_t const*>(address[4]),
-                    reinterpret_cast<std::uint8_t const*>(address[5]), reinterpret_cast<void*>(address[0]),
+                tasks.push_back({reinterpret_cast<std::uint8_t const*>(address[2]), reinterpret_cast<void*>(address[0]),
                     reinterpret_cast<void*>(address[1])});
             }
             auto const params = makeBoundaryParams(numKvHeads, tokensPerPage, headDim, nvfp4ScaleOrigQuant,
