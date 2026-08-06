@@ -179,8 +179,10 @@ bool isCurrentDeviceSm100FamilyCached()
 //! * `cp_async_commit_group()` and `cp_async_wait_group<N>()` are reused from
 //!   TensorRT-LLM's shared `cudaAsyncOps.cuh` primitives.
 //! * Every raw/packed main-payload source load uses batchedCopy's 16-byte
-//!   `cp.async.cg` grain. FP8 offload redistributes a grain into two
-//!   quantization rounds; onboard consumes four packed words per grain.
+//!   `cp.async.cg` grain. The retained tiled FP8 offload path consumes one
+//!   complete 16-value scale group per lane; onboard consumes four packed
+//!   words per grain. Diagnostic whole-Page/double-buffer paths retain their
+//!   original two-round mapping.
 //! * FP8 and large/tiny FP16/BF16 cohorts first write the native packed/scales
 //!   layout into one CTA-local shared tile. After all math completes, every
 //!   lane participates in dense 16-byte mapped-Host stores. Medium 16-bit
@@ -483,6 +485,84 @@ __device__ void store16BitValues(T* output, std::uint32_t elementOffset, float2 
     }
     uint4 const outputGrain = make_uint4(outputWords[0], outputWords[1], outputWords[2], outputWords[3]);
     reinterpret_cast<uint4*>(output + elementOffset)[0] = outputGrain;
+}
+
+//! Quantize one complete 16-value FP8 grain in one lane while preserving the
+//! accepted boundary scale contract exactly.
+//!
+//! The generic `cvt_warp_fp8_to_fp4` cannot be used here: its `SFScaleVal`
+//! contract deliberately cancels the source FP8 scale before publishing the
+//! block scale. Boundary compression instead restores the runtime FP8 domain
+//! with `fp8ScaleQuantOrig`, then applies an independent calibrated
+//! `nvfp4ScaleOrigQuant`. Restoring and reducing both eight-value halves
+//! locally avoids the former adjacent-lane redistribution and warp
+//! synchronization. The helper then rounds one E4M3 scale and packs each half
+//! with the production `fp32_vec_to_e2m1` primitive.
+__device__ uint2 quantizeFp8GrainToNvfp4(
+    uint4 grain, float fp8ScaleQuantOrig, float nvfp4ScaleOrigQuant, std::uint8_t* scaleOutput)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    std::uint64_t const fp8Bytes[2]
+        = {static_cast<std::uint64_t>(grain.x) | (static_cast<std::uint64_t>(grain.y) << 32U),
+            static_cast<std::uint64_t>(grain.z) | (static_cast<std::uint64_t>(grain.w) << 32U)};
+    PackedVec<half> restored[2];
+#pragma unroll
+    for (std::uint32_t halfGroup = 0; halfGroup < 2; ++halfGroup)
+    {
+#pragma unroll
+        for (std::uint32_t i = 0; i < 4; ++i)
+        {
+            __nv_fp8_e4m3 lo;
+            __nv_fp8_e4m3 hi;
+            lo.__x = static_cast<std::uint8_t>(fp8Bytes[halfGroup] >> (16U * i));
+            hi.__x = static_cast<std::uint8_t>(fp8Bytes[halfGroup] >> (16U * i + 8U));
+            float const loValue = static_cast<float>(lo) * fp8ScaleQuantOrig;
+            float const hiValue = static_cast<float>(hi) * fp8ScaleQuantOrig;
+            restored[halfGroup].elts[i] = __floats2half2_rn(loValue, hiValue);
+        }
+    }
+
+    auto firstHalfMax = cuda_abs(restored[0].elts[0]);
+    auto secondHalfMax = cuda_abs(restored[1].elts[0]);
+#pragma unroll
+    for (std::uint32_t i = 1; i < 4; ++i)
+    {
+        firstHalfMax = cuda_max(firstHalfMax, cuda_abs(restored[0].elts[i]));
+        secondHalfMax = cuda_max(secondHalfMax, cuda_abs(restored[1].elts[i]));
+    }
+    auto const localMax = cuda_max(firstHalfMax, secondHalfMax);
+    float const vecMax = static_cast<float>(cuda_max(localMax.x, localMax.y));
+
+    float scaleValue = nvfp4ScaleOrigQuant * (vecMax * reciprocal_approximate_ftz(6.0F));
+    __nv_fp8_e4m3 const roundedScale(scaleValue);
+    *scaleOutput = roundedScale.__x;
+    scaleValue = static_cast<float>(roundedScale);
+    float const outputScale = vecMax != 0.0F
+        ? reciprocal_approximate_ftz(scaleValue * reciprocal_approximate_ftz(nvfp4ScaleOrigQuant))
+        : 0.0F;
+
+    std::uint32_t packed[2];
+#pragma unroll
+    for (std::uint32_t halfGroup = 0; halfGroup < 2; ++halfGroup)
+    {
+        float2 values[4];
+#pragma unroll
+        for (std::uint32_t i = 0; i < 4; ++i)
+        {
+            values[i] = __half22float2(restored[halfGroup].elts[i]);
+            values[i].x *= outputScale;
+            values[i].y *= outputScale;
+        }
+        packed[halfGroup] = fp32_vec_to_e2m1(values);
+    }
+    return make_uint2(packed[0], packed[1]);
+#else
+    static_cast<void>(grain);
+    static_cast<void>(fp8ScaleQuantOrig);
+    static_cast<void>(nvfp4ScaleOrigQuant);
+    static_cast<void>(scaleOutput);
+    return make_uint2(0U, 0U);
+#endif
 }
 
 // FP16/BF16 GPU Page -> Host NVFP4: fused quantization plus D2H.
@@ -847,8 +927,9 @@ __global__ void offloadFrom16BitTiledKernel(std::array<Nvfp4BoundaryOffloadPageT
 //! FP8 E4M3 GPU Page -> Host NVFP4, compressed-output-tiled alternative.
 //!
 //! The output tile is identical to the 16-bit path; only its raw input is
-//! smaller (1.78x the NVFP4 payload). Source FP8 restoration and the production
-//! FP16->FP4 primitive remain byte-for-byte the same as the whole-Page path.
+//! smaller (1.78x the NVFP4 payload). One lane restores and quantizes one
+//! complete 16-value group, preserving the whole-Page path's scale and packed
+//! byte contract without its adjacent-lane redistribution.
 template <std::uint32_t N>
 __global__ void offloadFromFp8TiledKernel(std::array<Nvfp4BoundaryOffloadPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
@@ -888,50 +969,21 @@ __global__ void offloadFromFp8TiledKernel(std::array<Nvfp4BoundaryOffloadPageTas
             {
                 std::uint32_t const transformIteration = iteration - kAsyncStages;
                 cp_async_wait_group<kAsyncStages - 1>();
-                __syncwarp();
-
-                std::uint32_t const lane = threadIdx.x & 31U;
-                std::uint32_t const warpThreadBase = threadIdx.x - lane;
-                std::uint32_t const warpGrainBase = kThreadsPerBlock * transformIteration + threadIdx.x - lane;
-#pragma unroll
-                for (std::uint32_t round = 0; round < 2; ++round)
+                // The async load already assigns one complete 16-value scale
+                // group to this lane. Consume it in place; no adjacent-lane
+                // redistribution or warp-wide synchronization is required.
+                std::uint32_t const localGrain = kThreadsPerBlock * transformIteration + threadIdx.x;
+                if (localGrain < grains)
                 {
-                    std::uint32_t const sourceThread = warpThreadBase + round * 16U + (lane >> 1U);
-                    std::uint32_t const localGrain = warpGrainBase + round * 16U + (lane >> 1U);
-                    std::uint32_t const localHalfGroup = localGrain * 2U + (lane & 1U);
-                    bool const valid = localGrain < grains;
-                    if (valid)
-                    {
-                        uint4 const grain = rawStages[stage][sourceThread];
-                        std::uint64_t const fp8Bytes = (lane & 1U) == 0
-                            ? static_cast<std::uint64_t>(grain.x) | (static_cast<std::uint64_t>(grain.y) << 32U)
-                            : static_cast<std::uint64_t>(grain.z) | (static_cast<std::uint64_t>(grain.w) << 32U);
-
-                        std::uint32_t const globalHalfGroup = firstHalfGroup + localHalfGroup;
-                        std::uint32_t const laneInScale = globalHalfGroup & 1U;
-                        std::uint32_t const scaleGroup = globalHalfGroup >> 1U;
-                        std::uint32_t const row = scaleGroup / scalesPerRow;
-                        std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
-
-                        PackedVec<half> restored;
-#pragma unroll
-                        for (std::uint32_t i = 0; i < 4; ++i)
-                        {
-                            __nv_fp8_e4m3 lo;
-                            __nv_fp8_e4m3 hi;
-                            lo.__x = static_cast<std::uint8_t>(fp8Bytes >> (16U * i));
-                            hi.__x = static_cast<std::uint8_t>(fp8Bytes >> (16U * i + 8U));
-                            float const loValue = static_cast<float>(lo) * params.fp8ScaleQuantOrig[role];
-                            float const hiValue = static_cast<float>(hi) * params.fp8ScaleQuantOrig[role];
-                            restored.elts[i] = __floats2half2_rn(loValue, hiValue);
-                        }
-
-                        std::uint32_t const localScaleOffset
-                            = scaleOffset(role, row, scaleInRow, scalesPerRow) - firstRow * scalesPerRow;
-                        std::uint8_t* scale = laneInScale == 0 ? scaleStages + localScaleOffset : nullptr;
-                        packedStages[localHalfGroup] = cvt_warp_fp16_to_fp4<half, kElementsPerBlockScale, false>(
-                            restored, params.nvfp4ScaleOrigQuant[role], scale);
-                    }
+                    std::uint32_t const scaleGroup = firstGrain + localGrain;
+                    std::uint32_t const row = scaleGroup / scalesPerRow;
+                    std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
+                    std::uint32_t const localScaleOffset
+                        = scaleOffset(role, row, scaleInRow, scalesPerRow) - firstRow * scalesPerRow;
+                    uint2 const packed
+                        = quantizeFp8GrainToNvfp4(rawStages[stage][threadIdx.x], params.fp8ScaleQuantOrig[role],
+                            params.nvfp4ScaleOrigQuant[role], scaleStages + localScaleOffset);
+                    reinterpret_cast<uint2*>(packedStages)[localGrain] = packed;
                 }
             }
 
