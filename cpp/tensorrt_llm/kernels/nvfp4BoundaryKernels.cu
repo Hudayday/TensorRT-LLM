@@ -51,12 +51,20 @@ using detail::Nvfp4BoundaryTransferPipeline;
 // keep batchedCopy's one-split low-bandwidth policy.
 constexpr std::uint32_t kThreadsPerBlock = 128;
 constexpr std::uint32_t kAsyncStages = 4;
+// Mapped Host reads have much longer dependency latency than the GPU-resident
+// raw inputs consumed by offload. Keep batchedCopy's four-stage ring for raw
+// GPU loads, but let the phase/double-buffer onboard loaders use all eight
+// hardware cp.async groups before throttling. This changes only how many
+// already-disjoint 16-byte Host grains are in flight; layout, arithmetic, and
+// the number of final GPU stores remain unchanged.
+constexpr std::uint32_t kHostLoadAsyncStages = 8;
 constexpr std::uint32_t kHostMemorySplits = 1;
 constexpr std::uint32_t kWarpSize = 32;
 constexpr std::uint32_t kDoubleBufferCount = 2;
 // DOUBLE-BUFFER A/B: the initial one-transform/three-transfer split was
-// byte-exact but transform-starved offload. This isolated follow-up gives each
-// stage two complete warps. Production kAuto does not select the candidate.
+// byte-exact but transform-starved offload. The retained candidate gives each
+// stage two complete warps. kAuto may select it only for the measured large
+// FP16/BF16 onboard cohort; offload and FP8 keep the simpler tiled schedule.
 constexpr std::uint32_t kTransformWarps = 2;
 constexpr std::uint32_t kTransformThreads = kTransformWarps * kWarpSize;
 constexpr std::uint32_t kTransferThreads = kThreadsPerBlock - kTransformThreads;
@@ -86,6 +94,13 @@ constexpr std::uint32_t kMaxWholePageCompactStagingBytes = 36U * 1024U;
 constexpr std::uint32_t kMinTiledOffload16BitSmallTaskCount = 8;
 constexpr std::uint32_t kMaxTiledOffload16BitSmallTaskCount = 16;
 constexpr std::uint32_t kMinTiledOffload16BitLargeTaskCount = 48;
+// On the accepted H=8/P=64/D=128 B200 sweep, named-barrier overlap first wins
+// consistently at 136 tasks, or 9.5625 MiB of compact input per descriptor
+// launch. The 9.5-MiB gate includes that measured point but excludes 129 tasks,
+// where double buffering is still neutral/slower. Express the crossover in
+// bytes instead of total Hook Pages: a Hook larger than 256 tasks is split, and
+// every launch (including its tail) makes its own scheduling decision.
+constexpr std::uint64_t kMinDoubleBufferedOnboard16BitBatchBytes = 19ULL * 512ULL * 1024ULL;
 
 static_assert(kThreadsPerBlock % 2 == 0, "An NVFP4 scale group is shared by two lanes");
 static_assert(kTransformThreads % kWarpSize == 0 && kTransferThreads % kWarpSize == 0,
@@ -928,9 +943,9 @@ __global__ void offloadFromFp8TiledKernel(std::array<Nvfp4BoundaryOffloadPageTas
 
 //! FP16/BF16 GPU Page -> Host NVFP4 with CTA-local double buffering.
 //!
-//! NEW SCHEDULING ONLY: one producer warp retains the production
+//! NEW SCHEDULING ONLY: two producer warps retain the production
 //! `cvt_warp_fp16_to_fp4` primitive and four-stage raw-input `cp.async` ring.
-//! Three writer warps concurrently flush the previous native packed+scale tile
+//! Two writer warps concurrently flush the previous native packed+scale tile
 //! through the same 16-byte mapped-Host stores as `flushCompactRangeToHost`.
 //! Named barriers publish and release each ping-pong buffer without a full-CTA
 //! phase barrier. Layout, quantization math, Page descriptors, and final Host
@@ -1019,7 +1034,7 @@ __global__ void offloadFrom16BitDoubleBufferedKernel(
             cp_async_wait_group<0>();
 
             // Publish this buffer while immediately continuing to the other
-            // buffer. The transfer warps supply the remaining 96 arrivals.
+            // buffer. The two transfer warps supply the remaining arrivals.
             namedBarrierArrive(kReadyBarrierBase + buffer);
         }
     }
@@ -1037,7 +1052,7 @@ __global__ void offloadFrom16BitDoubleBufferedKernel(
             std::uint32_t const halfGroups = rows * halfGroupsPerRow;
             auto const* compactBuffer = compactStages + buffer * compactStageCapacityBytes;
 
-            // MAPPED-HOST TRANSFER: three warps stream the prior compact tile
+            // MAPPED-HOST TRANSFER: two warps stream the prior compact tile
             // while the producer quantizes the next tile into the other buffer.
             flushCompactRangeToHostForGroup(compactBuffer, task, role, halfGroupsPerRole, packedStageCapacityBytes,
                 packedBytesPerRole(firstHalfGroup), packedBytesPerRole(halfGroups), firstRow * scalesPerRow,
@@ -1214,9 +1229,9 @@ __device__ void loadCompactRangeFromHostForGroup(std::uint8_t* compactStages, Nv
 
     for (std::uint32_t iteration = 0; iteration < iterations; ++iteration)
     {
-        if (iteration >= kAsyncStages)
+        if (iteration >= kHostLoadAsyncStages)
         {
-            cp_async_wait_group<kAsyncStages - 1>();
+            cp_async_wait_group<kHostLoadAsyncStages - 1>();
         }
         std::uint32_t const grain = groupThreads * iteration + groupThread;
         bool const valid = grain < totalGrains;
@@ -1270,8 +1285,8 @@ __device__ void loadCompactRangeFromHost(std::uint8_t* compactStages, Nvfp4Bound
 // unpackE2m1ToFloat adapts the cvt.rn.f16x2.e2m1x2 sequence from
 // ARCQuant/fused-MoE; it does not call a MoE kernel. Every lane pipelines one
 // 16-byte mapped-Host grain and expands its four packed words. Each adjacent
-// word pair shares one scalar scale load; the scale Pool stays separate
-// because K and V use different native ordering.
+// word pair shares one scalar scale load. Packed and scale segments coexist in
+// one concatenated Host Slot; K and V scale segments keep their native order.
 // Dequant PTX sources:
 // https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/arcquantFP4.cu
 // https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/fusedMoeCommKernels.cu
@@ -1625,8 +1640,8 @@ __global__ void onboardToFp8PhaseKernel(std::array<Nvfp4BoundaryOnboardPageTask,
 
 //! Host NVFP4 -> FP16/BF16 GPU Page with CTA-local double buffering.
 //!
-//! Three loader warps pipeline mapped-Host packed/scales into one shared tile
-//! while one consumer warp applies the accepted E2M1 dequant primitive to the
+//! Two loader warps pipeline mapped-Host packed/scales into one shared tile
+//! while two consumer warps apply the accepted E2M1 dequant primitive to the
 //! other tile. Ready/released named barriers replace the current tile-wide
 //! load -> `__syncthreads()` -> dequant -> `__syncthreads()` sequence.
 template <std::uint32_t N, typename T>
@@ -2056,6 +2071,23 @@ bool useMeasuredTiledAutoGeometry(Nvfp4BoundaryKernelParams const& params)
         && params.headDim == kMeasuredAutoHeadDim;
 }
 
+bool useDoubleBufferedAutoFor16BitOnboard(
+    std::uint32_t count, std::uint32_t halfGroups, Nvfp4BoundaryKernelParams const& params)
+{
+    if (!useMeasuredTiledAutoGeometry(params))
+    {
+        return false;
+    }
+
+    // `count` is the effective task count in this one descriptor launch, not
+    // the original Hook cohort. K and V share one compact Host Slot, hence the
+    // factor of two. This selects double buffering at 136--256 measured tasks;
+    // <=129-task launches and small tails retain the lower-overhead phase kernel.
+    std::uint64_t const compactBatchBytes
+        = static_cast<std::uint64_t>(count) * 2U * compactStagingBytesPerRole(halfGroups);
+    return compactBatchBytes >= kMinDoubleBufferedOnboard16BitBatchBytes;
+}
+
 bool requiresBoundedTiledStaging(std::uint32_t halfGroups)
 {
     // Whole-Page staging is a latency/performance choice, not a correctness
@@ -2182,7 +2214,9 @@ void launchOnboardTo16Bit(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks
         {
             constexpr std::uint32_t taskCapacity = decltype(capacity)::value;
             dim3 const grid(kHostMemorySplits, 2, count);
-            if (pipeline == Nvfp4BoundaryTransferPipeline::kDoubleBufferedTiled)
+            if (pipeline == Nvfp4BoundaryTransferPipeline::kDoubleBufferedTiled
+                || (pipeline == Nvfp4BoundaryTransferPipeline::kAuto
+                    && useDoubleBufferedAutoFor16BitOnboard(count, halfGroups, params)))
             {
                 std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
                 std::uint32_t const sharedBytes = kDoubleBufferCount * compactStagingBytesPerRole(tileHalfGroups);
