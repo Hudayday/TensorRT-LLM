@@ -65,6 +65,10 @@ constexpr std::uint32_t kDoubleBufferCount = 2;
 // byte-exact but transform-starved offload. The retained candidate gives each
 // stage two complete warps. kAuto may select it only for the measured large
 // FP16/BF16 onboard cohort; offload and FP8 keep the simpler tiled schedule.
+// R4-A retained the balanced split. A one-loader/three-consumer build was only
+// 0.05--0.1% faster at the measured 256-task launch, which is below a safe
+// selection margin and leaves less transfer-latency tolerance for other Page
+// shapes. The previous three-loader/one-consumer split was consistently slower.
 constexpr std::uint32_t kTransformWarps = 2;
 constexpr std::uint32_t kTransformThreads = kTransformWarps * kWarpSize;
 constexpr std::uint32_t kTransferThreads = kThreadsPerBlock - kTransformThreads;
@@ -83,7 +87,11 @@ constexpr std::uint32_t kMaxTasksPerLaunch = 256;
 constexpr std::uint32_t kElementsPerLane = 8;
 constexpr std::uint32_t kElementsPerBlockScale = 16;
 constexpr std::uint32_t kNativeVScaleRows = 4;
-constexpr std::uint32_t kTargetScaleTransferBytes = kThreadsPerBlock * sizeof(uint4);
+// R4-A selected a 1-KiB scale interval (128 model-like rows per tile). Relative
+// to the former 2-KiB interval it reduces the ping-pong shared working set from
+// 36 KiB to 18 KiB and improves the 256-task Host-onboard launch by about 1.5%
+// without changing compact bytes, arithmetic, or the public task contract.
+constexpr std::uint32_t kTargetScaleTransferBytes = 1024;
 constexpr std::size_t kModernKernelParameterLimit = 32764;
 constexpr std::uint32_t kTinyDenseFlushPageCount = 8;
 constexpr std::uint64_t kLargeDenseFlushBatchBytes = 4'000'000;
@@ -103,8 +111,12 @@ constexpr std::uint32_t kMinTiledOffload16BitLargeTaskCount = 48;
 constexpr std::uint64_t kMinDoubleBufferedOnboard16BitBatchBytes = 19ULL * 512ULL * 1024ULL;
 
 static_assert(kThreadsPerBlock % 2 == 0, "An NVFP4 scale group is shared by two lanes");
+static_assert(kTransformWarps > 0 && kTransformWarps < kThreadsPerBlock / kWarpSize,
+    "Double buffering requires at least one complete loader warp and one complete consumer warp");
 static_assert(kTransformThreads % kWarpSize == 0 && kTransferThreads % kWarpSize == 0,
     "Double-buffer producer and transfer groups must contain complete warps");
+static_assert(kTargetScaleTransferBytes > 0 && kTargetScaleTransferBytes % sizeof(uint4) == 0,
+    "Compact scale transfer must remain a positive 16-byte multiple");
 static_assert(kMaxTasksPerLaunch == 32 || kMaxTasksPerLaunch == 64 || kMaxTasksPerLaunch == 128
         || kMaxTasksPerLaunch == 256 || kMaxTasksPerLaunch == 512,
     "Boundary launch-capacity A/B supports powers of two from 32 through 512");

@@ -24,6 +24,8 @@
 //!   staged_sm   : the same transform through GPU compact staging, followed
 //!                 or preceded by KVCM V2's real batchedCopy implementation;
 //!   staged_dma  : the same staging transform with cudaMemcpyBatchAsync.
+//!   bounded_dma : a benchmark-only two-buffer copy-engine pipeline that
+//!                 bounds compact GPU staging and overlaps adjacent chunks.
 //!   device_transform    : only raw <-> compact transformation in GPU memory;
 //!   mapped_host_copy_sm : only the concatenated compact-Page mapped-Host SM copy.
 //!
@@ -121,6 +123,7 @@ enum class Variant
     kFused,
     kStagedSm,
     kStagedDma,
+    kBoundedDma,
     kDeviceTransform,
     kMappedHostCopySm,
 };
@@ -146,6 +149,7 @@ struct Options
     std::optional<Variant> selectedArm;
     std::optional<Variant> profileVariant;
     Nvfp4BoundaryTransferPipeline fusedPipeline{Nvfp4BoundaryTransferPipeline::kAuto};
+    std::size_t stagingChunkPages{128};
     std::optional<SchedulerShape> schedulerShape;
     std::optional<std::size_t> physicalRecordWindow;
 };
@@ -310,11 +314,22 @@ std::size_t kvcmCopyChunksPerCall(Options const& options)
         + static_cast<std::size_t>(tasksPerNativeCall(options) % kKvcmCopyDescriptorCapacity != 0);
 }
 
+std::size_t boundedDmaChunksPerCall(Options const& options)
+{
+    return tasksPerNativeCall(options) / options.stagingChunkPages
+        + static_cast<std::size_t>(tasksPerNativeCall(options) % options.stagingChunkPages != 0);
+}
+
+std::size_t boundedDmaBufferCount(Options const& options)
+{
+    return boundedDmaChunksPerCall(options) > 1 ? 2 : 1;
+}
+
 ExpectedLaunchCounts expectedLaunchCounts(Options const& options, Variant variant)
 {
     ExpectedLaunchCounts result{};
     std::size_t const nativeCalls = nativeTransformCallsPerIteration(options);
-    if (variant != Variant::kMappedHostCopySm)
+    if (variant != Variant::kMappedHostCopySm && variant != Variant::kBoundedDma)
     {
         result.transformKernels = checkedProduct(nativeCalls, descriptorChunksPerCall(options), "descriptor chunks");
     }
@@ -330,6 +345,12 @@ ExpectedLaunchCounts expectedLaunchCounts(Options const& options, Variant varian
         // cudaMemcpyBatchAsync is one API call per native layer/cohort call;
         // it is reported separately and is not mislabeled as a CUDA kernel.
         result.dmaBatchCalls = nativeCalls;
+    }
+    else if (variant == Variant::kBoundedDma)
+    {
+        std::size_t const chunks = checkedProduct(nativeCalls, boundedDmaChunksPerCall(options), "bounded DMA chunks");
+        result.transformKernels = chunks;
+        result.dmaBatchCalls = chunks;
     }
     result.totalKernels = result.transformKernels + result.smCopyKernels;
     return result;
@@ -375,6 +396,7 @@ std::string_view toString(Variant value)
     case Variant::kFused: return "fused";
     case Variant::kStagedSm: return "staged_sm";
     case Variant::kStagedDma: return "staged_dma";
+    case Variant::kBoundedDma: return "bounded_dma";
     case Variant::kDeviceTransform: return "device_transform";
     case Variant::kMappedHostCopySm: return "mapped_host_copy_sm";
     }
@@ -395,6 +417,10 @@ Variant parseVariant(std::string const& value)
     {
         return Variant::kStagedDma;
     }
+    if (value == "bounded_dma")
+    {
+        return Variant::kBoundedDma;
+    }
     if (value == "device_transform")
     {
         return Variant::kDeviceTransform;
@@ -404,7 +430,7 @@ Variant parseVariant(std::string const& value)
         return Variant::kMappedHostCopySm;
     }
     fail(
-        "variant must be fused, staged_sm, staged_dma, device_transform, or "
+        "variant must be fused, staged_sm, staged_dma, bounded_dma, device_transform, or "
         "mapped_host_copy_sm");
 }
 
@@ -535,12 +561,12 @@ void printHelp(char const* executable)
               << "  --iterations N                 Timed iterations per sample (default: 100)\n"
               << "  --samples N                    Repeated samples (default: 15)\n"
               << "  --arm NAME                     Time only one arm: fused, "
-                 "staged_sm, staged_dma,\n"
+                 "staged_sm, staged_dma, bounded_dma,\n"
               << "                                  device_transform, or "
                  "mapped_host_copy_sm\n"
-              << "                                  (default: time the original three "
+              << "                                  (default: time all four transport "
                  "arms)\n"
-              << "  --profile-variant NAME         Capture one of the same five arms\n"
+              << "  --profile-variant NAME         Capture one of the same six arms\n"
               << "                                  between cudaProfilerStart/Stop; "
                  "--iterations\n"
               << "                                  controls the captured steady-state "
@@ -550,6 +576,8 @@ void printHelp(char const* executable)
               << "                                  or double_buffered_tiled\n"
               << "                                  (default: auto; ignored by staged "
                  "paths)\n"
+              << "  --staging-chunk-pages N        bounded_dma chunk size in [1, 256]\n"
+              << "                                  (default: 128; two compact buffers)\n"
               << "  --seed N                       Input/permutation seed (default: "
                  "20260805)\n"
               << "  --help                         Show this text\n\n"
@@ -675,6 +703,10 @@ Options parseOptions(int argc, char** argv)
         {
             result.fusedPipeline = parseTransferPipeline(value);
         }
+        else if (auto value = optionValue(index, argc, argv, argument, "--staging-chunk-pages"); !value.empty())
+        {
+            result.stagingChunkPages = parseUnsigned(value, "--staging-chunk-pages");
+        }
         else if (auto value = optionValue(index, argc, argv, argument, "--seed"); !value.empty())
         {
             result.seed = parseUnsigned(value, "--seed");
@@ -728,6 +760,10 @@ Options parseOptions(int argc, char** argv)
     {
         fail("--pages must be in [1, UINT32_MAX]");
     }
+    if (result.stagingChunkPages == 0 || result.stagingChunkPages > kKvcmCopyDescriptorCapacity)
+    {
+        fail("--staging-chunk-pages must be in [1, 256]");
+    }
     if (result.warmup < 0 || result.iterations <= 0 || result.samples <= 0)
     {
         fail("--warmup must be non-negative; --iterations and --samples must be positive");
@@ -773,9 +809,10 @@ private:
 class CudaEvent
 {
 public:
-    CudaEvent()
+    explicit CudaEvent(bool enableTiming = false)
     {
-        checkCuda(cudaEventCreate(&mEvent), "cudaEventCreate");
+        unsigned int const flags = enableTiming ? cudaEventDefault : cudaEventDisableTiming;
+        checkCuda(cudaEventCreateWithFlags(&mEvent, flags), "cudaEventCreateWithFlags");
     }
 
     ~CudaEvent()
@@ -949,6 +986,18 @@ struct NativeTransformCall
     std::vector<void*> dmaDestinations;
     std::vector<void const*> dmaSources;
     std::vector<std::size_t> dmaSizes;
+
+    struct BoundedDmaChunk
+    {
+        std::size_t buffer{};
+        std::vector<Nvfp4BoundaryOffloadPageTask> offload;
+        std::vector<Nvfp4BoundaryOnboardPageTask> onboard;
+        std::vector<void*> dmaDestinations;
+        std::vector<void const*> dmaSources;
+        std::vector<std::size_t> dmaSizes;
+    };
+
+    std::vector<BoundedDmaChunk> boundedDmaChunks;
 };
 
 std::vector<std::size_t> makeSlotOrder(std::size_t pages, AddressMode mode, std::uint64_t seed)
@@ -1106,6 +1155,8 @@ public:
         , mHostSm(mPhysicalRecords, mLayout)
         , mHostDma(mPhysicalRecords, mLayout)
         , mStaging(mPhysicalRecords, mLayout)
+        , mBoundedStaging(
+              boundedDmaBufferCount(options) * std::min(options.stagingChunkPages, pagesPerRequest(options)), mLayout)
     {
         mRawInput.k.copyFrom(makeRawPool(options, mLayout, mSlots, mParams, 0));
         mRawInput.v.copyFrom(makeRawPool(options, mLayout, mSlots, mParams, 1));
@@ -1114,6 +1165,12 @@ public:
         // once, outside correctness and timing, instead of relying on default-
         // stream ordering that a non-blocking stream deliberately does not have.
         checkCuda(cudaDeviceSynchronize(), "raw input initialization synchronization");
+        // Both compact buffers are initially free. Later records alternate
+        // ownership between the owner/transform stream and copy-engine stream.
+        for (CudaEvent const& free : mBoundedBufferFree)
+        {
+            checkCuda(cudaEventRecord(free, mStream), "initialize bounded DMA free event");
+        }
         buildTasks();
         prepareCanonicalInput();
     }
@@ -1123,6 +1180,7 @@ public:
         // Drain any work that still owns Pool pointers before member
         // destruction releases mapped Host or device storage.
         static_cast<void>(cudaStreamSynchronize(mStream));
+        static_cast<void>(cudaStreamSynchronize(mTransferStream));
     }
 
     [[nodiscard]] PoolLayout const& layout() const
@@ -1156,6 +1214,9 @@ public:
             if (mDmaAvailable)
             {
                 compareCompact(mHostFused, mHostDma, "fused", "staged_dma");
+                enqueue(Variant::kBoundedDma);
+                synchronizeBoth("bounded-DMA offload correctness synchronization");
+                compareCompact(mHostFused, mHostDma, "fused", "bounded_dma");
             }
         }
         else
@@ -1164,6 +1225,9 @@ public:
             if (mDmaAvailable)
             {
                 compareRaw(mRawFused, mRawDma, "fused", "staged_dma");
+                enqueue(Variant::kBoundedDma);
+                synchronizeBoth("bounded-DMA onboard correctness synchronization");
+                compareRaw(mRawFused, mRawDma, "fused", "bounded_dma");
             }
         }
         // This gate establishes that only the transport implementation changed:
@@ -1180,14 +1244,21 @@ public:
             {
                 enqueue(variant);
             }
-            checkCuda(cudaStreamSynchronize(mStream), "warm-up synchronization");
+            synchronizeBoth("warm-up synchronization");
         }
     }
 
     TimingSample measure(Variant variant, int sample)
     {
-        checkCuda(cudaStreamSynchronize(mStream), "pre-sample synchronization");
+        synchronizeBoth("pre-sample synchronization");
         checkCuda(cudaEventRecord(mStart, mStream), "record sample start");
+        if (variant == Variant::kBoundedDma)
+        {
+            // Prevent the copy stream from beginning timed work before the
+            // owner-stream start event. The stop event is similarly ordered
+            // after the final copy by enqueue().
+            checkCuda(cudaStreamWaitEvent(mTransferStream, mStart), "bound copy stream to sample start");
+        }
         auto const cpuStart = Clock::now();
         for (int iteration = 0; iteration < mOptions.iterations; ++iteration)
         {
@@ -1206,25 +1277,31 @@ public:
 
     void profile(Variant variant)
     {
-        if (variant == Variant::kStagedDma && !mDmaAvailable)
+        if ((variant == Variant::kStagedDma || variant == Variant::kBoundedDma) && !mDmaAvailable)
         {
-            fail("cannot profile staged_dma: " + mDmaUnavailableReason);
+            fail("cannot profile copy-engine staging: " + mDmaUnavailableReason);
         }
 
         // Nsight Systems starts collection only after correctness and warmup.
         // Synchronizing before and after the captured loop makes the report one
         // exact steady-state pipeline rather than a mixture of setup and teardown.
-        checkCuda(cudaStreamSynchronize(mStream), "pre-profile synchronization");
+        synchronizeBoth("pre-profile synchronization");
         checkCuda(cudaProfilerStart(), "cudaProfilerStart");
         for (int iteration = 0; iteration < mOptions.iterations; ++iteration)
         {
             enqueue(variant);
         }
-        checkCuda(cudaStreamSynchronize(mStream), "profile synchronization");
+        synchronizeBoth("profile synchronization");
         checkCuda(cudaProfilerStop(), "cudaProfilerStop");
     }
 
 private:
+    void synchronizeBoth(std::string_view operation)
+    {
+        checkCuda(cudaStreamSynchronize(mStream), operation);
+        checkCuda(cudaStreamSynchronize(mTransferStream), operation);
+    }
+
     void buildTasks()
     {
         std::size_t const requestCount = requests(mOptions);
@@ -1263,6 +1340,7 @@ private:
                     std::size_t const physical = mSlots[record % mPhysicalRecords];
                     appendPageTasks(call, physical);
                 }
+                buildBoundedDmaChunks(call);
                 mNativeCalls.push_back(std::move(call));
             }
         }
@@ -1315,6 +1393,49 @@ private:
         }
     }
 
+    void buildBoundedDmaChunks(NativeTransformCall& call)
+    {
+        std::size_t const pageCount = call.offloadFused.size();
+        std::size_t const capacity = std::min(mOptions.stagingChunkPages, pagesPerRequest(mOptions));
+        for (std::size_t begin = 0, chunkIndex = 0; begin < pageCount;
+             begin += mOptions.stagingChunkPages, ++chunkIndex)
+        {
+            std::size_t const count = std::min(mOptions.stagingChunkPages, pageCount - begin);
+            auto& chunk = call.boundedDmaChunks.emplace_back();
+            chunk.buffer = chunkIndex % boundedDmaBufferCount(mOptions);
+            chunk.offload.reserve(count);
+            chunk.onboard.reserve(count);
+            chunk.dmaDestinations.reserve(count);
+            chunk.dmaSources.reserve(count);
+            chunk.dmaSizes.assign(count, mLayout.compactStride);
+
+            std::size_t const bufferBase = chunk.buffer * capacity;
+            for (std::size_t local = 0; local < count; ++local)
+            {
+                std::size_t const page = begin + local;
+                auto* staging = slot(mBoundedStaging.data, bufferBase + local, mLayout.compactStride);
+
+                // Only the compact destination/source changes. Runtime raw
+                // addresses and final Host Page addresses remain the exact
+                // same disjoint descriptors used by the full-staging control.
+                auto const& offload = call.offloadFused[page];
+                auto const& onboard = call.onboardDma[page];
+                chunk.offload.push_back({offload.rawK, offload.rawV, staging});
+                chunk.onboard.push_back({staging, onboard.rawK, onboard.rawV});
+                if (mOptions.direction == Direction::kOffload)
+                {
+                    chunk.dmaDestinations.push_back(call.dmaDestinations[page]);
+                    chunk.dmaSources.push_back(staging);
+                }
+                else
+                {
+                    chunk.dmaDestinations.push_back(staging);
+                    chunk.dmaSources.push_back(call.dmaSources[page]);
+                }
+            }
+        }
+    }
+
     void prepareCanonicalInput()
     {
         // Onboard needs one byte-stable native NVFP4 Host source. Produce it
@@ -1335,6 +1456,7 @@ private:
         // Queue device clears on the same stream as the verification kernels.
         // Host clears are safe here because verify() runs before any timed work.
         mStaging.fill(kUntouchedByte, mStream);
+        mBoundedStaging.fill(kUntouchedByte, mStream);
         if (mOptions.direction == Direction::kOffload)
         {
             mHostFused.fill(kUntouchedByte);
@@ -1359,7 +1481,8 @@ private:
         checkDriver(status, "batchedCopy compact Page");
     }
 
-    cudaError_t copyCompactWithDma(NativeTransformCall const& call)
+    cudaError_t copyCompactWithDma(std::vector<void*> const& destinations, std::vector<void const*> const& sources,
+        std::vector<std::size_t> const& sizes, cudaStream_t stream)
     {
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
         // Match the CUDA-13 call shape already used by TRT-LLM's
@@ -1369,12 +1492,59 @@ private:
         attributes[0].srcAccessOrder = cudaMemcpySrcAccessOrderStream;
         attributes[0].flags = 1U;
         std::size_t attributeIndices[1]{0};
-        return cudaMemcpyBatchAsync(call.dmaDestinations.data(), call.dmaSources.data(), call.dmaSizes.data(),
-            call.dmaSizes.size(), attributes, attributeIndices, 1, mStream);
+        return cudaMemcpyBatchAsync(
+            destinations.data(), sources.data(), sizes.data(), sizes.size(), attributes, attributeIndices, 1, stream);
 #else
-        static_cast<void>(call);
+        static_cast<void>(destinations);
+        static_cast<void>(sources);
+        static_cast<void>(sizes);
+        static_cast<void>(stream);
         return cudaErrorNotSupported;
 #endif
+    }
+
+    cudaError_t copyCompactWithDma(NativeTransformCall const& call)
+    {
+        return copyCompactWithDma(call.dmaDestinations, call.dmaSources, call.dmaSizes, mStream);
+    }
+
+    void enqueueBoundedDma(NativeTransformCall const& call)
+    {
+        for (auto const& chunk : call.boundedDmaChunks)
+        {
+            std::size_t const buffer = chunk.buffer;
+            if (mOptions.direction == Direction::kOffload)
+            {
+                // The owner stream may overwrite a compact buffer only after
+                // the copy engine has completed the preceding D2H from it.
+                checkCuda(cudaStreamWaitEvent(mStream, mBoundedBufferFree[buffer]), "wait for D2H staging buffer");
+                kernels::invokeNvfp4BoundaryOffloadCompress(
+                    chunk.offload, mParams, runtimeType(mOptions.dtype), mStream);
+                checkCuda(cudaEventRecord(mBoundedBufferReady[buffer], mStream), "publish compressed staging buffer");
+
+                checkCuda(cudaStreamWaitEvent(mTransferStream, mBoundedBufferReady[buffer]),
+                    "copy stream waits for compression");
+                checkCuda(copyCompactWithDma(chunk.dmaDestinations, chunk.dmaSources, chunk.dmaSizes, mTransferStream),
+                    "bounded cudaMemcpyBatchAsync offload");
+                checkCuda(cudaEventRecord(mBoundedBufferFree[buffer], mTransferStream), "release D2H staging buffer");
+            }
+            else
+            {
+                // The copy stream fills the next compact buffer while the owner
+                // stream decompresses the previous buffer into disjoint raw Pages.
+                checkCuda(cudaStreamWaitEvent(mTransferStream, mBoundedBufferFree[buffer]),
+                    "wait for decompression staging buffer");
+                checkCuda(copyCompactWithDma(chunk.dmaDestinations, chunk.dmaSources, chunk.dmaSizes, mTransferStream),
+                    "bounded cudaMemcpyBatchAsync onboard");
+                checkCuda(cudaEventRecord(mBoundedBufferReady[buffer], mTransferStream), "publish H2D staging buffer");
+
+                checkCuda(cudaStreamWaitEvent(mStream, mBoundedBufferReady[buffer]),
+                    "owner stream waits for H2D staging buffer");
+                kernels::invokeNvfp4BoundaryOnboardDecompress(
+                    chunk.onboard, mParams, runtimeType(mOptions.dtype), mStream);
+                checkCuda(cudaEventRecord(mBoundedBufferFree[buffer], mStream), "release decompressed staging buffer");
+            }
+        }
     }
 
     void enqueue(Variant variant)
@@ -1385,6 +1555,16 @@ private:
         for (NativeTransformCall const& call : mNativeCalls)
         {
             enqueueCall(call, variant);
+        }
+        if (variant == Variant::kBoundedDma && mOptions.direction == Direction::kOffload)
+        {
+            // Completion/publication must cover the final D2H copies, not merely
+            // the quantization kernels that produced their staging buffers.
+            for (std::size_t buffer = 0; buffer < boundedDmaBufferCount(mOptions); ++buffer)
+            {
+                checkCuda(
+                    cudaStreamWaitEvent(mStream, mBoundedBufferFree[buffer]), "join bounded D2H before completion");
+            }
         }
     }
 
@@ -1413,6 +1593,7 @@ private:
                     call.offloadStaging, mParams, runtimeType(mOptions.dtype), mStream);
                 checkCuda(copyCompactWithDma(call), "cudaMemcpyBatchAsync offload");
                 break;
+            case Variant::kBoundedDma: enqueueBoundedDma(call); break;
             }
         }
         else
@@ -1438,6 +1619,7 @@ private:
                 kernels::invokeNvfp4BoundaryOnboardDecompress(
                     call.onboardDma, mParams, runtimeType(mOptions.dtype), mStream);
                 break;
+            case Variant::kBoundedDma: enqueueBoundedDma(call); break;
             }
         }
     }
@@ -1527,8 +1709,11 @@ private:
     std::size_t mPhysicalRecords{};
     std::vector<std::size_t> mSlots;
     CudaStream mStream;
-    CudaEvent mStart;
-    CudaEvent mStop;
+    CudaStream mTransferStream;
+    CudaEvent mStart{true};
+    CudaEvent mStop{true};
+    std::array<CudaEvent, 2> mBoundedBufferReady;
+    std::array<CudaEvent, 2> mBoundedBufferFree;
 
     RawDevicePools mRawInput;
     RawDevicePools mRawFused;
@@ -1538,6 +1723,7 @@ private:
     CompactHostPools mHostSm;
     CompactHostPools mHostDma;
     CompactDevicePools mStaging;
+    CompactDevicePools mBoundedStaging;
 
     std::vector<NativeTransformCall> mNativeCalls;
     bool mDmaAvailable{true};
@@ -1566,6 +1752,21 @@ double pagesPerSecond(std::size_t pages, double microseconds)
 double gigabytesPerSecond(std::size_t bytesPerPage, std::size_t pages, double microseconds)
 {
     return static_cast<double>(bytesPerPage) * static_cast<double>(pages) / (microseconds * 1.0e3);
+}
+
+std::size_t gpuStagingBytes(Options const& options, PoolLayout const& layout, Variant variant)
+{
+    if (variant == Variant::kFused)
+    {
+        return 0;
+    }
+    if (variant == Variant::kBoundedDma)
+    {
+        std::size_t const pagesPerBuffer = std::min(options.stagingChunkPages, pagesPerRequest(options));
+        return checkedProduct(boundedDmaBufferCount(options) * pagesPerBuffer, layout.compactStagingBytesPerPage(),
+            "bounded GPU staging bytes");
+    }
+    return checkedProduct(physicalRecordCount(options), layout.compactStagingBytesPerPage(), "GPU staging bytes");
 }
 
 std::string csvEscape(std::string const& value)
@@ -1613,7 +1814,8 @@ public:
                "tokens_per_page,head_dim,pdl,warmup,iterations,seed,gpu_us,cpu_enqueue_us,min_gpu_us,"
                "median_gpu_us,p95_gpu_us,pages_per_s,effective_raw_gbps,effective_compact_gbps,"
                "staged_over_fused,"
-               "raw_bytes_per_page,compact_bytes_per_page,gpu_staging_bytes,cudart_version,driver_version,"
+               "raw_bytes_per_page,compact_bytes_per_page,gpu_staging_bytes,staging_chunk_pages,cudart_version,driver_"
+               "version,"
                "device_name,benchmark_shape,requests,pages_per_request,local_layers,"
                "logical_page_layer_records,physical_page_layer_records,bounded_address_replay,"
                "physical_record_window,assumed_migration_hook_calls_per_iteration,"
@@ -1635,9 +1837,7 @@ public:
         double const pps = pagesPerSecond(records, sample.gpuUs);
         double const rawGbps = gigabytesPerSecond(layout.rawBoundaryBytesPerPage(), records, sample.gpuUs);
         double const compactGbps = gigabytesPerSecond(layout.compactBoundaryBytesPerPage(), records, sample.gpuUs);
-        std::size_t const stagingBytes = sample.variant == Variant::kFused
-            ? 0
-            : checkedProduct(physicalRecordCount(options), layout.compactStagingBytesPerPage(), "GPU staging bytes");
+        std::size_t const stagingBytes = gpuStagingBytes(options, layout, sample.variant);
         *mOutput << "sample,ok,," << toString(sample.variant) << ',' << toString(options.fusedPipeline) << ','
                  << sample.sample << ',' << toString(options.direction) << ',' << toString(options.dtype) << ','
                  << toString(options.addressMode) << ',' << reportedPages(options) << ',' << kNumKvHeads << ','
@@ -1649,7 +1849,8 @@ public:
             *mOutput << *sample.speedupOverFused;
         }
         *mOutput << ',' << layout.rawBoundaryBytesPerPage() << ',' << layout.compactBoundaryBytesPerPage() << ','
-                 << stagingBytes << ',' << runtimeVersion << ',' << driverVersion << ',' << csvEscape(deviceName);
+                 << stagingBytes << ',' << options.stagingChunkPages << ',' << runtimeVersion << ',' << driverVersion
+                 << ',' << csvEscape(deviceName);
         appendShapeColumns(options, sample.variant, sample.gpuUs);
         *mOutput << '\n';
     }
@@ -1662,9 +1863,7 @@ public:
         double const pps = pagesPerSecond(records, gpu.median);
         double const rawGbps = gigabytesPerSecond(layout.rawBoundaryBytesPerPage(), records, gpu.median);
         double const compactGbps = gigabytesPerSecond(layout.compactBoundaryBytesPerPage(), records, gpu.median);
-        std::size_t const stagingBytes = variant == Variant::kFused
-            ? 0
-            : checkedProduct(physicalRecordCount(options), layout.compactStagingBytesPerPage(), "GPU staging bytes");
+        std::size_t const stagingBytes = gpuStagingBytes(options, layout, variant);
         *mOutput << "summary,ok,," << toString(variant) << ',' << toString(options.fusedPipeline) << ",,"
                  << toString(options.direction) << ',' << toString(options.dtype) << ','
                  << toString(options.addressMode) << ',' << reportedPages(options) << ',' << kNumKvHeads << ','
@@ -1676,7 +1875,8 @@ public:
             *mOutput << *speedup;
         }
         *mOutput << ',' << layout.rawBoundaryBytesPerPage() << ',' << layout.compactBoundaryBytesPerPage() << ','
-                 << stagingBytes << ',' << runtimeVersion << ',' << driverVersion << ',' << csvEscape(deviceName);
+                 << stagingBytes << ',' << options.stagingChunkPages << ',' << runtimeVersion << ',' << driverVersion
+                 << ',' << csvEscape(deviceName);
         appendShapeColumns(options, variant, gpu.median);
         *mOutput << '\n';
     }
@@ -1690,9 +1890,8 @@ public:
                  << ',' << kNumKvHeads << ',' << kTokensPerPage << ',' << kHeadDim << ',' << (pdl ? 1 : 0) << ','
                  << options.warmup << ',' << options.iterations << ',' << options.seed << ",,,,,,,,,,"
                  << layout.rawBoundaryBytesPerPage() << ',' << layout.compactBoundaryBytesPerPage() << ','
-                 << checkedProduct(
-                        physicalRecordCount(options), layout.compactStagingBytesPerPage(), "GPU staging bytes")
-                 << ',' << runtimeVersion << ',' << driverVersion << ',' << csvEscape(deviceName);
+                 << gpuStagingBytes(options, layout, variant) << ',' << options.stagingChunkPages << ','
+                 << runtimeVersion << ',' << driverVersion << ',' << csvEscape(deviceName);
         appendShapeColumns(options, variant, std::nullopt);
         *mOutput << '\n';
     }
@@ -1744,7 +1943,7 @@ std::vector<Variant> requestedVariants(Options const& options)
     {
         return {*options.profileVariant};
     }
-    return {Variant::kFused, Variant::kStagedSm, Variant::kStagedDma};
+    return {Variant::kFused, Variant::kStagedSm, Variant::kStagedDma, Variant::kBoundedDma};
 }
 
 std::vector<Variant> variantOrder(int sample, bool dmaAvailable, std::vector<Variant> result)
@@ -1752,6 +1951,7 @@ std::vector<Variant> variantOrder(int sample, bool dmaAvailable, std::vector<Var
     if (!dmaAvailable)
     {
         result.erase(std::remove(result.begin(), result.end(), Variant::kStagedDma), result.end());
+        result.erase(std::remove(result.begin(), result.end(), Variant::kBoundedDma), result.end());
     }
     if (!result.empty())
     {
@@ -1781,14 +1981,17 @@ int run(Options const& options)
     BenchmarkFixture fixture(options);
     fixture.verify();
     std::vector<Variant> const requested = requestedVariants(options);
-    bool const requestsDma = std::find(requested.begin(), requested.end(), Variant::kStagedDma) != requested.end();
+    bool const requestsDma = std::any_of(requested.begin(), requested.end(),
+        [](Variant variant) { return variant == Variant::kStagedDma || variant == Variant::kBoundedDma; });
     if (requestsDma && !fixture.dmaAvailable())
     {
-        std::cerr << "staged_dma unsupported: " << fixture.dmaUnavailableReason() << '\n';
+        std::cerr << "copy-engine staging unsupported: " << fixture.dmaUnavailableReason() << '\n';
     }
-    if (options.selectedArm.has_value() && *options.selectedArm == Variant::kStagedDma && !fixture.dmaAvailable())
+    if (options.selectedArm.has_value()
+        && (*options.selectedArm == Variant::kStagedDma || *options.selectedArm == Variant::kBoundedDma)
+        && !fixture.dmaAvailable())
     {
-        fail("cannot time staged_dma: " + fixture.dmaUnavailableReason());
+        fail("cannot time copy-engine staging: " + fixture.dmaUnavailableReason());
     }
     fixture.warmup(variantOrder(0, fixture.dmaAvailable(), requested));
 
@@ -1827,7 +2030,7 @@ int run(Options const& options)
     std::optional<Summary> fusedGpu;
     for (Variant variant : requested)
     {
-        if (variant == Variant::kStagedDma && !fixture.dmaAvailable())
+        if ((variant == Variant::kStagedDma || variant == Variant::kBoundedDma) && !fixture.dmaAvailable())
         {
             output.unsupported(options, fixture.layout(), variant, fixture.dmaUnavailableReason(), pdl, runtimeVersion,
                 driverVersion, properties.name);
