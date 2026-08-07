@@ -16,51 +16,24 @@
  */
 
 #include "bindings.h"
-#include "tensorrt_llm/kernels/nvfp4BoundaryKernels.h"
+#include "tensorrt_llm/kv_cache_compression/nvfp4ColdPageCodec.h"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/array.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/vector.h>
 
-#include <array>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 namespace nb = nanobind;
+namespace compression = tensorrt_llm::kv_cache_compression;
 namespace kernels = tensorrt_llm::kernels;
+namespace kv = tensorrt_llm::batch_manager::kv_cache_manager_v2;
 
 namespace tensorrt_llm::nanobind::kv_cache_compression
 {
-namespace
-{
-
-using BoundaryAddressTuple = std::array<std::uintptr_t, 3>;
-using BoundaryScalePair = std::array<float, 2>;
-
-//! Build the immutable parameters shared by one homogeneous Page/layer cohort.
-//!
-//! Keeping this conversion in the binding makes the Python prototype pass only
-//! plain values and raw addresses. It does not create Tensor views over KVCM
-//! memory, switch streams, or acquire ownership of any source/destination Slot.
-kernels::Nvfp4BoundaryKernelParams makeBoundaryParams(std::int32_t numKvHeads, std::int32_t tokensPerPage,
-    std::int32_t headDim, BoundaryScalePair const& nvfp4ScaleOrigQuant, BoundaryScalePair const& nvfp4ScaleQuantOrig,
-    BoundaryScalePair const& fp8ScaleOrigQuant, BoundaryScalePair const& fp8ScaleQuantOrig)
-{
-    kernels::Nvfp4BoundaryKernelParams params{};
-    params.numKvHeads = numKvHeads;
-    params.tokensPerPage = tokensPerPage;
-    params.headDim = headDim;
-    for (std::size_t role = 0; role < 2; ++role)
-    {
-        params.nvfp4ScaleOrigQuant[role] = nvfp4ScaleOrigQuant[role];
-        params.nvfp4ScaleQuantOrig[role] = nvfp4ScaleQuantOrig[role];
-        params.fp8ScaleOrigQuant[role] = fp8ScaleOrigQuant[role];
-        params.fp8ScaleQuantOrig[role] = fp8ScaleQuantOrig[role];
-    }
-    return params;
-}
-
-} // namespace
 
 void initBindings(nb::module_& module)
 {
@@ -69,73 +42,72 @@ void initBindings(nb::module_& module)
         .value("BFLOAT16", kernels::Nvfp4BoundaryRuntimeType::kBfloat16)
         .value("FP8_E4M3", kernels::Nvfp4BoundaryRuntimeType::kFp8E4m3);
 
-    // Prototype/Python-parity bridge for boundary compression. The Python
-    // Compression Manager lowers KVCM-owned addresses to plain tuples and
-    // crosses into the native launchers here. This binding neither selects
-    // the compression algorithm nor owns Page residency/migration.
-    //
-    // The product C++ StorageManager/Compression Manager path will call the
-    // same native launchers directly; it must not route _batchedMigrate()
-    // through Python or nanobind.
-    //
-    // Every tuple uses one canonical order in both directions:
-    //   raw K, raw V, compact Host Page.
-    // The compact Page contains K packed, V packed, K block scales, then V
-    // block scales. Native code derives those four region offsets from the
-    // homogeneous cohort geometry rather than repeating them per Page.
-    // A tuple is one (Page, layer) task. The native launcher batches all tasks
-    // in this homogeneous cohort and internally chunks only very large batches.
-    module.def(
-        "nvfp4_boundary_offload_compress",
-        [](std::vector<BoundaryAddressTuple> const& addresses, std::int32_t numKvHeads, std::int32_t tokensPerPage,
-            std::int32_t headDim, BoundaryScalePair const& nvfp4ScaleOrigQuant,
-            BoundaryScalePair const& nvfp4ScaleQuantOrig, BoundaryScalePair const& fp8ScaleOrigQuant,
-            BoundaryScalePair const& fp8ScaleQuantOrig, kernels::Nvfp4BoundaryRuntimeType runtimeType,
-            std::uintptr_t stream)
-        {
-            std::vector<kernels::Nvfp4BoundaryOffloadPageTask> tasks;
-            tasks.reserve(addresses.size());
-            for (auto const& address : addresses)
-            {
-                tasks.push_back({reinterpret_cast<void const*>(address[0]), reinterpret_cast<void const*>(address[1]),
-                    reinterpret_cast<std::uint8_t*>(address[2])});
-            }
-            auto const params = makeBoundaryParams(numKvHeads, tokensPerPage, headDim, nvfp4ScaleOrigQuant,
-                nvfp4ScaleQuantOrig, fp8ScaleOrigQuant, fp8ScaleQuantOrig);
-            kernels::invokeNvfp4BoundaryOffloadCompress(
-                tasks, params, runtimeType, reinterpret_cast<cudaStream_t>(stream));
-        },
-        nb::arg("addresses"), nb::arg("num_kv_heads"), nb::arg("tokens_per_page"), nb::arg("head_dim"),
-        nb::arg("nvfp4_scale_orig_quant"), nb::arg("nvfp4_scale_quant_orig"), nb::arg("fp8_scale_orig_quant"),
-        nb::arg("fp8_scale_quant_orig"), nb::arg("runtime_type"), nb::arg("stream"),
-        nb::call_guard<nb::gil_scoped_release>(),
-        "Compress a homogeneous batch of non-contiguous GPU KV Pages directly into mapped Host NVFP4 buffers");
+    nb::class_<compression::Nvfp4ColdPageLayerConfig>(module, "Nvfp4ColdPageLayerConfig")
+        .def(nb::init<>())
+        .def_prop_rw(
+            "layer_group_id",
+            [](compression::Nvfp4ColdPageLayerConfig const& self) { return self.layerGroupId.value(); },
+            [](compression::Nvfp4ColdPageLayerConfig& self, int value) { self.layerGroupId = kv::LayerGroupId{value}; })
+        .def_rw("layer_id", &compression::Nvfp4ColdPageLayerConfig::layerId)
+        .def_rw("runtime_type", &compression::Nvfp4ColdPageLayerConfig::runtimeType)
+        .def_rw("num_kv_heads", &compression::Nvfp4ColdPageLayerConfig::numKvHeads)
+        .def_rw("tokens_per_page", &compression::Nvfp4ColdPageLayerConfig::tokensPerPage)
+        .def_rw("head_dim", &compression::Nvfp4ColdPageLayerConfig::headDim)
+        .def_rw("nvfp4_scale_orig_quant", &compression::Nvfp4ColdPageLayerConfig::nvfp4ScaleOrigQuant)
+        .def_rw("nvfp4_scale_quant_orig", &compression::Nvfp4ColdPageLayerConfig::nvfp4ScaleQuantOrig)
+        .def_rw("fp8_scale_orig_quant", &compression::Nvfp4ColdPageLayerConfig::fp8ScaleOrigQuant)
+        .def_rw("fp8_scale_quant_orig", &compression::Nvfp4ColdPageLayerConfig::fp8ScaleQuantOrig);
 
-    module.def(
-        "nvfp4_boundary_onboard_decompress",
-        [](std::vector<BoundaryAddressTuple> const& addresses, std::int32_t numKvHeads, std::int32_t tokensPerPage,
-            std::int32_t headDim, BoundaryScalePair const& nvfp4ScaleOrigQuant,
-            BoundaryScalePair const& nvfp4ScaleQuantOrig, BoundaryScalePair const& fp8ScaleOrigQuant,
-            BoundaryScalePair const& fp8ScaleQuantOrig, kernels::Nvfp4BoundaryRuntimeType runtimeType,
-            std::uintptr_t stream)
-        {
-            std::vector<kernels::Nvfp4BoundaryOnboardPageTask> tasks;
-            tasks.reserve(addresses.size());
-            for (auto const& address : addresses)
+    // Yao Yao's KVCM-facing hook type. It is intentionally data-plane only:
+    // Python creates a concrete codec and hands the same native object to the
+    // selected Python or C++ KVCM V2 implementation during initialization.
+    nb::class_<kv::IKvCacheColdPageCodec>(module, "IKvCacheColdPageCodec");
+
+    // QuantizationCompression constructs, configures, and retains this native
+    // object. KVCM's future native integration receives the same object and
+    // invokes the exact C++ methods directly, without a Python callback.
+    nb::class_<compression::Nvfp4ColdPageCodec, kv::IKvCacheColdPageCodec>(module, "Nvfp4ColdPageCodec")
+        .def(nb::init<std::vector<compression::Nvfp4ColdPageLayerConfig>>(), nb::arg("layer_configs"))
+        .def("configure", &compression::Nvfp4ColdPageCodec::configure, nb::arg("gpu_desc"),
+            "Configure one authoritative GPU PoolGroupDesc")
+        .def(
+            "query_cold_page_bytes", [](compression::Nvfp4ColdPageCodec const& self, int layerGroupId)
+            { return self.queryColdPageBytes(kv::LayerGroupId{layerGroupId}); }, nb::arg("layer_group_id"),
+            "Return the fixed byte stride of one compact Host Slot")
+        .def(
+            "encode",
+            [](compression::Nvfp4ColdPageCodec& self, int layerGroupId, std::uintptr_t dstBasePtr,
+                std::vector<std::int32_t> const& dstBasePageIndices,
+                std::vector<std::int32_t> const& srcBasePageIndices, std::uintptr_t stream)
             {
-                tasks.push_back({reinterpret_cast<std::uint8_t const*>(address[2]), reinterpret_cast<void*>(address[0]),
-                    reinterpret_cast<void*>(address[1])});
-            }
-            auto const params = makeBoundaryParams(numKvHeads, tokensPerPage, headDim, nvfp4ScaleOrigQuant,
-                nvfp4ScaleQuantOrig, fp8ScaleOrigQuant, fp8ScaleQuantOrig);
-            kernels::invokeNvfp4BoundaryOnboardDecompress(
-                tasks, params, runtimeType, reinterpret_cast<cudaStream_t>(stream));
-        },
-        nb::arg("addresses"), nb::arg("num_kv_heads"), nb::arg("tokens_per_page"), nb::arg("head_dim"),
-        nb::arg("nvfp4_scale_orig_quant"), nb::arg("nvfp4_scale_quant_orig"), nb::arg("fp8_scale_orig_quant"),
-        nb::arg("fp8_scale_quant_orig"), nb::arg("runtime_type"), nb::arg("stream"),
-        nb::call_guard<nb::gil_scoped_release>(),
-        "Restore mapped Host NVFP4 buffers directly into a homogeneous batch of non-contiguous GPU KV Pages");
+                if (dstBasePageIndices.size() != srcBasePageIndices.size())
+                {
+                    throw std::invalid_argument("encode Page-index arrays must have the same length");
+                }
+                return self.encode(kv::LayerGroupId{layerGroupId}, reinterpret_cast<void*>(dstBasePtr),
+                    dstBasePageIndices.data(), srcBasePageIndices.data(), dstBasePageIndices.size(),
+                    reinterpret_cast<cudaStream_t>(stream));
+            },
+            nb::arg("layer_group_id"), nb::arg("dst_base_ptr"), nb::arg("dst_base_page_indices"),
+            nb::arg("src_base_page_indices"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
+            "Enqueue GPU runtime KV to mapped-Host NVFP4 for disjoint base Pages")
+        .def(
+            "decode",
+            [](compression::Nvfp4ColdPageCodec& self, int layerGroupId,
+                std::vector<std::int32_t> const& dstBasePageIndices, std::uintptr_t srcBasePtr,
+                std::vector<std::int32_t> const& srcBasePageIndices, std::uintptr_t stream)
+            {
+                if (dstBasePageIndices.size() != srcBasePageIndices.size())
+                {
+                    throw std::invalid_argument("decode Page-index arrays must have the same length");
+                }
+                return self.decode(kv::LayerGroupId{layerGroupId}, dstBasePageIndices.data(),
+                    reinterpret_cast<void const*>(srcBasePtr), srcBasePageIndices.data(), dstBasePageIndices.size(),
+                    reinterpret_cast<cudaStream_t>(stream));
+            },
+            nb::arg("layer_group_id"), nb::arg("dst_base_page_indices"), nb::arg("src_base_ptr"),
+            nb::arg("src_base_page_indices"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
+            "Enqueue mapped-Host NVFP4 to GPU runtime KV for disjoint base Pages");
 }
 
 } // namespace tensorrt_llm::nanobind::kv_cache_compression

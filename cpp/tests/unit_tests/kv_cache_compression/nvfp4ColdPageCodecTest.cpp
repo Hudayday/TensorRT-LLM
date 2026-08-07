@@ -1,0 +1,175 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "tensorrt_llm/kv_cache_compression/nvfp4ColdPageCodec.h"
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <type_traits>
+#include <vector>
+
+namespace tensorrt_llm::kv_cache_compression
+{
+namespace
+{
+
+static_assert(std::is_base_of_v<kv::IKvCacheColdPageCodec, Nvfp4ColdPageCodec>);
+
+namespace kv = batch_manager::kv_cache_manager_v2;
+
+std::vector<kernels::Nvfp4BoundaryOffloadPageTask> gOffloadTasks;
+std::vector<kernels::Nvfp4BoundaryOnboardPageTask> gOnboardTasks;
+cudaStream_t gStream{};
+
+constexpr std::uintptr_t kGpuKBase = 0x100000;
+constexpr std::uintptr_t kGpuVBase = 0x200000;
+constexpr std::uintptr_t kColdBase = 0x300000;
+constexpr std::size_t kGpuSlotBytes = 512;
+constexpr std::size_t kLayerRawBytes = 128;
+constexpr std::size_t kLayerColdBytesAligned = 80;
+constexpr std::size_t kColdSlotBytes = 160;
+constexpr std::uintptr_t kStreamValue = 0x7000;
+
+std::vector<Nvfp4ColdPageLayerConfig> makeLayers()
+{
+    std::vector<Nvfp4ColdPageLayerConfig> layers;
+    for (int layerId : {0, 1})
+    {
+        Nvfp4ColdPageLayerConfig layer;
+        layer.layerGroupId = kv::LayerGroupId{3};
+        layer.layerId = layerId;
+        layer.runtimeType = kernels::Nvfp4BoundaryRuntimeType::kFloat16;
+        layer.numKvHeads = 1;
+        layer.tokensPerPage = 4;
+        layer.headDim = 16;
+        layer.nvfp4ScaleOrigQuant = {2.0F, 4.0F};
+        layer.nvfp4ScaleQuantOrig = {0.5F, 0.25F};
+        layers.push_back(layer);
+    }
+    return layers;
+}
+
+kv::PoolGroupDesc makeGpuDesc()
+{
+    kv::SlotDescVariant variant;
+    variant.lifeCycleId = kv::LayerGroupId{3};
+    variant.coalescedBuffers = kv::TypedVec<kv::PoolIndex, kv::CoalescedBuffer>{
+        kv::CoalescedBuffer{kLayerRawBytes, {{0, "key"}, {1, "key"}}},
+        kv::CoalescedBuffer{kLayerRawBytes, {{0, "value"}, {1, "value"}}},
+    };
+
+    kv::PoolGroupDesc gpuDesc;
+    gpuDesc.poolGroupIndex = kv::PoolGroupIndex{0};
+    gpuDesc.numSlots = kv::SlotCount{8};
+    gpuDesc.slotDesc.variants = {variant};
+    gpuDesc.pools = kv::TypedVec<kv::PoolIndex, kv::PoolDesc>{
+        kv::PoolDesc{kv::PoolIndex{0}, kGpuKBase, kGpuSlotBytes},
+        kv::PoolDesc{kv::PoolIndex{1}, kGpuVBase, kGpuSlotBytes},
+    };
+    return gpuDesc;
+}
+
+TEST(Nvfp4ColdPageCodecTest, ConfiguresLayoutAndLowersDisjointPages)
+{
+    gOffloadTasks.clear();
+    gOnboardTasks.clear();
+    gStream = nullptr;
+
+    Nvfp4ColdPageCodec codec{makeLayers()};
+    EXPECT_TRUE(codec.configure(makeGpuDesc()));
+    EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{3}), kColdSlotBytes);
+
+    std::int32_t const coldIndices[]{2, 5};
+    std::int32_t const gpuIndices[]{1, 3};
+    auto const stream = reinterpret_cast<cudaStream_t>(kStreamValue);
+    EXPECT_TRUE(
+        codec.encode(kv::LayerGroupId{3}, reinterpret_cast<void*>(kColdBase), coldIndices, gpuIndices, 2, stream));
+    EXPECT_EQ(gStream, stream);
+    ASSERT_EQ(gOffloadTasks.size(), 4U);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(gOffloadTasks[0].rawK), kGpuKBase + kGpuSlotBytes);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(gOffloadTasks[1].rawK), kGpuKBase + kGpuSlotBytes + kLayerRawBytes);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(gOffloadTasks[2].rawV), kGpuVBase + 3 * kGpuSlotBytes);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(gOffloadTasks[3].rawV), kGpuVBase + 3 * kGpuSlotBytes + kLayerRawBytes);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(gOffloadTasks[0].compactPage), kColdBase + 2 * kColdSlotBytes);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(gOffloadTasks[1].compactPage),
+        kColdBase + 2 * kColdSlotBytes + kLayerColdBytesAligned);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(gOffloadTasks[2].compactPage), kColdBase + 5 * kColdSlotBytes);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(gOffloadTasks[3].compactPage),
+        kColdBase + 5 * kColdSlotBytes + kLayerColdBytesAligned);
+
+    EXPECT_TRUE(codec.decode(
+        kv::LayerGroupId{3}, gpuIndices, reinterpret_cast<void const*>(kColdBase), coldIndices, 2, stream));
+    ASSERT_EQ(gOnboardTasks.size(), 4U);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(gOnboardTasks[0].compactPage),
+        reinterpret_cast<std::uintptr_t>(gOffloadTasks[0].compactPage));
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(gOnboardTasks[3].rawV),
+        reinterpret_cast<std::uintptr_t>(gOffloadTasks[3].rawV));
+}
+
+TEST(Nvfp4ColdPageCodecTest, DispatchesThroughYaoColdPageCodecInterface)
+{
+    gOffloadTasks.clear();
+    gOnboardTasks.clear();
+
+    Nvfp4ColdPageCodec concrete{makeLayers()};
+    kv::IKvCacheColdPageCodec& codec = concrete;
+    ASSERT_TRUE(codec.configure(makeGpuDesc()));
+
+    std::int32_t const coldIndices[]{2, 5};
+    std::int32_t const gpuIndices[]{1, 3};
+    auto const stream = reinterpret_cast<cudaStream_t>(kStreamValue);
+    ASSERT_TRUE(
+        codec.encode(kv::LayerGroupId{3}, reinterpret_cast<void*>(kColdBase), coldIndices, gpuIndices, 2, stream));
+    ASSERT_TRUE(codec.decode(
+        kv::LayerGroupId{3}, gpuIndices, reinterpret_cast<void const*>(kColdBase), coldIndices, 2, stream));
+
+    EXPECT_EQ(gOffloadTasks.size(), 4U);
+    EXPECT_EQ(gOnboardTasks.size(), 4U);
+    EXPECT_EQ(gStream, stream);
+}
+
+TEST(Nvfp4ColdPageCodecTest, RejectedConfigurePreservesPublishedLayout)
+{
+    Nvfp4ColdPageCodec codec{makeLayers()};
+    auto const gpuDesc = makeGpuDesc();
+    ASSERT_TRUE(codec.configure(gpuDesc));
+    EXPECT_FALSE(codec.configure(gpuDesc));
+    EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{3}), kColdSlotBytes);
+}
+
+} // namespace
+} // namespace tensorrt_llm::kv_cache_compression
+
+namespace tensorrt_llm::kernels
+{
+
+void invokeNvfp4BoundaryOffloadCompress(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,
+    Nvfp4BoundaryKernelParams const&, Nvfp4BoundaryRuntimeType, cudaStream_t stream)
+{
+    kv_cache_compression::gOffloadTasks = tasks;
+    kv_cache_compression::gStream = stream;
+}
+
+void invokeNvfp4BoundaryOnboardDecompress(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks,
+    Nvfp4BoundaryKernelParams const&, Nvfp4BoundaryRuntimeType, cudaStream_t stream)
+{
+    kv_cache_compression::gOnboardTasks = tasks;
+    kv_cache_compression::gStream = stream;
+}
+
+} // namespace tensorrt_llm::kernels

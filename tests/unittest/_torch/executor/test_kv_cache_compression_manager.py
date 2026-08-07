@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 """Unit tests for the KV-cache compression manager framework
 (``KVCacheCompressionManager`` in ``resource_manager.py``) — the
 ``BaseResourceManager``-based single-manager design.
@@ -78,6 +77,7 @@ class _PhysicalLengthChangingConfig(KvCacheCompressionConfig):
 
 
 class _BlockReuseCompatibleConfig(KvCacheCompressionConfig):
+
     def supports_block_reuse(self) -> bool:
         return True
 
@@ -123,12 +123,14 @@ def _batch(context=(), generation=(), last_chunk=()):
 
 
 class TestBaseABC:
+
     def test_inherits_base_resource_manager(self):
         # So PyExecutor's main loop auto-invokes prepare/update/free_resources.
         assert issubclass(KVCacheCompressionManager, BaseResourceManager)
 
     def test_four_hooks_default_noop(self, fake_kv_cache_manager):
-        m = KVCacheCompressionManager(_compression_config(), fake_kv_cache_manager)
+        m = KVCacheCompressionManager(_compression_config(),
+                                      fake_kv_cache_manager)
         assert m.on_request_init(MagicMock()) is None
         assert m.on_context_step_end([MagicMock()]) is None
         assert m.on_generation_step_begin(MagicMock()) is None
@@ -136,42 +138,63 @@ class TestBaseABC:
         assert m.on_request_finish(MagicMock()) is None
 
     def test_storage_boundary_hooks_fail_closed(self, fake_kv_cache_manager):
-        m = KVCacheCompressionManager(_compression_config(), fake_kv_cache_manager)
-        batch = {
-            "pool_group_index": 2,
-            "src_life_cycles": (0, 1),
-            "src_addresses": ((0x1000,), (0x2000,)),
-            "dst_addresses": ((0x3000, 0x4000), (0x5000, 0x6000)),
+        m = KVCacheCompressionManager(_compression_config(),
+                                      fake_kv_cache_manager)
+        offload_batch = {
+            "layer_group_id": 2,
+            "dst_base_ptr": 0x3000,
+            "dst_base_page_indices": (4, 7),
+            "src_base_page_indices": (1, 3),
+            "stream": 0x7000,
+        }
+        onboard_batch = {
+            "layer_group_id": 2,
+            "dst_base_page_indices": (1, 3),
+            "src_base_ptr": 0x3000,
+            "src_base_page_indices": (4, 7),
             "stream": 0x7000,
         }
 
         with pytest.raises(NotImplementedError, match="GPU-to-Host"):
-            m.on_offload_compress(**batch)
+            m.on_offload_compress(**offload_batch)
         with pytest.raises(NotImplementedError, match="Host-to-GPU"):
-            m.on_onboard_decompress(**batch)
+            m.on_onboard_decompress(**onboard_batch)
 
     def test_storage_boundary_hooks_have_explicit_keyword_only_contract(self):
         expected = {
-            "pool_group_index",
-            "src_life_cycles",
-            "src_addresses",
-            "dst_addresses",
-            "stream",
+            "on_offload_compress": {
+                "layer_group_id",
+                "dst_base_ptr",
+                "dst_base_page_indices",
+                "src_base_page_indices",
+                "stream",
+            },
+            "on_onboard_decompress": {
+                "layer_group_id",
+                "dst_base_page_indices",
+                "src_base_ptr",
+                "src_base_page_indices",
+                "stream",
+            },
         }
-        for hook_name in ("on_offload_compress", "on_onboard_decompress"):
-            parameters = signature(getattr(KVCacheCompressionManager, hook_name)).parameters
-            assert set(parameters) == {"self", *expected}
-            assert all(parameters[name].kind is Parameter.KEYWORD_ONLY for name in expected)
+        for hook_name, hook_parameters in expected.items():
+            parameters = signature(getattr(KVCacheCompressionManager,
+                                           hook_name)).parameters
+            assert set(parameters) == {"self", *hook_parameters}
+            assert all(parameters[name].kind is Parameter.KEYWORD_ONLY
+                       for name in hook_parameters)
 
     def test_hooks_accept_extra_kwargs(self, fake_kv_cache_manager):
         # **kwargs lets the framework pass new args later without breaking
         # existing overrides.
-        m = KVCacheCompressionManager(_compression_config(), fake_kv_cache_manager)
+        m = KVCacheCompressionManager(_compression_config(),
+                                      fake_kv_cache_manager)
         assert m.on_request_init(MagicMock(), future_arg=1) is None
         assert m.on_generation_step_end(MagicMock(), future_arg=1) is None
 
     def test_resource_counts_are_zero(self, fake_kv_cache_manager):
-        m = KVCacheCompressionManager(_compression_config(), fake_kv_cache_manager)
+        m = KVCacheCompressionManager(_compression_config(),
+                                      fake_kv_cache_manager)
         # The manager owns no physical resources (the V2 cache manager does),
         # so it must not gate the scheduler.
         assert m.get_max_resource_count() == 0
@@ -197,7 +220,8 @@ class TestBaseABC:
         with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
             KVCacheCompressionManager(config, MagicMock())
         with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
-            KVCacheCompressionManager(config, _v2_manager(is_draft=False), MagicMock())
+            KVCacheCompressionManager(config, _v2_manager(is_draft=False),
+                                      MagicMock())
 
     def test_request_field_defaults_to_zero(self):
         """LlmRequest carries the compression count (the manager's only
@@ -223,30 +247,35 @@ class TestBaseABC:
 
 
 class TestResourceManagerAPI:
+
     def test_target_update_receives_metadata_before_final_compression(self):
         calls = []
         metadata = MagicMock(name="attention_metadata")
         draft = MagicMock(name="draft_kv_cache_manager")
         target = MagicMock(name="target_kv_cache_manager")
         compression = MagicMock(name="compression_manager")
-        draft.update_resources.side_effect = lambda *args: calls.append(("draft", args))
-        target.update_resources.side_effect = lambda *args: calls.append(("target", args))
-        compression.update_resources.side_effect = lambda *args: calls.append(("compression", args))
-        manager = ResourceManager(
-            {
-                ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft,
-                ResourceManagerType.KV_CACHE_MANAGER: target,
-                ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER: compression,
-            }
-        )
+        draft.update_resources.side_effect = lambda *args: calls.append(
+            ("draft", args))
+        target.update_resources.side_effect = lambda *args: calls.append(
+            ("target", args))
+        compression.update_resources.side_effect = lambda *args: calls.append(
+            ("compression", args))
+        manager = ResourceManager({
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER:
+            draft,
+            ResourceManagerType.KV_CACHE_MANAGER:
+            target,
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER:
+            compression,
+        })
         batch = _batch(generation=[_req(1)])
 
         manager.update_resources(batch, metadata, 2.0)
 
         assert calls == [
-            ("draft", (batch,)),
+            ("draft", (batch, )),
             ("target", (batch, metadata, 2.0)),
-            ("compression", (batch,)),
+            ("compression", (batch, )),
         ]
 
     def test_real_v2_target_receives_relocation_metadata(self):
@@ -256,14 +285,17 @@ class TestResourceManagerAPI:
         target.kv_cache_map = {}
         batch = _batch(generation=[_req(1)])
         metadata = MagicMock(name="attention_metadata")
-        manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: target})
+        manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: target})
 
-        with patch.object(kv_cache_v2_module, "_update_kv_cache_draft_token_location") as relocate:
+        with patch.object(kv_cache_v2_module,
+                          "_update_kv_cache_draft_token_location") as relocate:
             manager.update_resources(batch, metadata, 2.0)
 
         relocate.assert_called_once_with(target, batch, metadata, 2.0)
 
-    def test_prepare_fires_init_on_first_chunk_only(self, fake_kv_cache_manager):
+    def test_prepare_fires_init_on_first_chunk_only(self,
+                                                    fake_kv_cache_manager):
         rec = []
         m = _MockCompressionManager(fake_kv_cache_manager, rec, "s")
         # First prefill chunk -> init fires.
@@ -272,7 +304,8 @@ class TestResourceManagerAPI:
         m.prepare_resources(_batch(context=[_req(1, first_chunk=False)]))
         assert rec == ["s:on_request_init"]
 
-    def test_update_fires_context_end_on_last_chunk(self, fake_kv_cache_manager):
+    def test_update_fires_context_end_on_last_chunk(self,
+                                                    fake_kv_cache_manager):
         rec = []
         m = _MockCompressionManager(fake_kv_cache_manager, rec, "s")
         req = _req(1)
@@ -305,11 +338,14 @@ class TestResourceManagerAPI:
 
 
 class TestFactory:
-    def test_returns_none_when_no_algorithm_registered(self, fake_kv_cache_manager):
+
+    def test_returns_none_when_no_algorithm_registered(self,
+                                                       fake_kv_cache_manager):
         # Framework-only: no concrete algorithm ships, so any config -> None.
         cfg = MagicMock()
         cfg.algorithm = "made_up_method"
-        assert create_kv_cache_compression_manager(cfg, fake_kv_cache_manager) is None
+        assert create_kv_cache_compression_manager(
+            cfg, fake_kv_cache_manager) is None
 
     def test_warns_for_unregistered_algorithm(self, fake_kv_cache_manager):
         cfg = MagicMock()
@@ -324,21 +360,18 @@ class TestFactory:
         target = _v2_manager(is_draft=False)
         draft = _v2_manager(is_draft=True)
 
-        assert (
-            create_kv_cache_compression_manager(
-                cfg,
-                target,
-                draft_kv_cache_manager=draft,
-            )
-            is None
-        )
+        assert (create_kv_cache_compression_manager(
+            cfg,
+            target,
+            draft_kv_cache_manager=draft,
+        ) is None)
 
     def test_triattention_requires_sm100_family(self, fake_kv_cache_manager):
         cfg = MagicMock()
         cfg.algorithm = "triattention"
         with (
-            patch.object(util_mod, "is_sm_100f", return_value=False),
-            pytest.raises(RuntimeError, match="SM100-family"),
+                patch.object(util_mod, "is_sm_100f", return_value=False),
+                pytest.raises(RuntimeError, match="SM100-family"),
         ):
             create_kv_cache_compression_manager(cfg, fake_kv_cache_manager)
 
@@ -358,7 +391,8 @@ class TestFactory:
 
         config = KvCacheCompressionConfig(algorithm="offload")
         kv_cache_config = SimpleNamespace(enable_block_reuse=False)
-        spec_config = SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode.DFLASH)
+        spec_config = SimpleNamespace(
+            spec_dec_mode=SpeculativeDecodingMode.DFLASH)
         with pytest.raises(ValueError, match="speculative decoding"):
             validate_kv_cache_compression_compatibility(
                 config,
@@ -378,6 +412,7 @@ class TestFactory:
 
 
 class TestCanonicalImports:
+
     def test_names_importable_from_canonical_modules(self):
         from tensorrt_llm._torch.pyexecutor import _util, resource_manager
 
@@ -401,6 +436,7 @@ class TestCanonicalImports:
 
 
 class TestCompressionCompatibility:
+
     def test_raises_when_reuse_on(self):
         config = _compression_config()
         with pytest.raises(ValueError, match="block reuse"):

@@ -2527,21 +2527,21 @@ class KVCacheCompressionManager(BaseResourceManager):
     def on_offload_compress(
         self,
         *,
-        pool_group_index: int,
-        src_life_cycles: Sequence[int],
-        src_addresses: Sequence[Sequence[int]],
-        dst_addresses: Sequence[Sequence[int]],
+        layer_group_id: int,
+        dst_base_ptr: int,
+        dst_base_page_indices: Sequence[int],
+        src_base_page_indices: Sequence[int],
         stream: int,
     ) -> None:
         """Enqueue compression plus GPU-to-Host transfer for a Page batch.
 
-        KVCM supplies one source and destination physical-Pool address row per
-        Page after selecting the Pages, admitting destination Slots, and
-        waiting on prior ready events. The concrete manager resolves logical
-        K/V roles using its immutable tier layouts and submits all work to
-        ``stream``. It must not publish a Page, release a Slot, or synchronize
-        the stream on success. If it raises, the caller must fence ``stream``
-        before recycling either Slot because a prefix may already be queued.
+        KVCM selects Pages, admits destination Slots, and waits on prior ready
+        events. The configured codec derives GPU addresses from KVCM's GPU
+        descriptor; this call supplies the compact Host Pool base, both Page-
+        index arrays, and ``stream``. It must not publish a Page, release a
+        Slot, or synchronize the stream on success. If it raises, the caller
+        must fence ``stream`` before recycling either Slot because a prefix may
+        already be queued.
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not implement GPU-to-Host "
@@ -2550,19 +2550,20 @@ class KVCacheCompressionManager(BaseResourceManager):
     def on_onboard_decompress(
         self,
         *,
-        pool_group_index: int,
-        src_life_cycles: Sequence[int],
-        src_addresses: Sequence[Sequence[int]],
-        dst_addresses: Sequence[Sequence[int]],
+        layer_group_id: int,
+        dst_base_page_indices: Sequence[int],
+        src_base_ptr: int,
+        src_base_page_indices: Sequence[int],
         stream: int,
     ) -> None:
         """Enqueue Host-to-GPU transfer plus runtime-format restoration.
 
-        The destination rows describe already-admitted GPU runtime Slots. The
-        compressed Host source remains authoritative until KVCM fences this
-        stream and publishes the destination. The manager receives no Page,
-        PageStatus, Attention object, or Attention metadata. If the hook raises,
-        the caller must fence ``stream`` before rolling back reserved Slots.
+        The destination indices describe already-admitted GPU runtime Slots;
+        ``src_base_ptr`` and source indices select compact Host Slots. The Host
+        source remains authoritative until KVCM fences this stream and
+        publishes the destination. The manager receives no Page, PageStatus,
+        Attention object, or Attention metadata. If the hook raises, the
+        caller must fence ``stream`` before rolling back reserved Slots.
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not implement Host-to-GPU "
