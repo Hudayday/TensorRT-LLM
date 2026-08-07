@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/eventSink.h"
@@ -110,6 +111,10 @@ public:
 
     void destroy();
 
+    //! Install the compression-manager-owned codec before any request uses
+    //! the Host tier. Passing nullptr only detaches the codec during shutdown.
+    void setColdPageCodec(std::shared_ptr<IKvCacheColdPageCodec> codec);
+
     // ---- Allocation -------------------------------------------------------
 
     // Allocate slots for all life cycles at the given cache level.
@@ -202,10 +207,10 @@ public:
     }
 
     PoolGroupIndex getPoolGroupIndex(LifeCycleId lc) const;
-    PoolIndex numPools(PoolGroupIndex pgIdx) const;
+    PoolIndex numPools(PoolGroupIndex pgIdx, CacheLevel level = kGpuLevel) const;
 
     // Return the byte size of each pool in a pool group.
-    TypedVec<PoolIndex, size_t> slotSize(PoolGroupIndex pgIdx) const;
+    TypedVec<PoolIndex, size_t> slotSize(PoolGroupIndex pgIdx, CacheLevel level = kGpuLevel) const;
 
     // Current ratio list for a cache level (proportional to byte usage per pool group).
     TypedVec<PoolGroupIndex, float> getRatioList(CacheLevel level) const;
@@ -279,8 +284,6 @@ private:
     size_t minQuotaForLevel(
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists, size_t granularity) const;
 
-    PoolIndex mNumPools(PoolGroupIndex pgIdx) const;
-
     // Internal helpers.
     void _prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals, CacheLevel lvlId,
         TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>>& fallenPages,
@@ -326,6 +329,7 @@ private:
     TypedVec<PoolGroupIndex, SlotDesc> mSlotDescList;
     TypedVec<PoolGroupIndex, SlotCount> mMinSlots;
     TypedVec<CacheLevel, CacheLevelManager> mLevels;
+    std::shared_ptr<IKvCacheColdPageCodec> mColdPageCodec;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

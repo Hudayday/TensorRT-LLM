@@ -18,6 +18,7 @@
 #pragma once
 
 #include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/lifeCycleRegistry.h"
 
 #include <cstddef>
 #include <cstdint>

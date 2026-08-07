@@ -524,6 +524,8 @@ class HostCacheLevelStorage : public CacheLevelStorage
 {
 public:
     HostCacheLevelStorage(StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
+    HostCacheLevelStorage(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
 
     CacheTier cacheTier() const noexcept override
     {

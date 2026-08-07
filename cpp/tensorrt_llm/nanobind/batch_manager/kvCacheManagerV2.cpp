@@ -1830,6 +1830,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("cache_tier_list", [](kv::KvCacheManager const& self) { return self.cacheTierList().raw(); })
         .def_prop_ro("all_buffer_ids", &kv::KvCacheManager::allBufferIds)
         .def_prop_ro("pool_group_descs", [](kv::KvCacheManager const& self) { return self.poolGroupDescs().raw(); })
+        .def(
+            "set_cold_page_codec",
+            [](kv::KvCacheManager& self, nb::object codec)
+            {
+                self.setColdPageCodec(codec.is_none() ? std::shared_ptr<kv::IKvCacheColdPageCodec>{}
+                                                      : nb::cast<std::shared_ptr<kv::IKvCacheColdPageCodec>>(codec));
+            },
+            nb::arg("codec").none(), "Install the compression-manager-owned native codec before request admission")
         .def("clamp_max_seq_len_for_mem", &kv::KvCacheManager::clampMaxSeqLenForMem, nb::arg("batch_size"),
             nb::arg("token_num_upper_bound"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("allow_seq_rebasing", &kv::KvCacheManager::allowSeqRebasing)

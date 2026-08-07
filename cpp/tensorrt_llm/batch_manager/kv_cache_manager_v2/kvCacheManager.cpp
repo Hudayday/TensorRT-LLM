@@ -154,6 +154,11 @@ void KvCacheManager::clearReusableBlocks()
     mRadixTree->clear();
 }
 
+void KvCacheManager::setColdPageCodec(std::shared_ptr<IKvCacheColdPageCodec> codec)
+{
+    mStorage->setColdPageCodec(std::move(codec));
+}
+
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope,
     std::vector<TokenIdExt> const& inputTokens, std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb,
     std::optional<int> expectedPromptLength)

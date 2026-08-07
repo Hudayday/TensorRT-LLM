@@ -194,6 +194,8 @@ class StorageManager:
         "_levels",
         "_min_slots",
         "_event_manager",
+        "_cache_tier_configs",
+        "_cold_page_codec",
         "__rawref__",
     )
     _life_cycles: LifeCycleRegistry
@@ -207,6 +209,8 @@ class StorageManager:
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
     _min_slots: TypedIndexList[PoolGroupIndex, int]
     _event_manager: "KVCacheEventManager | None"
+    _cache_tier_configs: Sequence[CacheTierConfig]
+    _cold_page_codec: object | None
     __rawref__: rawref.ref["StorageManager"]
 
     def __init__(
@@ -223,6 +227,8 @@ class StorageManager:
     ) -> None:
         self.__rawref__ = rawref.NULL
         self._event_manager = event_manager
+        self._cache_tier_configs = tuple(config.cache_tiers)
+        self._cold_page_codec = None
         assert config.cache_tiers[GPU_LEVEL].tier == CacheTier.GPU_MEM, (
             "The first cache tier must be GPU memory"
         )
@@ -300,6 +306,72 @@ class StorageManager:
         assert self.num_pool_groups == get_uniform_attribute(
             self._levels, lambda level: level.storage.num_pool_groups
         )
+
+    def set_cold_page_codec(self, codec: object | None) -> None:
+        """Install the preconfigured cold-Page codec before request admission.
+
+        The codec owns representation-specific geometry. StorageManager owns
+        physical tiers, so it queries one compact stride per lifecycle and
+        rebuilds the empty Host level as one Pool per PoolGroup. Runtime GPU
+        Pools and the logical Page object remain unchanged.
+
+        This prototype deliberately supports exactly GPU+Host. A Disk tier
+        needs a separately specified cold-preserving Host<->Disk route and a
+        Disk->GPU staging rule; silently treating a Disk address as mapped Host
+        memory would violate the codec ABI.
+        """
+
+        if codec is None:
+            # Detaching ends future transform calls but does not rewrite the
+            # already configured Host storage layout during shutdown.
+            self._cold_page_codec = None
+            return
+        if self._cold_page_codec is not None:
+            raise RuntimeError("A cold-Page codec is already installed")
+        if len(self._levels) != 2 or self._levels[1].cache_tier != CacheTier.HOST_MEM:
+            raise RuntimeError("Boundary compression P0 requires exactly GPU and Host cache tiers")
+
+        host_level = CacheLevel(1)
+        old_level = self._levels[host_level]
+        for pg_idx in typed_range(self.num_pool_groups):
+            if old_level.storage.get_num_free_slots(pg_idx) != old_level.storage.num_slots(
+                pg_idx
+            ) or old_level.controller.num_evictable_pages(pg_idx):
+                raise RuntimeError(
+                    "A cold-Page codec must be installed before any Page uses the Host tier"
+                )
+
+        cold_slot_size_lists = make_typed(
+            lambda _: make_typed(lambda _: 0, PoolIndex(1)), self.num_pool_groups
+        )
+        for pg_idx, slot_desc in typed_enumerate(self._slot_desc_list):
+            strides = {
+                int(codec.query_cold_page_bytes(int(variant.life_cycle_id)))
+                for variant in slot_desc.variants
+            }
+            if 0 in strides or len(strides) != 1:
+                raise RuntimeError(
+                    "Every lifecycle sharing a PoolGroup must have one identical, "
+                    "non-zero cold Page stride"
+                )
+            cold_slot_size_lists[pg_idx][PoolIndex(0)] = strides.pop()
+
+        host_config = self._cache_tier_configs[host_level]
+        ratio = old_level.storage.ratio_list
+        slot_counts = self._compute_slot_count_for_level(host_config, cold_slot_size_lists, ratio)
+
+        # Registration is initialization-only. Releasing the unused raw Host
+        # allocation before creating the compact allocation avoids a transient
+        # double-quota reservation. Any allocation failure aborts startup.
+        old_level.storage.destroy()
+        self._levels[host_level] = CacheLevelManager(
+            self._life_cycle_grouping,
+            host_level,
+            host_config,
+            cold_slot_size_lists,
+            slot_counts,
+        )
+        self._cold_page_codec = codec
 
     def __del__(self) -> None:
         self.destroy()
@@ -589,7 +661,8 @@ class StorageManager:
             "dst_level and src_level must be different unless performing defragmentation"
         )
         num_slots = len(src_pages)
-        num_pools = self.num_pools(pool_group_index)
+        src_num_pools = self.num_pools(pool_group_index, src_level)
+        dst_num_pools = self.num_pools(pool_group_index, dst_level)
         src_pool_group = self._pool_group(src_level, pool_group_index)
         dst_pool_group = self._pool_group(dst_level, pool_group_index)
         if dst_pool_group.num_free_slots < num_slots:
@@ -598,25 +671,82 @@ class StorageManager:
         try:
             assert len(dst_slots) == num_slots
             prior_events: set[CachedCudaEvent] = set()
-            tasks_per_pool: TypedIndexList[PoolIndex, list[CopyTask]] = make_typed(
-                lambda _: list[CopyTask](), num_pools
+            tasks_per_pool: TypedIndexList[PoolIndex, list[CopyTask]] | None = None
+            use_encode = (
+                self._cold_page_codec is not None
+                and src_level == GPU_LEVEL
+                and self._levels[dst_level].cache_tier == CacheTier.HOST_MEM
             )
+            use_decode = (
+                self._cold_page_codec is not None
+                and dst_level == GPU_LEVEL
+                and self._levels[src_level].cache_tier == CacheTier.HOST_MEM
+            )
+            if not (use_encode or use_decode):
+                if src_num_pools != dst_num_pools:
+                    raise RuntimeError(
+                        "Raw migration requires identical source/destination Pool counts"
+                    )
+                tasks_per_pool = make_typed(lambda _: list[CopyTask](), src_num_pools)
             for src, dst in zip(src_pages, dst_slots):
                 assert defrag or src.node_ref is None
                 prior_events.update((dst.ready_event, src.ready_event))
-                dst_addresses = dst_pool_group.slot_address(dst.slot_id)
-                src_addresses = src_pool_group.slot_address(src.slot_id)
-                for pool_idx in typed_range(num_pools):
-                    tasks_per_pool[pool_idx].append(
-                        CopyTask(dst_addresses[pool_idx], src_addresses[pool_idx])
-                    )
+                if tasks_per_pool is not None:
+                    dst_addresses = dst_pool_group.slot_address(dst.slot_id)
+                    src_addresses = src_pool_group.slot_address(src.slot_id)
+                    for pool_idx in typed_range(src_num_pools):
+                        tasks_per_pool[pool_idx].append(
+                            CopyTask(dst_addresses[pool_idx], src_addresses[pool_idx])
+                        )
             dst_tier = self._levels[dst_level].cache_tier
             src_tier = self._levels[src_level].cache_tier
+            codec_submission_failed = False
             with TemporaryCudaStream(prior_events) as stream:
-                slot_sizes = self.slot_size(pool_group_index)
-                for pool_idx, tasks in typed_enumerate(tasks_per_pool):
-                    batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks, stream.get())
+                if use_encode or use_decode:
+                    codec = self._cold_page_codec
+                    assert codec is not None
+                    cold_pool_group = dst_pool_group if use_encode else src_pool_group
+                    cold_base = int(cold_pool_group.slot_address(SlotId(0))[PoolIndex(0)])
+                    by_life_cycle = partition(
+                        list(zip(src_pages, dst_slots)), lambda pair: pair[0].life_cycle
+                    )
+                    for life_cycle, page_slots in by_life_cycle.items():
+                        src_indices = [int(page.slot_id) for page, _ in page_slots]
+                        dst_indices = [int(slot.slot_id) for _, slot in page_slots]
+                        if use_encode:
+                            submitted = codec.encode(
+                                int(life_cycle),
+                                cold_base,
+                                dst_indices,
+                                src_indices,
+                                int(stream.get()),
+                            )
+                        else:
+                            submitted = codec.decode(
+                                int(life_cycle),
+                                dst_indices,
+                                cold_base,
+                                src_indices,
+                                int(stream.get()),
+                            )
+                        if not submitted:
+                            # Leave the stream scope normally so it records a
+                            # fence for any earlier lifecycle already queued.
+                            # The failure is raised only after that fence is
+                            # attached to source/destination ownership below.
+                            codec_submission_failed = True
+                            break
+                else:
+                    assert tasks_per_pool is not None
+                    slot_sizes = self.slot_size(pool_group_index, src_level)
+                    for pool_idx, tasks in typed_enumerate(tasks_per_pool):
+                        batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks, stream.get())
             finish_event = stream.take_finish_event()
+            if codec_submission_failed:
+                for src, dst in zip(src_pages, dst_slots):
+                    src.ready_event = finish_event
+                    dst.ready_event = finish_event
+                raise RuntimeError("Cold-Page codec submission failed")
             emit_cache_level_updates = (
                 update_src
                 and not defrag
@@ -683,13 +813,15 @@ class StorageManager:
     ) -> PoolGroupBase:
         return self._levels[cache_level].storage._pool_groups[pool_group_index]
 
-    def num_pools(self, pool_group_index: PoolGroupIndex) -> PoolIndex:
-        return get_uniform_attribute(
-            self._levels, lambda level: level.storage._pool_groups[pool_group_index].num_pools
-        )
+    def num_pools(
+        self, pool_group_index: PoolGroupIndex, cache_level: CacheLevel = GPU_LEVEL
+    ) -> PoolIndex:
+        return self._levels[cache_level].storage._pool_groups[pool_group_index].num_pools
 
-    def slot_size(self, pool_group_index: PoolGroupIndex) -> TypedIndexList[PoolIndex, int]:
-        return self._slot_desc_list[pool_group_index].slot_size_list
+    def slot_size(
+        self, pool_group_index: PoolGroupIndex, cache_level: CacheLevel = GPU_LEVEL
+    ) -> TypedIndexList[PoolIndex, int]:
+        return self._levels[cache_level].storage.slot_size(pool_group_index)
 
     def num_slots(
         self, pool_group_index: PoolGroupIndex, cache_level: CacheLevel = GPU_LEVEL

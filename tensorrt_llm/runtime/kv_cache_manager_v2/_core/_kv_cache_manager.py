@@ -301,6 +301,16 @@ class KVCacheManager:
     def clear_reusable_blocks(self) -> None:
         self._radix_tree.clear()
 
+    def set_cold_page_codec(self, codec: object | None) -> None:
+        """Install/detach the compression-manager-owned native codec.
+
+        Registration is initialization-only. StorageManager remains the owner
+        of tier allocation and migration publication; the codec owns only the
+        representation transform submitted on StorageManager's CUDA stream.
+        """
+
+        self._storage.set_cold_page_codec(codec)
+
     def get_mem_pool_base_address(
         self, layer_id: LayerId, data_role: DataRole, index_mode: PageIndexMode | None = None
     ) -> MemAddress:

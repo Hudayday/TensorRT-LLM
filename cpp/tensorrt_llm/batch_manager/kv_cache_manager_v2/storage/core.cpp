@@ -642,13 +642,27 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(
 
 HostCacheLevelStorage::HostCacheLevelStorage(
     StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList)
+    : HostCacheLevelStorage(
+        [&]()
+        {
+            TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> sizes;
+            sizes.reserve(storageCfg.slotDescList.size());
+            for (auto const& slotDesc : storageCfg.slotDescList)
+                sizes.push_back(slotDesc.slotSizeList());
+            return sizes;
+        }(),
+        slotCountList)
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(slotCountList.size() == storageCfg.slotDescList.size(),
-        "HostCacheLevelStorage: slotCountList and slotDescList must have the same length");
-    for (PoolGroupIndex pgIdx{0}; pgIdx < storageCfg.slotDescList.size(); ++pgIdx)
+}
+
+HostCacheLevelStorage::HostCacheLevelStorage(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList)
+{
+    TLLM_CHECK_DEBUG_WITH_INFO(slotCountList.size() == slotSizeLists.size(),
+        "HostCacheLevelStorage: slotCountList and slotSizeLists must have the same length");
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotSizeLists.size(); ++pgIdx)
     {
-        mPoolGroups.push_back(
-            std::make_unique<HostPoolGroup>(slotCountList[pgIdx], storageCfg.slotDescList[pgIdx].slotSizeList()));
+        mPoolGroups.push_back(std::make_unique<HostPoolGroup>(slotCountList[pgIdx], slotSizeLists[pgIdx]));
     }
 }
 

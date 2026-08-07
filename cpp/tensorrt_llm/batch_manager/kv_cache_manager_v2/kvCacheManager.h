@@ -130,6 +130,10 @@ public:
     // Clear all reusable (committed) blocks from the radix tree.
     void clearReusableBlocks();
 
+    //! Register the compression-manager-owned native cold-Page codec before
+    //! request admission. The StorageManager remains the migration owner.
+    void setColdPageCodec(std::shared_ptr<IKvCacheColdPageCodec> codec);
+
     // ---- KvCache creation -------------------------------------------------
 
     // Create a new KvCache. Returned cache is SUSPENDED; call activate() with a stream.
