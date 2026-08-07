@@ -101,7 +101,6 @@ constexpr std::int32_t kMeasuredAutoHeadDim = 128;
 constexpr std::uint32_t kMaxWholePageCompactStagingBytes = 36U * 1024U;
 constexpr std::uint32_t kMinTiledOffload16BitSmallTaskCount = 8;
 constexpr std::uint32_t kMaxTiledOffload16BitSmallTaskCount = 16;
-constexpr std::uint32_t kMinTiledOffload16BitLargeTaskCount = 48;
 // On the accepted H=8/P=64/D=128 B200 sweep, named-barrier overlap first wins
 // consistently at 136 tasks, or 9.5625 MiB of compact input per descriptor
 // launch. The 9.5-MiB gate includes that measured point but excludes 129 tasks,
@@ -866,7 +865,8 @@ __global__ void offloadFrom16BitTiledKernel(std::array<Nvfp4BoundaryOffloadPageT
     auto* scaleStages = compactStages + packedStageCapacityBytes;
 
     asm volatile("griddepcontrol.wait;\n" : : : "memory");
-    for (std::uint32_t firstRow = 0; firstRow < totalRows; firstRow += tileRows)
+    for (std::uint32_t firstRow = blockIdx.x * tileRows; firstRow < totalRows;
+         firstRow += gridDim.x * tileRows)
     {
         std::uint32_t const rows = std::min(tileRows, totalRows - firstRow);
         std::uint32_t const firstHalfGroup = firstRow * halfGroupsPerRow;
@@ -1576,7 +1576,8 @@ __global__ void onboardTo16BitPhaseKernel(std::array<Nvfp4BoundaryOnboardPageTas
     extern __shared__ __align__(16) std::uint8_t compactStages[];
 
     asm volatile("griddepcontrol.wait;\n" : : : "memory");
-    for (std::uint32_t firstRow = 0; firstRow < totalRows; firstRow += tileRows)
+    for (std::uint32_t firstRow = blockIdx.x * tileRows; firstRow < totalRows;
+         firstRow += gridDim.x * tileRows)
     {
         std::uint32_t const rows = std::min(tileRows, totalRows - firstRow);
         std::uint32_t const firstHalfGroup = firstRow * halfGroupsPerRow;
@@ -1649,7 +1650,8 @@ __global__ void onboardToFp8PhaseKernel(std::array<Nvfp4BoundaryOnboardPageTask,
     extern __shared__ __align__(16) std::uint8_t compactStages[];
 
     asm volatile("griddepcontrol.wait;\n" : : : "memory");
-    for (std::uint32_t firstRow = 0; firstRow < totalRows; firstRow += tileRows)
+    for (std::uint32_t firstRow = blockIdx.x * tileRows; firstRow < totalRows;
+         firstRow += gridDim.x * tileRows)
     {
         std::uint32_t const rows = std::min(tileRows, totalRows - firstRow);
         std::uint32_t const firstHalfGroup = firstRow * halfGroupsPerRow;
@@ -2173,12 +2175,33 @@ bool useTiledAutoFor16BitOffload(std::uint32_t count, Nvfp4BoundaryKernelParams 
         return false;
     }
 
-    // Preserve the direct-path middle-cohort win. Across the shared FP16/BF16
-    // policy audit, tiled has no median or P95 regression at 8--16 or 48--1024;
-    // BF16 direct is still 7% faster at 40 tasks.
-    bool const smallTiledCohort
-        = count >= kMinTiledOffload16BitSmallTaskCount && count <= kMaxTiledOffload16BitSmallTaskCount;
-    return smallTiledCohort || count >= kMinTiledOffload16BitLargeTaskCount;
+    // The current B200 re-audit found the direct middle interval obsolete:
+    // tiled wins at every measured 17--47-task point. Counts below eight keep
+    // the lower-overhead whole-Page path.
+    return count >= kMinTiledOffload16BitSmallTaskCount;
+}
+
+std::uint32_t autoOffload16BitHostSplits(
+    std::uint32_t count, Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryTransferPipeline pipeline)
+{
+    // Each CTA owns disjoint compressed tiles of one Page/role. Four CTAs win
+    // only while an 8--16-Page launch is too small to fill B200 by Page alone.
+    // Forced pipelines and unmeasured Page geometries retain one CTA/Page.
+    return pipeline == Nvfp4BoundaryTransferPipeline::kAuto && useMeasuredTiledAutoGeometry(params)
+            && count >= kMinTiledOffload16BitSmallTaskCount && count <= kMaxTiledOffload16BitSmallTaskCount
+        ? 4U
+        : 1U;
+}
+
+std::uint32_t autoOnboardHostSplits(
+    std::uint32_t count, Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryTransferPipeline pipeline)
+{
+    // Two CTAs/Page hide mapped-Host input latency for tiny onboard launches.
+    // At 16 Pages the gain disappears, so larger launches retain the existing
+    // one-CTA/Page phase or double-buffered schedule.
+    return pipeline == Nvfp4BoundaryTransferPipeline::kAuto && useMeasuredTiledAutoGeometry(params) && count <= 12U
+        ? 2U
+        : 1U;
 }
 
 //! Current zero-global-staging product choices for the measured SM100 Page
@@ -2206,9 +2229,10 @@ void launchOffloadFrom16Bit(std::vector<Nvfp4BoundaryOffloadPageTask> const& tas
         [&](auto capacity, Nvfp4BoundaryOffloadPageTask const* taskData, std::uint32_t count)
         {
             constexpr std::uint32_t taskCapacity = decltype(capacity)::value;
-            // BATCHEDCOPY REUSE: Host transfers use one low-bandwidth split per
-            // Page/role; the kernel itself pipelines all source tiles in that CTA.
-            dim3 const grid(kHostMemorySplits, 2, count);
+            // BATCHEDCOPY ADAPTATION: large cohorts keep one low-bandwidth CTA
+            // per Page/role. Tiny measured cohorts split disjoint Page tiles
+            // across CTAs so the launch can fill B200 without changing bytes.
+            dim3 const grid(autoOffload16BitHostSplits(count, params, pipeline), 2, count);
             if (pipeline == Nvfp4BoundaryTransferPipeline::kDoubleBufferedTiled)
             {
                 std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
@@ -2294,7 +2318,7 @@ void launchOnboardTo16Bit(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks
         [&](auto capacity, Nvfp4BoundaryOnboardPageTask const* taskData, std::uint32_t count)
         {
             constexpr std::uint32_t taskCapacity = decltype(capacity)::value;
-            dim3 const grid(kHostMemorySplits, 2, count);
+            dim3 const grid(autoOnboardHostSplits(count, params, pipeline), 2, count);
             if (pipeline == Nvfp4BoundaryTransferPipeline::kDoubleBufferedTiled
                 || (pipeline == Nvfp4BoundaryTransferPipeline::kAuto
                     && useDoubleBufferedAutoFor16BitOnboard(count, halfGroups, params)))
@@ -2337,7 +2361,7 @@ void launchOnboardToFp8(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks, 
         [&](auto capacity, Nvfp4BoundaryOnboardPageTask const* taskData, std::uint32_t count)
         {
             constexpr std::uint32_t taskCapacity = decltype(capacity)::value;
-            dim3 const grid(kHostMemorySplits, 2, count);
+            dim3 const grid(autoOnboardHostSplits(count, params, pipeline), 2, count);
             if (pipeline == Nvfp4BoundaryTransferPipeline::kDoubleBufferedTiled)
             {
                 std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
