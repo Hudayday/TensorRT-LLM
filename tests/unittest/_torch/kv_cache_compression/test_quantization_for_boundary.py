@@ -345,7 +345,7 @@ def test_later_cohort_alignment_is_validated_before_any_kernel_launch():
 def test_layout_rejects_noncontiguous_or_multi_pool_compact_buffers():
     fields = vars(_layout()).copy()
     fields["block_scale_k"] = BoundaryBufferLayout(1, fields["block_scale_k"].offset)
-    with pytest.raises(ValueError, match="one physical Host Pool"):
+    with pytest.raises(ValueError, match="one physical lower-tier Pool"):
         Nvfp4BoundaryLayerLayout(**fields)
 
     fields = vars(_layout()).copy()

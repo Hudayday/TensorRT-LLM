@@ -68,8 +68,10 @@ class Nvfp4BoundaryLayerLayout:
     One KVCM Page may contain several layers. Therefore the manager produces
     one native task for each ``(Page, layer)`` pair, not one task for the whole
     Page. ``runtime_*`` locations belong to the active GPU layout. The four
-    compact BufferIds must occupy one physical Host Pool in this exact order:
-    K packed, V packed, K block scales, V block scales. Native code receives
+    compact BufferIds must occupy one physical lower-tier Pool in this exact
+    order: K packed, V packed, K block scales, V block scales. P0 passes its
+    mapped-Host address to the native kernel; a later Disk tier can persist the
+    same contiguous record without changing its layout. Native code receives
     only the address of the first region and derives the remaining offsets.
 
     Scale pairs are ordered ``(K, V)``.  ``*_orig_quant`` converts values from
@@ -123,7 +125,7 @@ class Nvfp4BoundaryLayerLayout:
             self.block_scale_v,
         )
         if len({layout.pool_index for layout in compact_layouts}) != 1:
-            raise ValueError("NVFP4 compact BufferIds must share one physical Host Pool")
+            raise ValueError("NVFP4 compact BufferIds must share one physical lower-tier Pool")
         elements = self.num_kv_heads * self.tokens_per_page * self.head_dim
         packed_bytes = elements // 2
         scale_bytes = elements // 16

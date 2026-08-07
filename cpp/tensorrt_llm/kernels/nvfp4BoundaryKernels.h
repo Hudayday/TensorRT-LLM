@@ -45,7 +45,10 @@ enum class Nvfp4BoundaryRuntimeType : std::uint8_t
 //! address. The compact address starts one contiguous record whose regions are
 //! `[K packed][V packed][K block scales][V block scales]`. Region offsets are
 //! derived from the homogeneous batch geometry; they are not repeated in every
-//! Page descriptor. The three addresses must be 16-byte aligned and remain
+//! Page descriptor. The mapped-Host level therefore needs one physical Pool,
+//! not four Pools for the four logical regions. A Disk level can persist this
+//! same record unchanged after Host staging; these CUDA APIs never address a
+//! Disk backend directly. The three addresses must be 16-byte aligned and remain
 //! valid and non-overwritable until work submitted to the caller's stream
 //! completes.
 struct Nvfp4BoundaryOffloadPageTask

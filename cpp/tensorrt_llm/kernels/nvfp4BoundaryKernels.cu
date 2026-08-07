@@ -496,30 +496,28 @@ __device__ void store16BitValues(T* output, std::uint32_t elementOffset, float2 
 //! with `fp8ScaleQuantOrig`, then applies an independent calibrated
 //! `nvfp4ScaleOrigQuant`. Restoring and reducing both eight-value halves
 //! locally avoids the former adjacent-lane redistribution and warp
-//! synchronization. The helper then rounds one E4M3 scale and packs each half
-//! with the production `fp32_vec_to_e2m1` primitive.
-__device__ uint2 quantizeFp8GrainToNvfp4(
-    uint4 grain, float fp8ScaleQuantOrig, float nvfp4ScaleOrigQuant, std::uint8_t* scaleOutput)
+//! synchronization. The input uses the same `PackedVec<__nv_fp8_e4m3>` and
+//! `__nv_fp8x2_e4m3 -> float2` conversion surface as the production
+//! `cvt_warp_fp8_to_fp4` helper. Only that pair-conversion surface is reused:
+//! the boundary path must retain its independent source-FP8 and
+//! destination-NVFP4 global scales. The helper then rounds one E4M3 scale and
+//! packs each half with the production `fp32_vec_to_e2m1` primitive.
+__device__ uint2 quantizeFp8GrainToNvfp4(PackedVec<__nv_fp8_e4m3> const& grain, float fp8ScaleQuantOrig,
+    float nvfp4ScaleOrigQuant, std::uint8_t* scaleOutput)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    std::uint64_t const fp8Bytes[2]
-        = {static_cast<std::uint64_t>(grain.x) | (static_cast<std::uint64_t>(grain.y) << 32U),
-            static_cast<std::uint64_t>(grain.z) | (static_cast<std::uint64_t>(grain.w) << 32U)};
+    // NVFP4 REUSE: convert adjacent E4M3 values through the production packed
+    // FP8x2 type instead of reconstructing and casting two scalar FP8 objects.
+    // ALGORITHM INVARIANT: multiplication remains in FP32 and each restored
+    // pair is rounded to FP16 before the unchanged 16-value absmax reduction.
     PackedVec<half> restored[2];
 #pragma unroll
-    for (std::uint32_t halfGroup = 0; halfGroup < 2; ++halfGroup)
+    for (std::uint32_t pair = 0; pair < 8; ++pair)
     {
-#pragma unroll
-        for (std::uint32_t i = 0; i < 4; ++i)
-        {
-            __nv_fp8_e4m3 lo;
-            __nv_fp8_e4m3 hi;
-            lo.__x = static_cast<std::uint8_t>(fp8Bytes[halfGroup] >> (16U * i));
-            hi.__x = static_cast<std::uint8_t>(fp8Bytes[halfGroup] >> (16U * i + 8U));
-            float const loValue = static_cast<float>(lo) * fp8ScaleQuantOrig;
-            float const hiValue = static_cast<float>(hi) * fp8ScaleQuantOrig;
-            restored[halfGroup].elts[i] = __floats2half2_rn(loValue, hiValue);
-        }
+        float2 values = static_cast<float2>(grain.elts[pair]);
+        values.x *= fp8ScaleQuantOrig;
+        values.y *= fp8ScaleQuantOrig;
+        restored[pair / 4U].elts[pair % 4U] = __float22half2_rn(values);
     }
 
     auto firstHalfMax = cuda_abs(restored[0].elts[0]);
@@ -947,7 +945,10 @@ __global__ void offloadFromFp8TiledKernel(std::array<Nvfp4BoundaryOffloadPageTas
     std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
     std::uint32_t const packedStageCapacityBytes = packedBytesPerRole(tileHalfGroups);
 
-    __shared__ __align__(16) uint4 rawStages[kAsyncStages][kThreadsPerBlock];
+    // BATCHEDCOPY ADAPTATION: cp.async still moves one 16-byte grain. Naming
+    // the shared object as production PackedVec exposes its eight FP8x2 pairs
+    // directly to the quantizer without changing bytes, alignment, or layout.
+    __shared__ __align__(16) PackedVec<__nv_fp8_e4m3> rawStages[kAsyncStages][kThreadsPerBlock];
     extern __shared__ __align__(16) std::uint8_t compactStages[];
     auto* packedStages = reinterpret_cast<std::uint32_t*>(compactStages);
     auto* scaleStages = compactStages + packedStageCapacityBytes;
@@ -989,7 +990,8 @@ __global__ void offloadFromFp8TiledKernel(std::array<Nvfp4BoundaryOffloadPageTas
 
             std::uint32_t const localLoadGrain = kThreadsPerBlock * iteration + threadIdx.x;
             bool const valid = localLoadGrain < grains;
-            auto const* rawInput = reinterpret_cast<uint4 const*>(selectRawInput<__nv_fp8_e4m3>(task, role));
+            auto const* rawInput
+                = reinterpret_cast<PackedVec<__nv_fp8_e4m3> const*>(selectRawInput<__nv_fp8_e4m3>(task, role));
             auto const* source = valid ? rawInput + firstGrain + localLoadGrain : rawInput;
             copyAsyncGlobalToShared(&rawStages[stage][threadIdx.x], source, valid);
             cp_async_commit_group();
@@ -2178,6 +2180,21 @@ bool useTiledAutoFor16BitOffload(std::uint32_t count, Nvfp4BoundaryKernelParams 
         = count >= kMinTiledOffload16BitSmallTaskCount && count <= kMaxTiledOffload16BitSmallTaskCount;
     return smallTiledCohort || count >= kMinTiledOffload16BitLargeTaskCount;
 }
+
+//! Current zero-global-staging product choices for the measured SM100 Page
+//! geometry. Each row is still one fused transform-plus-transfer launch:
+//!
+//!   FP16/BF16 -> NVFP4 + D2H: measured tiled/direct crossover policy
+//!   FP8       -> NVFP4 + D2H: compressed-output tiled, including the
+//!                              packed FP8x2 restoration fast path
+//!   H2D + NVFP4 -> FP16/BF16: tiled for smaller launches, double-buffered
+//!                              for the accepted large-launch interval
+//!   H2D + NVFP4 -> FP8: compressed-input tiled
+//!
+//! Unmeasured geometries preserve the conservative fallback selected below.
+//! The faster benchmark-only bounded-DMA onboard experiment is deliberately
+//! excluded: it needs KVCM-owned GPU staging admission and is not a drop-in
+//! replacement for the direct-write Hook contract.
 
 template <typename T>
 void launchOffloadFrom16Bit(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,

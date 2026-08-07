@@ -34,8 +34,9 @@ enum class Nvfp4BoundaryTransferPipeline : std::uint8_t
     kAuto,
     kWholePage,
     kCompressedOutputTiled,
-    //! Benchmark-only two-tile producer/transfer warp pipeline. Production
-    //! `kAuto` never selects this candidate until byte-exact A/B accepts it.
+    //! Two-tile producer/transfer warp pipeline. Benchmarks may force it for
+    //! any supported path; production `kAuto` selects it only for the measured
+    //! large-cohort FP16/BF16 onboard region.
     kDoubleBufferedTiled,
 };
 
