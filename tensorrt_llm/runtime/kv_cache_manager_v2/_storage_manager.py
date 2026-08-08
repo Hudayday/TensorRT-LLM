@@ -272,11 +272,17 @@ class StorageManager:
             init_ratio = cast(TypedIndexList[PoolGroupIndex, float], list(initial_pool_ratio))
         elif typical_batch is not None:
             init_ratio = self.ratio_from_batch(
-                typical_batch, tokens_per_block, swa_scratch_reuse, gpu_granularity
+                typical_batch,
+                tokens_per_block,
+                swa_scratch_reuse,
+                gpu_granularity,
+                slot_size_lists,
             )
         elif constraints:
             # Use the constraint slot counts as the ratio basis.
-            min_bytes = self._slots_to_bytes(self._min_slots, gpu_granularity)
+            min_bytes = self._slots_to_bytes(
+                self._min_slots, gpu_granularity, slot_size_lists
+            )
             total = sum(min_bytes)
             init_ratio = typed_map(min_bytes, lambda x: x / total)
         else:
@@ -285,6 +291,7 @@ class StorageManager:
                 tokens_per_block,
                 swa_scratch_reuse,
                 gpu_granularity,
+                slot_size_lists,
             )
 
         num_levels = CacheLevel(len(config.cache_tiers))
@@ -707,15 +714,40 @@ class StorageManager:
                     assert codec is not None
                     cold_pool_group = dst_pool_group if use_encode else src_pool_group
                     cold_base = int(cold_pool_group.slot_address(SlotId(0))[PoolIndex(0)])
-                    by_life_cycle = partition(
-                        list(zip(src_pages, dst_slots)), lambda pair: pair[0].life_cycle
-                    )
-                    for life_cycle, page_slots in by_life_cycle.items():
+                    by_batching_layer_group: dict[LifeCycleId, list[tuple[Page, Slot]]] = {}
+                    batching_layer_groups: dict[LifeCycleId, LifeCycleId] = {}
+                    for page, slot in zip(src_pages, dst_slots):
+                        life_cycle = page.life_cycle
+                        batching_layer_group = batching_layer_groups.get(life_cycle)
+                        if batching_layer_group is None:
+                            batching_layer_group = LifeCycleId(
+                                codec.get_batching_layer_group_id(int(life_cycle))
+                            )
+                            if (
+                                batching_layer_group < 0
+                                or batching_layer_group > life_cycle
+                                or batching_layer_group >= len(self._life_cycle_grouping)
+                                or self._life_cycle_grouping[batching_layer_group]
+                                != pool_group_index
+                                or codec.get_batching_layer_group_id(int(batching_layer_group))
+                                != int(batching_layer_group)
+                                or codec.query_cold_page_bytes(int(batching_layer_group))
+                                != codec.query_cold_page_bytes(int(life_cycle))
+                            ):
+                                raise RuntimeError(
+                                    "Cold-Page codec returned an invalid cross-lifecycle "
+                                    "batching representative"
+                                )
+                            batching_layer_groups[life_cycle] = batching_layer_group
+                        by_batching_layer_group.setdefault(batching_layer_group, []).append(
+                            (page, slot)
+                        )
+                    for batching_layer_group, page_slots in by_batching_layer_group.items():
                         src_indices = [int(page.slot_id) for page, _ in page_slots]
                         dst_indices = [int(slot.slot_id) for _, slot in page_slots]
                         if use_encode:
                             submitted = codec.encode(
-                                int(life_cycle),
+                                int(batching_layer_group),
                                 cold_base,
                                 dst_indices,
                                 src_indices,
@@ -723,7 +755,7 @@ class StorageManager:
                             )
                         else:
                             submitted = codec.decode(
-                                int(life_cycle),
+                                int(batching_layer_group),
                                 dst_indices,
                                 cold_base,
                                 src_indices,
@@ -1030,10 +1062,13 @@ class StorageManager:
         tokens_per_block: int,
         swa_scratch_reuse: SwaScratchReuseConfig | None,
         granularity: int,
+        slot_size_lists: (
+            TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]] | None
+        ) = None,
     ) -> TypedIndexList[PoolGroupIndex, float]:
         """Compute the ratio of bytes needed per pool group for a batch described by a BatchDesc."""
         num_slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
-        num_bytes = self._slots_to_bytes(num_slots, granularity)
+        num_bytes = self._slots_to_bytes(num_slots, granularity, slot_size_lists)
         total = sum(num_bytes)
         assert total > 0
         return typed_map(num_bytes, lambda x: x / total)
@@ -1135,12 +1170,27 @@ class StorageManager:
         return num_slots
 
     def _slots_to_bytes(
-        self, num_slots: TypedIndexList[PoolGroupIndex, int], granularity: int
+        self,
+        num_slots: TypedIndexList[PoolGroupIndex, int],
+        granularity: int,
+        slot_size_lists: (
+            TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]] | None
+        ) = None,
     ) -> TypedIndexList[PoolGroupIndex, int]:
-        """Convert slot counts to bytes, rounding up each pool to granularity."""
+        """Convert slot counts to bytes, rounding up each Pool to granularity.
+
+        During construction, ``_levels`` does not exist yet. The caller passes
+        the GPU layout derived from ``SlotDesc`` explicitly. Runtime callers
+        omit it and use the live GPU-level layout.
+        """
         num_bytes = filled_list(0, self.num_pool_groups)
         for pg_idx in typed_range(self.num_pool_groups):
-            for pool_size in self.slot_size(pg_idx):
+            slot_sizes = (
+                self.slot_size(pg_idx)
+                if slot_size_lists is None
+                else slot_size_lists[pg_idx]
+            )
+            for pool_size in slot_sizes:
                 num_bytes[pg_idx] += round_up(num_slots[pg_idx] * pool_size, granularity)
         return num_bytes
 

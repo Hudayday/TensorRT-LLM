@@ -21,6 +21,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
 #include <cstdint>
@@ -31,6 +32,62 @@ namespace nb = nanobind;
 namespace compression = tensorrt_llm::kv_cache_compression;
 namespace kernels = tensorrt_llm::kernels;
 namespace kv = tensorrt_llm::batch_manager::kv_cache_manager_v2;
+
+namespace
+{
+
+//! Convert either Python KVCM V2's dataclass descriptor or C++ KVCM V2's
+//! nanobind descriptor into the codec's native initialization contract.
+//!
+//! Both backends deliberately expose the same field names. Keeping this
+//! one-time adapter beside the codec binding avoids a Python callback on the
+//! migration path and does not duplicate runtime Page addresses or geometry.
+kv::PoolGroupDesc toNativePoolGroupDesc(nb::handle value)
+{
+    auto const desc = nb::borrow<nb::object>(value);
+    kv::PoolGroupDesc nativeDesc;
+    nativeDesc.poolGroupIndex = kv::PoolGroupIndex{nb::cast<int>(desc.attr("pool_group_index"))};
+    nativeDesc.numSlots = kv::SlotCount{nb::cast<int>(desc.attr("num_slots"))};
+
+    auto const slotDesc = desc.attr("slot_desc");
+    for (nb::handle variantValue : nb::cast<nb::iterable>(slotDesc.attr("variants")))
+    {
+        auto const variant = nb::borrow<nb::object>(variantValue);
+        kv::SlotDescVariant nativeVariant;
+        nativeVariant.lifeCycleId = kv::LifeCycleId{nb::cast<int>(variant.attr("layer_group_id"))};
+        for (nb::handle coalescedValue : nb::cast<nb::iterable>(variant.attr("coalesced_buffers")))
+        {
+            auto const coalesced = nb::borrow<nb::object>(coalescedValue);
+            kv::CoalescedBuffer nativeCoalesced;
+            nativeCoalesced.singleBufferSize = nb::cast<std::size_t>(coalesced.attr("single_buffer_size"));
+            for (nb::handle bufferValue : nb::cast<nb::iterable>(coalesced.attr("buffer_ids")))
+            {
+                auto const buffer = nb::borrow<nb::object>(bufferValue);
+                nativeCoalesced.bufferIds.push_back(
+                    {nb::cast<int>(buffer.attr("layer_id")), nb::cast<std::string>(buffer.attr("role"))});
+            }
+            nativeVariant.coalescedBuffers.push_back(std::move(nativeCoalesced));
+        }
+        nativeDesc.slotDesc.variants.push_back(std::move(nativeVariant));
+    }
+
+    int expectedPoolIndex = 0;
+    for (nb::handle poolValue : nb::cast<nb::iterable>(desc.attr("pools")))
+    {
+        auto const pool = nb::borrow<nb::object>(poolValue);
+        int const poolIndex = nb::cast<int>(pool.attr("pool_index"));
+        if (poolIndex != expectedPoolIndex)
+        {
+            throw std::invalid_argument("PoolGroupDesc pools must be ordered by contiguous pool_index");
+        }
+        nativeDesc.pools.push_back({kv::PoolIndex{poolIndex}, nb::cast<kv::MemAddress>(pool.attr("base_address")),
+            nb::cast<std::size_t>(pool.attr("slot_bytes"))});
+        ++expectedPoolIndex;
+    }
+    return nativeDesc;
+}
+
+} // namespace
 
 namespace tensorrt_llm::nanobind::kv_cache_compression
 {
@@ -68,12 +125,19 @@ void initBindings(nb::module_& module)
     // invokes the exact C++ methods directly, without a Python callback.
     nb::class_<compression::Nvfp4ColdPageCodec, kv::IKvCacheColdPageCodec>(module, "Nvfp4ColdPageCodec")
         .def(nb::init<std::vector<compression::Nvfp4ColdPageLayerConfig>>(), nb::arg("layer_configs"))
-        .def("configure", &compression::Nvfp4ColdPageCodec::configure, nb::arg("gpu_desc"),
+        .def("configure",
+            [](compression::Nvfp4ColdPageCodec& self, nb::object const& gpuDesc)
+            { return self.configure(toNativePoolGroupDesc(gpuDesc)); },
+            nb::arg("gpu_desc"),
             "Configure one authoritative GPU PoolGroupDesc")
         .def(
             "query_cold_page_bytes", [](compression::Nvfp4ColdPageCodec const& self, int layerGroupId)
             { return self.queryColdPageBytes(kv::LayerGroupId{layerGroupId}); }, nb::arg("layer_group_id"),
             "Return the fixed byte stride of one compact Host Slot")
+        .def(
+            "get_batching_layer_group_id", [](compression::Nvfp4ColdPageCodec const& self, int layerGroupId)
+            { return self.getBatchingLayerGroupId(kv::LayerGroupId{layerGroupId}).value(); }, nb::arg("layer_group_id"),
+            "Return the representative layer group used for codec batching")
         .def(
             "encode",
             [](compression::Nvfp4ColdPageCodec& self, int layerGroupId, std::uintptr_t dstBasePtr,

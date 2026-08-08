@@ -2485,11 +2485,24 @@ def create_kv_cache_compression_manager(
             raise RuntimeError(
                 "NVFP4 boundary compression requires an SM100-family device "
                 "(SM100 or SM103).")
+        from ..kv_cache_compression.quantization_for_boundary import (
+            QuantizationCompression,
+            build_uncalibrated_nvfp4_layer_configs_for_testing,
+        )
+
         if boundary_layer_configs is None:
-            raise RuntimeError("QuantizationCompression requires the KVCM V2 "
-                               "boundary layer configuration handoff")
-        from ..kv_cache_compression.quantization_for_boundary import \
-            QuantizationCompression
+            if os.getenv("TLLM_KVCC_ALLOW_UNCALIBRATED_UNIT_SCALES") != "1":
+                raise RuntimeError(
+                    "QuantizationCompression requires the KVCM V2 boundary "
+                    "layer configuration handoff. Set "
+                    "TLLM_KVCC_ALLOW_UNCALIBRATED_UNIT_SCALES=1 only for the "
+                    "mechanism E2E test; it is not an accuracy configuration.")
+            logger.warning(
+                "QuantizationCompression is using unit NVFP4 global scales "
+                "for a mechanism-only test; accuracy conclusions are invalid")
+            boundary_layer_configs = (
+                build_uncalibrated_nvfp4_layer_configs_for_testing(
+                    kv_cache_manager))
 
         manager = QuantizationCompression(
             config,

@@ -84,6 +84,34 @@ kv::PoolGroupDesc makeGpuDesc()
     return gpuDesc;
 }
 
+std::vector<Nvfp4ColdPageLayerConfig> makeEquivalentLifeCycleLayers(bool identicalParameters)
+{
+    auto layers = makeLayers();
+    for (int layerId : {2, 3})
+    {
+        Nvfp4ColdPageLayerConfig layer = layers.at(static_cast<std::size_t>(layerId - 2));
+        layer.layerGroupId = kv::LayerGroupId{4};
+        layer.layerId = layerId;
+        layers.push_back(layer);
+    }
+    if (!identicalParameters)
+    {
+        layers.back().nvfp4ScaleOrigQuant[0] = 8.0F;
+    }
+    return layers;
+}
+
+kv::PoolGroupDesc makeEquivalentLifeCycleGpuDesc()
+{
+    auto gpuDesc = makeGpuDesc();
+    auto secondVariant = gpuDesc.slotDesc.variants.front();
+    secondVariant.lifeCycleId = kv::LayerGroupId{4};
+    secondVariant.coalescedBuffers[kv::PoolIndex{0}].bufferIds = {{2, "key"}, {3, "key"}};
+    secondVariant.coalescedBuffers[kv::PoolIndex{1}].bufferIds = {{2, "value"}, {3, "value"}};
+    gpuDesc.slotDesc.variants.push_back(std::move(secondVariant));
+    return gpuDesc;
+}
+
 TEST(Nvfp4ColdPageCodecTest, ConfiguresLayoutAndLowersDisjointPages)
 {
     gOffloadTasks.clear();
@@ -150,6 +178,26 @@ TEST(Nvfp4ColdPageCodecTest, RejectedConfigurePreservesPublishedLayout)
     ASSERT_TRUE(codec.configure(gpuDesc));
     EXPECT_FALSE(codec.configure(gpuDesc));
     EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{3}), kColdSlotBytes);
+}
+
+TEST(Nvfp4ColdPageCodecTest, ReturnsSmallestRepresentativeForIdenticalPhysicalTransforms)
+{
+    Nvfp4ColdPageCodec codec{makeEquivalentLifeCycleLayers(
+        /*identicalParameters=*/true)};
+    ASSERT_TRUE(codec.configure(makeEquivalentLifeCycleGpuDesc()));
+
+    EXPECT_EQ(codec.getBatchingLayerGroupId(kv::LayerGroupId{3}), kv::LayerGroupId{3});
+    EXPECT_EQ(codec.getBatchingLayerGroupId(kv::LayerGroupId{4}), kv::LayerGroupId{3});
+}
+
+TEST(Nvfp4ColdPageCodecTest, KeepsDifferentKernelParametersInSeparateBatches)
+{
+    Nvfp4ColdPageCodec codec{makeEquivalentLifeCycleLayers(
+        /*identicalParameters=*/false)};
+    ASSERT_TRUE(codec.configure(makeEquivalentLifeCycleGpuDesc()));
+
+    EXPECT_EQ(codec.getBatchingLayerGroupId(kv::LayerGroupId{3}), kv::LayerGroupId{3});
+    EXPECT_EQ(codec.getBatchingLayerGroupId(kv::LayerGroupId{4}), kv::LayerGroupId{4});
 }
 
 } // namespace

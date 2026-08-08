@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import Optional, Sequence, Tuple
 
-from ..pyexecutor.resource_manager import KVCacheCompressionManager
+from ..pyexecutor.resource_manager import DataType, KVCacheCompressionManager
 
 ScalePair = Tuple[float, float]
 _INT32_MAX = (1 << 31) - 1
@@ -100,6 +100,48 @@ class Nvfp4BoundaryLayerConfig:
                     "Every K/V scale pair must contain two finite positive values"
                 )
             object.__setattr__(self, field_name, pair)
+
+
+def build_uncalibrated_nvfp4_layer_configs_for_testing(
+    kv_cache_manager,
+) -> tuple[Nvfp4BoundaryLayerConfig, ...]:
+    """Build the geometry-only handoff used by the mechanism E2E test.
+
+    KVCM V2 already owns the local layer geometry and lifecycle mapping needed
+    by the codec.  Production must additionally obtain calibrated K/V global
+    scales from a model-loader-owned provider.  Until that provider exists,
+    this helper uses explicit unit scales and is reachable only through the
+    fail-closed test gate in ``create_kv_cache_compression_manager``.
+
+    No Attention object or Attention metadata is inspected here.
+    """
+
+    runtime_dtype = {
+        DataType.HALF: "float16",
+        DataType.BF16: "bfloat16",
+        DataType.FP8: "fp8_e4m3",
+    }.get(kv_cache_manager.dtype)
+    if runtime_dtype is None:
+        raise RuntimeError(
+            "The uncalibrated NVFP4 mechanism test supports FP16, BF16, or "
+            f"FP8 runtime KV, not {kv_cache_manager.dtype}")
+
+    unit_scale = (1.0, 1.0)
+    return tuple(
+        Nvfp4BoundaryLayerConfig(
+            layer_group_id=int(
+                kv_cache_manager.impl.get_layer_group_id(layer_id)),
+            layer_id=layer_id,
+            num_kv_heads=int(
+                kv_cache_manager.num_kv_heads_per_layer[layer_id]),
+            tokens_per_page=int(kv_cache_manager.tokens_per_block),
+            head_dim=int(kv_cache_manager.head_dim_per_layer[layer_id]),
+            runtime_dtype=runtime_dtype,
+            nvfp4_scale_orig_quant=unit_scale,
+            nvfp4_scale_quant_orig=unit_scale,
+            fp8_scale_orig_quant=unit_scale,
+            fp8_scale_quant_orig=unit_scale,
+        ) for layer_id in range(kv_cache_manager.num_local_layers))
 
 
 class QuantizationCompression(KVCacheCompressionManager):

@@ -191,12 +191,12 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     }
     else if (typicalBatch.has_value())
     {
-        initRatio = ratioFromBatch(*typicalBatch, tokensPerBlock, mSwaScratchReuse, gpuGranularity);
+        initRatio = ratioFromBatch(*typicalBatch, tokensPerBlock, mSwaScratchReuse, gpuGranularity, slotSizeLists);
     }
     else if (!constraints.empty())
     {
         // Use the constraint slot counts as the ratio basis.
-        auto minBytes = slotsToBytes(mMinSlots, gpuGranularity);
+        auto minBytes = slotsToBytes(mMinSlots, gpuGranularity, slotSizeLists);
         initRatio = normalizeToRatio(minBytes);
     }
     else
@@ -204,7 +204,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         // Fallback: average history length 2048.
         BatchDesc fallback;
         fallback.kvCaches.push_back(KVCacheDesc{2049, 2048});
-        initRatio = ratioFromBatch(fallback, tokensPerBlock, mSwaScratchReuse, gpuGranularity);
+        initRatio = ratioFromBatch(fallback, tokensPerBlock, mSwaScratchReuse, gpuGranularity, slotSizeLists);
     }
 
     mLevels.reserve(config.cacheTiers.size());
@@ -720,25 +720,42 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
                 auto& coldPoolGroup = useEncode ? dstPoolGroup : srcPoolGroup;
                 auto const coldBase = std::get<MemAddress>(coldPoolGroup.slotAddress(SlotId{0}).at(PoolIndex{0}));
                 std::map<LifeCycleId, std::pair<std::vector<std::int32_t>, std::vector<std::int32_t>>> batches;
+                std::map<LifeCycleId, LayerGroupId> batchingLayerGroups;
                 for (std::size_t i = 0; i < srcPages.size(); ++i)
                 {
-                    auto& [dstIndices, srcIndices] = batches[srcPages.at(i)->lifeCycle];
+                    auto const lifeCycle = srcPages.at(i)->lifeCycle;
+                    auto [representativeIt, inserted]
+                        = batchingLayerGroups.emplace(lifeCycle, mColdPageCodec->getBatchingLayerGroupId(lifeCycle));
+                    auto const representative = representativeIt->second;
+                    if (inserted)
+                    {
+                        if (representative < LayerGroupId{0} || representative > lifeCycle
+                            || representative >= numLifeCycles() || mLifeCycleGrouping.at(representative) != pgIdx
+                            || mColdPageCodec->getBatchingLayerGroupId(representative) != representative
+                            || mColdPageCodec->queryColdPageBytes(representative)
+                                != mColdPageCodec->queryColdPageBytes(lifeCycle))
+                        {
+                            throw std::runtime_error(
+                                "Cold-Page codec returned an invalid cross-lifecycle batching representative");
+                        }
+                    }
+                    auto& [dstIndices, srcIndices] = batches[representative];
                     dstIndices.push_back(dstSlots.at(i).slotId().value());
                     srcIndices.push_back(srcPages.at(i)->slotId().value());
                 }
-                for (auto const& [lifeCycle, indices] : batches)
+                for (auto const& [batchingLayerGroup, indices] : batches)
                 {
                     auto const& [dstIndices, srcIndices] = indices;
                     bool submitted = false;
                     if (useEncode)
                     {
-                        submitted
-                            = mColdPageCodec->encode(lifeCycle, reinterpret_cast<void*>(coldBase), dstIndices.data(),
-                                srcIndices.data(), srcIndices.size(), reinterpret_cast<cudaStream_t>(stream));
+                        submitted = mColdPageCodec->encode(batchingLayerGroup, reinterpret_cast<void*>(coldBase),
+                            dstIndices.data(), srcIndices.data(), srcIndices.size(),
+                            reinterpret_cast<cudaStream_t>(stream));
                     }
                     else
                     {
-                        submitted = mColdPageCodec->decode(lifeCycle, dstIndices.data(),
+                        submitted = mColdPageCodec->decode(batchingLayerGroup, dstIndices.data(),
                             reinterpret_cast<void const*>(coldBase), srcIndices.data(), srcIndices.size(),
                             reinterpret_cast<cudaStream_t>(stream));
                     }
@@ -1218,6 +1235,15 @@ TypedVec<PoolGroupIndex, float> StorageManager::ratioFromBatch(BatchDesc const& 
     return normalizeToRatio(numBytes);
 }
 
+TypedVec<PoolGroupIndex, float> StorageManager::ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
+    std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t granularity,
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists) const
+{
+    auto numSlots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
+    auto numBytes = slotsToBytes(numSlots, granularity, slotSizeLists);
+    return normalizeToRatio(numBytes);
+}
+
 // ---------------------------------------------------------------------------
 // computeMinSlotsFromConstraints
 // ---------------------------------------------------------------------------
@@ -1343,6 +1369,22 @@ TypedVec<PoolGroupIndex, size_t> StorageManager::slotsToBytes(
     for (PoolGroupIndex pgIdx{0}; pgIdx < numSlots.size(); ++pgIdx)
     {
         for (auto poolSize : slotSize(pgIdx))
+        {
+            numBytes[pgIdx] += roundUp(slotCountToSizeT(numSlots[pgIdx]) * poolSize, granularity);
+        }
+    }
+    return numBytes;
+}
+
+TypedVec<PoolGroupIndex, size_t> StorageManager::slotsToBytes(TypedVec<PoolGroupIndex, SlotCount> const& numSlots,
+    size_t granularity, TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists) const
+{
+    // mLevels is intentionally unavailable while the constructor computes its
+    // initial PoolGroup ratio. Use the GPU SlotDesc layout that will create L0.
+    TypedVec<PoolGroupIndex, size_t> numBytes(numPoolGroups(), 0);
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numSlots.size(); ++pgIdx)
+    {
+        for (auto poolSize : slotSizeLists.at(pgIdx))
         {
             numBytes[pgIdx] += roundUp(slotCountToSizeT(numSlots[pgIdx]) * poolSize, granularity);
         }

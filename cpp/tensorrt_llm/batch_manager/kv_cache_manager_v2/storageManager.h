@@ -276,8 +276,13 @@ private:
     TypedVec<PoolGroupIndex, SlotCount> computeMinSlotsFromConstraints(std::vector<BatchDesc> const& constraints,
         int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse,
         float maxUtilForResume = 1.0f) const;
+    TypedVec<PoolGroupIndex, float> ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
+        std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t granularity,
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists) const;
     TypedVec<PoolGroupIndex, size_t> slotsToBytes(
         TypedVec<PoolGroupIndex, SlotCount> const& numSlots, size_t granularity) const;
+    TypedVec<PoolGroupIndex, size_t> slotsToBytes(TypedVec<PoolGroupIndex, SlotCount> const& numSlots,
+        size_t granularity, TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists) const;
     TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         TypedVec<PoolGroupIndex, float> const& ratio) const;

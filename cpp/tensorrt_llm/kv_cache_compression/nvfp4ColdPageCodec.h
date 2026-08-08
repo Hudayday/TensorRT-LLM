@@ -81,6 +81,10 @@ public:
     //! Zero means that the group is not configured or its layout was rejected.
     [[nodiscard]] std::size_t queryColdPageBytes(kv::LayerGroupId layerGroupId) const noexcept override;
 
+    //! Merge lifecycle calls only when their complete physical NVFP4 transform
+    //! is identical. KVCM still verifies same-PoolGroup membership and stride.
+    [[nodiscard]] kv::LayerGroupId getBatchingLayerGroupId(kv::LayerGroupId layerGroupId) const noexcept override;
+
     //! Enqueue GPU runtime KV -> mapped-Host NVFP4 for disjoint base Pages.
     bool encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, std::int32_t const* dstBasePageIndices,
         std::int32_t const* srcBasePageIndices, std::size_t numBasePages, cudaStream_t stream) noexcept override;
@@ -113,6 +117,7 @@ private:
 
     std::vector<Nvfp4ColdPageLayerConfig> mLayerConfigs;
     std::map<kv::LayerGroupId, LayerGroupState> mLayerGroups;
+    std::map<kv::LayerGroupId, kv::LayerGroupId> mBatchingLayerGroups;
 };
 
 } // namespace tensorrt_llm::kv_cache_compression

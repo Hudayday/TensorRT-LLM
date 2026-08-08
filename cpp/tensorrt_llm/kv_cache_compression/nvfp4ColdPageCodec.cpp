@@ -250,16 +250,67 @@ bool Nvfp4ColdPageCodec::configure(kv::PoolGroupDesc const& gpuDesc) noexcept
             pending.emplace(variant.lifeCycleId, std::move(state));
         }
 
+        // All variants in one PoolGroupDesc use the same physical Pools and
+        // Slot strides, but their lifecycle rules and buffer meanings may
+        // differ. Collapse calls only when the bytes seen by every kernel task
+        // are identical. Semantic layer IDs are intentionally ignored: once
+        // pool/offset placement and every kernel-visible parameter match, the
+        // transform is the same operation over another Page-index array.
+        auto const sameCodecBehavior = [](LayerGroupState const& lhs, LayerGroupState const& rhs)
+        {
+            if (lhs.coldPageBytes != rhs.coldPageBytes || lhs.layers.size() != rhs.layers.size())
+            {
+                return false;
+            }
+            for (std::size_t i = 0; i < lhs.layers.size(); ++i)
+            {
+                auto const& left = lhs.layers[i];
+                auto const& right = rhs.layers[i];
+                if (left.gpuK.poolIndex != right.gpuK.poolIndex || left.gpuK.offset != right.gpuK.offset
+                    || left.gpuV.poolIndex != right.gpuV.poolIndex || left.gpuV.offset != right.gpuV.offset
+                    || left.coldOffset != right.coldOffset || cohortKey(left.config) != cohortKey(right.config))
+                {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        std::map<kv::LayerGroupId, kv::LayerGroupId> pendingBatchingLayerGroups;
+        for (auto const& [layerGroupId, state] : pending)
+        {
+            auto representative = layerGroupId;
+            for (auto const& [candidateId, candidateState] : pending)
+            {
+                if (candidateId >= layerGroupId)
+                {
+                    break;
+                }
+                if (sameCodecBehavior(candidateState, state))
+                {
+                    representative = candidateId;
+                    break;
+                }
+            }
+            pendingBatchingLayerGroups.emplace(layerGroupId, representative);
+        }
+
         // Publish the entire descriptor atomically. Configuration happens only
         // during manager construction, so copying the small immutable map is
         // preferable to leaving a partially configured codec if allocation
         // throws while inserting one of several layer groups.
         auto configured = mLayerGroups;
+        auto batchingLayerGroups = mBatchingLayerGroups;
         for (auto& [layerGroupId, state] : pending)
         {
             configured.emplace(layerGroupId, std::move(state));
         }
+        for (auto const& [layerGroupId, representative] : pendingBatchingLayerGroups)
+        {
+            batchingLayerGroups.emplace(layerGroupId, representative);
+        }
         mLayerGroups.swap(configured);
+        mBatchingLayerGroups.swap(batchingLayerGroups);
         return true;
     }
     catch (std::exception const& error)
@@ -273,6 +324,12 @@ std::size_t Nvfp4ColdPageCodec::queryColdPageBytes(kv::LayerGroupId layerGroupId
 {
     auto const found = mLayerGroups.find(layerGroupId);
     return found == mLayerGroups.end() ? 0U : found->second.coldPageBytes;
+}
+
+kv::LayerGroupId Nvfp4ColdPageCodec::getBatchingLayerGroupId(kv::LayerGroupId layerGroupId) const noexcept
+{
+    auto const found = mBatchingLayerGroups.find(layerGroupId);
+    return found == mBatchingLayerGroups.end() ? layerGroupId : found->second;
 }
 
 bool Nvfp4ColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, std::int32_t const* dstBasePageIndices,

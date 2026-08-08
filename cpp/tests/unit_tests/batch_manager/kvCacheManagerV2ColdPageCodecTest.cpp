@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -46,6 +47,12 @@ public:
         return 1U << 20;
     }
 
+    LayerGroupId getBatchingLayerGroupId(LayerGroupId layerGroup) const override
+    {
+        auto const found = batchingLayerGroups.find(layerGroup);
+        return found == batchingLayerGroups.end() ? layerGroup : found->second;
+    }
+
     bool encode(LayerGroupId layerGroup, void*, std::int32_t const* dstIndices, std::int32_t const* srcIndices,
         size_t count, cudaStream_t stream) override
     {
@@ -63,6 +70,7 @@ public:
     }
 
     bool submit = true;
+    std::map<LayerGroupId, LayerGroupId> batchingLayerGroups;
     std::vector<Call> calls;
 };
 
@@ -77,6 +85,18 @@ KVCacheManagerConfig makeTieredConfig()
     layer.buffers.push_back(BufferConfig{"key", 1 << 20, std::nullopt});
     layer.buffers.push_back(BufferConfig{"value", 1 << 20, std::nullopt});
     config.layers.emplace_back(std::move(layer));
+    return config;
+}
+
+KVCacheManagerConfig makeTwoLifeCycleTieredConfig()
+{
+    auto config = makeTieredConfig();
+    AttentionLayerConfig slidingWindowLayer;
+    slidingWindowLayer.layerId = 1;
+    slidingWindowLayer.slidingWindowSize = 4;
+    slidingWindowLayer.buffers.push_back(BufferConfig{"key", 1 << 20, std::nullopt});
+    slidingWindowLayer.buffers.push_back(BufferConfig{"value", 1 << 20, std::nullopt});
+    config.layers.emplace_back(std::move(slidingWindowLayer));
     return config;
 }
 
@@ -149,6 +169,51 @@ TEST(KvCacheManagerV2ColdPageCodecTest, InstallsCompactHostLayoutAndRoutesBothDi
         std::all_of(pages.begin(), pages.end(), [](auto const& page) { return page->cacheLevel == kGpuLevel; }));
 
     cache->close();
+    manager->setColdPageCodec(nullptr);
+}
+
+TEST(KvCacheManagerV2ColdPageCodecTest, BatchesCodecEquivalentLifeCyclesInOneCall)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeTwoLifeCycleTieredConfig());
+    auto codec = std::make_shared<RecordingColdPageCodec>();
+    codec->batchingLayerGroups.emplace(LayerGroupId{1}, LayerGroupId{0});
+    manager->setColdPageCodec(codec);
+
+    auto& storage = manager->storage();
+    ASSERT_EQ(storage.numLifeCycles(), LifeCycleId{2});
+    ASSERT_EQ(storage.getPoolGroupIndex(LifeCycleId{0}), storage.getPoolGroupIndex(LifeCycleId{1}));
+
+    TypedVec<LifeCycleId, SlotCount> oneSlotEach(LifeCycleId{2}, 1);
+    auto slots = storage.newGpuSlots(oneSlotEach);
+    RootBlock& root = manager->radixTree().addOrGetExisting({});
+    std::vector<TokenIdExt> tokens;
+    for (int token = 0; token < manager->tokensPerBlock(); ++token)
+        tokens.emplace_back(TokenId{token});
+    auto block = addOrGetExistingBlock(&root, LifeCycleId{2}, std::move(tokens));
+
+    std::vector<SharedPtr<Page>> pages;
+    for (LifeCycleId lifeCycle{0}; lifeCycle < LifeCycleId{2}; ++lifeCycle)
+    {
+        auto page = makeShared<CommittedPage>(
+            &storage, block, lifeCycle, kGpuLevel, static_cast<int>(block->tokens.size()), kPriorityDefault);
+        page->setSlot(slots[lifeCycle].front());
+        block->storage[lifeCycle] = page.get();
+        storage.scheduleForEviction(*page);
+        pages.push_back(page);
+    }
+
+    // The GPU PoolGroup has two Slots. Requesting one new Slot per lifecycle
+    // evicts both Pages in one PoolGroup migration. The representative API
+    // lets KVCM concatenate both lifecycle index arrays into one codec call.
+    auto replacementSlots = storage.newGpuSlots(oneSlotEach);
+    ASSERT_EQ(codec->calls.size(), 1);
+    EXPECT_TRUE(codec->calls.front().encode);
+    EXPECT_EQ(codec->calls.front().layerGroup, LayerGroupId{0});
+    EXPECT_EQ(codec->calls.front().srcIndices.size(), 2);
+
+    for (LifeCycleId lifeCycle{0}; lifeCycle < LifeCycleId{2}; ++lifeCycle)
+        storage.releaseSlot(lifeCycle, kGpuLevel, std::move(replacementSlots[lifeCycle].front()));
     manager->setColdPageCodec(nullptr);
 }
 

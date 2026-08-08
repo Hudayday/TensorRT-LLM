@@ -10,8 +10,10 @@ import pytest
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary import (
     Nvfp4BoundaryLayerConfig,
     QuantizationCompression,
+    build_uncalibrated_nvfp4_layer_configs_for_testing,
 )
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
+from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 from tensorrt_llm.llmapi.llm_args import QuantizationCompressionConfig
 
 
@@ -194,6 +196,52 @@ def test_factory_builds_and_configures_manager_for_kvcm_handoff():
     assert manager.native_codec is codec
     codec.configure.assert_called_once_with("gpu-pg-0")
     backend.set_cold_page_codec.assert_called_once_with(codec)
+
+
+def test_test_only_geometry_handoff_reads_kvcm_without_attention_metadata():
+    backend = SimpleNamespace(get_layer_group_id=lambda layer_id: (2, 2)[layer_id])
+    kv_cache_manager = SimpleNamespace(
+        dtype=DataType.BF16,
+        impl=backend,
+        num_local_layers=2,
+        num_kv_heads_per_layer=(8, 4),
+        head_dim_per_layer=(128, 256),
+        tokens_per_block=64,
+    )
+
+    configs = build_uncalibrated_nvfp4_layer_configs_for_testing(
+        kv_cache_manager)
+
+    assert [(item.layer_group_id, item.layer_id) for item in configs] == [
+        (2, 0),
+        (2, 1),
+    ]
+    assert [item.num_kv_heads for item in configs] == [8, 4]
+    assert [item.head_dim for item in configs] == [128, 256]
+    assert all(item.runtime_dtype == "bfloat16" for item in configs)
+    assert all(item.nvfp4_scale_orig_quant == (1.0, 1.0)
+               for item in configs)
+
+
+def test_factory_unit_scale_fallback_is_explicitly_gated():
+    manager = _v2_manager(
+        SimpleNamespace(
+            pool_group_descs=("gpu-pg-0", ),
+            get_layer_group_id=lambda _layer_id: 0,
+            set_cold_page_codec=MagicMock(),
+        ))
+    manager.dtype = DataType.BF16
+    manager.num_local_layers = 1
+    manager.num_kv_heads_per_layer = (8, )
+    manager.head_dim_per_layer = (128, )
+    manager.tokens_per_block = 64
+
+    with (
+            patch.object(util_mod, "is_sm_100f", return_value=True),
+            patch.dict("os.environ", {}, clear=True),
+            pytest.raises(RuntimeError, match="mechanism E2E test"),
+    ):
+        util_mod.create_kv_cache_compression_manager(_config(), manager)
 
 
 @pytest.mark.parametrize("backend_type", (_PythonKvcmBackend, _CppKvcmBackend))

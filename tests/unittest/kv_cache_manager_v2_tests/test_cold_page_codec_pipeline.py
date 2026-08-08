@@ -18,13 +18,17 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager import StorageMan
 
 
 class _Codec:
-    def __init__(self, strides=None, *, submit=True):
+    def __init__(self, strides=None, *, submit=True, batching=None):
         self.strides = strides or {0: 72 << 10}
         self.submit = submit
+        self.batching = batching or {}
         self.calls = []
 
     def query_cold_page_bytes(self, layer_group_id):
         return self.strides.get(layer_group_id, 0)
+
+    def get_batching_layer_group_id(self, layer_group_id):
+        return self.batching.get(layer_group_id, layer_group_id)
 
     def encode(self, *args):
         self.calls.append(("encode", args))
@@ -301,6 +305,73 @@ def test_boundary_migration_batches_pages_of_one_lifecycle_in_one_codec_call():
     _, args = codec.calls[0]
     assert args[2] == [5, 17]
     assert args[3] == [3, 11]
+
+
+@pytest.mark.parametrize(
+    "src_level,dst_level,method",
+    [
+        (GPU_LEVEL, CacheLevel(1), "encode"),
+        (CacheLevel(1), GPU_LEVEL, "decode"),
+    ],
+)
+def test_boundary_migration_batches_codec_equivalent_lifecycles_together(
+    src_level, dst_level, method
+):
+    codec = _Codec({0: 4096, 1: 4096}, batching={1: 0})
+    pages = [
+        _Page(3, 0, src_level),
+        _Page(11, 1, src_level),
+        _Page(19, 0, src_level),
+    ]
+    manager, _, _ = _migration_manager(
+        codec,
+        src_level=src_level,
+        dst_level=dst_level,
+        src_pages=pages,
+        dst_ids=(5, 17, 23),
+    )
+
+    with patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager.TemporaryCudaStream",
+        _TempStream,
+    ):
+        manager._batched_migrate(0, dst_level, src_level, pages, update_src=True)
+
+    assert len(codec.calls) == 1
+    operation, args = codec.calls[0]
+    assert operation == method
+    assert args[0] == 0
+    assert args[2 if method == "encode" else 1] == [5, 17, 23]
+    assert args[3] == [3, 11, 19]
+
+
+@pytest.mark.parametrize(
+    "batching,match",
+    [
+        ({0: 1}, "invalid cross-lifecycle"),
+        ({1: -1}, "invalid cross-lifecycle"),
+    ],
+)
+def test_boundary_migration_rejects_invalid_batching_representative(batching, match):
+    codec = _Codec({0: 4096, 1: 4096}, batching=batching)
+    life_cycle = next(iter(batching))
+    page = _Page(3, life_cycle, GPU_LEVEL)
+    manager, _, _ = _migration_manager(
+        codec,
+        src_level=GPU_LEVEL,
+        dst_level=CacheLevel(1),
+        src_pages=[page],
+        dst_ids=(5,),
+    )
+
+    with (
+        patch(
+            "tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager.TemporaryCudaStream",
+            _TempStream,
+        ),
+        pytest.raises(RuntimeError, match=match),
+    ):
+        manager._batched_migrate(0, CacheLevel(1), GPU_LEVEL, [page], update_src=True)
 
 
 def test_codec_submission_failure_does_not_publish_destination_mapping():

@@ -49,6 +49,21 @@ public:
     //! Query the cold-page stride for one layer group. Zero indicates failure.
     [[nodiscard]] virtual std::size_t queryColdPageBytes(LayerGroupId layerGroupId) const = 0;
 
+    //! Return the representative layer-group ID used for cross-lifecycle batching.
+    //!
+    //! KVCM may concatenate Page-index arrays for lifecycles that return the
+    //! same ID and issue one encode or decode call using that ID. Equal IDs
+    //! promise identical codec behavior, including the algorithm, parameters,
+    //! cold-Page size, and encoded representation. The returned ID must be the
+    //! smallest lifecycle ID in that codec-equivalence class, and all members
+    //! must belong to the same configured GPU PoolGroup.
+    //!
+    //! The default keeps each lifecycle in its own codec call.
+    [[nodiscard]] virtual LayerGroupId getBatchingLayerGroupId(LayerGroupId layerGroupId) const
+    {
+        return layerGroupId;
+    }
+
     //! Enqueue GPU hot Pages -> cold Pages on stream.
     virtual bool encode(LayerGroupId layerGroupId, void* dstBasePtr, std::int32_t const* dstBasePageIndices,
         std::int32_t const* srcBasePageIndices, std::size_t numBasePages, cudaStream_t stream)
