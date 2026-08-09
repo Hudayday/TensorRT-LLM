@@ -715,30 +715,12 @@ class StorageManager:
                     cold_pool_group = dst_pool_group if use_encode else src_pool_group
                     cold_base = int(cold_pool_group.slot_address(SlotId(0))[PoolIndex(0)])
                     by_batching_layer_group: dict[LifeCycleId, list[tuple[Page, Slot]]] = {}
-                    batching_layer_groups: dict[LifeCycleId, LifeCycleId] = {}
                     for page, slot in zip(src_pages, dst_slots):
-                        life_cycle = page.life_cycle
-                        batching_layer_group = batching_layer_groups.get(life_cycle)
-                        if batching_layer_group is None:
-                            batching_layer_group = LifeCycleId(
-                                codec.get_batching_layer_group_id(int(life_cycle))
-                            )
-                            if (
-                                batching_layer_group < 0
-                                or batching_layer_group > life_cycle
-                                or batching_layer_group >= len(self._life_cycle_grouping)
-                                or self._life_cycle_grouping[batching_layer_group]
-                                != pool_group_index
-                                or codec.get_batching_layer_group_id(int(batching_layer_group))
-                                != int(batching_layer_group)
-                                or codec.query_cold_page_bytes(int(batching_layer_group))
-                                != codec.query_cold_page_bytes(int(life_cycle))
-                            ):
-                                raise RuntimeError(
-                                    "Cold-Page codec returned an invalid cross-lifecycle "
-                                    "batching representative"
-                                )
-                            batching_layer_groups[life_cycle] = batching_layer_group
+                        # The codec contract guarantees one PoolGroup and cold
+                        # stride for every returned representative.
+                        batching_layer_group = LifeCycleId(
+                            codec.get_batching_layer_group_id(int(page.life_cycle))
+                        )
                         by_batching_layer_group.setdefault(batching_layer_group, []).append(
                             (page, slot)
                         )

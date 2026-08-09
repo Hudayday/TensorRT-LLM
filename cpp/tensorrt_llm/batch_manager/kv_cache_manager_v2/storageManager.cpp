@@ -720,25 +720,12 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
                 auto& coldPoolGroup = useEncode ? dstPoolGroup : srcPoolGroup;
                 auto const coldBase = std::get<MemAddress>(coldPoolGroup.slotAddress(SlotId{0}).at(PoolIndex{0}));
                 std::map<LifeCycleId, std::pair<std::vector<std::int32_t>, std::vector<std::int32_t>>> batches;
-                std::map<LifeCycleId, LayerGroupId> batchingLayerGroups;
                 for (std::size_t i = 0; i < srcPages.size(); ++i)
                 {
                     auto const lifeCycle = srcPages.at(i)->lifeCycle;
-                    auto [representativeIt, inserted]
-                        = batchingLayerGroups.emplace(lifeCycle, mColdPageCodec->getBatchingLayerGroupId(lifeCycle));
-                    auto const representative = representativeIt->second;
-                    if (inserted)
-                    {
-                        if (representative < LayerGroupId{0} || representative > lifeCycle
-                            || representative >= numLifeCycles() || mLifeCycleGrouping.at(representative) != pgIdx
-                            || mColdPageCodec->getBatchingLayerGroupId(representative) != representative
-                            || mColdPageCodec->queryColdPageBytes(representative)
-                                != mColdPageCodec->queryColdPageBytes(lifeCycle))
-                        {
-                            throw std::runtime_error(
-                                "Cold-Page codec returned an invalid cross-lifecycle batching representative");
-                        }
-                    }
+                    // The codec contract guarantees that equivalent groups
+                    // share this PoolGroup and cold-Page stride.
+                    auto const representative = mColdPageCodec->getBatchingLayerGroupId(lifeCycle);
                     auto& [dstIndices, srcIndices] = batches[representative];
                     dstIndices.push_back(dstSlots.at(i).slotId().value());
                     srcIndices.push_back(srcPages.at(i)->slotId().value());

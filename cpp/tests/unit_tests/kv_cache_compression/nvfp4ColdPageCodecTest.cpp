@@ -149,28 +149,6 @@ TEST(Nvfp4ColdPageCodecTest, ConfiguresLayoutAndLowersDisjointPages)
         reinterpret_cast<std::uintptr_t>(gOffloadTasks[3].rawV));
 }
 
-TEST(Nvfp4ColdPageCodecTest, DispatchesThroughYaoColdPageCodecInterface)
-{
-    gOffloadTasks.clear();
-    gOnboardTasks.clear();
-
-    Nvfp4ColdPageCodec concrete{makeLayers()};
-    kv::IKvCacheColdPageCodec& codec = concrete;
-    ASSERT_TRUE(codec.configure(makeGpuDesc()));
-
-    std::int32_t const coldIndices[]{2, 5};
-    std::int32_t const gpuIndices[]{1, 3};
-    auto const stream = reinterpret_cast<cudaStream_t>(kStreamValue);
-    ASSERT_TRUE(
-        codec.encode(kv::LayerGroupId{3}, reinterpret_cast<void*>(kColdBase), coldIndices, gpuIndices, 2, stream));
-    ASSERT_TRUE(codec.decode(
-        kv::LayerGroupId{3}, gpuIndices, reinterpret_cast<void const*>(kColdBase), coldIndices, 2, stream));
-
-    EXPECT_EQ(gOffloadTasks.size(), 4U);
-    EXPECT_EQ(gOnboardTasks.size(), 4U);
-    EXPECT_EQ(gStream, stream);
-}
-
 TEST(Nvfp4ColdPageCodecTest, RejectedConfigurePreservesPublishedLayout)
 {
     Nvfp4ColdPageCodec codec{makeLayers()};

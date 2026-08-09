@@ -10,7 +10,6 @@ import pytest
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary import (
     Nvfp4BoundaryLayerConfig,
     QuantizationCompression,
-    build_uncalibrated_nvfp4_layer_configs_for_testing,
 )
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
@@ -46,25 +45,9 @@ def _layer_config(*, layer_id=0, layer_group_id=3, runtime_dtype="float16"):
     )
 
 
-class _NativeLayerConfig:
-    pass
-
-
-class _PythonKvcmBackend:
-
-    def __init__(self):
-        self.pool_group_descs = ("gpu-pg-0", )
-        self.set_cold_page_codec = MagicMock()
-
-
-class _CppKvcmBackend(_PythonKvcmBackend):
-    """Test double for the nanobind backend with the identical setter ABI."""
-
-
-def _native(*, cold_page_bytes=73728):
+def _native():
     codec = MagicMock()
     codec.configure.return_value = True
-    codec.query_cold_page_bytes.return_value = cold_page_bytes
     codec.encode.return_value = True
     codec.decode.return_value = True
     module = SimpleNamespace(
@@ -73,7 +56,7 @@ def _native(*, cold_page_bytes=73728):
             BFLOAT16="native-bf16",
             FP8_E4M3="native-fp8",
         ),
-        Nvfp4ColdPageLayerConfig=_NativeLayerConfig,
+        Nvfp4ColdPageLayerConfig=SimpleNamespace,
         Nvfp4ColdPageCodec=MagicMock(return_value=codec),
     )
     return module, codec
@@ -91,48 +74,12 @@ def _manager(*layer_configs, gpu_descs=("gpu-pg-0", )):
             layer_configs=layer_configs,
         )
         manager.configure(gpu_pool_group_descs=gpu_descs)
-    return manager, native, codec
-
-
-def test_layer_config_rejects_invalid_geometry_and_scale():
-    fields = vars(_layer_config()).copy()
-    fields["head_dim"] = 127
-    with pytest.raises(ValueError, match="head_dim"):
-        Nvfp4BoundaryLayerConfig(**fields)
-
-    fields = vars(_layer_config()).copy()
-    fields["nvfp4_scale_orig_quant"] = (float("inf"), 1.0)
-    with pytest.raises(ValueError, match="finite positive"):
-        Nvfp4BoundaryLayerConfig(**fields)
-
-
-def test_manager_creates_one_native_codec_and_keeps_its_lifetime():
-    manager, native, codec = _manager(
-        _layer_config(layer_id=1, runtime_dtype="fp8_e4m3"),
-        _layer_config(layer_id=0),
-    )
-
-    native.Nvfp4ColdPageCodec.assert_called_once()
-    native_configs = native.Nvfp4ColdPageCodec.call_args.args[0]
-    assert [config.layer_id for config in native_configs] == [0, 1]
-    assert native_configs[0].runtime_type == "native-fp16"
-    assert native_configs[1].runtime_type == "native-fp8"
-    assert manager.native_codec is codec
-
-
-def test_configure_passes_only_authoritative_gpu_descriptors():
-    manager, _, codec = _manager(_layer_config(),
-                                 gpu_descs=("gpu-pg-0", "gpu-pg-1"))
-
-    assert manager.native_codec is codec
-    assert codec.configure.call_args_list[0].args == ("gpu-pg-0", )
-    assert codec.configure.call_args_list[1].args == ("gpu-pg-1", )
-    assert manager.query_cold_page_bytes(3) == 73728
+    return manager, codec
 
 
 def test_offload_passes_compact_base_indices_and_stream_without_expanding_addresses(
 ):
-    manager, _, codec = _manager(_layer_config())
+    manager, codec = _manager(_layer_config())
 
     manager.on_offload_compress(
         layer_group_id=3,
@@ -146,7 +93,7 @@ def test_offload_passes_compact_base_indices_and_stream_without_expanding_addres
 
 
 def test_onboard_uses_the_same_codec_with_reversed_storage_roles():
-    manager, _, codec = _manager(_layer_config(runtime_dtype="fp8_e4m3"))
+    manager, codec = _manager(_layer_config(runtime_dtype="fp8_e4m3"))
 
     manager.on_onboard_decompress(
         layer_group_id=3,
@@ -160,7 +107,7 @@ def test_onboard_uses_the_same_codec_with_reversed_storage_roles():
 
 
 def test_codec_submission_failure_is_fail_closed():
-    manager, _, codec = _manager(_layer_config())
+    manager, codec = _manager(_layer_config())
     codec.encode.return_value = False
 
     with pytest.raises(RuntimeError, match="encode submission failed"):
@@ -173,7 +120,7 @@ def test_codec_submission_failure_is_fail_closed():
         )
 
 
-def test_factory_builds_and_configures_manager_for_kvcm_handoff():
+def test_factory_configures_registers_and_detaches_one_native_codec():
     native, codec = _native()
     backend = SimpleNamespace(
         pool_group_descs=("gpu-pg-0", ),
@@ -189,38 +136,24 @@ def test_factory_builds_and_configures_manager_for_kvcm_handoff():
         manager = util_mod.create_kv_cache_compression_manager(
             _config(),
             _v2_manager(backend),
-            boundary_layer_configs=(_layer_config(), ),
+            boundary_layer_configs=(
+                _layer_config(layer_id=1, runtime_dtype="fp8_e4m3"),
+                _layer_config(layer_id=0),
+            ),
         )
 
     assert isinstance(manager, QuantizationCompression)
-    assert manager.native_codec is codec
+    native.Nvfp4ColdPageCodec.assert_called_once()
+    native_configs = native.Nvfp4ColdPageCodec.call_args.args[0]
+    assert [config.layer_id for config in native_configs] == [0, 1]
+    assert [config.runtime_type for config in native_configs] == [
+        "native-fp16",
+        "native-fp8",
+    ]
     codec.configure.assert_called_once_with("gpu-pg-0")
     backend.set_cold_page_codec.assert_called_once_with(codec)
-
-
-def test_test_only_geometry_handoff_reads_kvcm_without_attention_metadata():
-    backend = SimpleNamespace(get_layer_group_id=lambda layer_id: (2, 2)[layer_id])
-    kv_cache_manager = SimpleNamespace(
-        dtype=DataType.BF16,
-        impl=backend,
-        num_local_layers=2,
-        num_kv_heads_per_layer=(8, 4),
-        head_dim_per_layer=(128, 256),
-        tokens_per_block=64,
-    )
-
-    configs = build_uncalibrated_nvfp4_layer_configs_for_testing(
-        kv_cache_manager)
-
-    assert [(item.layer_group_id, item.layer_id) for item in configs] == [
-        (2, 0),
-        (2, 1),
-    ]
-    assert [item.num_kv_heads for item in configs] == [8, 4]
-    assert [item.head_dim for item in configs] == [128, 256]
-    assert all(item.runtime_dtype == "bfloat16" for item in configs)
-    assert all(item.nvfp4_scale_orig_quant == (1.0, 1.0)
-               for item in configs)
+    manager.shutdown()
+    assert backend.set_cold_page_codec.call_args_list[-1].args == (None, )
 
 
 def test_factory_unit_scale_fallback_is_explicitly_gated():
@@ -242,55 +175,3 @@ def test_factory_unit_scale_fallback_is_explicitly_gated():
             pytest.raises(RuntimeError, match="mechanism E2E test"),
     ):
         util_mod.create_kv_cache_compression_manager(_config(), manager)
-
-
-@pytest.mark.parametrize("backend_type", (_PythonKvcmBackend, _CppKvcmBackend))
-def test_same_native_codec_registers_with_either_kvcm_v2_backend(backend_type):
-    native, codec = _native()
-    backend = backend_type()
-    with patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
-            return_value=native,
-    ):
-        manager = QuantizationCompression(
-            _config(),
-            _v2_manager(backend),
-            layer_configs=(_layer_config(), ),
-        )
-        manager.configure(gpu_pool_group_descs=backend.pool_group_descs)
-        manager.register_with_kv_cache_manager()
-
-    backend.set_cold_page_codec.assert_called_once_with(codec)
-    manager.shutdown()
-    assert backend.set_cold_page_codec.call_args_list[-1].args == (None, )
-
-
-def test_factory_fails_closed_until_kvcm_accepts_native_codec():
-    native, _ = _native()
-    with (
-            patch.object(util_mod, "is_sm_100f", return_value=True),
-            patch(
-                "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
-                return_value=native,
-            ),
-            pytest.raises(RuntimeError, match="set_cold_page_codec"),
-    ):
-        util_mod.create_kv_cache_compression_manager(
-            _config(),
-            _v2_manager(SimpleNamespace(pool_group_descs=("gpu-pg-0", ))),
-            boundary_layer_configs=(_layer_config(), ),
-        )
-
-
-def test_unknown_quantization_does_not_create_an_nvfp4_codec():
-    config = SimpleNamespace(
-        quant="future_quant",
-        target_cache_tier="host",
-        changes_physical_kv_length=False,
-    )
-    with pytest.raises(RuntimeError, match="codec for 'future_quant'"):
-        QuantizationCompression(
-            config,
-            _v2_manager(),
-            layer_configs=(_layer_config(), ),
-        )

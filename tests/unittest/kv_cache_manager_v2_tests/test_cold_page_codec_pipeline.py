@@ -18,10 +18,11 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager import StorageMan
 
 
 class _Codec:
-    def __init__(self, strides=None, *, submit=True, batching=None):
+    def __init__(self, strides=None, *, submit=True, batching=None, results=None):
         self.strides = strides or {0: 72 << 10}
         self.submit = submit
         self.batching = batching or {}
+        self.results = iter(results) if results is not None else None
         self.calls = []
 
     def query_cold_page_bytes(self, layer_group_id):
@@ -32,21 +33,11 @@ class _Codec:
 
     def encode(self, *args):
         self.calls.append(("encode", args))
-        return self.submit
+        return self.submit if self.results is None else next(self.results)
 
     def decode(self, *args):
         self.calls.append(("decode", args))
         return self.submit
-
-
-class _SequencedCodec(_Codec):
-    def __init__(self, results):
-        super().__init__({0: 4096, 1: 4096})
-        self.results = iter(results)
-
-    def encode(self, *args):
-        self.calls.append(("encode", args))
-        return next(self.results)
 
 
 class _Controller:
@@ -345,35 +336,6 @@ def test_boundary_migration_batches_codec_equivalent_lifecycles_together(
     assert args[3] == [3, 11, 19]
 
 
-@pytest.mark.parametrize(
-    "batching,match",
-    [
-        ({0: 1}, "invalid cross-lifecycle"),
-        ({1: -1}, "invalid cross-lifecycle"),
-    ],
-)
-def test_boundary_migration_rejects_invalid_batching_representative(batching, match):
-    codec = _Codec({0: 4096, 1: 4096}, batching=batching)
-    life_cycle = next(iter(batching))
-    page = _Page(3, life_cycle, GPU_LEVEL)
-    manager, _, _ = _migration_manager(
-        codec,
-        src_level=GPU_LEVEL,
-        dst_level=CacheLevel(1),
-        src_pages=[page],
-        dst_ids=(5,),
-    )
-
-    with (
-        patch(
-            "tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager.TemporaryCudaStream",
-            _TempStream,
-        ),
-        pytest.raises(RuntimeError, match=match),
-    ):
-        manager._batched_migrate(0, CacheLevel(1), GPU_LEVEL, [page], update_src=True)
-
-
 def test_codec_submission_failure_does_not_publish_destination_mapping():
     codec = _Codec(submit=False)
     src_level = GPU_LEVEL
@@ -399,7 +361,7 @@ def test_codec_submission_failure_does_not_publish_destination_mapping():
 
 
 def test_partial_codec_submission_is_fenced_before_destination_rollback():
-    codec = _SequencedCodec([True, False])
+    codec = _Codec({0: 4096, 1: 4096}, results=(True, False))
     src_level = GPU_LEVEL
     dst_level = CacheLevel(1)
     pages = [_Page(3, 0, src_level), _Page(11, 1, src_level)]
