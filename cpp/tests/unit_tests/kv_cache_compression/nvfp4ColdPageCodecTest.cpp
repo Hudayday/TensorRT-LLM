@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <iterator>
 #include <type_traits>
 #include <vector>
 
@@ -121,12 +122,12 @@ TEST(Nvfp4ColdPageCodecTest, ConfiguresLayoutAndLowersDisjointPages)
     Nvfp4ColdPageCodec codec{makeLayers()};
     EXPECT_TRUE(codec.configure(makeGpuDesc()));
     EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{3}), kColdSlotBytes);
+    EXPECT_EQ(codec.queryPageIndexLocation(kv::LayerGroupId{3}), kv::PageIndexLocation::kHost);
 
-    std::int32_t const coldIndices[]{2, 5};
-    std::int32_t const gpuIndices[]{1, 3};
+    kv::PageIndexPair const offloadIndices[]{{2, 1}, {5, 3}};
     auto const stream = reinterpret_cast<cudaStream_t>(kStreamValue);
-    EXPECT_TRUE(
-        codec.encode(kv::LayerGroupId{3}, reinterpret_cast<void*>(kColdBase), coldIndices, gpuIndices, 2, stream));
+    EXPECT_TRUE(codec.encode(
+        kv::LayerGroupId{3}, reinterpret_cast<void*>(kColdBase), offloadIndices, std::size(offloadIndices), stream));
     EXPECT_EQ(gStream, stream);
     ASSERT_EQ(gOffloadTasks.size(), 4U);
     EXPECT_EQ(reinterpret_cast<std::uintptr_t>(gOffloadTasks[0].rawK), kGpuKBase + kGpuSlotBytes);
@@ -140,8 +141,9 @@ TEST(Nvfp4ColdPageCodecTest, ConfiguresLayoutAndLowersDisjointPages)
     EXPECT_EQ(reinterpret_cast<std::uintptr_t>(gOffloadTasks[3].compactPage),
         kColdBase + 5 * kColdSlotBytes + kLayerColdBytesAligned);
 
-    EXPECT_TRUE(codec.decode(
-        kv::LayerGroupId{3}, gpuIndices, reinterpret_cast<void const*>(kColdBase), coldIndices, 2, stream));
+    kv::PageIndexPair const onboardIndices[]{{1, 2}, {3, 5}};
+    EXPECT_TRUE(codec.decode(kv::LayerGroupId{3}, reinterpret_cast<void const*>(kColdBase), onboardIndices,
+        std::size(onboardIndices), stream));
     ASSERT_EQ(gOnboardTasks.size(), 4U);
     EXPECT_EQ(reinterpret_cast<std::uintptr_t>(gOnboardTasks[0].compactPage),
         reinterpret_cast<std::uintptr_t>(gOffloadTasks[0].compactPage));

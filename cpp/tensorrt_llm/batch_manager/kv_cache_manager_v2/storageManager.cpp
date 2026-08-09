@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <numeric>
 #include <set>
 #include <string>
@@ -719,31 +720,40 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
             {
                 auto& coldPoolGroup = useEncode ? dstPoolGroup : srcPoolGroup;
                 auto const coldBase = std::get<MemAddress>(coldPoolGroup.slotAddress(SlotId{0}).at(PoolIndex{0}));
-                std::map<LifeCycleId, std::pair<std::vector<std::int32_t>, std::vector<std::int32_t>>> batches;
+                std::map<LifeCycleId, std::vector<PageIndexPair>> batches;
+                auto const toPageIndex = [](SlotId slotId)
+                {
+                    auto const value = slotId.value();
+                    TLLM_CHECK_WITH_INFO(value >= 0 && value <= std::numeric_limits<std::int32_t>::max(),
+                        "Cold-Page codec Page index exceeds int32_t");
+                    return static_cast<std::int32_t>(value);
+                };
                 for (std::size_t i = 0; i < srcPages.size(); ++i)
                 {
                     auto const lifeCycle = srcPages.at(i)->lifeCycle;
                     // The codec contract guarantees that equivalent groups
                     // share this PoolGroup and cold-Page stride.
                     auto const representative = mColdPageCodec->getBatchingLayerGroupId(lifeCycle);
-                    auto& [dstIndices, srcIndices] = batches[representative];
-                    dstIndices.push_back(dstSlots.at(i).slotId().value());
-                    srcIndices.push_back(srcPages.at(i)->slotId().value());
+                    batches[representative].push_back(PageIndexPair{
+                        toPageIndex(dstSlots.at(i).slotId()), toPageIndex(srcPages.at(i)->slotId())});
                 }
-                for (auto const& [batchingLayerGroup, indices] : batches)
+                for (auto const& [batchingLayerGroup, pageIndices] : batches)
                 {
-                    auto const& [dstIndices, srcIndices] = indices;
+                    if (mColdPageCodec->queryPageIndexLocation(batchingLayerGroup) != PageIndexLocation::kHost)
+                    {
+                        throw std::runtime_error(
+                            "This KVCM integration currently provides Host Page-index pairs only");
+                    }
                     bool submitted = false;
                     if (useEncode)
                     {
                         submitted = mColdPageCodec->encode(batchingLayerGroup, reinterpret_cast<void*>(coldBase),
-                            dstIndices.data(), srcIndices.data(), srcIndices.size(),
-                            reinterpret_cast<cudaStream_t>(stream));
+                            pageIndices.data(), pageIndices.size(), reinterpret_cast<cudaStream_t>(stream));
                     }
                     else
                     {
-                        submitted = mColdPageCodec->decode(batchingLayerGroup, dstIndices.data(),
-                            reinterpret_cast<void const*>(coldBase), srcIndices.data(), srcIndices.size(),
+                        submitted = mColdPageCodec->decode(batchingLayerGroup, reinterpret_cast<void const*>(coldBase),
+                            pageIndices.data(), pageIndices.size(),
                             reinterpret_cast<cudaStream_t>(stream));
                     }
                     if (!submitted)

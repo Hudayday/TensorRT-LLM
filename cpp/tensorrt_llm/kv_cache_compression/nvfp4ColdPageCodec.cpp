@@ -332,8 +332,13 @@ kv::LayerGroupId Nvfp4ColdPageCodec::getBatchingLayerGroupId(kv::LayerGroupId la
     return found == mBatchingLayerGroups.end() ? layerGroupId : found->second;
 }
 
-bool Nvfp4ColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, std::int32_t const* dstBasePageIndices,
-    std::int32_t const* srcBasePageIndices, std::size_t numBasePages, cudaStream_t stream) noexcept
+kv::PageIndexLocation Nvfp4ColdPageCodec::queryPageIndexLocation(kv::LayerGroupId) const noexcept
+{
+    return kv::PageIndexLocation::kHost;
+}
+
+bool Nvfp4ColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr,
+    kv::PageIndexPair const* pageIndices, std::size_t numBasePages, cudaStream_t stream) noexcept
 {
     try
     {
@@ -341,11 +346,9 @@ bool Nvfp4ColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr,
         {
             return true;
         }
-        if (dstBasePtr == nullptr || dstBasePageIndices == nullptr || srcBasePageIndices == nullptr)
+        if (dstBasePtr == nullptr || pageIndices == nullptr)
         {
-            throw std::invalid_argument(
-                "Non-empty encode requires base pointers "
-                "and both Page-index arrays");
+            throw std::invalid_argument("Non-empty encode requires the cold base pointer and Page-index pairs");
         }
         auto const found = mLayerGroups.find(layerGroupId);
         if (found == mLayerGroups.end())
@@ -356,7 +359,7 @@ bool Nvfp4ColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr,
         std::map<KernelCohortKey, std::vector<kernels::Nvfp4BoundaryOffloadPageTask>> cohorts;
         for (std::size_t page = 0; page < numBasePages; ++page)
         {
-            auto const srcIndex = srcBasePageIndices[page];
+            auto const srcIndex = pageIndices[page].src;
             if (srcIndex < 0 || static_cast<kv::SlotCount>(srcIndex) >= state.gpuDesc.numSlots)
             {
                 throw std::invalid_argument(
@@ -364,7 +367,7 @@ bool Nvfp4ColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr,
                     "configured GPU Slot capacity");
             }
             auto const coldPage = addBytes(static_cast<std::uint8_t*>(dstBasePtr),
-                checkedPageOffset(dstBasePageIndices[page], state.coldPageBytes));
+                checkedPageOffset(pageIndices[page].dst, state.coldPageBytes));
             for (auto const& layer : state.layers)
             {
                 auto const gpuAddress = [&](BufferLocation const& location)
@@ -393,9 +396,8 @@ bool Nvfp4ColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr,
     }
 }
 
-bool Nvfp4ColdPageCodec::decode(kv::LayerGroupId layerGroupId, std::int32_t const* dstBasePageIndices,
-    void const* srcBasePtr, std::int32_t const* srcBasePageIndices, std::size_t numBasePages,
-    cudaStream_t stream) noexcept
+bool Nvfp4ColdPageCodec::decode(kv::LayerGroupId layerGroupId, void const* srcBasePtr,
+    kv::PageIndexPair const* pageIndices, std::size_t numBasePages, cudaStream_t stream) noexcept
 {
     try
     {
@@ -403,11 +405,9 @@ bool Nvfp4ColdPageCodec::decode(kv::LayerGroupId layerGroupId, std::int32_t cons
         {
             return true;
         }
-        if (srcBasePtr == nullptr || dstBasePageIndices == nullptr || srcBasePageIndices == nullptr)
+        if (srcBasePtr == nullptr || pageIndices == nullptr)
         {
-            throw std::invalid_argument(
-                "Non-empty decode requires base pointers "
-                "and both Page-index arrays");
+            throw std::invalid_argument("Non-empty decode requires the cold base pointer and Page-index pairs");
         }
         auto const found = mLayerGroups.find(layerGroupId);
         if (found == mLayerGroups.end())
@@ -418,7 +418,7 @@ bool Nvfp4ColdPageCodec::decode(kv::LayerGroupId layerGroupId, std::int32_t cons
         std::map<KernelCohortKey, std::vector<kernels::Nvfp4BoundaryOnboardPageTask>> cohorts;
         for (std::size_t page = 0; page < numBasePages; ++page)
         {
-            auto const dstIndex = dstBasePageIndices[page];
+            auto const dstIndex = pageIndices[page].dst;
             if (dstIndex < 0 || static_cast<kv::SlotCount>(dstIndex) >= state.gpuDesc.numSlots)
             {
                 throw std::invalid_argument(
@@ -426,7 +426,7 @@ bool Nvfp4ColdPageCodec::decode(kv::LayerGroupId layerGroupId, std::int32_t cons
                     "the configured GPU Slot capacity");
             }
             auto const coldPage = addBytes(static_cast<std::uint8_t const*>(srcBasePtr),
-                checkedPageOffset(srcBasePageIndices[page], state.coldPageBytes));
+                checkedPageOffset(pageIndices[page].src, state.coldPageBytes));
             for (auto const& layer : state.layers)
             {
                 auto const gpuAddress = [&](BufferLocation const& location)

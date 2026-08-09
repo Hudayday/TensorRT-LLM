@@ -99,6 +99,10 @@ void initBindings(nb::module_& module)
         .value("BFLOAT16", kernels::Nvfp4BoundaryRuntimeType::kBfloat16)
         .value("FP8_E4M3", kernels::Nvfp4BoundaryRuntimeType::kFp8E4m3);
 
+    nb::enum_<kv::PageIndexLocation>(module, "PageIndexLocation")
+        .value("HOST", kv::PageIndexLocation::kHost)
+        .value("DEVICE", kv::PageIndexLocation::kDevice);
+
     nb::class_<compression::Nvfp4ColdPageLayerConfig>(module, "Nvfp4ColdPageLayerConfig")
         .def(nb::init<>())
         .def_prop_rw(
@@ -139,38 +143,42 @@ void initBindings(nb::module_& module)
             { return self.getBatchingLayerGroupId(kv::LayerGroupId{layerGroupId}).value(); }, nb::arg("layer_group_id"),
             "Return the representative layer group used for codec batching")
         .def(
+            "query_page_index_location", [](compression::Nvfp4ColdPageCodec const& self, int layerGroupId)
+            { return static_cast<int>(self.queryPageIndexLocation(kv::LayerGroupId{layerGroupId})); },
+            nb::arg("layer_group_id"), "Return 0 for Host Page-index pairs or 1 for Device Page-index pairs")
+        .def(
             "encode",
             [](compression::Nvfp4ColdPageCodec& self, int layerGroupId, std::uintptr_t dstBasePtr,
-                std::vector<std::int32_t> const& dstBasePageIndices,
-                std::vector<std::int32_t> const& srcBasePageIndices, std::uintptr_t stream)
+                std::vector<std::array<std::int32_t, 2>> const& pageIndexPairs, std::uintptr_t stream)
             {
-                if (dstBasePageIndices.size() != srcBasePageIndices.size())
+                std::vector<kv::PageIndexPair> pageIndices;
+                pageIndices.reserve(pageIndexPairs.size());
+                for (auto const& pair : pageIndexPairs)
                 {
-                    throw std::invalid_argument("encode Page-index arrays must have the same length");
+                    pageIndices.push_back({pair[0], pair[1]});
                 }
                 return self.encode(kv::LayerGroupId{layerGroupId}, reinterpret_cast<void*>(dstBasePtr),
-                    dstBasePageIndices.data(), srcBasePageIndices.data(), dstBasePageIndices.size(),
-                    reinterpret_cast<cudaStream_t>(stream));
+                    pageIndices.data(), pageIndices.size(), reinterpret_cast<cudaStream_t>(stream));
             },
-            nb::arg("layer_group_id"), nb::arg("dst_base_ptr"), nb::arg("dst_base_page_indices"),
-            nb::arg("src_base_page_indices"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
+            nb::arg("layer_group_id"), nb::arg("dst_base_ptr"), nb::arg("page_index_pairs"), nb::arg("stream"),
+            nb::call_guard<nb::gil_scoped_release>(),
             "Enqueue GPU runtime KV to mapped-Host NVFP4 for disjoint base Pages")
         .def(
             "decode",
-            [](compression::Nvfp4ColdPageCodec& self, int layerGroupId,
-                std::vector<std::int32_t> const& dstBasePageIndices, std::uintptr_t srcBasePtr,
-                std::vector<std::int32_t> const& srcBasePageIndices, std::uintptr_t stream)
+            [](compression::Nvfp4ColdPageCodec& self, int layerGroupId, std::uintptr_t srcBasePtr,
+                std::vector<std::array<std::int32_t, 2>> const& pageIndexPairs, std::uintptr_t stream)
             {
-                if (dstBasePageIndices.size() != srcBasePageIndices.size())
+                std::vector<kv::PageIndexPair> pageIndices;
+                pageIndices.reserve(pageIndexPairs.size());
+                for (auto const& pair : pageIndexPairs)
                 {
-                    throw std::invalid_argument("decode Page-index arrays must have the same length");
+                    pageIndices.push_back({pair[0], pair[1]});
                 }
-                return self.decode(kv::LayerGroupId{layerGroupId}, dstBasePageIndices.data(),
-                    reinterpret_cast<void const*>(srcBasePtr), srcBasePageIndices.data(), dstBasePageIndices.size(),
-                    reinterpret_cast<cudaStream_t>(stream));
+                return self.decode(kv::LayerGroupId{layerGroupId}, reinterpret_cast<void const*>(srcBasePtr),
+                    pageIndices.data(), pageIndices.size(), reinterpret_cast<cudaStream_t>(stream));
             },
-            nb::arg("layer_group_id"), nb::arg("dst_base_page_indices"), nb::arg("src_base_ptr"),
-            nb::arg("src_base_page_indices"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
+            nb::arg("layer_group_id"), nb::arg("src_base_ptr"), nb::arg("page_index_pairs"), nb::arg("stream"),
+            nb::call_guard<nb::gil_scoped_release>(),
             "Enqueue mapped-Host NVFP4 to GPU runtime KV for disjoint base Pages");
 }
 

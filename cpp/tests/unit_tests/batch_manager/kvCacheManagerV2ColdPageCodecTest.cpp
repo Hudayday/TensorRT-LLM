@@ -32,40 +32,42 @@ public:
     {
         bool encode;
         LayerGroupId layerGroup;
-        std::vector<std::int32_t> dstIndices;
-        std::vector<std::int32_t> srcIndices;
+        std::vector<PageIndexPair> pageIndices;
         cudaStream_t stream;
     };
 
-    bool configure(PoolGroupDesc const&) override
+    bool configure(PoolGroupDesc const&) noexcept override
     {
         return true;
     }
 
-    size_t queryColdPageBytes(LayerGroupId) const override
+    size_t queryColdPageBytes(LayerGroupId) const noexcept override
     {
         return 1U << 20;
     }
 
-    LayerGroupId getBatchingLayerGroupId(LayerGroupId layerGroup) const override
+    LayerGroupId getBatchingLayerGroupId(LayerGroupId layerGroup) const noexcept override
     {
         auto const found = batchingLayerGroups.find(layerGroup);
         return found == batchingLayerGroups.end() ? layerGroup : found->second;
     }
 
-    bool encode(LayerGroupId layerGroup, void*, std::int32_t const* dstIndices, std::int32_t const* srcIndices,
-        size_t count, cudaStream_t stream) override
+    PageIndexLocation queryPageIndexLocation(LayerGroupId) const noexcept override
     {
-        calls.push_back(
-            Call{true, layerGroup, {dstIndices, dstIndices + count}, {srcIndices, srcIndices + count}, stream});
+        return PageIndexLocation::kHost;
+    }
+
+    bool encode(LayerGroupId layerGroup, void*, PageIndexPair const* pageIndices, size_t count,
+        cudaStream_t stream) noexcept override
+    {
+        calls.push_back(Call{true, layerGroup, {pageIndices, pageIndices + count}, stream});
         return submit;
     }
 
-    bool decode(LayerGroupId layerGroup, std::int32_t const* dstIndices, void const*, std::int32_t const* srcIndices,
-        size_t count, cudaStream_t stream) override
+    bool decode(LayerGroupId layerGroup, void const*, PageIndexPair const* pageIndices, size_t count,
+        cudaStream_t stream) noexcept override
     {
-        calls.push_back(
-            Call{false, layerGroup, {dstIndices, dstIndices + count}, {srcIndices, srcIndices + count}, stream});
+        calls.push_back(Call{false, layerGroup, {pageIndices, pageIndices + count}, stream});
         return submit;
     }
 
@@ -148,7 +150,7 @@ TEST(KvCacheManagerV2ColdPageCodecTest, InstallsCompactHostLayoutAndRoutesBothDi
     auto temporarySlots = storage.newGpuSlots(twoSlots);
     ASSERT_EQ(codec->calls.size(), 1);
     EXPECT_TRUE(codec->calls.front().encode);
-    EXPECT_EQ(codec->calls.front().srcIndices.size(), 2);
+    EXPECT_EQ(codec->calls.front().pageIndices.size(), 2);
     for (auto& slot : temporarySlots[lifeCycle])
         storage.releaseSlot(lifeCycle, kGpuLevel, std::move(slot));
 
@@ -164,7 +166,7 @@ TEST(KvCacheManagerV2ColdPageCodecTest, InstallsCompactHostLayoutAndRoutesBothDi
 
     ASSERT_EQ(codec->calls.size(), 2);
     EXPECT_FALSE(codec->calls.back().encode);
-    EXPECT_EQ(codec->calls.back().dstIndices.size(), 2);
+    EXPECT_EQ(codec->calls.back().pageIndices.size(), 2);
     EXPECT_TRUE(
         std::all_of(pages.begin(), pages.end(), [](auto const& page) { return page->cacheLevel == kGpuLevel; }));
 
@@ -210,7 +212,7 @@ TEST(KvCacheManagerV2ColdPageCodecTest, BatchesCodecEquivalentLifeCyclesInOneCal
     ASSERT_EQ(codec->calls.size(), 1);
     EXPECT_TRUE(codec->calls.front().encode);
     EXPECT_EQ(codec->calls.front().layerGroup, LayerGroupId{0});
-    EXPECT_EQ(codec->calls.front().srcIndices.size(), 2);
+    EXPECT_EQ(codec->calls.front().pageIndices.size(), 2);
 
     for (LifeCycleId lifeCycle{0}; lifeCycle < LifeCycleId{2}; ++lifeCycle)
         storage.releaseSlot(lifeCycle, kGpuLevel, std::move(replacementSlots[lifeCycle].front()));

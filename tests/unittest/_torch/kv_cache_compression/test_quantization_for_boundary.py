@@ -84,12 +84,11 @@ def test_offload_passes_compact_base_indices_and_stream_without_expanding_addres
     manager.on_offload_compress(
         layer_group_id=3,
         dst_base_ptr=0x300000,
-        dst_base_page_indices=(2, 5),
-        src_base_page_indices=(1, 3),
+        page_index_pairs=((2, 1), (5, 3)),
         stream=0x7000,
     )
 
-    codec.encode.assert_called_once_with(3, 0x300000, [2, 5], [1, 3], 0x7000)
+    codec.encode.assert_called_once_with(3, 0x300000, [(2, 1), (5, 3)], 0x7000)
 
 
 def test_onboard_uses_the_same_codec_with_reversed_storage_roles():
@@ -97,13 +96,12 @@ def test_onboard_uses_the_same_codec_with_reversed_storage_roles():
 
     manager.on_onboard_decompress(
         layer_group_id=3,
-        dst_base_page_indices=(1, 3),
         src_base_ptr=0x300000,
-        src_base_page_indices=(2, 5),
+        page_index_pairs=((1, 2), (3, 5)),
         stream=0x7000,
     )
 
-    codec.decode.assert_called_once_with(3, [1, 3], 0x300000, [2, 5], 0x7000)
+    codec.decode.assert_called_once_with(3, 0x300000, [(1, 2), (3, 5)], 0x7000)
 
 
 def test_codec_submission_failure_is_fail_closed():
@@ -114,8 +112,7 @@ def test_codec_submission_failure_is_fail_closed():
         manager.on_offload_compress(
             layer_group_id=3,
             dst_base_ptr=0x300000,
-            dst_base_page_indices=(2, ),
-            src_base_page_indices=(1, ),
+            page_index_pairs=((2, 1), ),
             stream=0x7000,
         )
 

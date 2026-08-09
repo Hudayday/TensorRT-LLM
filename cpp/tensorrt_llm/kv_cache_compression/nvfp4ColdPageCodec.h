@@ -85,13 +85,19 @@ public:
     //! is identical. KVCM still verifies same-PoolGroup membership and stride.
     [[nodiscard]] kv::LayerGroupId getBatchingLayerGroupId(kv::LayerGroupId layerGroupId) const noexcept override;
 
+    //! Request Host Page-index pairs. encode()/decode() lower every pair into
+    //! self-contained kernel tasks before returning, so CUDA work does not
+    //! retain the PageIndexPair array.
+    [[nodiscard]] kv::PageIndexLocation queryPageIndexLocation(
+        kv::LayerGroupId layerGroupId) const noexcept override;
+
     //! Enqueue GPU runtime KV -> mapped-Host NVFP4 for disjoint base Pages.
-    bool encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, std::int32_t const* dstBasePageIndices,
-        std::int32_t const* srcBasePageIndices, std::size_t numBasePages, cudaStream_t stream) noexcept override;
+    bool encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, kv::PageIndexPair const* pageIndices,
+        std::size_t numBasePages, cudaStream_t stream) noexcept override;
 
     //! Enqueue mapped-Host NVFP4 -> GPU runtime KV for disjoint base Pages.
-    bool decode(kv::LayerGroupId layerGroupId, std::int32_t const* dstBasePageIndices, void const* srcBasePtr,
-        std::int32_t const* srcBasePageIndices, std::size_t numBasePages, cudaStream_t stream) noexcept override;
+    bool decode(kv::LayerGroupId layerGroupId, void const* srcBasePtr, kv::PageIndexPair const* pageIndices,
+        std::size_t numBasePages, cudaStream_t stream) noexcept override;
 
 private:
     struct BufferLocation

@@ -23,11 +23,29 @@
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime_api.h>
+#include <type_traits>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 struct PoolGroupDesc;
+
+//! Location of the Page-index array passed to encode() and decode().
+enum class PageIndexLocation
+{
+    kHost,
+    kDevice,
+};
+
+//! Source and destination Page indices for one logical Page conversion.
+struct alignas(8) PageIndexPair
+{
+    std::int32_t dst;
+    std::int32_t src;
+};
+
+static_assert(sizeof(PageIndexPair) == 8);
+static_assert(std::is_trivially_copyable_v<PageIndexPair>);
 
 //! Transform hook invoked by KVCM when Pages cross a hot/cold layout boundary.
 //!
@@ -38,40 +56,40 @@ struct PoolGroupDesc;
 class IKvCacheColdPageCodec
 {
 public:
-    IKvCacheColdPageCodec() = default;
-    virtual ~IKvCacheColdPageCodec() = default;
+    IKvCacheColdPageCodec();
+    virtual ~IKvCacheColdPageCodec();
 
     IKvCacheColdPageCodec(IKvCacheColdPageCodec const&) = delete;
     IKvCacheColdPageCodec& operator=(IKvCacheColdPageCodec const&) = delete;
 
-    virtual bool configure(PoolGroupDesc const& gpuDesc) = 0;
+    virtual bool configure(PoolGroupDesc const& gpuDesc) noexcept = 0;
 
     //! Query the cold-page stride for one layer group. Zero indicates failure.
-    [[nodiscard]] virtual std::size_t queryColdPageBytes(LayerGroupId layerGroupId) const = 0;
+    [[nodiscard]] virtual std::size_t queryColdPageBytes(LayerGroupId layerGroupId) const noexcept = 0;
 
     //! Return the representative layer-group ID used for cross-lifecycle batching.
     //!
     //! KVCM may concatenate Page-index arrays for lifecycles that return the
     //! same ID and issue one encode or decode call using that ID. Equal IDs
     //! promise identical codec behavior, including the algorithm, parameters,
-    //! cold-Page size, and encoded representation. The returned ID must be the
-    //! smallest lifecycle ID in that codec-equivalence class, and all members
-    //! must belong to the same configured GPU PoolGroup.
+    //! cold-Page size, encoded representation, and Page-index location. The
+    //! returned ID must be the smallest lifecycle ID in that codec-equivalence
+    //! class, and all members must belong to the same configured GPU PoolGroup.
     //!
     //! The default keeps each lifecycle in its own codec call.
-    [[nodiscard]] virtual LayerGroupId getBatchingLayerGroupId(LayerGroupId layerGroupId) const
-    {
-        return layerGroupId;
-    }
+    [[nodiscard]] virtual LayerGroupId getBatchingLayerGroupId(LayerGroupId layerGroupId) const noexcept;
+
+    //! Return the required memory location for the PageIndexPair array.
+    [[nodiscard]] virtual PageIndexLocation queryPageIndexLocation(LayerGroupId layerGroupId) const noexcept = 0;
 
     //! Enqueue GPU hot Pages -> cold Pages on stream.
-    virtual bool encode(LayerGroupId layerGroupId, void* dstBasePtr, std::int32_t const* dstBasePageIndices,
-        std::int32_t const* srcBasePageIndices, std::size_t numBasePages, cudaStream_t stream)
+    virtual bool encode(LayerGroupId layerGroupId, void* dstBasePtr, PageIndexPair const* pageIndices,
+        std::size_t numBasePages, cudaStream_t stream) noexcept
         = 0;
 
     //! Enqueue cold Pages -> GPU hot Pages on stream.
-    virtual bool decode(LayerGroupId layerGroupId, std::int32_t const* dstBasePageIndices, void const* srcBasePtr,
-        std::int32_t const* srcBasePageIndices, std::size_t numBasePages, cudaStream_t stream)
+    virtual bool decode(LayerGroupId layerGroupId, void const* srcBasePtr, PageIndexPair const* pageIndices,
+        std::size_t numBasePages, cudaStream_t stream) noexcept
         = 0;
 };
 

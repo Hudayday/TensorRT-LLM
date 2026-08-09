@@ -205,8 +205,7 @@ class QuantizationCompression(KVCacheCompressionManager):
         *,
         layer_group_id: int,
         dst_base_ptr: int,
-        dst_base_page_indices: Sequence[int],
-        src_base_page_indices: Sequence[int],
+        page_index_pairs: Sequence[tuple[int, int]],
         stream: int,
     ) -> None:
         """Enqueue GPU runtime KV -> mapped-Host compact KV."""
@@ -214,24 +213,21 @@ class QuantizationCompression(KVCacheCompressionManager):
         if not self._configured:
             raise RuntimeError("configure() must run before migration")
         if not self._native_codec.encode(layer_group_id, dst_base_ptr,
-                                         list(dst_base_page_indices),
-                                         list(src_base_page_indices), stream):
+                                         list(page_index_pairs), stream):
             raise RuntimeError("NVFP4 cold-page encode submission failed")
 
     def on_onboard_decompress(
         self,
         *,
         layer_group_id: int,
-        dst_base_page_indices: Sequence[int],
         src_base_ptr: int,
-        src_base_page_indices: Sequence[int],
+        page_index_pairs: Sequence[tuple[int, int]],
         stream: int,
     ) -> None:
         """Enqueue mapped-Host compact KV -> GPU runtime KV."""
 
         if not self._configured:
             raise RuntimeError("configure() must run before migration")
-        if not self._native_codec.decode(
-                layer_group_id, list(dst_base_page_indices), src_base_ptr,
-                list(src_base_page_indices), stream):
+        if not self._native_codec.decode(layer_group_id, src_base_ptr,
+                                         list(page_index_pairs), stream):
             raise RuntimeError("NVFP4 cold-page decode submission failed")

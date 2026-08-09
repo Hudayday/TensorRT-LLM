@@ -31,6 +31,9 @@ class _Codec:
     def get_batching_layer_group_id(self, layer_group_id):
         return self.batching.get(layer_group_id, layer_group_id)
 
+    def query_page_index_location(self, _layer_group_id):
+        return 0
+
     def encode(self, *args):
         self.calls.append(("encode", args))
         return self.submit if self.results is None else next(self.results)
@@ -294,8 +297,7 @@ def test_boundary_migration_batches_pages_of_one_lifecycle_in_one_codec_call():
 
     assert len(codec.calls) == 1
     _, args = codec.calls[0]
-    assert args[2] == [5, 17]
-    assert args[3] == [3, 11]
+    assert args[2] == [(5, 3), (17, 11)]
 
 
 @pytest.mark.parametrize(
@@ -332,8 +334,7 @@ def test_boundary_migration_batches_codec_equivalent_lifecycles_together(
     operation, args = codec.calls[0]
     assert operation == method
     assert args[0] == 0
-    assert args[2 if method == "encode" else 1] == [5, 17, 23]
-    assert args[3] == [3, 11, 19]
+    assert args[2] == [(5, 3), (17, 11), (23, 19)]
 
 
 def test_codec_submission_failure_does_not_publish_destination_mapping():

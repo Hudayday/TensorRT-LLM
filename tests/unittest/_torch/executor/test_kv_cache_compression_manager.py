@@ -143,15 +143,13 @@ class TestBaseABC:
         offload_batch = {
             "layer_group_id": 2,
             "dst_base_ptr": 0x3000,
-            "dst_base_page_indices": (4, 7),
-            "src_base_page_indices": (1, 3),
+            "page_index_pairs": ((4, 1), (7, 3)),
             "stream": 0x7000,
         }
         onboard_batch = {
             "layer_group_id": 2,
-            "dst_base_page_indices": (1, 3),
             "src_base_ptr": 0x3000,
-            "src_base_page_indices": (4, 7),
+            "page_index_pairs": ((1, 4), (3, 7)),
             "stream": 0x7000,
         }
 
@@ -165,15 +163,13 @@ class TestBaseABC:
             "on_offload_compress": {
                 "layer_group_id",
                 "dst_base_ptr",
-                "dst_base_page_indices",
-                "src_base_page_indices",
+                "page_index_pairs",
                 "stream",
             },
             "on_onboard_decompress": {
                 "layer_group_id",
-                "dst_base_page_indices",
                 "src_base_ptr",
-                "src_base_page_indices",
+                "page_index_pairs",
                 "stream",
             },
         }

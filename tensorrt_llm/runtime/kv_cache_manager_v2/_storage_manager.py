@@ -725,22 +725,25 @@ class StorageManager:
                             (page, slot)
                         )
                     for batching_layer_group, page_slots in by_batching_layer_group.items():
-                        src_indices = [int(page.slot_id) for page, _ in page_slots]
-                        dst_indices = [int(slot.slot_id) for _, slot in page_slots]
+                        if codec.query_page_index_location(int(batching_layer_group)) != 0:
+                            raise RuntimeError(
+                                "Python KVCM currently provides Host Page-index pairs only"
+                            )
+                        page_indices = [
+                            (int(slot.slot_id), int(page.slot_id)) for page, slot in page_slots
+                        ]
                         if use_encode:
                             submitted = codec.encode(
                                 int(batching_layer_group),
                                 cold_base,
-                                dst_indices,
-                                src_indices,
+                                page_indices,
                                 int(stream.get()),
                             )
                         else:
                             submitted = codec.decode(
                                 int(batching_layer_group),
-                                dst_indices,
                                 cold_base,
-                                src_indices,
+                                page_indices,
                                 int(stream.get()),
                             )
                         if not submitted:
