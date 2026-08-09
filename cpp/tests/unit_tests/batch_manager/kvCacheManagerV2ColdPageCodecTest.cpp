@@ -205,17 +205,55 @@ TEST(KvCacheManagerV2ColdPageCodecTest, BatchesCodecEquivalentLifeCyclesInOneCal
         pages.push_back(page);
     }
 
-    // The GPU PoolGroup has two Slots. Requesting one new Slot per lifecycle
-    // evicts both Pages in one PoolGroup migration. The representative API
-    // lets KVCM concatenate both lifecycle index arrays into one codec call.
-    auto replacementSlots = storage.newGpuSlots(oneSlotEach);
+    // The 4 MiB GPU PoolGroup has four 1 MiB Slots. Two are occupied above;
+    // requesting four more leaves a two-Slot deficit and therefore evicts both
+    // reusable Pages in one PoolGroup migration. The representative API lets
+    // KVCM concatenate both lifecycle index arrays into one codec call.
+    TypedVec<LifeCycleId, SlotCount> twoSlotsEach(LifeCycleId{2}, 2);
+    auto replacementSlots = storage.newGpuSlots(twoSlotsEach);
     ASSERT_EQ(codec->calls.size(), 1);
     EXPECT_TRUE(codec->calls.front().encode);
     EXPECT_EQ(codec->calls.front().layerGroup, LayerGroupId{0});
     EXPECT_EQ(codec->calls.front().pageIndices.size(), 2);
 
     for (LifeCycleId lifeCycle{0}; lifeCycle < LifeCycleId{2}; ++lifeCycle)
-        storage.releaseSlot(lifeCycle, kGpuLevel, std::move(replacementSlots[lifeCycle].front()));
+    {
+        for (auto& slot : replacementSlots[lifeCycle])
+            storage.releaseSlot(lifeCycle, kGpuLevel, std::move(slot));
+    }
+    manager->setColdPageCodec(nullptr);
+}
+
+TEST(KvCacheManagerV2ColdPageCodecTest, PartialSnapshotCloneUsesCodecWithoutMovingSourcePage)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeTieredConfig());
+    auto codec = std::make_shared<RecordingColdPageCodec>();
+    manager->setColdPageCodec(codec);
+
+    auto& storage = manager->storage();
+    LifeCycleId const lifeCycle{0};
+    TypedVec<LifeCycleId, SlotCount> oneSlot(LifeCycleId{1}, 1);
+    auto gpuSlots = storage.newGpuSlots(oneSlot);
+
+    RootBlock& root = manager->radixTree().addOrGetExisting({});
+    auto block = addOrGetExistingBlock(&root, LifeCycleId{1}, {TokenIdExt{TokenId{7}}});
+    auto source = makeShared<CommittedPage>(
+        &storage, block, lifeCycle, kGpuLevel, /*numTokensInBlock=*/1, kPriorityDefault);
+    source->setSlot(gpuSlots[lifeCycle].front());
+    SlotId const sourceSlotId = source->slotId();
+
+    auto coldSlot = storage.clonePageToLevel(source, CacheLevel{1});
+
+    ASSERT_EQ(codec->calls.size(), 1);
+    EXPECT_TRUE(codec->calls.front().encode);
+    ASSERT_EQ(codec->calls.front().pageIndices.size(), 1);
+    EXPECT_EQ(codec->calls.front().pageIndices.front().src, sourceSlotId.value());
+    EXPECT_EQ(codec->calls.front().pageIndices.front().dst, coldSlot.slotId().value());
+    EXPECT_EQ(source->cacheLevel, kGpuLevel);
+    EXPECT_EQ(source->slotId(), sourceSlotId);
+
+    storage.releaseSlot(lifeCycle, CacheLevel{1}, std::move(coldSlot));
     manager->setColdPageCodec(nullptr);
 }
 

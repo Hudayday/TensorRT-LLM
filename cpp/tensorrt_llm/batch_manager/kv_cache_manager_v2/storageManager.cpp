@@ -655,7 +655,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
 // _batchedMigrate
 // ---------------------------------------------------------------------------
 
-void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, CacheLevel srcLevel,
+std::vector<Slot> StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, CacheLevel srcLevel,
     std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder,
     bool defrag)
 {
@@ -829,6 +829,11 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
                     scheduleForEviction(*srcPages.at(i));
             }
         }
+        if (!updateSrc)
+        {
+            return dstSlots;
+        }
+        return {};
     }
     catch (...)
     {
@@ -836,6 +841,16 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
             dstPoolGroup.release(std::move(s));
         throw;
     }
+}
+
+Slot StorageManager::clonePageToLevel(SharedPtr<Page> const& srcPage, CacheLevel dstLevel)
+{
+    PoolGroupIndex const pgIdx = getPoolGroupIndex(srcPage->lifeCycle);
+    auto slots = _batchedMigrate(
+        pgIdx, dstLevel, srcPage->cacheLevel, {srcPage}, /*updateSrc=*/false, MigrationRecorder{},
+        /*defrag=*/dstLevel == srcPage->cacheLevel);
+    TLLM_CHECK_WITH_INFO(slots.size() == 1, "A one-Page clone must return exactly one destination Slot");
+    return std::move(slots.front());
 }
 
 // ---------------------------------------------------------------------------

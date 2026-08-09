@@ -1447,23 +1447,21 @@ class _KVCache:
         pg_idx = storage.get_pool_group_index(lc_idx)
         for lvl in typed_range(src_page.cache_level, storage.num_cache_levels):
             try:
-                new_slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1)[0]
+                # Keep src_page alive, but create the snapshot through the
+                # normal copy/encode/decode route. A raw per-Pool copy is not
+                # valid when GPU and Host have different representations.
+                new_slots = storage._batched_migrate(
+                    pg_idx,
+                    lvl,
+                    src_page.cache_level,
+                    [src_page],
+                    update_src=False,
+                    defrag=lvl == src_page.cache_level,
+                )
+                assert new_slots is not None and len(new_slots) == 1
+                new_slot = new_slots[0]
             except OutOfPagesError:
                 continue
-            cuda_stream = self.cuda_stream
-            new_slot.ready_event.wait_in_stream(cuda_stream)
-            slot_size = storage.slot_size(pg_idx)
-            for p in typed_range(storage.num_pools(pg_idx)):
-                dst = storage.slot_address(lvl, pg_idx, new_slot.slot_id, p)
-                src = storage.slot_address(src_page.cache_level, pg_idx, src_page.slot_id, p)
-                batched_copy(
-                    storage.cache_tiers[lvl],
-                    storage.cache_tiers[src_page.cache_level],
-                    slot_size[p],
-                    [CopyTask(dst, src)],
-                    cuda_stream,
-                )
-            new_slot.ready_event = CachedCudaEvent(cuda_stream)
             priority = self._get_priority(tree_block.ordinal, self.manager._life_cycles[lc_idx])
             committed = CommittedPage(
                 storage, tree_block, lc_idx, lvl, new_slot, num_tokens_in_block, priority

@@ -132,6 +132,12 @@ public:
     std::vector<Slot> newSlotsForPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount numSlots,
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
+    //! Copy one Page into a new Slot at dstLevel without changing the source
+    //! Page's mapping. Unlike a raw Slot copy, this follows the same
+    //! copy/encode/decode route as normal migration, so level-specific Pool
+    //! layouts remain valid for partial-prefix and SSM snapshots.
+    Slot clonePageToLevel(SharedPtr<Page> const& srcPage, CacheLevel dstLevel);
+
     // Release a slot back to its pool.
     void releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot);
 
@@ -294,7 +300,7 @@ private:
         TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>>& fallenPages,
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
-    void _batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, CacheLevel srcLevel,
+    std::vector<Slot> _batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, CacheLevel srcLevel,
         std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder = {},
         bool defrag = false);
 

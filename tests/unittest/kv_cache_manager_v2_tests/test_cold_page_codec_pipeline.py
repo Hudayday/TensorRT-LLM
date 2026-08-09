@@ -300,6 +300,34 @@ def test_boundary_migration_batches_pages_of_one_lifecycle_in_one_codec_call():
     assert args[2] == [(5, 3), (17, 11)]
 
 
+def test_partial_snapshot_clone_encodes_without_replacing_source_mapping():
+    """update_src=False is the representation-aware partial snapshot path."""
+    codec = _Codec({0: 4096})
+    src_level = GPU_LEVEL
+    dst_level = CacheLevel(1)
+    page = _Page(3, 0, src_level)
+    manager, gpu_pg, host_pg = _migration_manager(
+        codec, src_level=src_level, dst_level=dst_level, src_pages=[page], dst_ids=(5,)
+    )
+
+    with patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager.TemporaryCudaStream",
+        _TempStream,
+    ):
+        dst_slots = manager._batched_migrate(
+            0, dst_level, src_level, [page], update_src=False
+        )
+
+    assert dst_slots is not None
+    assert [slot.slot_id for slot in dst_slots] == [5]
+    assert codec.calls[0][0] == "encode"
+    assert codec.calls[0][1][2] == [(5, 3)]
+    assert page.slot_id == 3
+    assert page.cache_level == src_level
+    assert not gpu_pg.released
+    assert not host_pg.released
+
+
 @pytest.mark.parametrize(
     "src_level,dst_level,method",
     [

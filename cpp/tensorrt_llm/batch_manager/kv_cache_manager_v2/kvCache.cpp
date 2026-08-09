@@ -36,7 +36,7 @@ namespace
 {
 
 // Copy one slot's data across all pools in a pool group.
-// Used by resume() (GPU→GPU partial block copy) and _snapshotSsmToTreeBlock().
+// Used by resume() for the GPU→GPU private copy of a reused partial block.
 void copySlotData(StorageManager& storageMgr, CacheLevel dstLevel, CacheLevel srcLevel, PoolGroupIndex pgIdx,
     SlotId dstSlotId, SlotId srcSlotId, CUstream stream)
 {
@@ -790,26 +790,21 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
     }
 
     auto& storageMgr = mManager->storage();
-    PoolGroupIndex pgIdx = storageMgr.getPoolGroupIndex(lcIdx);
 
     for (CacheLevel lvl = srcPage->cacheLevel; lvl < storageMgr.numCacheLevels(); ++lvl)
     {
         Slot newSlot;
         try
         {
-            auto slots = storageMgr.newSlotsForPoolGroup(lvl, pgIdx, 1);
-            newSlot = std::move(slots[0]);
+            // A snapshot keeps srcPage alive, but its destination must still
+            // use the normal level-to-level transform. In particular,
+            // GPU two-Pool raw KV -> Host one-Pool NVFP4 cannot be raw-copied.
+            newSlot = storageMgr.clonePageToLevel(srcPage, lvl);
         }
         catch (OutOfPagesError const&)
         {
             continue;
         }
-
-        CUstream stream = cudaStream();
-        newSlot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
-        copySlotData(storageMgr, lvl, srcPage->cacheLevel, pgIdx, newSlot.slotId(), srcPage->slotId(), stream);
-
-        newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
         auto committed = makeShared<CommittedPage>(
             &storageMgr, treeBlock, lcIdx, lvl, numTokensInBlock, getPriority(treeBlock->ordinal(), lcIdx));
         committed->setSlot(newSlot);
