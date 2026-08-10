@@ -2508,13 +2508,12 @@ def create_kv_cache_compression_manager(
             config,
             kv_cache_manager,
             layer_configs=boundary_layer_configs,
-            draft_kv_cache_manager=draft_kv_cache_manager,
         )
         gpu_pool_group_descs = boundary_gpu_pool_group_descs
         if gpu_pool_group_descs is None:
             gpu_pool_group_descs = kv_cache_manager.impl.pool_group_descs
-        manager.configure(gpu_pool_group_descs=gpu_pool_group_descs)
-        manager.register_with_kv_cache_manager()
+        manager.register_with_kv_cache_manager(
+            gpu_pool_group_descs=gpu_pool_group_descs)
         return manager
 
     if config.algorithm == "triattention":

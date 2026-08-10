@@ -77,10 +77,6 @@ std::size_t scalarCount(Nvfp4ColdPageLayerConfig const& config)
 std::size_t compactLayerBytes(Nvfp4ColdPageLayerConfig const& config)
 {
     auto const elements = scalarCount(config);
-    if (elements % kElementsPerBlockScale != 0U)
-    {
-        throw std::invalid_argument("NVFP4 Page scalar count must be divisible by 16");
-    }
     auto const packedBytes = elements / kPackedElementsPerByte;
     auto const scaleBytes = elements / kElementsPerBlockScale;
     return checkedMul(packedBytes, 2U, "NVFP4 packed Page size overflows size_t")
@@ -356,7 +352,9 @@ bool Nvfp4ColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr,
             throw std::invalid_argument("encode received an unconfigured layer group");
         }
         auto const& state = found->second;
-        std::map<KernelCohortKey, std::vector<kernels::Nvfp4BoundaryOffloadPageTask>> cohorts;
+        using Cohort
+            = std::pair<Nvfp4ColdPageLayerConfig const*, std::vector<kernels::Nvfp4BoundaryOffloadPageTask>>;
+        std::map<KernelCohortKey, Cohort> cohorts;
         for (std::size_t page = 0; page < numBasePages; ++page)
         {
             auto const srcIndex = pageIndices[page].src;
@@ -375,17 +373,18 @@ bool Nvfp4ColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr,
                     auto const& pool = state.gpuDesc.pools[location.poolIndex];
                     return pool.baseAddress + checkedPageOffset(srcIndex, pool.slotBytes) + location.offset;
                 };
-                cohorts[cohortKey(layer.config)].push_back({reinterpret_cast<void const*>(gpuAddress(layer.gpuK)),
+                auto& [config, tasks] = cohorts[cohortKey(layer.config)];
+                config = &layer.config;
+                tasks.push_back({reinterpret_cast<void const*>(gpuAddress(layer.gpuK)),
                     reinterpret_cast<void const*>(gpuAddress(layer.gpuV)), addBytes(coldPage, layer.coldOffset)});
             }
         }
 
-        for (auto const& [key, tasks] : cohorts)
+        for (auto const& item : cohorts)
         {
-            auto const& firstLayer = *std::find_if(state.layers.begin(), state.layers.end(),
-                [&](LayerState const& layer) { return cohortKey(layer.config) == key; });
+            auto const& [config, tasks] = item.second;
             kernels::invokeNvfp4BoundaryOffloadCompress(
-                tasks, makeKernelParams(firstLayer.config), firstLayer.config.runtimeType, stream);
+                tasks, makeKernelParams(*config), config->runtimeType, stream);
         }
         return true;
     }
@@ -415,7 +414,9 @@ bool Nvfp4ColdPageCodec::decode(kv::LayerGroupId layerGroupId, void const* srcBa
             throw std::invalid_argument("decode received an unconfigured layer group");
         }
         auto const& state = found->second;
-        std::map<KernelCohortKey, std::vector<kernels::Nvfp4BoundaryOnboardPageTask>> cohorts;
+        using Cohort
+            = std::pair<Nvfp4ColdPageLayerConfig const*, std::vector<kernels::Nvfp4BoundaryOnboardPageTask>>;
+        std::map<KernelCohortKey, Cohort> cohorts;
         for (std::size_t page = 0; page < numBasePages; ++page)
         {
             auto const dstIndex = pageIndices[page].dst;
@@ -434,17 +435,18 @@ bool Nvfp4ColdPageCodec::decode(kv::LayerGroupId layerGroupId, void const* srcBa
                     auto const& pool = state.gpuDesc.pools[location.poolIndex];
                     return pool.baseAddress + checkedPageOffset(dstIndex, pool.slotBytes) + location.offset;
                 };
-                cohorts[cohortKey(layer.config)].push_back({addBytes(coldPage, layer.coldOffset),
-                    reinterpret_cast<void*>(gpuAddress(layer.gpuK)), reinterpret_cast<void*>(gpuAddress(layer.gpuV))});
+                auto& [config, tasks] = cohorts[cohortKey(layer.config)];
+                config = &layer.config;
+                tasks.push_back({addBytes(coldPage, layer.coldOffset), reinterpret_cast<void*>(gpuAddress(layer.gpuK)),
+                    reinterpret_cast<void*>(gpuAddress(layer.gpuV))});
             }
         }
 
-        for (auto const& [key, tasks] : cohorts)
+        for (auto const& item : cohorts)
         {
-            auto const& firstLayer = *std::find_if(state.layers.begin(), state.layers.end(),
-                [&](LayerState const& layer) { return cohortKey(layer.config) == key; });
+            auto const& [config, tasks] = item.second;
             kernels::invokeNvfp4BoundaryOnboardDecompress(
-                tasks, makeKernelParams(firstLayer.config), firstLayer.config.runtimeType, stream);
+                tasks, makeKernelParams(*config), config->runtimeType, stream);
         }
         return true;
     }

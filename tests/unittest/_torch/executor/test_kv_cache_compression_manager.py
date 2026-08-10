@@ -21,7 +21,6 @@ sparse-attention backend); the ``create_kv_cache_compression_manager`` factory
 lives in ``_util.py`` next to ``_create_kv_cache_manager``.
 """
 
-from inspect import Parameter, signature
 from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import MagicMock, patch
@@ -136,49 +135,6 @@ class TestBaseABC:
         assert m.on_generation_step_begin(MagicMock()) is None
         assert m.on_generation_step_end(MagicMock()) is None
         assert m.on_request_finish(MagicMock()) is None
-
-    def test_storage_boundary_hooks_fail_closed(self, fake_kv_cache_manager):
-        m = KVCacheCompressionManager(_compression_config(),
-                                      fake_kv_cache_manager)
-        offload_batch = {
-            "layer_group_id": 2,
-            "dst_base_ptr": 0x3000,
-            "page_index_pairs": ((4, 1), (7, 3)),
-            "stream": 0x7000,
-        }
-        onboard_batch = {
-            "layer_group_id": 2,
-            "src_base_ptr": 0x3000,
-            "page_index_pairs": ((1, 4), (3, 7)),
-            "stream": 0x7000,
-        }
-
-        with pytest.raises(NotImplementedError, match="GPU-to-Host"):
-            m.on_offload_compress(**offload_batch)
-        with pytest.raises(NotImplementedError, match="Host-to-GPU"):
-            m.on_onboard_decompress(**onboard_batch)
-
-    def test_storage_boundary_hooks_have_explicit_keyword_only_contract(self):
-        expected = {
-            "on_offload_compress": {
-                "layer_group_id",
-                "dst_base_ptr",
-                "page_index_pairs",
-                "stream",
-            },
-            "on_onboard_decompress": {
-                "layer_group_id",
-                "src_base_ptr",
-                "page_index_pairs",
-                "stream",
-            },
-        }
-        for hook_name, hook_parameters in expected.items():
-            parameters = signature(getattr(KVCacheCompressionManager,
-                                           hook_name)).parameters
-            assert set(parameters) == {"self", *hook_parameters}
-            assert all(parameters[name].kind is Parameter.KEYWORD_ONLY
-                       for name in hook_parameters)
 
     def test_hooks_accept_extra_kwargs(self, fake_kv_cache_manager):
         # **kwargs lets the framework pass new args later without breaking

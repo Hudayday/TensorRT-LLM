@@ -129,11 +129,15 @@ def build_uncalibrated_nvfp4_layer_configs_for_testing(
 class QuantizationCompression(KVCacheCompressionManager):
     """Own a quantization codec used only at cold storage boundaries.
 
-    This object owns codec selection and configuration. Its native C++ codec is
-    the data-plane object that KVCM V2 retains and invokes from migration.
-    The Python encode/decode wrappers below provide backend parity and focused
-    prototype testing; the product C++ hot path does not cross Python. KVCM's
-    integration must detach its codec reference when this manager is removed.
+    This object owns codec selection, configuration, registration, and
+    teardown. Its native C++ codec is the actual pair of migration hooks:
+    KVCM V2 invokes ``encode`` for GPU-to-Host offload and ``decode`` for
+    Host-to-GPU onboard. Keeping those hooks native avoids a C++-to-Python
+    callback in ``_batchedMigrate`` while leaving algorithm ownership here.
+
+    Page selection, destination admission, ready events, publication, rollback,
+    and eviction remain KVCM responsibilities. The manager therefore exposes
+    no second Python forwarding API for the same data-plane operations.
     """
 
     def __init__(
@@ -142,51 +146,31 @@ class QuantizationCompression(KVCacheCompressionManager):
         kv_cache_manager,
         *,
         layer_configs: Sequence[Nvfp4BoundaryLayerConfig],
-        draft_kv_cache_manager=None,
     ) -> None:
-        if config.target_cache_tier != "host":
-            raise ValueError(
-                "QuantizationCompression P0 supports the Host tier only")
-        if draft_kv_cache_manager is not None:
-            raise ValueError(
-                "Boundary compression does not support an independent draft KV cache"
-            )
         super().__init__(config, kv_cache_manager, draft_kv_cache_manager=None)
-        if config.quant != "nvfp4":
-            raise RuntimeError(
-                f"No quantization-compression codec for {config.quant!r}")
         self._native_codec = _create_nvfp4_codec(layer_configs)
-        self._configured = False
         self._registered_backend = None
 
-    def configure(self, *, gpu_pool_group_descs: Sequence[object]) -> None:
-        """Bind KVCM's authoritative GPU layouts before codec injection.
+    def register_with_kv_cache_manager(
+            self, *, gpu_pool_group_descs: Sequence[object]) -> None:
+        """Configure and register one native codec with KVCM V2.
 
-        This is a concrete-manager initialization method, not a method added to
-        the generic compression-manager base class.
+        Registration is deliberately one initialization transaction. KVCM's
+        authoritative GPU descriptors are consumed first; only after every
+        descriptor is accepted is the codec published to the backend. This
+        avoids a manager-side ``configured`` state whose only purpose was to
+        police the ordering of two setup calls made next to each other.
+
+        Both Python and C++ KVCM V2 backends expose ``set_cold_page_codec``.
+        The Python backend invokes the nanobind object directly; the C++
+        backend retains the same ``IKvCacheColdPageCodec`` instance. Neither
+        path creates a second codec or calls back into this Python manager.
         """
 
-        if self._configured:
-            raise RuntimeError("QuantizationCompression is already configured")
         for gpu_desc in gpu_pool_group_descs:
             if not self._native_codec.configure(gpu_desc):
                 raise RuntimeError(
                     "NVFP4 cold-page codec rejected a GPU PoolGroupDesc")
-        self._configured = True
-
-    def register_with_kv_cache_manager(self) -> None:
-        """Register the manager-owned native hook with the selected V2 backend.
-
-        Both the Python and C++ KVCM V2 implementations expose the same
-        ``set_cold_page_codec`` initialization contract. The Python backend
-        later invokes the nanobind codec directly; the C++ backend retains its
-        ``IKvCacheColdPageCodec`` pointer. Neither path creates a second codec.
-        """
-
-        if not self._configured:
-            raise RuntimeError("configure() must run before codec registration")
-        if self._registered_backend is not None:
-            raise RuntimeError("QuantizationCompression is already registered")
         backend = self.kv_cache_manager.impl
         backend.set_cold_page_codec(self._native_codec)
         self._registered_backend = backend
@@ -199,35 +183,3 @@ class QuantizationCompression(KVCacheCompressionManager):
             return
         backend.set_cold_page_codec(None)
         self._registered_backend = None
-
-    def on_offload_compress(
-        self,
-        *,
-        layer_group_id: int,
-        dst_base_ptr: int,
-        page_index_pairs: Sequence[tuple[int, int]],
-        stream: int,
-    ) -> None:
-        """Enqueue GPU runtime KV -> mapped-Host compact KV."""
-
-        if not self._configured:
-            raise RuntimeError("configure() must run before migration")
-        if not self._native_codec.encode(layer_group_id, dst_base_ptr,
-                                         list(page_index_pairs), stream):
-            raise RuntimeError("NVFP4 cold-page encode submission failed")
-
-    def on_onboard_decompress(
-        self,
-        *,
-        layer_group_id: int,
-        src_base_ptr: int,
-        page_index_pairs: Sequence[tuple[int, int]],
-        stream: int,
-    ) -> None:
-        """Enqueue mapped-Host compact KV -> GPU runtime KV."""
-
-        if not self._configured:
-            raise RuntimeError("configure() must run before migration")
-        if not self._native_codec.decode(layer_group_id, src_base_ptr,
-                                         list(page_index_pairs), stream):
-            raise RuntimeError("NVFP4 cold-page decode submission failed")

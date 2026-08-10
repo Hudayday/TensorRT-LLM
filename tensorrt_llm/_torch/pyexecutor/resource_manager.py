@@ -2520,55 +2520,6 @@ class KVCacheCompressionManager(BaseResourceManager):
         """
 
     # ================================================================== #
-    # Storage-boundary hooks. Once integrated, KVCM V2 calls one of these  #
-    # from its migration transaction; they are not ResourceManager hooks. #
-    # ================================================================== #
-
-    def on_offload_compress(
-        self,
-        *,
-        layer_group_id: int,
-        dst_base_ptr: int,
-        page_index_pairs: Sequence[tuple[int, int]],
-        stream: int,
-    ) -> None:
-        """Enqueue compression plus GPU-to-Host transfer for a Page batch.
-
-        KVCM selects Pages, admits destination Slots, and waits on prior ready
-        events. The configured codec derives GPU addresses from KVCM's GPU
-        descriptor; this call supplies the compact Host Pool base, the
-        ``(dst, src)`` Page-index pairs, and ``stream``. It must not publish a
-        Page, release a Slot, or synchronize the stream on success. If it
-        raises, the caller must fence ``stream`` before recycling either Slot
-        because a prefix may already be queued.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not implement GPU-to-Host "
-            "KV-cache compression")
-
-    def on_onboard_decompress(
-        self,
-        *,
-        layer_group_id: int,
-        src_base_ptr: int,
-        page_index_pairs: Sequence[tuple[int, int]],
-        stream: int,
-    ) -> None:
-        """Enqueue Host-to-GPU transfer plus runtime-format restoration.
-
-        The destination indices in ``page_index_pairs`` describe already-
-        admitted GPU runtime Slots; ``src_base_ptr`` and source indices in the
-        same pairs select compact Host Slots. The Host source remains
-        authoritative until KVCM fences this stream and publishes the
-        destination. The manager receives no Page, PageStatus, Attention
-        object, or Attention metadata. If the hook raises, the caller must
-        fence ``stream`` before rolling back reserved Slots.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not implement Host-to-GPU "
-            "KV-cache decompression")
-
-    # ================================================================== #
     # BaseResourceManager interface — PyExecutor auto-invokes these each  #
     # iteration; they translate into the semantic lifecycle hooks above.  #
     # ================================================================== #

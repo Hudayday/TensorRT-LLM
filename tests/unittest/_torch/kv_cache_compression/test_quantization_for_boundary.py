@@ -48,8 +48,6 @@ def _layer_config(*, layer_id=0, layer_group_id=3, runtime_dtype="float16"):
 def _native():
     codec = MagicMock()
     codec.configure.return_value = True
-    codec.encode.return_value = True
-    codec.decode.return_value = True
     module = SimpleNamespace(
         Nvfp4BoundaryRuntimeType=SimpleNamespace(
             FLOAT16="native-fp16",
@@ -60,61 +58,6 @@ def _native():
         Nvfp4ColdPageCodec=MagicMock(return_value=codec),
     )
     return module, codec
-
-
-def _manager(*layer_configs, gpu_descs=("gpu-pg-0", )):
-    native, codec = _native()
-    with patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary._load_native_bindings",
-            return_value=native,
-    ):
-        manager = QuantizationCompression(
-            _config(),
-            _v2_manager(),
-            layer_configs=layer_configs,
-        )
-        manager.configure(gpu_pool_group_descs=gpu_descs)
-    return manager, codec
-
-
-def test_offload_passes_compact_base_indices_and_stream_without_expanding_addresses(
-):
-    manager, codec = _manager(_layer_config())
-
-    manager.on_offload_compress(
-        layer_group_id=3,
-        dst_base_ptr=0x300000,
-        page_index_pairs=((2, 1), (5, 3)),
-        stream=0x7000,
-    )
-
-    codec.encode.assert_called_once_with(3, 0x300000, [(2, 1), (5, 3)], 0x7000)
-
-
-def test_onboard_uses_the_same_codec_with_reversed_storage_roles():
-    manager, codec = _manager(_layer_config(runtime_dtype="fp8_e4m3"))
-
-    manager.on_onboard_decompress(
-        layer_group_id=3,
-        src_base_ptr=0x300000,
-        page_index_pairs=((1, 2), (3, 5)),
-        stream=0x7000,
-    )
-
-    codec.decode.assert_called_once_with(3, 0x300000, [(1, 2), (3, 5)], 0x7000)
-
-
-def test_codec_submission_failure_is_fail_closed():
-    manager, codec = _manager(_layer_config())
-    codec.encode.return_value = False
-
-    with pytest.raises(RuntimeError, match="encode submission failed"):
-        manager.on_offload_compress(
-            layer_group_id=3,
-            dst_base_ptr=0x300000,
-            page_index_pairs=((2, 1), ),
-            stream=0x7000,
-        )
 
 
 def test_factory_configures_registers_and_detaches_one_native_codec():
