@@ -17,7 +17,7 @@
 
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/nvfp4BoundaryKernelsInternal.h"
+#include "tensorrt_llm/kernels/nvfp4BoundaryKernels.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -43,7 +43,6 @@ using tensorrt_llm::kernels::Nvfp4BoundaryKernelParams;
 using tensorrt_llm::kernels::Nvfp4BoundaryOffloadPageTask;
 using tensorrt_llm::kernels::Nvfp4BoundaryOnboardPageTask;
 using tensorrt_llm::kernels::Nvfp4BoundaryRuntimeType;
-using tensorrt_llm::kernels::detail::Nvfp4BoundaryTransferPipeline;
 
 constexpr std::size_t kGuardBytes = 64;
 constexpr std::uint8_t kCanary = 0xA5;
@@ -466,9 +465,7 @@ std::vector<std::uint8_t> decompressReference(ReferenceNvfp4 const& compressed, 
 
 void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultGeometry,
     std::size_t numPages = kDefaultNumPages, InputPattern inputPattern = InputPattern::kDense,
-    bool synchronizeBetweenDirections = true,
-    Nvfp4BoundaryTransferPipeline offloadPipeline = Nvfp4BoundaryTransferPipeline::kAuto,
-    Nvfp4BoundaryTransferPipeline onboardPipeline = Nvfp4BoundaryTransferPipeline::kAuto)
+    bool synchronizeBetweenDirections = true)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
     if (!tensorrt_llm::common::isSM100Family())
@@ -523,8 +520,7 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         }
     };
 
-    tensorrt_llm::kernels::detail::invokeNvfp4BoundaryOffloadCompressWithPipeline(
-        offloadTasks, params, runtimeType, offloadPipeline, stream);
+    tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(offloadTasks, params, runtimeType, stream);
 
     if (synchronizeBetweenDirections)
     {
@@ -544,8 +540,7 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
     {
         onboardTasks.push_back({page->compactPage.bytes(), page->rawOutputK.data(), page->rawOutputV.data()});
     }
-    tensorrt_llm::kernels::detail::invokeNvfp4BoundaryOnboardDecompressWithPipeline(
-        onboardTasks, params, runtimeType, onboardPipeline, stream);
+    tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(onboardTasks, params, runtimeType, stream);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     if (!synchronizeBetweenDirections)
@@ -616,38 +611,6 @@ TEST(Nvfp4BoundaryGeometryTest, BoundsAutoStagingForLargeFp8Page)
 {
     runBoundaryRoundTrip(RawKind::kFp8, kLargeGeometry, 1);
 }
-
-class Nvfp4BoundaryTiledOffloadTest : public testing::TestWithParam<RawKind>
-{
-};
-
-TEST_P(Nvfp4BoundaryTiledOffloadTest, MatchesCpuOracleAndNativeLayout)
-{
-    runBoundaryRoundTrip(GetParam(), kModelLikeGeometry, 3, InputPattern::kDense, true,
-        Nvfp4BoundaryTransferPipeline::kCompressedOutputTiled);
-}
-
-INSTANTIATE_TEST_SUITE_P(AllRuntimeTypes, Nvfp4BoundaryTiledOffloadTest,
-    testing::Values(RawKind::kFloat16, RawKind::kBfloat16, RawKind::kFp8));
-
-class Nvfp4BoundaryOnboardPhaseTest : public testing::TestWithParam<RawKind>
-{
-};
-
-TEST_P(Nvfp4BoundaryOnboardPhaseTest, WholePageMatchesCpuOracle)
-{
-    runBoundaryRoundTrip(GetParam(), kModelLikeGeometry, 3, InputPattern::kDense, true,
-        Nvfp4BoundaryTransferPipeline::kAuto, Nvfp4BoundaryTransferPipeline::kWholePage);
-}
-
-TEST_P(Nvfp4BoundaryOnboardPhaseTest, CompressedOutputTilesMatchCpuOracle)
-{
-    runBoundaryRoundTrip(GetParam(), kModelLikeGeometry, 3, InputPattern::kDense, true,
-        Nvfp4BoundaryTransferPipeline::kAuto, Nvfp4BoundaryTransferPipeline::kCompressedOutputTiled);
-}
-
-INSTANTIATE_TEST_SUITE_P(AllRuntimeTypes, Nvfp4BoundaryOnboardPhaseTest,
-    testing::Values(RawKind::kFloat16, RawKind::kBfloat16, RawKind::kFp8));
 
 class Nvfp4BoundaryInputPatternTest : public testing::TestWithParam<RawKind>
 {

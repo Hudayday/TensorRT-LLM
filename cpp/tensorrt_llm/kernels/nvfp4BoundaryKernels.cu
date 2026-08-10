@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/nvfp4BoundaryKernelsInternal.h"
+#include "tensorrt_llm/kernels/nvfp4BoundaryKernels.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -42,8 +42,6 @@ namespace kernels
 namespace
 {
 
-using detail::Nvfp4BoundaryTransferPipeline;
-
 // BATCHEDCOPY REUSE: match KVCM V2's Host-copy CTA and four-stage pipeline.
 // Original implementation:
 // https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/batch_manager/kvCacheManagerV2Utils.cu
@@ -61,52 +59,33 @@ constexpr std::uint32_t kHostLoadAsyncStages = 8;
 constexpr std::uint32_t kHostMemorySplits = 1;
 constexpr std::uint32_t kWarpSize = 32;
 constexpr std::uint32_t kDoubleBufferCount = 2;
-// DOUBLE-BUFFER A/B: the initial one-transform/three-transfer split was
-// byte-exact but transform-starved offload. The retained candidate gives each
-// stage two complete warps. kAuto may select it only for the measured large
-// FP16/BF16 onboard cohort; offload and FP8 keep the simpler tiled schedule.
-// R4-A retained the balanced split. A one-loader/three-consumer build was only
-// 0.05--0.1% faster at the measured 256-task launch, which is below a safe
-// selection margin and leaves less transfer-latency tolerance for other Page
-// shapes. The previous three-loader/one-consumer split was consistently slower.
+// Split a CTA evenly between transform and transfer warps for the large
+// FP16/BF16 onboard path. Offload and FP8 use the simpler tiled schedule.
 constexpr std::uint32_t kTransformWarps = 2;
 constexpr std::uint32_t kTransformThreads = kTransformWarps * kWarpSize;
 constexpr std::uint32_t kTransferThreads = kThreadsPerBlock - kTransformThreads;
 constexpr std::uint32_t kReadyBarrierBase = 0;
 constexpr std::uint32_t kReleasedBarrierBase = kDoubleBufferCount;
 constexpr std::uint32_t kMinTasksPerLaunch = 32;
-#if defined(TRTLLM_NVFP4_BOUNDARY_MAX_TASKS_PER_LAUNCH)
-// BENCHMARK-ONLY A/B: build otherwise identical binaries with a different
-// by-value descriptor capacity. Production builds do not define this macro and
-// retain KVCM V2's current 256-task launch width. Remove the override after the
-// 32/64/128/256/512 same-work comparison selects or rejects a wider launch.
-constexpr std::uint32_t kMaxTasksPerLaunch = TRTLLM_NVFP4_BOUNDARY_MAX_TASKS_PER_LAUNCH;
-#else
 constexpr std::uint32_t kMaxTasksPerLaunch = 256;
-#endif
 constexpr std::uint32_t kElementsPerLane = 8;
 constexpr std::uint32_t kElementsPerBlockScale = 16;
 constexpr std::uint32_t kNativeVScaleRows = 4;
-// R4-A selected a 1-KiB scale interval (128 model-like rows per tile). Relative
-// to the former 2-KiB interval it reduces the ping-pong shared working set from
-// 36 KiB to 18 KiB and improves the 256-task Host-onboard launch by about 1.5%
-// without changing compact bytes, arithmetic, or the public task contract.
+// A 1-KiB scale interval bounds the ping-pong shared working set without
+// changing compact bytes, arithmetic, or the public task contract.
 constexpr std::uint32_t kTargetScaleTransferBytes = 1024;
 constexpr std::size_t kModernKernelParameterLimit = 32764;
 constexpr std::uint32_t kTinyDenseFlushPageCount = 8;
 constexpr std::uint64_t kLargeDenseFlushBatchBytes = 4'000'000;
-constexpr std::int32_t kMeasuredAutoNumKvHeads = 8;
-constexpr std::int32_t kMeasuredAutoTokensPerPage = 64;
-constexpr std::int32_t kMeasuredAutoHeadDim = 128;
+constexpr std::int32_t kStandardNumKvHeads = 8;
+constexpr std::int32_t kStandardTokensPerPage = 64;
+constexpr std::int32_t kStandardHeadDim = 128;
 constexpr std::uint32_t kMaxWholePageCompactStagingBytes = 36U * 1024U;
 constexpr std::uint32_t kMinTiledOffload16BitSmallTaskCount = 8;
 constexpr std::uint32_t kMaxTiledOffload16BitSmallTaskCount = 16;
-// On the accepted H=8/P=64/D=128 B200 sweep, named-barrier overlap first wins
-// consistently at 136 tasks, or 9.5625 MiB of compact input per descriptor
-// launch. The 9.5-MiB gate includes that measured point but excludes 129 tasks,
-// where double buffering is still neutral/slower. Express the crossover in
-// bytes instead of total Hook Pages: a Hook larger than 256 tasks is split, and
-// every launch (including its tail) makes its own scheduling decision.
+// Select named-barrier overlap only when a descriptor launch carries enough
+// compact input to amortize synchronization. Express the threshold in bytes
+// because Hooks larger than 256 tasks are split into independent launches.
 constexpr std::uint64_t kMinDoubleBufferedOnboard16BitBatchBytes = 19ULL * 512ULL * 1024ULL;
 
 static_assert(kThreadsPerBlock % 2 == 0, "An NVFP4 scale group is shared by two lanes");
@@ -116,9 +95,6 @@ static_assert(kTransformThreads % kWarpSize == 0 && kTransferThreads % kWarpSize
     "Double-buffer producer and transfer groups must contain complete warps");
 static_assert(kTargetScaleTransferBytes > 0 && kTargetScaleTransferBytes % sizeof(uint4) == 0,
     "Compact scale transfer must remain a positive 16-byte multiple");
-static_assert(kMaxTasksPerLaunch == 32 || kMaxTasksPerLaunch == 64 || kMaxTasksPerLaunch == 128
-        || kMaxTasksPerLaunch == 256 || kMaxTasksPerLaunch == 512,
-    "Boundary launch-capacity A/B supports powers of two from 32 through 512");
 static_assert(std::is_trivially_copyable_v<Nvfp4BoundaryOffloadPageTask>);
 static_assert(std::is_trivially_copyable_v<Nvfp4BoundaryOnboardPageTask>);
 static_assert(sizeof(std::array<Nvfp4BoundaryOffloadPageTask, kMaxTasksPerLaunch>) + sizeof(Nvfp4BoundaryKernelParams)
@@ -838,7 +814,7 @@ __global__ void offloadFromFp8Kernel(std::array<Nvfp4BoundaryOffloadPageTask, N>
 //! NVFP4 scale Pool: one 2-KiB scale wave plus eight 2-KiB packed waves for the
 //! model-like geometry. The corresponding raw input is 3.56x larger. This is
 //! still one kernel and one Page/role CTA; the barrier-delimited tile loop is
-//! intentionally simple so its A/B isolates tiling from writer-warp overlap.
+//! intentionally simple and does not add writer-warp overlap.
 template <std::uint32_t N, typename T>
 __global__ void offloadFrom16BitTiledKernel(std::array<Nvfp4BoundaryOffloadPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
@@ -1003,270 +979,6 @@ __global__ void offloadFromFp8TiledKernel(std::array<Nvfp4BoundaryOffloadPageTas
             packedBytesPerRole(firstHalfGroup), packedBytesPerRole(halfGroups), firstRow * scalesPerRow,
             rows * scalesPerRow);
         __syncthreads();
-    }
-#endif
-}
-
-//! FP16/BF16 GPU Page -> Host NVFP4 with CTA-local double buffering.
-//!
-//! NEW SCHEDULING ONLY: two producer warps retain the production
-//! `cvt_warp_fp16_to_fp4` primitive and four-stage raw-input `cp.async` ring.
-//! Two writer warps concurrently flush the previous native packed+scale tile
-//! through the same 16-byte mapped-Host stores as `flushCompactRangeToHost`.
-//! Named barriers publish and release each ping-pong buffer without a full-CTA
-//! phase barrier. Layout, quantization math, Page descriptors, and final Host
-//! addresses are unchanged from `offloadFrom16BitTiledKernel`.
-template <std::uint32_t N, typename T>
-__global__ void offloadFrom16BitDoubleBufferedKernel(
-    std::array<Nvfp4BoundaryOffloadPageTask, N> const __grid_constant__ tasks, Nvfp4BoundaryKernelParams params,
-    std::uint32_t halfGroupsPerRole)
-{
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    asm volatile("griddepcontrol.launch_dependents;\n");
-
-    std::uint32_t const role = blockIdx.y;
-    auto const& task = tasks[blockIdx.z];
-    std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
-    std::uint32_t const halfGroupsPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerLane;
-    std::uint32_t const totalRows
-        = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
-    std::uint32_t const tileRows = compressedTransferRows(params);
-    std::uint32_t const tileCount = (totalRows + tileRows - 1U) / tileRows;
-    std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
-    std::uint32_t const packedStageCapacityBytes = packedBytesPerRole(tileHalfGroups);
-    std::uint32_t const compactStageCapacityBytes = compactStagingBytesPerRole(tileHalfGroups);
-
-    // BATCHEDCOPY REUSE: only the producer warp needs the raw four-stage ring.
-    // DOUBLE-BUFFER ADAPTATION: dynamic shared memory contains two complete
-    // native compact tiles, not a persistent device-global compact Page.
-    __shared__ __align__(16) PackedVec<T> rawStages[kAsyncStages][kTransformThreads];
-    extern __shared__ __align__(16) std::uint8_t compactStages[];
-
-    asm volatile("griddepcontrol.wait;\n" : : : "memory");
-    if (threadIdx.x < kTransformThreads)
-    {
-        std::uint32_t const producerThread = threadIdx.x;
-        for (std::uint32_t tileIndex = 0; tileIndex < tileCount; ++tileIndex)
-        {
-            std::uint32_t const buffer = tileIndex % kDoubleBufferCount;
-            if (tileIndex >= kDoubleBufferCount)
-            {
-                namedBarrierWait(kReleasedBarrierBase + buffer);
-            }
-
-            std::uint32_t const firstRow = tileIndex * tileRows;
-            std::uint32_t const rows = std::min(tileRows, totalRows - firstRow);
-            std::uint32_t const firstHalfGroup = firstRow * halfGroupsPerRow;
-            std::uint32_t const halfGroups = rows * halfGroupsPerRow;
-            std::uint32_t const iterations = (halfGroups + kTransformThreads - 1U) / kTransformThreads;
-            auto* compactBuffer = compactStages + buffer * compactStageCapacityBytes;
-            auto* packedStages = reinterpret_cast<std::uint32_t*>(compactBuffer);
-            auto* scaleStages = compactBuffer + packedStageCapacityBytes;
-
-            for (std::uint32_t iteration = 0; iteration < iterations + kAsyncStages; ++iteration)
-            {
-                std::uint32_t const stage = iteration % kAsyncStages;
-                if (iteration >= kAsyncStages)
-                {
-                    std::uint32_t const transformIteration = iteration - kAsyncStages;
-                    std::uint32_t const localHalfGroup = kTransformThreads * transformIteration + producerThread;
-                    cp_async_wait_group<kAsyncStages - 1>();
-                    if (localHalfGroup < halfGroups)
-                    {
-                        std::uint32_t const globalHalfGroup = firstHalfGroup + localHalfGroup;
-                        std::uint32_t const laneInScale = globalHalfGroup & 1U;
-                        std::uint32_t const scaleGroup = globalHalfGroup >> 1U;
-                        std::uint32_t const row = scaleGroup / scalesPerRow;
-                        std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
-                        std::uint32_t const localScaleOffset
-                            = scaleOffset(role, row, scaleInRow, scalesPerRow) - firstRow * scalesPerRow;
-                        std::uint8_t* scale = laneInScale == 0 ? scaleStages + localScaleOffset : nullptr;
-                        PackedVec<T> input = rawStages[stage][producerThread];
-
-                        // NVFP4 DIRECT REUSE: the arithmetic and scale bytes
-                        // are identical to the accepted tiled baseline.
-                        packedStages[localHalfGroup] = cvt_warp_fp16_to_fp4<T, kElementsPerBlockScale, false>(
-                            input, params.nvfp4ScaleOrigQuant[role], scale);
-                    }
-                }
-
-                std::uint32_t const localLoadHalfGroup = kTransformThreads * iteration + producerThread;
-                bool const valid = localLoadHalfGroup < halfGroups;
-                auto const* rawInput = reinterpret_cast<PackedVec<T> const*>(selectRawInput<T>(task, role));
-                auto const* source = valid ? rawInput + firstHalfGroup + localLoadHalfGroup : rawInput;
-                copyAsyncGlobalToShared(&rawStages[stage][producerThread], source, valid);
-                cp_async_commit_group();
-            }
-            cp_async_wait_group<0>();
-
-            // Publish this buffer while immediately continuing to the other
-            // buffer. The two transfer warps supply the remaining arrivals.
-            namedBarrierArrive(kReadyBarrierBase + buffer);
-        }
-    }
-    else
-    {
-        std::uint32_t const writerThread = threadIdx.x - kTransformThreads;
-        for (std::uint32_t tileIndex = 0; tileIndex < tileCount; ++tileIndex)
-        {
-            std::uint32_t const buffer = tileIndex % kDoubleBufferCount;
-            namedBarrierWait(kReadyBarrierBase + buffer);
-
-            std::uint32_t const firstRow = tileIndex * tileRows;
-            std::uint32_t const rows = std::min(tileRows, totalRows - firstRow);
-            std::uint32_t const firstHalfGroup = firstRow * halfGroupsPerRow;
-            std::uint32_t const halfGroups = rows * halfGroupsPerRow;
-            auto const* compactBuffer = compactStages + buffer * compactStageCapacityBytes;
-
-            // MAPPED-HOST TRANSFER: two warps stream the prior compact tile
-            // while the producer quantizes the next tile into the other buffer.
-            flushCompactRangeToHostForGroup(compactBuffer, task, role, halfGroupsPerRole, packedStageCapacityBytes,
-                packedBytesPerRole(firstHalfGroup), packedBytesPerRole(halfGroups), firstRow * scalesPerRow,
-                rows * scalesPerRow, writerThread, kTransferThreads);
-
-            if (tileIndex + kDoubleBufferCount < tileCount)
-            {
-                namedBarrierArrive(kReleasedBarrierBase + buffer);
-            }
-        }
-    }
-#endif
-}
-
-//! FP8 E4M3 GPU Page -> Host NVFP4 with the same two-buffer warp protocol.
-//!
-//! FP8 restoration and `cvt_warp_fp16_to_fp4` are copied unchanged from the
-//! accepted FP8 tiled path. Only the number/roles of participating warps and
-//! the ready/released handoff are new.
-template <std::uint32_t N>
-__global__ void offloadFromFp8DoubleBufferedKernel(
-    std::array<Nvfp4BoundaryOffloadPageTask, N> const __grid_constant__ tasks, Nvfp4BoundaryKernelParams params,
-    std::uint32_t halfGroupsPerRole)
-{
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    asm volatile("griddepcontrol.launch_dependents;\n");
-
-    std::uint32_t const role = blockIdx.y;
-    auto const& task = tasks[blockIdx.z];
-    std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
-    std::uint32_t const halfGroupsPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerLane;
-    std::uint32_t const totalRows
-        = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
-    std::uint32_t const tileRows = compressedTransferRows(params);
-    std::uint32_t const tileCount = (totalRows + tileRows - 1U) / tileRows;
-    std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
-    std::uint32_t const packedStageCapacityBytes = packedBytesPerRole(tileHalfGroups);
-    std::uint32_t const compactStageCapacityBytes = compactStagingBytesPerRole(tileHalfGroups);
-
-    __shared__ __align__(16) uint4 rawStages[kAsyncStages][kTransformThreads];
-    extern __shared__ __align__(16) std::uint8_t compactStages[];
-
-    asm volatile("griddepcontrol.wait;\n" : : : "memory");
-    if (threadIdx.x < kTransformThreads)
-    {
-        std::uint32_t const producerThread = threadIdx.x;
-        std::uint32_t const lane = producerThread & (kWarpSize - 1U);
-        for (std::uint32_t tileIndex = 0; tileIndex < tileCount; ++tileIndex)
-        {
-            std::uint32_t const buffer = tileIndex % kDoubleBufferCount;
-            if (tileIndex >= kDoubleBufferCount)
-            {
-                namedBarrierWait(kReleasedBarrierBase + buffer);
-            }
-
-            std::uint32_t const firstRow = tileIndex * tileRows;
-            std::uint32_t const rows = std::min(tileRows, totalRows - firstRow);
-            std::uint32_t const firstHalfGroup = firstRow * halfGroupsPerRow;
-            std::uint32_t const halfGroups = rows * halfGroupsPerRow;
-            std::uint32_t const firstGrain = firstHalfGroup / 2U;
-            std::uint32_t const grains = halfGroups / 2U;
-            std::uint32_t const iterations = (grains + kTransformThreads - 1U) / kTransformThreads;
-            auto* compactBuffer = compactStages + buffer * compactStageCapacityBytes;
-            auto* packedStages = reinterpret_cast<std::uint32_t*>(compactBuffer);
-            auto* scaleStages = compactBuffer + packedStageCapacityBytes;
-
-            for (std::uint32_t iteration = 0; iteration < iterations + kAsyncStages; ++iteration)
-            {
-                std::uint32_t const stage = iteration % kAsyncStages;
-                if (iteration >= kAsyncStages)
-                {
-                    std::uint32_t const transformIteration = iteration - kAsyncStages;
-                    cp_async_wait_group<kAsyncStages - 1>();
-                    __syncwarp();
-                    std::uint32_t const warpThreadBase = producerThread - lane;
-                    std::uint32_t const warpGrainBase = kTransformThreads * transformIteration + warpThreadBase;
-#pragma unroll
-                    for (std::uint32_t round = 0; round < 2; ++round)
-                    {
-                        std::uint32_t const sourceThread = warpThreadBase + round * 16U + (lane >> 1U);
-                        std::uint32_t const localGrain = warpGrainBase + round * 16U + (lane >> 1U);
-                        std::uint32_t const localHalfGroup = localGrain * 2U + (lane & 1U);
-                        if (localGrain < grains)
-                        {
-                            uint4 const grain = rawStages[stage][sourceThread];
-                            std::uint64_t const fp8Bytes = (lane & 1U) == 0
-                                ? static_cast<std::uint64_t>(grain.x) | (static_cast<std::uint64_t>(grain.y) << 32U)
-                                : static_cast<std::uint64_t>(grain.z) | (static_cast<std::uint64_t>(grain.w) << 32U);
-
-                            std::uint32_t const globalHalfGroup = firstHalfGroup + localHalfGroup;
-                            std::uint32_t const laneInScale = globalHalfGroup & 1U;
-                            std::uint32_t const scaleGroup = globalHalfGroup >> 1U;
-                            std::uint32_t const row = scaleGroup / scalesPerRow;
-                            std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
-
-                            PackedVec<half> restored;
-#pragma unroll
-                            for (std::uint32_t i = 0; i < 4; ++i)
-                            {
-                                __nv_fp8_e4m3 lo;
-                                __nv_fp8_e4m3 hi;
-                                lo.__x = static_cast<std::uint8_t>(fp8Bytes >> (16U * i));
-                                hi.__x = static_cast<std::uint8_t>(fp8Bytes >> (16U * i + 8U));
-                                float const loValue = static_cast<float>(lo) * params.fp8ScaleQuantOrig[role];
-                                float const hiValue = static_cast<float>(hi) * params.fp8ScaleQuantOrig[role];
-                                restored.elts[i] = __floats2half2_rn(loValue, hiValue);
-                            }
-
-                            std::uint32_t const localScaleOffset
-                                = scaleOffset(role, row, scaleInRow, scalesPerRow) - firstRow * scalesPerRow;
-                            std::uint8_t* scale = laneInScale == 0 ? scaleStages + localScaleOffset : nullptr;
-                            packedStages[localHalfGroup] = cvt_warp_fp16_to_fp4<half, kElementsPerBlockScale, false>(
-                                restored, params.nvfp4ScaleOrigQuant[role], scale);
-                        }
-                    }
-                }
-
-                std::uint32_t const localLoadGrain = kTransformThreads * iteration + producerThread;
-                bool const valid = localLoadGrain < grains;
-                auto const* rawInput = reinterpret_cast<uint4 const*>(selectRawInput<__nv_fp8_e4m3>(task, role));
-                auto const* source = valid ? rawInput + firstGrain + localLoadGrain : rawInput;
-                copyAsyncGlobalToShared(&rawStages[stage][producerThread], source, valid);
-                cp_async_commit_group();
-            }
-            cp_async_wait_group<0>();
-            namedBarrierArrive(kReadyBarrierBase + buffer);
-        }
-    }
-    else
-    {
-        std::uint32_t const writerThread = threadIdx.x - kTransformThreads;
-        for (std::uint32_t tileIndex = 0; tileIndex < tileCount; ++tileIndex)
-        {
-            std::uint32_t const buffer = tileIndex % kDoubleBufferCount;
-            namedBarrierWait(kReadyBarrierBase + buffer);
-            std::uint32_t const firstRow = tileIndex * tileRows;
-            std::uint32_t const rows = std::min(tileRows, totalRows - firstRow);
-            std::uint32_t const firstHalfGroup = firstRow * halfGroupsPerRow;
-            std::uint32_t const halfGroups = rows * halfGroupsPerRow;
-            auto const* compactBuffer = compactStages + buffer * compactStageCapacityBytes;
-            flushCompactRangeToHostForGroup(compactBuffer, task, role, halfGroupsPerRole, packedStageCapacityBytes,
-                packedBytesPerRole(firstHalfGroup), packedBytesPerRole(halfGroups), firstRow * scalesPerRow,
-                rows * scalesPerRow, writerThread, kTransferThreads);
-            if (tileIndex + kDoubleBufferCount < tileCount)
-            {
-                namedBarrierArrive(kReleasedBarrierBase + buffer);
-            }
-        }
     }
 #endif
 }
@@ -1550,15 +1262,9 @@ __global__ void onboardToFp8Kernel(std::array<Nvfp4BoundaryOnboardPageTask, N> c
 #endif
 }
 
-//! Host NVFP4 -> FP16/BF16 GPU Page with phase-separated transfer/dequant.
-//!
-//! `Tiled=false` loads the complete Page/role compact payload before any math.
-//! `Tiled=true` repeats the same operation in scale-full compressed tiles. The
-//! current interleaved streaming kernel remains the automatic reference, so
-//! these two specializations can be measured without silently changing the
-//! production path.
-template <bool Tiled, std::uint32_t N, typename T>
-__global__ void onboardTo16BitPhaseKernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ tasks,
+//! Host NVFP4 -> FP16/BF16 GPU Page with tiled transfer/dequant phases.
+template <std::uint32_t N, typename T>
+__global__ void onboardTo16BitTiledKernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -1570,8 +1276,8 @@ __global__ void onboardTo16BitPhaseKernel(std::array<Nvfp4BoundaryOnboardPageTas
     std::uint32_t const halfGroupsPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerLane;
     std::uint32_t const totalRows
         = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
-    std::uint32_t const tileRows = Tiled ? compressedTransferRows(params) : totalRows;
-    std::uint32_t const tileHalfGroups = Tiled ? compressedTransferHalfGroups(params) : halfGroupsPerRole;
+    std::uint32_t const tileRows = compressedTransferRows(params);
+    std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
     std::uint32_t const packedStageCapacityBytes = packedBytesPerRole(tileHalfGroups);
     extern __shared__ __align__(16) std::uint8_t compactStages[];
 
@@ -1623,16 +1329,15 @@ __global__ void onboardTo16BitPhaseKernel(std::array<Nvfp4BoundaryOnboardPageTas
             }
         }
 
-        // All consumers must finish before the next compact tile overwrites
-        // shared memory. `Tiled=false` executes this barrier only once.
+        // All consumers must finish before the next compact tile overwrites shared memory.
         __syncthreads();
     }
 #endif
 }
 
-//! Host NVFP4 -> FP8 GPU Page with phase-separated transfer/dequant/requant.
-template <bool Tiled, std::uint32_t N>
-__global__ void onboardToFp8PhaseKernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ tasks,
+//! Host NVFP4 -> FP8 GPU Page with tiled transfer/dequant/requant phases.
+template <std::uint32_t N>
+__global__ void onboardToFp8TiledKernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ tasks,
     Nvfp4BoundaryKernelParams params, std::uint32_t halfGroupsPerRole)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -1644,8 +1349,8 @@ __global__ void onboardToFp8PhaseKernel(std::array<Nvfp4BoundaryOnboardPageTask,
     std::uint32_t const halfGroupsPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerLane;
     std::uint32_t const totalRows
         = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
-    std::uint32_t const tileRows = Tiled ? compressedTransferRows(params) : totalRows;
-    std::uint32_t const tileHalfGroups = Tiled ? compressedTransferHalfGroups(params) : halfGroupsPerRole;
+    std::uint32_t const tileRows = compressedTransferRows(params);
+    std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
     std::uint32_t const packedStageCapacityBytes = packedBytesPerRole(tileHalfGroups);
     extern __shared__ __align__(16) std::uint8_t compactStages[];
 
@@ -1801,119 +1506,11 @@ __global__ void onboardTo16BitDoubleBufferedKernel(
                         std::uint32_t const halfGroup = firstPairHalfGroup + laneInScale;
                         float2 values[4];
                         // NVFP4 DIRECT REUSE: no arithmetic or output-layout
-                        // change relative to onboardTo16BitPhaseKernel<true>.
+                        // change relative to onboardTo16BitTiledKernel.
                         unpackE2m1ToFloat(packedWords[pair * 2U + laneInScale], values);
                         store16BitValues(
                             selectRawOutput<T>(task, role), halfGroup * kElementsPerLane, values, dequantScale);
                     }
-                }
-            }
-
-            if (tileIndex + kDoubleBufferCount < tileCount)
-            {
-                namedBarrierArrive(kReleasedBarrierBase + buffer);
-            }
-        }
-    }
-#endif
-}
-
-//! Host NVFP4 -> FP8 E4M3 GPU Page with the same two-buffer warp protocol.
-template <std::uint32_t N>
-__global__ void onboardToFp8DoubleBufferedKernel(
-    std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ tasks, Nvfp4BoundaryKernelParams params,
-    std::uint32_t halfGroupsPerRole)
-{
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    asm volatile("griddepcontrol.launch_dependents;\n");
-
-    std::uint32_t const role = blockIdx.y;
-    auto const& task = tasks[blockIdx.z];
-    std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
-    std::uint32_t const halfGroupsPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerLane;
-    std::uint32_t const totalRows
-        = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
-    std::uint32_t const tileRows = compressedTransferRows(params);
-    std::uint32_t const tileCount = (totalRows + tileRows - 1U) / tileRows;
-    std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
-    std::uint32_t const packedStageCapacityBytes = packedBytesPerRole(tileHalfGroups);
-    std::uint32_t const compactStageCapacityBytes = compactStagingBytesPerRole(tileHalfGroups);
-    extern __shared__ __align__(16) std::uint8_t compactStages[];
-
-    asm volatile("griddepcontrol.wait;\n" : : : "memory");
-    if (threadIdx.x >= kTransformThreads)
-    {
-        std::uint32_t const loaderThread = threadIdx.x - kTransformThreads;
-        for (std::uint32_t tileIndex = 0; tileIndex < tileCount; ++tileIndex)
-        {
-            std::uint32_t const buffer = tileIndex % kDoubleBufferCount;
-            if (tileIndex >= kDoubleBufferCount)
-            {
-                namedBarrierWait(kReleasedBarrierBase + buffer);
-            }
-            std::uint32_t const firstRow = tileIndex * tileRows;
-            std::uint32_t const rows = std::min(tileRows, totalRows - firstRow);
-            std::uint32_t const firstHalfGroup = firstRow * halfGroupsPerRow;
-            std::uint32_t const halfGroups = rows * halfGroupsPerRow;
-            auto* compactBuffer = compactStages + buffer * compactStageCapacityBytes;
-            loadCompactRangeFromHostForGroup(compactBuffer, task, role, halfGroupsPerRole, packedStageCapacityBytes,
-                packedBytesPerRole(firstHalfGroup), packedBytesPerRole(halfGroups), firstRow * scalesPerRow,
-                rows * scalesPerRow, loaderThread, kTransferThreads);
-            namedBarrierArrive(kReadyBarrierBase + buffer);
-        }
-    }
-    else
-    {
-        std::uint32_t const consumerThread = threadIdx.x;
-        for (std::uint32_t tileIndex = 0; tileIndex < tileCount; ++tileIndex)
-        {
-            std::uint32_t const buffer = tileIndex % kDoubleBufferCount;
-            namedBarrierWait(kReadyBarrierBase + buffer);
-            std::uint32_t const firstRow = tileIndex * tileRows;
-            std::uint32_t const rows = std::min(tileRows, totalRows - firstRow);
-            std::uint32_t const firstHalfGroup = firstRow * halfGroupsPerRow;
-            std::uint32_t const halfGroups = rows * halfGroupsPerRow;
-            std::uint32_t const packedBytes = packedBytesPerRole(halfGroups);
-            auto const* compactBuffer = compactStages + buffer * compactStageCapacityBytes;
-            auto const* packedStages = reinterpret_cast<uint4 const*>(compactBuffer);
-            auto const* scaleStages = compactBuffer + packedStageCapacityBytes;
-            std::uint32_t const packedGrains = packedBytes / sizeof(uint4);
-
-            for (std::uint32_t localGrain = consumerThread; localGrain < packedGrains; localGrain += kTransformThreads)
-            {
-                uint4 const packedGrain = packedStages[localGrain];
-                std::uint32_t const packedWords[4] = {packedGrain.x, packedGrain.y, packedGrain.z, packedGrain.w};
-                std::uint32_t const globalGrain = firstHalfGroup / 4U + localGrain;
-#pragma unroll
-                for (std::uint32_t pair = 0; pair < 2; ++pair)
-                {
-                    std::uint32_t const firstPairHalfGroup = globalGrain * 4U + pair * 2U;
-                    std::uint32_t const scaleGroup = firstPairHalfGroup >> 1U;
-                    std::uint32_t const row = scaleGroup / scalesPerRow;
-                    std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
-                    std::uint32_t const localScaleOffset
-                        = scaleOffset(role, row, scaleInRow, scalesPerRow) - firstRow * scalesPerRow;
-
-                    __nv_fp8_e4m3 blockScale;
-                    blockScale.__x = scaleStages[localScaleOffset];
-                    float const dequantScale = static_cast<float>(blockScale) * params.nvfp4ScaleQuantOrig[role]
-                        * params.fp8ScaleOrigQuant[role];
-                    std::uint64_t packedFp8[2];
-#pragma unroll
-                    for (std::uint32_t laneInScale = 0; laneInScale < 2; ++laneInScale)
-                    {
-                        float2 values[4];
-                        unpackE2m1ToFloat(packedWords[pair * 2U + laneInScale], values);
-#pragma unroll
-                        for (std::uint32_t i = 0; i < 4; ++i)
-                        {
-                            values[i].x *= dequantScale;
-                            values[i].y *= dequantScale;
-                        }
-                        packedFp8[laneInScale] = fp32_vec_to_e4m3(values);
-                    }
-                    reinterpret_cast<uint4*>(selectRawOutput<__nv_fp8_e4m3>(task, role))[firstPairHalfGroup / 2U]
-                        = collectTwoFp8Words(packedFp8[0], packedFp8[1]);
                 }
             }
 
@@ -2071,8 +1668,7 @@ void launchBoundaryBatch(Kernel kernel, Task const* tasks, std::uint32_t count, 
 
 //! Submit disjoint Page descriptors with the same power-of-two specialization
 //! scheme as KVCM V2 `launchBatchedCopy`. Production currently uses a 256-task
-//! maximum; the benchmark-only override also evaluates 32/64/128/512. Every
-//! tail recursively selects the smallest 32-or-larger specialization that can
+//! maximum. Every tail recursively selects the smallest 32-or-larger specialization that can
 //! hold it. The actual count remains in grid.z, so padded descriptors are never
 //! observed and a diagnostic maximum cannot silently drop an intermediate
 //! specialization.
@@ -2091,10 +1687,7 @@ void launchTaskTail(Task const* tasks, std::uint32_t count, LaunchBatch const& l
     }
     else
     {
-        // Keep every power-of-two tail specialization down to 32. Deriving
-        // only max/2, max/4, and max/8 was sufficient for the original 256
-        // maximum, but a 512 diagnostic build would otherwise route 33--64
-        // descriptors through an invalid array<32> kernel argument.
+        // Keep every power-of-two tail specialization down to 32.
         launchTaskTail<N / 2U>(tasks, count, launchBatch);
     }
 }
@@ -2120,37 +1713,34 @@ void launchTaskBatches(std::vector<Task> const& tasks, LaunchBatch const& launch
 
 bool useDenseHostFlush(std::uint32_t count, std::uint32_t halfGroups)
 {
-    // Preserve the original whole-Page/direct auto policy wherever the newer
-    // compressed-output-tiled policy has no accepted measurements. A tiny
+    // Preserve the whole-Page/direct policy outside the tuned standard Page
+    // geometry. A tiny
     // cohort avoids the shuffle/scalar-store tail; a sufficiently large byte
     // volume avoids coupling sparse direct stores to mapped-Host backpressure.
-    // The measured H=8/P=64/D=128 tiled intervals are selected before this
-    // fallback.
+    // Standard H=8/P=64/D=128 tiled intervals are selected before this fallback.
     std::uint64_t const batchBytes = static_cast<std::uint64_t>(count) * 2U * compactStagingBytesPerRole(halfGroups);
     return count <= kTinyDenseFlushPageCount || batchBytes >= kLargeDenseFlushBatchBytes;
 }
 
-bool useMeasuredTiledAutoGeometry(Nvfp4BoundaryKernelParams const& params)
+bool useTiledStandardGeometry(Nvfp4BoundaryKernelParams const& params)
 {
-    // The forced tiled pipeline is layout-generic, but automatic performance
-    // dispatch must not extrapolate one B200 shape sweep to unmeasured Page
-    // geometries. Extend this gate only after an aligned shape A/B.
-    return params.numKvHeads == kMeasuredAutoNumKvHeads && params.tokensPerPage == kMeasuredAutoTokensPerPage
-        && params.headDim == kMeasuredAutoHeadDim;
+    // Do not extrapolate the standard-Page scheduling heuristic to other Page
+    // geometries.
+    return params.numKvHeads == kStandardNumKvHeads && params.tokensPerPage == kStandardTokensPerPage
+        && params.headDim == kStandardHeadDim;
 }
 
 bool useDoubleBufferedAutoFor16BitOnboard(
     std::uint32_t count, std::uint32_t halfGroups, Nvfp4BoundaryKernelParams const& params)
 {
-    if (!useMeasuredTiledAutoGeometry(params))
+    if (!useTiledStandardGeometry(params))
     {
         return false;
     }
 
     // `count` is the effective task count in this one descriptor launch, not
     // the original Hook cohort. K and V share one compact Host Slot, hence the
-    // factor of two. This selects double buffering at 136--256 measured tasks;
-    // <=129-task launches and small tails retain the lower-overhead phase kernel.
+    // factor of two. Smaller launches retain the lower-overhead tiled kernel.
     std::uint64_t const compactBatchBytes
         = static_cast<std::uint64_t>(count) * 2U * compactStagingBytesPerRole(halfGroups);
     return compactBatchBytes >= kMinDoubleBufferedOnboard16BitBatchBytes;
@@ -2160,68 +1750,59 @@ bool requiresBoundedTiledStaging(std::uint32_t halfGroups)
 {
     // Whole-Page staging is a latency/performance choice, not a correctness
     // requirement. Keep it within the largest dynamic allocation exercised by
-    // the accepted H=8/P=64/D=128 matrix (32 KiB packed + 4 KiB scales).
+    // the supported H=8/P=64/D=128 geometry (32 KiB packed + 4 KiB scales).
     // Larger valid Pages use the existing bounded tile, whose compact staging
     // is selected from a roughly 2-KiB scale wave and does not grow with Page
     // size. This avoids an architecture-dependent launch failure without
-    // extrapolating the measured performance policy to a new geometry.
+    // extrapolating the standard-geometry policy to a new geometry.
     return compactStagingBytesPerRole(halfGroups) > kMaxWholePageCompactStagingBytes;
 }
 
 bool useTiledAutoFor16BitOffload(std::uint32_t count, Nvfp4BoundaryKernelParams const& params)
 {
-    if (!useMeasuredTiledAutoGeometry(params))
+    if (!useTiledStandardGeometry(params))
     {
         return false;
     }
 
-    // The current B200 re-audit found the direct middle interval obsolete:
-    // tiled wins at every measured 17--47-task point. Counts below eight keep
-    // the lower-overhead whole-Page path.
+    // Counts below eight keep the lower-overhead whole-Page path.
     return count >= kMinTiledOffload16BitSmallTaskCount;
 }
 
-std::uint32_t autoOffload16BitHostSplits(
-    std::uint32_t count, Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryTransferPipeline pipeline)
+std::uint32_t autoOffload16BitHostSplits(std::uint32_t count, Nvfp4BoundaryKernelParams const& params)
 {
     // Each CTA owns disjoint compressed tiles of one Page/role. Four CTAs win
-    // only while an 8--16-Page launch is too small to fill B200 by Page alone.
-    // Forced pipelines and unmeasured Page geometries retain one CTA/Page.
-    return pipeline == Nvfp4BoundaryTransferPipeline::kAuto && useMeasuredTiledAutoGeometry(params)
-            && count >= kMinTiledOffload16BitSmallTaskCount && count <= kMaxTiledOffload16BitSmallTaskCount
+    // only while an 8--16-Page launch is too small to fill the device by Page alone.
+    // Other Page geometries retain one CTA/Page.
+    return useTiledStandardGeometry(params) && count >= kMinTiledOffload16BitSmallTaskCount
+            && count <= kMaxTiledOffload16BitSmallTaskCount
         ? 4U
         : 1U;
 }
 
-std::uint32_t autoOnboardHostSplits(
-    std::uint32_t count, Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryTransferPipeline pipeline)
+std::uint32_t autoOnboardHostSplits(std::uint32_t count, Nvfp4BoundaryKernelParams const& params)
 {
     // Two CTAs/Page hide mapped-Host input latency for tiny onboard launches.
     // At 16 Pages the gain disappears, so larger launches retain the existing
     // one-CTA/Page phase or double-buffered schedule.
-    return pipeline == Nvfp4BoundaryTransferPipeline::kAuto && useMeasuredTiledAutoGeometry(params) && count <= 12U
-        ? 2U
-        : 1U;
+    return useTiledStandardGeometry(params) && count <= 12U ? 2U : 1U;
 }
 
-//! Current zero-global-staging product choices for the measured SM100 Page
+//! Zero-global-staging product choices for the standard SM100 Page
 //! geometry. Each row is still one fused transform-plus-transfer launch:
 //!
-//!   FP16/BF16 -> NVFP4 + D2H: measured tiled/direct crossover policy
+//!   FP16/BF16 -> NVFP4 + D2H: bounded tiled/direct dispatch
 //!   FP8       -> NVFP4 + D2H: compressed-output tiled, including the
 //!                              packed FP8x2 restoration fast path
 //!   H2D + NVFP4 -> FP16/BF16: tiled for smaller launches, double-buffered
-//!                              for the accepted large-launch interval
+//!                              for the large-launch interval
 //!   H2D + NVFP4 -> FP8: compressed-input tiled
 //!
-//! Unmeasured geometries preserve the conservative fallback selected below.
-//! The faster benchmark-only bounded-DMA onboard experiment is deliberately
-//! excluded: it needs KVCM-owned GPU staging admission and is not a drop-in
-//! replacement for the direct-write Hook contract.
+//! Other geometries preserve the conservative fallback selected below.
 
 template <typename T>
 void launchOffloadFrom16Bit(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,
-    Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryTransferPipeline pipeline, cudaStream_t stream)
+    Nvfp4BoundaryKernelParams const& params, cudaStream_t stream)
 {
     std::uint32_t const halfGroups = halfGroupsPerRole(params);
     dim3 const block(kThreadsPerBlock);
@@ -2230,44 +1811,30 @@ void launchOffloadFrom16Bit(std::vector<Nvfp4BoundaryOffloadPageTask> const& tas
         {
             constexpr std::uint32_t taskCapacity = decltype(capacity)::value;
             // BATCHEDCOPY ADAPTATION: large cohorts keep one low-bandwidth CTA
-            // per Page/role. Tiny measured cohorts split disjoint Page tiles
-            // across CTAs so the launch can fill B200 without changing bytes.
-            dim3 const grid(autoOffload16BitHostSplits(count, params, pipeline), 2, count);
-            if (pipeline == Nvfp4BoundaryTransferPipeline::kDoubleBufferedTiled)
-            {
-                std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
-                std::uint32_t const sharedBytes = kDoubleBufferCount * compactStagingBytesPerRole(tileHalfGroups);
-                launchBoundaryBatch<taskCapacity>(offloadFrom16BitDoubleBufferedKernel<taskCapacity, T>, taskData,
-                    count, grid, block, sharedBytes, params, halfGroups, stream);
-            }
-            else if (pipeline == Nvfp4BoundaryTransferPipeline::kCompressedOutputTiled
-                || (pipeline == Nvfp4BoundaryTransferPipeline::kAuto
-                    && (useTiledAutoFor16BitOffload(count, params) || requiresBoundedTiledStaging(halfGroups))))
+            // per Page/role. Tiny cohorts split disjoint Page tiles
+            // across CTAs to increase occupancy without changing bytes.
+            dim3 const grid(autoOffload16BitHostSplits(count, params), 2, count);
+            if (useTiledAutoFor16BitOffload(count, params) || requiresBoundedTiledStaging(halfGroups))
             {
                 std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
                 launchBoundaryBatch<taskCapacity>(offloadFrom16BitTiledKernel<taskCapacity, T>, taskData, count, grid,
                     block, compactStagingBytesPerRole(tileHalfGroups), params, halfGroups, stream);
             }
-            else if (pipeline == Nvfp4BoundaryTransferPipeline::kWholePage
-                || (pipeline == Nvfp4BoundaryTransferPipeline::kAuto && useDenseHostFlush(count, halfGroups)))
+            else if (useDenseHostFlush(count, halfGroups))
             {
                 launchBoundaryBatch<taskCapacity>(offloadFrom16BitKernel<true, taskCapacity, T>, taskData, count, grid,
                     block, compactStagingBytesPerRole(halfGroups), params, halfGroups, stream);
             }
-            else if (pipeline == Nvfp4BoundaryTransferPipeline::kAuto)
+            else
             {
                 launchBoundaryBatch<taskCapacity>(offloadFrom16BitKernel<false, taskCapacity, T>, taskData, count, grid,
                     block, 0, params, halfGroups, stream);
-            }
-            else
-            {
-                TLLM_THROW("Unsupported NVFP4 boundary offload pipeline");
             }
         });
 }
 
 void launchOffloadFromFp8(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,
-    Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryTransferPipeline pipeline, cudaStream_t stream)
+    Nvfp4BoundaryKernelParams const& params, cudaStream_t stream)
 {
     std::uint32_t const halfGroups = halfGroupsPerRole(params);
     dim3 const block(kThreadsPerBlock);
@@ -2276,41 +1843,25 @@ void launchOffloadFromFp8(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks
         {
             constexpr std::uint32_t taskCapacity = decltype(capacity)::value;
             dim3 const grid(kHostMemorySplits, 2, count);
-            // FP8 conversion makes the interleaved/whole-Page mapped-Host path
-            // slower even for one Page. The compressed-output tile wins every
-            // measured B200 cohort from one through 1,024 Pages, so kAuto uses
-            // it without changing the quantization math or launch count.
-            if (pipeline == Nvfp4BoundaryTransferPipeline::kDoubleBufferedTiled)
-            {
-                std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
-                std::uint32_t const sharedBytes = kDoubleBufferCount * compactStagingBytesPerRole(tileHalfGroups);
-                launchBoundaryBatch<taskCapacity>(offloadFromFp8DoubleBufferedKernel<taskCapacity>, taskData, count,
-                    grid, block, sharedBytes, params, halfGroups, stream);
-            }
-            else if (pipeline == Nvfp4BoundaryTransferPipeline::kCompressedOutputTiled
-                || (pipeline == Nvfp4BoundaryTransferPipeline::kAuto
-                    && (useMeasuredTiledAutoGeometry(params) || requiresBoundedTiledStaging(halfGroups))))
+            // FP8 uses compressed-output tiles for the standard Page geometry
+            // without changing the quantization math or launch count.
+            if (useTiledStandardGeometry(params) || requiresBoundedTiledStaging(halfGroups))
             {
                 std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
                 launchBoundaryBatch<taskCapacity>(offloadFromFp8TiledKernel<taskCapacity>, taskData, count, grid, block,
                     compactStagingBytesPerRole(tileHalfGroups), params, halfGroups, stream);
             }
-            else if (pipeline == Nvfp4BoundaryTransferPipeline::kAuto
-                || pipeline == Nvfp4BoundaryTransferPipeline::kWholePage)
+            else
             {
                 launchBoundaryBatch<taskCapacity>(offloadFromFp8Kernel<taskCapacity>, taskData, count, grid, block,
                     compactStagingBytesPerRole(halfGroups), params, halfGroups, stream);
-            }
-            else
-            {
-                TLLM_THROW("Unsupported NVFP4 boundary offload pipeline");
             }
         });
 }
 
 template <typename T>
 void launchOnboardTo16Bit(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks,
-    Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryTransferPipeline pipeline, cudaStream_t stream)
+    Nvfp4BoundaryKernelParams const& params, cudaStream_t stream)
 {
     std::uint32_t const halfGroups = halfGroupsPerRole(params);
     dim3 const block(kThreadsPerBlock);
@@ -2318,42 +1869,30 @@ void launchOnboardTo16Bit(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks
         [&](auto capacity, Nvfp4BoundaryOnboardPageTask const* taskData, std::uint32_t count)
         {
             constexpr std::uint32_t taskCapacity = decltype(capacity)::value;
-            dim3 const grid(autoOnboardHostSplits(count, params, pipeline), 2, count);
-            if (pipeline == Nvfp4BoundaryTransferPipeline::kDoubleBufferedTiled
-                || (pipeline == Nvfp4BoundaryTransferPipeline::kAuto
-                    && useDoubleBufferedAutoFor16BitOnboard(count, halfGroups, params)))
+            dim3 const grid(autoOnboardHostSplits(count, params), 2, count);
+            if (useDoubleBufferedAutoFor16BitOnboard(count, halfGroups, params))
             {
                 std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
                 std::uint32_t const sharedBytes = kDoubleBufferCount * compactStagingBytesPerRole(tileHalfGroups);
                 launchBoundaryBatch<taskCapacity>(onboardTo16BitDoubleBufferedKernel<taskCapacity, T>, taskData, count,
                     grid, block, sharedBytes, params, halfGroups, stream);
             }
-            else if (pipeline == Nvfp4BoundaryTransferPipeline::kWholePage)
-            {
-                launchBoundaryBatch<taskCapacity>(onboardTo16BitPhaseKernel<false, taskCapacity, T>, taskData, count,
-                    grid, block, compactStagingBytesPerRole(halfGroups), params, halfGroups, stream);
-            }
-            else if (pipeline == Nvfp4BoundaryTransferPipeline::kCompressedOutputTiled
-                || (pipeline == Nvfp4BoundaryTransferPipeline::kAuto && useMeasuredTiledAutoGeometry(params)))
+            else if (useTiledStandardGeometry(params))
             {
                 std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
-                launchBoundaryBatch<taskCapacity>(onboardTo16BitPhaseKernel<true, taskCapacity, T>, taskData, count,
+                launchBoundaryBatch<taskCapacity>(onboardTo16BitTiledKernel<taskCapacity, T>, taskData, count,
                     grid, block, compactStagingBytesPerRole(tileHalfGroups), params, halfGroups, stream);
-            }
-            else if (pipeline == Nvfp4BoundaryTransferPipeline::kAuto)
-            {
-                launchBoundaryBatch<taskCapacity>(
-                    onboardTo16BitKernel<taskCapacity, T>, taskData, count, grid, block, 0, params, halfGroups, stream);
             }
             else
             {
-                TLLM_THROW("Unsupported NVFP4 boundary onboard pipeline");
+                launchBoundaryBatch<taskCapacity>(
+                    onboardTo16BitKernel<taskCapacity, T>, taskData, count, grid, block, 0, params, halfGroups, stream);
             }
         });
 }
 
 void launchOnboardToFp8(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks, Nvfp4BoundaryKernelParams const& params,
-    Nvfp4BoundaryTransferPipeline pipeline, cudaStream_t stream)
+    cudaStream_t stream)
 {
     std::uint32_t const halfGroups = halfGroupsPerRole(params);
     dim3 const block(kThreadsPerBlock);
@@ -2361,34 +1900,17 @@ void launchOnboardToFp8(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks, 
         [&](auto capacity, Nvfp4BoundaryOnboardPageTask const* taskData, std::uint32_t count)
         {
             constexpr std::uint32_t taskCapacity = decltype(capacity)::value;
-            dim3 const grid(autoOnboardHostSplits(count, params, pipeline), 2, count);
-            if (pipeline == Nvfp4BoundaryTransferPipeline::kDoubleBufferedTiled)
+            dim3 const grid(autoOnboardHostSplits(count, params), 2, count);
+            if (useTiledStandardGeometry(params))
             {
                 std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
-                std::uint32_t const sharedBytes = kDoubleBufferCount * compactStagingBytesPerRole(tileHalfGroups);
-                launchBoundaryBatch<taskCapacity>(onboardToFp8DoubleBufferedKernel<taskCapacity>, taskData, count, grid,
-                    block, sharedBytes, params, halfGroups, stream);
-            }
-            else if (pipeline == Nvfp4BoundaryTransferPipeline::kWholePage)
-            {
-                launchBoundaryBatch<taskCapacity>(onboardToFp8PhaseKernel<false, taskCapacity>, taskData, count, grid,
-                    block, compactStagingBytesPerRole(halfGroups), params, halfGroups, stream);
-            }
-            else if (pipeline == Nvfp4BoundaryTransferPipeline::kCompressedOutputTiled
-                || (pipeline == Nvfp4BoundaryTransferPipeline::kAuto && useMeasuredTiledAutoGeometry(params)))
-            {
-                std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
-                launchBoundaryBatch<taskCapacity>(onboardToFp8PhaseKernel<true, taskCapacity>, taskData, count, grid,
+                launchBoundaryBatch<taskCapacity>(onboardToFp8TiledKernel<taskCapacity>, taskData, count, grid,
                     block, compactStagingBytesPerRole(tileHalfGroups), params, halfGroups, stream);
-            }
-            else if (pipeline == Nvfp4BoundaryTransferPipeline::kAuto)
-            {
-                launchBoundaryBatch<taskCapacity>(
-                    onboardToFp8Kernel<taskCapacity>, taskData, count, grid, block, 0, params, halfGroups, stream);
             }
             else
             {
-                TLLM_THROW("Unsupported NVFP4 boundary onboard pipeline");
+                launchBoundaryBatch<taskCapacity>(
+                    onboardToFp8Kernel<taskCapacity>, taskData, count, grid, block, 0, params, halfGroups, stream);
             }
         });
 }
@@ -2416,14 +1938,6 @@ void launchAndDrainOnFailure(cudaStream_t stream, Launch const& launch)
 void invokeNvfp4BoundaryOffloadCompress(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,
     Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryRuntimeType runtimeType, cudaStream_t stream)
 {
-    detail::invokeNvfp4BoundaryOffloadCompressWithPipeline(
-        tasks, params, runtimeType, Nvfp4BoundaryTransferPipeline::kAuto, stream);
-}
-
-void detail::invokeNvfp4BoundaryOffloadCompressWithPipeline(std::vector<Nvfp4BoundaryOffloadPageTask> const& tasks,
-    Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryRuntimeType runtimeType,
-    Nvfp4BoundaryTransferPipeline pipeline, cudaStream_t stream)
-{
     if (tasks.empty())
     {
         return;
@@ -2433,18 +1947,18 @@ void detail::invokeNvfp4BoundaryOffloadCompressWithPipeline(std::vector<Nvfp4Bou
     case Nvfp4BoundaryRuntimeType::kFloat16:
         validateParams(params, false);
         validateTasks(tasks, 16);
-        launchAndDrainOnFailure(stream, [&] { launchOffloadFrom16Bit<half>(tasks, params, pipeline, stream); });
+        launchAndDrainOnFailure(stream, [&] { launchOffloadFrom16Bit<half>(tasks, params, stream); });
         break;
     case Nvfp4BoundaryRuntimeType::kBfloat16:
         validateParams(params, false);
         validateTasks(tasks, 16);
         launchAndDrainOnFailure(
-            stream, [&] { launchOffloadFrom16Bit<__nv_bfloat16>(tasks, params, pipeline, stream); });
+            stream, [&] { launchOffloadFrom16Bit<__nv_bfloat16>(tasks, params, stream); });
         break;
     case Nvfp4BoundaryRuntimeType::kFp8E4m3:
         validateParams(params, true);
         validateTasks(tasks, 16);
-        launchAndDrainOnFailure(stream, [&] { launchOffloadFromFp8(tasks, params, pipeline, stream); });
+        launchAndDrainOnFailure(stream, [&] { launchOffloadFromFp8(tasks, params, stream); });
         break;
     default: TLLM_THROW("Unsupported NVFP4 boundary runtime type");
     }
@@ -2453,14 +1967,6 @@ void detail::invokeNvfp4BoundaryOffloadCompressWithPipeline(std::vector<Nvfp4Bou
 void invokeNvfp4BoundaryOnboardDecompress(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks,
     Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryRuntimeType runtimeType, cudaStream_t stream)
 {
-    detail::invokeNvfp4BoundaryOnboardDecompressWithPipeline(
-        tasks, params, runtimeType, Nvfp4BoundaryTransferPipeline::kAuto, stream);
-}
-
-void detail::invokeNvfp4BoundaryOnboardDecompressWithPipeline(std::vector<Nvfp4BoundaryOnboardPageTask> const& tasks,
-    Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryRuntimeType runtimeType,
-    Nvfp4BoundaryTransferPipeline pipeline, cudaStream_t stream)
-{
     if (tasks.empty())
     {
         return;
@@ -2470,17 +1976,17 @@ void detail::invokeNvfp4BoundaryOnboardDecompressWithPipeline(std::vector<Nvfp4B
     case Nvfp4BoundaryRuntimeType::kFloat16:
         validateParams(params, false);
         validateTasks(tasks, 16);
-        launchAndDrainOnFailure(stream, [&] { launchOnboardTo16Bit<half>(tasks, params, pipeline, stream); });
+        launchAndDrainOnFailure(stream, [&] { launchOnboardTo16Bit<half>(tasks, params, stream); });
         break;
     case Nvfp4BoundaryRuntimeType::kBfloat16:
         validateParams(params, false);
         validateTasks(tasks, 16);
-        launchAndDrainOnFailure(stream, [&] { launchOnboardTo16Bit<__nv_bfloat16>(tasks, params, pipeline, stream); });
+        launchAndDrainOnFailure(stream, [&] { launchOnboardTo16Bit<__nv_bfloat16>(tasks, params, stream); });
         break;
     case Nvfp4BoundaryRuntimeType::kFp8E4m3:
         validateParams(params, true);
         validateTasks(tasks, 16);
-        launchAndDrainOnFailure(stream, [&] { launchOnboardToFp8(tasks, params, pipeline, stream); });
+        launchAndDrainOnFailure(stream, [&] { launchOnboardToFp8(tasks, params, stream); });
         break;
     default: TLLM_THROW("Unsupported NVFP4 boundary runtime type");
     }
