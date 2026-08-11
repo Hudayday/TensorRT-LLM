@@ -41,7 +41,7 @@ from ._config import (
     KVCacheDesc,
     SwaScratchReuseConfig,
 )
-from ._copy_engine import CopyTask, batched_copy
+from ._copy_engine import CopyTask, _copy_engine, batched_copy
 from ._event_manager import KVCacheEventDiff
 from ._eviction_controller import EvictablePage, PerLevelEvictionController
 from ._exceptions import LogicError, OutOfPagesError
@@ -196,6 +196,7 @@ class StorageManager:
         "_event_manager",
         "_cache_tier_configs",
         "_cold_page_codec",
+        "_cold_page_modes",
         "__rawref__",
     )
     _life_cycles: LifeCycleRegistry
@@ -211,6 +212,7 @@ class StorageManager:
     _event_manager: "KVCacheEventManager | None"
     _cache_tier_configs: Sequence[CacheTierConfig]
     _cold_page_codec: object | None
+    _cold_page_modes: TypedIndexList[PoolGroupIndex, bool]
     __rawref__: rawref.ref["StorageManager"]
 
     def __init__(
@@ -243,6 +245,7 @@ class StorageManager:
         self._buffer_attr = config.buffer_attributes()
         self._life_cycle_grouping = config.life_cycle_grouping()
         self._slot_desc_list = config.slot_desc_list
+        self._cold_page_modes = filled_list(False, self.num_pool_groups)
         assert all(pg < self.num_pool_groups for pg in self._life_cycle_grouping)
         assert self.num_pool_groups == PoolGroupIndex(len(set(self._life_cycle_grouping)))
         slot_size_lists = typed_map(self._slot_desc_list, lambda pg: pg.slot_size_list)
@@ -280,9 +283,7 @@ class StorageManager:
             )
         elif constraints:
             # Use the constraint slot counts as the ratio basis.
-            min_bytes = self._slots_to_bytes(
-                self._min_slots, gpu_granularity, slot_size_lists
-            )
+            min_bytes = self._slots_to_bytes(self._min_slots, gpu_granularity, slot_size_lists)
             total = sum(min_bytes)
             init_ratio = typed_map(min_bytes, lambda x: x / total)
         else:
@@ -318,14 +319,10 @@ class StorageManager:
         """Install the preconfigured cold-Page codec before request admission.
 
         The codec owns representation-specific geometry. StorageManager owns
-        physical tiers, so it queries one compact stride per lifecycle and
-        rebuilds the empty Host level as one Pool per PoolGroup. Runtime GPU
-        Pools and the logical Page object remain unchanged.
-
-        This prototype deliberately supports exactly GPU+Host. A Disk tier
-        needs a separately specified cold-preserving Host<->Disk route and a
-        Disk->GPU staging rule; silently treating a Disk address as mapped Host
-        memory would violate the codec ABI.
+        physical tiers, so it queries each lifecycle before rebuilding every
+        empty Host/Disk level. PoolGroups accepted by the codec become one
+        compact Pool; declined PoolGroups retain their original raw multi-Pool
+        layout. Runtime GPU Pools and the logical Page object remain unchanged.
         """
 
         if codec is None:
@@ -335,49 +332,89 @@ class StorageManager:
             return
         if self._cold_page_codec is not None:
             raise RuntimeError("A cold-Page codec is already installed")
-        if len(self._levels) != 2 or self._levels[1].cache_tier != CacheTier.HOST_MEM:
-            raise RuntimeError("Boundary compression P0 requires exactly GPU and Host cache tiers")
+        if len(self._levels) < 2 or self._levels[1].cache_tier != CacheTier.HOST_MEM:
+            raise RuntimeError("Boundary compression P0 requires a Host tier immediately below GPU")
+        if any(level.cache_tier != CacheTier.DISK for level in self._levels[2:]):
+            raise RuntimeError("Boundary compression supports only Disk tiers below Host")
 
-        host_level = CacheLevel(1)
-        old_level = self._levels[host_level]
-        for pg_idx in typed_range(self.num_pool_groups):
-            if old_level.storage.get_num_free_slots(pg_idx) != old_level.storage.num_slots(
-                pg_idx
-            ) or old_level.controller.num_evictable_pages(pg_idx):
-                raise RuntimeError(
-                    "A cold-Page codec must be installed before any Page uses the Host tier"
-                )
+        for cold_level in self._levels[1:]:
+            for pg_idx in typed_range(self.num_pool_groups):
+                if cold_level.storage.get_num_free_slots(pg_idx) != cold_level.storage.num_slots(
+                    pg_idx
+                ) or cold_level.controller.num_evictable_pages(pg_idx):
+                    raise RuntimeError(
+                        "A cold-Page codec must be installed before any Page uses a cold tier"
+                    )
 
-        cold_slot_size_lists = make_typed(
-            lambda _: make_typed(lambda _: 0, PoolIndex(1)), self.num_pool_groups
+        cold_slot_size_lists = cast(
+            TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]], []
         )
+        cold_page_modes = filled_list(False, self.num_pool_groups)
         for pg_idx, slot_desc in typed_enumerate(self._slot_desc_list):
-            strides = {
-                int(codec.query_cold_page_bytes(int(variant.life_cycle_id)))
-                for variant in slot_desc.variants
-            }
-            if 0 in strides or len(strides) != 1:
+            if not slot_desc.variants:
+                raise RuntimeError("A PoolGroup has no lifecycle variant")
+            has_raw_life_cycle = False
+            compressed_strides = set()
+            for variant in slot_desc.variants:
+                layer_group_id = int(variant.life_cycle_id)
+                stride = int(codec.query_cold_page_bytes(layer_group_id))
+                if stride == 0:
+                    # Zero is the codec ABI's raw fallback for unknown or
+                    # non-Attention lifecycles. QuantizationCompression checks
+                    # all expected Attention lifecycles before registration.
+                    has_raw_life_cycle = True
+                    continue
+                compressed_strides.add(stride)
+            has_codec_life_cycle = bool(compressed_strides)
+            if has_raw_life_cycle and has_codec_life_cycle:
                 raise RuntimeError(
-                    "Every lifecycle sharing a PoolGroup must have one identical, "
-                    "non-zero cold Page stride"
+                    "One PoolGroup cannot mix raw and compressed lifecycle representations"
                 )
-            cold_slot_size_lists[pg_idx][PoolIndex(0)] = strides.pop()
+            if len(compressed_strides) > 1:
+                raise RuntimeError(
+                    "Every compressed lifecycle sharing a PoolGroup must have one "
+                    "identical cold Page stride"
+                )
+            if has_codec_life_cycle:
+                cold_slot_size_lists.append(
+                    cast(TypedIndexList[PoolIndex, int], [compressed_strides.pop()])
+                )
+                cold_page_modes[pg_idx] = True
+            else:
+                # The codec deliberately declined this PoolGroup. Preserve its
+                # original layout (for example, Qwen3.5 GDN/SSM state).
+                cold_slot_size_lists.append(
+                    cast(TypedIndexList[PoolIndex, int], list(slot_desc.slot_size_list))
+                )
 
-        host_config = self._cache_tier_configs[host_level]
-        ratio = old_level.storage.ratio_list
-        slot_counts = self._compute_slot_count_for_level(host_config, cold_slot_size_lists, ratio)
+        for level_idx in range(1, len(self._levels)):
+            level = CacheLevel(level_idx)
+            old_level = self._levels[level]
+            granularity = old_level.storage.pool_size_granularity
+            cold_bytes = self._slots_to_bytes(
+                old_level.storage.slot_count_list,
+                granularity,
+                cold_slot_size_lists,
+            )
+            total = sum(cold_bytes)
+            assert total > 0
+            cold_ratio = typed_map(cold_bytes, lambda value: value / total)
+            tier_config = self._cache_tier_configs[level]
+            slot_counts = self._compute_slot_count_for_level(
+                tier_config, cold_slot_size_lists, cold_ratio
+            )
 
-        # Registration is initialization-only. Releasing the unused raw Host
-        # allocation before creating the compact allocation avoids a transient
-        # double-quota reservation. Any allocation failure aborts startup.
-        old_level.storage.destroy()
-        self._levels[host_level] = CacheLevelManager(
-            self._life_cycle_grouping,
-            host_level,
-            host_config,
-            cold_slot_size_lists,
-            slot_counts,
-        )
+            # Registration is initialization-only. Releasing each unused raw
+            # allocation first avoids a transient double-quota reservation.
+            old_level.storage.destroy()
+            self._levels[level] = CacheLevelManager(
+                self._life_cycle_grouping,
+                level,
+                tier_config,
+                cold_slot_size_lists,
+                slot_counts,
+            )
+        self._cold_page_modes = cold_page_modes
         self._cold_page_codec = codec
 
     def __del__(self) -> None:
@@ -679,16 +716,11 @@ class StorageManager:
             assert len(dst_slots) == num_slots
             prior_events: set[CachedCudaEvent] = set()
             tasks_per_pool: TypedIndexList[PoolIndex, list[CopyTask]] | None = None
-            use_encode = (
-                self._cold_page_codec is not None
-                and src_level == GPU_LEVEL
-                and self._levels[dst_level].cache_tier == CacheTier.HOST_MEM
+            use_codec = (
+                self._cold_page_codec is not None and self._cold_page_modes[pool_group_index]
             )
-            use_decode = (
-                self._cold_page_codec is not None
-                and dst_level == GPU_LEVEL
-                and self._levels[src_level].cache_tier == CacheTier.HOST_MEM
-            )
+            use_encode = use_codec and src_level == GPU_LEVEL and dst_level != GPU_LEVEL
+            use_decode = use_codec and dst_level == GPU_LEVEL and src_level != GPU_LEVEL
             if not (use_encode or use_decode):
                 if src_num_pools != dst_num_pools:
                     raise RuntimeError(
@@ -708,61 +740,167 @@ class StorageManager:
             dst_tier = self._levels[dst_level].cache_tier
             src_tier = self._levels[src_level].cache_tier
             codec_submission_failed = False
+            submission_error: Exception | None = None
             with TemporaryCudaStream(prior_events) as stream:
-                if use_encode or use_decode:
-                    codec = self._cold_page_codec
-                    assert codec is not None
-                    cold_pool_group = dst_pool_group if use_encode else src_pool_group
-                    cold_base = int(cold_pool_group.slot_address(SlotId(0))[PoolIndex(0)])
-                    by_batching_layer_group: dict[LifeCycleId, list[tuple[Page, Slot]]] = {}
-                    for page, slot in zip(src_pages, dst_slots):
-                        # The codec contract guarantees one PoolGroup and cold
-                        # stride for every returned representative.
-                        batching_layer_group = LifeCycleId(
-                            codec.get_batching_layer_group_id(int(page.life_cycle))
-                        )
-                        by_batching_layer_group.setdefault(batching_layer_group, []).append(
-                            (page, slot)
-                        )
-                    for batching_layer_group, page_slots in by_batching_layer_group.items():
-                        if codec.query_page_index_location(int(batching_layer_group)) != 0:
-                            raise RuntimeError(
-                                "Python KVCM currently provides Host Page-index pairs only"
+                try:
+                    if use_encode or use_decode:
+                        codec = self._cold_page_codec
+                        assert codec is not None
+
+                        def submit_codec_range(
+                            cold_base: MemAddress,
+                            begin: int,
+                            count: int,
+                            staging_indices: bool,
+                        ) -> bool:
+                            """Submit one cold-memory range without transferring Page ownership."""
+                            batches: dict[LifeCycleId, list[tuple[int, int]]] = {}
+                            for local_idx in range(count):
+                                page_idx = begin + local_idx
+                                page = src_pages[page_idx]
+                                slot = dst_slots[page_idx]
+                                batching_layer_group = LifeCycleId(
+                                    codec.get_batching_layer_group_id(int(page.life_cycle))
+                                )
+                                dst_idx = (
+                                    local_idx
+                                    if use_encode and staging_indices
+                                    else int(slot.slot_id)
+                                )
+                                src_idx = (
+                                    local_idx
+                                    if use_decode and staging_indices
+                                    else int(page.slot_id)
+                                )
+                                batches.setdefault(batching_layer_group, []).append(
+                                    (dst_idx, src_idx)
+                                )
+
+                            for batching_layer_group, page_indices in batches.items():
+                                if codec.query_page_index_location(int(batching_layer_group)) != 0:
+                                    raise RuntimeError(
+                                        "Python KVCM currently provides Host Page-index pairs only"
+                                    )
+                                submitted = (
+                                    codec.encode(
+                                        int(batching_layer_group),
+                                        int(cold_base),
+                                        page_indices,
+                                        int(stream.get()),
+                                    )
+                                    if use_encode
+                                    else codec.decode(
+                                        int(batching_layer_group),
+                                        int(cold_base),
+                                        page_indices,
+                                        int(stream.get()),
+                                    )
+                                )
+                                if not submitted:
+                                    return False
+                            return True
+
+                        cold_tier = dst_tier if use_encode else src_tier
+                        cold_pool_group = dst_pool_group if use_encode else src_pool_group
+                        if cold_tier == CacheTier.HOST_MEM:
+                            cold_base = cast(
+                                MemAddress,
+                                cold_pool_group.slot_address(SlotId(0))[PoolIndex(0)],
                             )
-                        page_indices = [
-                            (int(slot.slot_id), int(page.slot_id)) for page, slot in page_slots
-                        ]
-                        if use_encode:
-                            submitted = codec.encode(
-                                int(batching_layer_group),
-                                cold_base,
-                                page_indices,
-                                int(stream.get()),
+                            codec_submission_failed = not submit_codec_range(
+                                cold_base, 0, len(src_pages), False
                             )
                         else:
-                            submitted = codec.decode(
-                                int(batching_layer_group),
-                                cold_base,
-                                page_indices,
-                                int(stream.get()),
+                            cold_level = dst_level if use_encode else src_level
+                            cold_slot_sizes = self.slot_size(pool_group_index, cold_level)
+                            if len(cold_slot_sizes) != 1:
+                                raise RuntimeError(
+                                    "A compressed Disk PoolGroup must contain one compact Pool"
+                                )
+                            cold_page_bytes = cold_slot_sizes[PoolIndex(0)]
+                            staging_manager = _copy_engine.staging_buffer_manager
+                            if cold_page_bytes > staging_manager.size:
+                                raise RuntimeError(
+                                    "One compact cold Page exceeds KVCM staging capacity"
+                                )
+
+                            begin = 0
+                            while begin < len(src_pages) and not codec_submission_failed:
+                                remaining = len(src_pages) - begin
+                                with staging_manager.new(
+                                    cold_page_bytes,
+                                    cold_page_bytes * remaining,
+                                    stream.get(),
+                                ) as staging:
+                                    count = min(remaining, staging.size // cold_page_bytes)
+                                    assert count > 0
+                                    disk_tasks: list[CopyTask] = []
+                                    for local_idx in range(count):
+                                        page_idx = begin + local_idx
+                                        staged_address = MemAddress(
+                                            int(staging.address) + local_idx * cold_page_bytes
+                                        )
+                                        if use_encode:
+                                            disk_address = dst_pool_group.slot_address(
+                                                dst_slots[page_idx].slot_id
+                                            )[PoolIndex(0)]
+                                            disk_tasks.append(
+                                                CopyTask(disk_address, staged_address)
+                                            )
+                                        else:
+                                            disk_address = src_pool_group.slot_address(
+                                                src_pages[page_idx].slot_id
+                                            )[PoolIndex(0)]
+                                            disk_tasks.append(
+                                                CopyTask(staged_address, disk_address)
+                                            )
+
+                                    if use_encode:
+                                        codec_submission_failed = not submit_codec_range(
+                                            staging.address, begin, count, True
+                                        )
+                                        if not codec_submission_failed:
+                                            batched_copy(
+                                                CacheTier.DISK,
+                                                CacheTier.HOST_MEM,
+                                                cold_page_bytes,
+                                                disk_tasks,
+                                                staging.stream,
+                                            )
+                                    else:
+                                        batched_copy(
+                                            CacheTier.HOST_MEM,
+                                            CacheTier.DISK,
+                                            cold_page_bytes,
+                                            disk_tasks,
+                                            staging.stream,
+                                        )
+                                        codec_submission_failed = not submit_codec_range(
+                                            staging.address, begin, count, True
+                                        )
+                                begin += count
+                    else:
+                        assert tasks_per_pool is not None
+                        slot_sizes = self.slot_size(pool_group_index, src_level)
+                        for pool_idx, tasks in typed_enumerate(tasks_per_pool):
+                            batched_copy(
+                                dst_tier,
+                                src_tier,
+                                slot_sizes[pool_idx],
+                                tasks,
+                                stream.get(),
                             )
-                        if not submitted:
-                            # Leave the stream scope normally so it records a
-                            # fence for any earlier lifecycle already queued.
-                            # The failure is raised only after that fence is
-                            # attached to source/destination ownership below.
-                            codec_submission_failed = True
-                            break
-                else:
-                    assert tasks_per_pool is not None
-                    slot_sizes = self.slot_size(pool_group_index, src_level)
-                    for pool_idx, tasks in typed_enumerate(tasks_per_pool):
-                        batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks, stream.get())
+                except Exception as error:
+                    # Exit the stream scope normally so earlier transform/I/O
+                    # receives a completion fence before allocation rollback.
+                    submission_error = error
             finish_event = stream.take_finish_event()
-            if codec_submission_failed:
+            if codec_submission_failed or submission_error is not None:
                 for src, dst in zip(src_pages, dst_slots):
                     src.ready_event = finish_event
                     dst.ready_event = finish_event
+                if submission_error is not None:
+                    raise submission_error
                 raise RuntimeError("Cold-Page codec submission failed")
             emit_cache_level_updates = (
                 update_src
@@ -1019,7 +1157,11 @@ class StorageManager:
         lvl_storage.post_resize()
 
     def ratio_from_length(
-        self, tokens_per_block: int, history_length: int, capacity: int
+        self,
+        level: CacheLevel,
+        tokens_per_block: int,
+        history_length: int,
+        capacity: int,
     ) -> TypedIndexList[PoolGroupIndex, float]:
         if capacity < history_length:
             warnings.warn("Bad sampling for capacity and history_length")
@@ -1029,7 +1171,7 @@ class StorageManager:
         ssm_lc_idx = self._life_cycles.ssm_life_cycle_id
         for lc_idx, lc in typed_enumerate(self._life_cycles.get()):
             pg_idx = self.get_pool_group_index(lc_idx)
-            slot_size = self.slot_size(pg_idx)
+            slot_size = self.slot_size(pg_idx, level)
             num_required_blocks: int
             if lc_idx == ssm_lc_idx:
                 num_required_blocks = 1
@@ -1171,9 +1313,7 @@ class StorageManager:
         num_bytes = filled_list(0, self.num_pool_groups)
         for pg_idx in typed_range(self.num_pool_groups):
             slot_sizes = (
-                self.slot_size(pg_idx)
-                if slot_size_lists is None
-                else slot_size_lists[pg_idx]
+                self.slot_size(pg_idx) if slot_size_lists is None else slot_size_lists[pg_idx]
             )
             for pool_size in slot_sizes:
                 num_bytes[pg_idx] += round_up(num_slots[pg_idx] * pool_size, granularity)

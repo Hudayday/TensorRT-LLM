@@ -64,7 +64,8 @@ public:
 
     virtual bool configure(PoolGroupDesc const& gpuDesc) noexcept = 0;
 
-    //! Query the cold-page stride for one layer group. Zero indicates failure.
+    //! Query the cold-page stride for one layer group. Zero indicates failure
+    //! or an unknown layer group.
     [[nodiscard]] virtual std::size_t queryColdPageBytes(LayerGroupId layerGroupId) const noexcept = 0;
 
     //! Return the representative layer-group ID used for cross-lifecycle batching.

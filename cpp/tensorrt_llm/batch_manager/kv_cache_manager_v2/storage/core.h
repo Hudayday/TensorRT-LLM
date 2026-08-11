@@ -543,6 +543,8 @@ class DiskCacheLevelStorage : public CacheLevelStorage
 public:
     DiskCacheLevelStorage(StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
         std::string directory);
+    DiskCacheLevelStorage(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory);
 
     CacheTier cacheTier() const noexcept override
     {

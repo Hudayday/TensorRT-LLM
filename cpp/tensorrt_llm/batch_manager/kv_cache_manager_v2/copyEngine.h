@@ -177,6 +177,14 @@ public:
     void transfer(
         CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> const& tasks, CUstream stream);
 
+    // Acquire KVCM-owned CUDA-registered Host staging for a transform that
+    // cannot consume a DiskAddress directly. The returned RAII object fences
+    // reuse on stream; callers retain all Page and publication ownership.
+    StagingBuffer acquireStagingBuffer(size_t minSize, size_t maxSize, CUstream stream)
+    {
+        return getStagingManager().acquire(minSize, maxSize, stream);
+    }
+
     void close() noexcept
     {
         mStagingManager.reset();

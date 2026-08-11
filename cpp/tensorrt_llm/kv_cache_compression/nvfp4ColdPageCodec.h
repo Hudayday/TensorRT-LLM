@@ -54,18 +54,20 @@ struct Nvfp4ColdPageLayerConfig
 
 //! NVFP4 implementation behind QuantizationCompression's native data plane.
 //!
-//! QuantizationCompression is the lifecycle authority: it constructs and
-//! configures this object, then injects the same native object into KVCM V2.
-//! KVCM may retain shared ownership for asynchronous safety and invokes
-//! encode()/decode() directly from its migration transaction; C++ never calls
-//! back into Python on the hot path. The integration owner must detach the
-//! codec before tearing down the compression manager/KVCM pair.
+//! QuantizationCompression owns this codec's configuration, calibrated scales,
+//! registration, and lifetime. KVCM remains the sole Page-lifecycle authority:
+//! it selects Pages, allocates Slots, invokes encode()/decode() from its
+//! migration transaction, fences work, and publishes or rolls back mappings.
+//! C++ never calls back into Python on the hot path.
 //!
-//! This class intentionally matches IKvCacheColdPageCodec's configure/query/
-//! encode/decode contract. Once the KVCM-side interface lands, the only type
-//! integration required here is inheritance plus override specifiers; Page
-//! selection, admission, fencing, publication, rollback, and eviction remain
-//! KVCM responsibilities.
+//! A compact Host Slot concatenates one 16-byte-aligned record per configured
+//! layer. Each layer record is [K packed | V packed | K scales | V scales].
+//! KVCM uses only the fixed Slot stride and does not interpret these offsets.
+//!
+//! The only type crossing the manager boundary is this native object: Python
+//! owns and registers it but is absent from Page migration. Page selection,
+//! admission, fencing, publication, rollback, and eviction remain KVCM
+//! responsibilities.
 class Nvfp4ColdPageCodec final : public kv::IKvCacheColdPageCodec
 {
 public:
@@ -77,8 +79,8 @@ public:
     //! transactional: a rejected descriptor does not publish partial state.
     bool configure(kv::PoolGroupDesc const& gpuDesc) noexcept override;
 
-    //! Return the fixed byte stride of one compact Host Slot for a layer group.
-    //! Zero means that the group is not configured or its layout was rejected.
+    //! Return the fixed byte stride of one compact Host Slot for a supported
+    //! layer group. Zero indicates failure or an unknown layer group.
     [[nodiscard]] std::size_t queryColdPageBytes(kv::LayerGroupId layerGroupId) const noexcept override;
 
     //! Merge lifecycle calls only when their complete physical NVFP4 transform
@@ -88,8 +90,7 @@ public:
     //! Request Host Page-index pairs. encode()/decode() lower every pair into
     //! self-contained kernel tasks before returning, so CUDA work does not
     //! retain the PageIndexPair array.
-    [[nodiscard]] kv::PageIndexLocation queryPageIndexLocation(
-        kv::LayerGroupId layerGroupId) const noexcept override;
+    [[nodiscard]] kv::PageIndexLocation queryPageIndexLocation(kv::LayerGroupId layerGroupId) const noexcept override;
 
     //! Enqueue GPU runtime KV -> mapped-Host NVFP4 for disjoint base Pages.
     bool encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, kv::PageIndexPair const* pageIndices,
@@ -104,6 +105,7 @@ private:
     {
         kv::PoolIndex poolIndex{0};
         std::size_t offset = 0;
+        std::size_t bytes = 0;
     };
 
     struct LayerState
@@ -116,7 +118,10 @@ private:
 
     struct LayerGroupState
     {
-        kv::PoolGroupDesc gpuDesc;
+        // GPU virtual bases and Slot strides are stable layout state. KVCM's
+        // live Slot capacity is deliberately not cached here: dynamic Pool
+        // resizing remains allocator-owned and may issue larger Slot IDs.
+        kv::TypedVec<kv::PoolIndex, kv::PoolDesc> gpuPools;
         std::vector<LayerState> layers;
         std::size_t coldPageBytes = 0;
     };

@@ -156,7 +156,16 @@ void KvCacheManager::clearReusableBlocks()
 
 void KvCacheManager::setColdPageCodec(std::shared_ptr<IKvCacheColdPageCodec> codec)
 {
+    bool const installing = static_cast<bool>(codec);
     mStorage->setColdPageCodec(std::move(codec));
+    // Codec registration changes the per-level Slot geometry. Refresh the
+    // adaptive cold-tier target so a later sampling update cannot resize the
+    // new compact/raw hybrid layout toward ratios derived from the old raw
+    // layout.
+    if (installing)
+    {
+        mTargetRatioListOther = _currentOtherRatios();
+    }
 }
 
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope,
@@ -779,10 +788,13 @@ void KvCacheManager::tryUpdateTargetRatios()
     int avgCapacity = static_cast<int>(std::round(std::sqrt(mAvgSqrCapacity.value())));
     int avgHistoryLength = static_cast<int>(std::round(std::sqrt(mAvgSqrHistoryLength.value())));
     if (avgCapacity > 0)
-        mTargetRatioListGpu
-            = mStorage->constrainRatio(mStorage->ratioFromLength(tokensPerBlock, avgHistoryLength, avgCapacity));
+        mTargetRatioListGpu = mStorage->constrainRatio(
+            mStorage->ratioFromLength(kGpuLevel, tokensPerBlock, avgHistoryLength, avgCapacity));
     if (avgReusedLength > 0)
-        mTargetRatioListOther = mStorage->ratioFromLength(tokensPerBlock, avgReusedLength, avgReusedLength);
+    {
+        CacheLevel const coldLevel = mStorage->numCacheLevels() > CacheLevel{1} ? CacheLevel{1} : kGpuLevel;
+        mTargetRatioListOther = mStorage->ratioFromLength(coldLevel, tokensPerBlock, avgReusedLength, avgReusedLength);
+    }
 }
 
 TypedVec<PoolGroupIndex, float> KvCacheManager::_currentGpuRatio() const

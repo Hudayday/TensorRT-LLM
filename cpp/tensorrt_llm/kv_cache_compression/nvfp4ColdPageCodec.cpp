@@ -18,6 +18,7 @@
 #include "tensorrt_llm/kv_cache_compression/nvfp4ColdPageCodec.h"
 
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -187,8 +188,30 @@ bool Nvfp4ColdPageCodec::configure(kv::PoolGroupDesc const& gpuDesc) noexcept
                 throw std::invalid_argument("A layer group was configured more than once");
             }
 
+            // The compact cold record currently stores exactly K and V for
+            // every configured Attention layer. Reject an extra side buffer
+            // instead of silently dropping it when KVCM replaces the Host
+            // PoolGroup with one compact Pool.
+            std::set<kv::BufferId> supportedBuffers;
+            for (auto const* config : configs)
+            {
+                supportedBuffers.insert(kv::BufferId{config->layerId, kKeyRole});
+                supportedBuffers.insert(kv::BufferId{config->layerId, kValueRole});
+            }
+            for (auto const& coalesced : variant.coalescedBuffers)
+            {
+                for (auto const& bufferId : coalesced.bufferIds)
+                {
+                    if (supportedBuffers.count(bufferId) == 0U)
+                    {
+                        throw std::invalid_argument(
+                            "NVFP4 cold Pages support only the configured Attention K/V buffers");
+                    }
+                }
+            }
+
             LayerGroupState state;
-            state.gpuDesc = gpuDesc;
+            state.gpuPools = gpuDesc.pools;
             for (auto const* config : configs)
             {
                 LayerState layer;
@@ -203,12 +226,20 @@ bool Nvfp4ColdPageCodec::configure(kv::PoolGroupDesc const& gpuDesc) noexcept
                     {
                         if (bufferId.layerId == config->layerId && bufferId.role == kKeyRole)
                         {
-                            layer.gpuK = BufferLocation{poolIndex, offset};
+                            if (foundK)
+                            {
+                                throw std::invalid_argument("GPU PoolGroupDesc contains a duplicate key buffer");
+                            }
+                            layer.gpuK = BufferLocation{poolIndex, offset, coalesced.singleBufferSize};
                             foundK = true;
                         }
                         if (bufferId.layerId == config->layerId && bufferId.role == kValueRole)
                         {
-                            layer.gpuV = BufferLocation{poolIndex, offset};
+                            if (foundV)
+                            {
+                                throw std::invalid_argument("GPU PoolGroupDesc contains a duplicate value buffer");
+                            }
+                            layer.gpuV = BufferLocation{poolIndex, offset, coalesced.singleBufferSize};
                             foundV = true;
                         }
                         offset += coalesced.singleBufferSize;
@@ -232,8 +263,13 @@ bool Nvfp4ColdPageCodec::configure(kv::PoolGroupDesc const& gpuDesc) noexcept
                         throw std::invalid_argument("GPU buffer selects a missing Pool");
                     }
                     auto const& pool = gpuDesc.pools[location.poolIndex];
+                    if (location.bytes != rawBytes)
+                    {
+                        throw std::invalid_argument(
+                            "GPU key/value buffer size does not match the configured Attention Page geometry");
+                    }
                     if (pool.baseAddress == 0U || location.offset > pool.slotBytes
-                        || rawBytes > pool.slotBytes - location.offset)
+                        || location.bytes > pool.slotBytes - location.offset)
                     {
                         throw std::invalid_argument("GPU key/value buffer exceeds its configured Slot");
                     }
@@ -333,9 +369,10 @@ kv::PageIndexLocation Nvfp4ColdPageCodec::queryPageIndexLocation(kv::LayerGroupI
     return kv::PageIndexLocation::kHost;
 }
 
-bool Nvfp4ColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr,
-    kv::PageIndexPair const* pageIndices, std::size_t numBasePages, cudaStream_t stream) noexcept
+bool Nvfp4ColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, kv::PageIndexPair const* pageIndices,
+    std::size_t numBasePages, cudaStream_t stream) noexcept
 {
+    NVTX3_SCOPED_RANGE(KVCC_OFFLOAD_COMPRESS_D2H);
     try
     {
         if (numBasePages == 0U)
@@ -352,25 +389,18 @@ bool Nvfp4ColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr,
             throw std::invalid_argument("encode received an unconfigured layer group");
         }
         auto const& state = found->second;
-        using Cohort
-            = std::pair<Nvfp4ColdPageLayerConfig const*, std::vector<kernels::Nvfp4BoundaryOffloadPageTask>>;
+        using Cohort = std::pair<Nvfp4ColdPageLayerConfig const*, std::vector<kernels::Nvfp4BoundaryOffloadPageTask>>;
         std::map<KernelCohortKey, Cohort> cohorts;
         for (std::size_t page = 0; page < numBasePages; ++page)
         {
             auto const srcIndex = pageIndices[page].src;
-            if (srcIndex < 0 || static_cast<kv::SlotCount>(srcIndex) >= state.gpuDesc.numSlots)
-            {
-                throw std::invalid_argument(
-                    "encode source Page index exceeds the "
-                    "configured GPU Slot capacity");
-            }
-            auto const coldPage = addBytes(static_cast<std::uint8_t*>(dstBasePtr),
-                checkedPageOffset(pageIndices[page].dst, state.coldPageBytes));
+            auto const coldPage = addBytes(
+                static_cast<std::uint8_t*>(dstBasePtr), checkedPageOffset(pageIndices[page].dst, state.coldPageBytes));
             for (auto const& layer : state.layers)
             {
                 auto const gpuAddress = [&](BufferLocation const& location)
                 {
-                    auto const& pool = state.gpuDesc.pools[location.poolIndex];
+                    auto const& pool = state.gpuPools[location.poolIndex];
                     return pool.baseAddress + checkedPageOffset(srcIndex, pool.slotBytes) + location.offset;
                 };
                 auto& [config, tasks] = cohorts[cohortKey(layer.config)];
@@ -383,8 +413,7 @@ bool Nvfp4ColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr,
         for (auto const& item : cohorts)
         {
             auto const& [config, tasks] = item.second;
-            kernels::invokeNvfp4BoundaryOffloadCompress(
-                tasks, makeKernelParams(*config), config->runtimeType, stream);
+            kernels::invokeNvfp4BoundaryOffloadCompress(tasks, makeKernelParams(*config), config->runtimeType, stream);
         }
         return true;
     }
@@ -398,6 +427,7 @@ bool Nvfp4ColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr,
 bool Nvfp4ColdPageCodec::decode(kv::LayerGroupId layerGroupId, void const* srcBasePtr,
     kv::PageIndexPair const* pageIndices, std::size_t numBasePages, cudaStream_t stream) noexcept
 {
+    NVTX3_SCOPED_RANGE(KVCC_ONBOARD_H2D_DECOMPRESS);
     try
     {
         if (numBasePages == 0U)
@@ -414,25 +444,18 @@ bool Nvfp4ColdPageCodec::decode(kv::LayerGroupId layerGroupId, void const* srcBa
             throw std::invalid_argument("decode received an unconfigured layer group");
         }
         auto const& state = found->second;
-        using Cohort
-            = std::pair<Nvfp4ColdPageLayerConfig const*, std::vector<kernels::Nvfp4BoundaryOnboardPageTask>>;
+        using Cohort = std::pair<Nvfp4ColdPageLayerConfig const*, std::vector<kernels::Nvfp4BoundaryOnboardPageTask>>;
         std::map<KernelCohortKey, Cohort> cohorts;
         for (std::size_t page = 0; page < numBasePages; ++page)
         {
             auto const dstIndex = pageIndices[page].dst;
-            if (dstIndex < 0 || static_cast<kv::SlotCount>(dstIndex) >= state.gpuDesc.numSlots)
-            {
-                throw std::invalid_argument(
-                    "decode destination Page index exceeds "
-                    "the configured GPU Slot capacity");
-            }
             auto const coldPage = addBytes(static_cast<std::uint8_t const*>(srcBasePtr),
                 checkedPageOffset(pageIndices[page].src, state.coldPageBytes));
             for (auto const& layer : state.layers)
             {
                 auto const gpuAddress = [&](BufferLocation const& location)
                 {
-                    auto const& pool = state.gpuDesc.pools[location.poolIndex];
+                    auto const& pool = state.gpuPools[location.poolIndex];
                     return pool.baseAddress + checkedPageOffset(dstIndex, pool.slotBytes) + location.offset;
                 };
                 auto& [config, tasks] = cohorts[cohortKey(layer.config)];

@@ -27,6 +27,7 @@
 #include "kv_cache_manager_v2/storage/core.h"
 #include "tensorrt_llm/common/assert.h"
 
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -222,7 +223,8 @@ public:
     TypedVec<PoolGroupIndex, float> getRatioList(CacheLevel level) const;
 
     // Compute init ratio from an assumed average history length and capacity.
-    TypedVec<PoolGroupIndex, float> ratioFromLength(int tokensPerBlock, int historyLength, int capacity) const;
+    TypedVec<PoolGroupIndex, float> ratioFromLength(
+        CacheLevel level, int tokensPerBlock, int historyLength, int capacity) const;
 
     // Compute ratio from a BatchDesc.
     TypedVec<PoolGroupIndex, float> ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
@@ -274,6 +276,12 @@ public:
     friend class KvCacheIntrospection;
 
 private:
+    enum class ColdPageMode : std::uint8_t
+    {
+        kRaw,
+        kCodec,
+    };
+
     // Minimum per-pool-group slot counts to support a BatchDesc.
     TypedVec<PoolGroupIndex, SlotCount> computeSlotsForBatch(
         BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
@@ -341,6 +349,7 @@ private:
     TypedVec<PoolGroupIndex, SlotCount> mMinSlots;
     TypedVec<CacheLevel, CacheLevelManager> mLevels;
     std::shared_ptr<IKvCacheColdPageCodec> mColdPageCodec;
+    TypedVec<PoolGroupIndex, ColdPageMode> mColdPageModes;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

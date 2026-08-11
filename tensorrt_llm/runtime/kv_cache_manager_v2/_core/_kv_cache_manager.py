@@ -310,6 +310,11 @@ class KVCacheManager:
         """
 
         self._storage.set_cold_page_codec(codec)
+        # Codec registration changes cold-tier Slot geometry. Keep adaptive
+        # resizing anchored to the newly installed layout, not the raw-layout
+        # ratio captured during manager construction.
+        if codec is not None:
+            self._target_ratio_list_other = self._current_other_ratios
 
     def get_mem_pool_base_address(
         self, layer_id: LayerId, data_role: DataRole, index_mode: PageIndexMode | None = None
@@ -876,19 +881,22 @@ class KVCacheManager:
         storage = self._storage
 
         def ratio_from_length(
-            history_length: int, capacity: int
+            level: CacheLevel, history_length: int, capacity: int
         ) -> TypedIndexList[PoolGroupIndex, float]:
-            return storage.ratio_from_length(tokens_per_block, history_length, capacity)
+            return storage.ratio_from_length(level, tokens_per_block, history_length, capacity)
 
         avg_reused_length: int = round(self._avg_reused_length.value)
         avg_capacity: int = round(self._avg_sqr_capacity.value**0.5)
         avg_history_length: int = round(self._avg_sqr_history_length.value**0.5)
         if avg_capacity > 0:
             self._target_ratio_list_gpu = storage.constrain_ratio(
-                ratio_from_length(avg_history_length, avg_capacity)
+                ratio_from_length(GPU_LEVEL, avg_history_length, avg_capacity)
             )
         if avg_reused_length > 0:
-            self._target_ratio_list_other = ratio_from_length(avg_reused_length, avg_reused_length)
+            cold_level = CacheLevel(1) if storage.num_cache_levels > 1 else GPU_LEVEL
+            self._target_ratio_list_other = ratio_from_length(
+                cold_level, avg_reused_length, avg_reused_length
+            )
 
     # @TODO: need updating when dynamic resizing is supported.
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int:

@@ -518,12 +518,13 @@ class _KVCache:
             if life_cycle_key is None:
                 continue
             pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
-            page_size = sum(self.manager._storage.slot_size(pg_idx))
             stats = KVCacheStatsDelta()
             iteration_stats = KVCacheIterationStatsDelta()
             if src_level == GPU_LEVEL and dst_level > GPU_LEVEL:
                 iteration_stats.iter_offload_blocks = 1
-                iteration_stats.iter_offload_bytes = page_size
+                iteration_stats.iter_offload_bytes = sum(
+                    self.manager._storage.slot_size(pg_idx, dst_level)
+                )
             elif dst_level == GPU_LEVEL:
                 stats.alloc_total_blocks = 1
                 stats.alloc_new_blocks = 1
@@ -531,10 +532,14 @@ class _KVCache:
                 iteration_stats.iter_alloc_new_blocks = 1
                 if src_level > GPU_LEVEL:
                     iteration_stats.iter_onboard_blocks = 1
-                    iteration_stats.iter_onboard_bytes = page_size
+                    iteration_stats.iter_onboard_bytes = sum(
+                        self.manager._storage.slot_size(pg_idx, src_level)
+                    )
                 elif src_level == GPU_LEVEL:
                     iteration_stats.iter_intra_device_copy_blocks = 1
-                    iteration_stats.iter_intra_device_copy_bytes = page_size
+                    iteration_stats.iter_intra_device_copy_bytes = sum(
+                        self.manager._storage.slot_size(pg_idx, GPU_LEVEL)
+                    )
             if not stats.empty or not iteration_stats.empty:
                 self.manager.commit_stats(stats, {life_cycle_key: iteration_stats})
 
@@ -546,10 +551,8 @@ class _KVCache:
         """Record host-tier LRU drops (pages released without onboarding back to GPU).
 
         Mirrors _record_migrated_slots in structure: per-life-cycle attribution,
-        gated on _should_record_stats(), per-page bytes computed from slot_size.
-        cache_level is unused for now (we only have a 2-tier setup in practice;
-        all last-level drops are host drops) but kept in the signature for future
-        per-tier disambiguation.
+        gated on _should_record_stats(), and bytes from the representation that
+        actually occupies the dropped cache level.
         """
         if not self._should_record_stats() or not pages:
             return
@@ -558,7 +561,7 @@ class _KVCache:
             if life_cycle_key is None:
                 continue
             pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
-            page_size = sum(self.manager._storage.slot_size(pg_idx))
+            page_size = sum(self.manager._storage.slot_size(pg_idx, cache_level))
             iteration_stats = KVCacheIterationStatsDelta()
             iteration_stats.iter_host_dropped_blocks = 1
             iteration_stats.iter_host_dropped_bytes = page_size

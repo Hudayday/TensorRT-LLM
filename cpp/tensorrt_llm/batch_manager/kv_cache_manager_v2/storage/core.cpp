@@ -672,14 +672,28 @@ HostCacheLevelStorage::HostCacheLevelStorage(TypedVec<PoolGroupIndex, TypedVec<P
 
 DiskCacheLevelStorage::DiskCacheLevelStorage(
     StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory)
+    : DiskCacheLevelStorage(
+        [&]()
+        {
+            TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> sizes;
+            sizes.reserve(storageCfg.slotDescList.size());
+            for (auto const& slotDesc : storageCfg.slotDescList)
+                sizes.push_back(slotDesc.slotSizeList());
+            return sizes;
+        }(),
+        slotCountList, std::move(directory))
+{
+}
+
+DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory)
     : mDirectory(std::move(directory))
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(slotCountList.size() == storageCfg.slotDescList.size(),
-        "DiskCacheLevelStorage: slotCountList and slotDescList must have the same length");
-    for (PoolGroupIndex pgIdx{0}; pgIdx < storageCfg.slotDescList.size(); ++pgIdx)
+    TLLM_CHECK_DEBUG_WITH_INFO(slotCountList.size() == slotSizeLists.size(),
+        "DiskCacheLevelStorage: slotCountList and slotSizeLists must have the same length");
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotSizeLists.size(); ++pgIdx)
     {
-        mPoolGroups.push_back(std::make_unique<DiskPoolGroup>(
-            slotCountList[pgIdx], storageCfg.slotDescList[pgIdx].slotSizeList(), mDirectory));
+        mPoolGroups.push_back(std::make_unique<DiskPoolGroup>(slotCountList[pgIdx], slotSizeLists[pgIdx], mDirectory));
     }
 }
 

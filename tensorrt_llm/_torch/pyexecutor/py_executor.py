@@ -1487,8 +1487,17 @@ class PyExecutor:
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        for manager in self.resource_manager.resource_managers.values():
-            if manager:
+        # Compression codecs are registered into KVCM. Detach them while KVCM
+        # and its StorageManager are still alive. This does not change the
+        # resource-manager iteration order used during inference.
+        compression_type = ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
+        compression_manager = self.resource_manager.resource_managers.get(
+            compression_type)
+        if compression_manager is not None:
+            compression_manager.shutdown()
+        for manager_type, manager in self.resource_manager.resource_managers.items(
+        ):
+            if manager is not None and manager_type != compression_type:
                 manager.shutdown()
         # Note: do NOT call engine.cleanup() here. PyExecutor.shutdown() is
         # also invoked mid-init by configure_kv_cache_capacity() in

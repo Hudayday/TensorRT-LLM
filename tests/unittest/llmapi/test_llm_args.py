@@ -3062,6 +3062,7 @@ kv_cache_compression_config:
   algorithm: quantization_for_boundary
   quant: nvfp4
   target_cache_tier: host
+  scale_checkpoint_path: /tmp/nvfp4-kv-scales
 """)
 
     config = TorchLlmArgs(model="/tmp/dummy_model",
@@ -3070,6 +3071,7 @@ kv_cache_compression_config:
     assert isinstance(config, QuantizationCompressionConfig)
     assert config.quant == "nvfp4"
     assert config.target_cache_tier == "host"
+    assert config.scale_checkpoint_path == "/tmp/nvfp4-kv-scales"
     assert not config.changes_physical_kv_length
     assert config.supports_block_reuse()
     assert not config.supports_speculative_decoding()
@@ -3083,6 +3085,7 @@ def test_quantization_compression_config_rejects_unimplemented_format_or_tier():
             kv_cache_compression_config={
                 "algorithm": "quantization_for_boundary",
                 "quant": "fp8",
+                "scale_checkpoint_path": "/tmp/nvfp4-kv-scales",
             },
         )
     with pytest.raises(ValidationError):
@@ -3091,6 +3094,7 @@ def test_quantization_compression_config_rejects_unimplemented_format_or_tier():
             kv_cache_compression_config={
                 "algorithm": "quantization_for_boundary",
                 "target_cache_tier": "disk",
+                "scale_checkpoint_path": "/tmp/nvfp4-kv-scales",
             },
         )
 

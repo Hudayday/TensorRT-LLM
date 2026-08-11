@@ -19,6 +19,7 @@ import types
 from unittest.mock import MagicMock, Mock
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
@@ -204,6 +205,43 @@ def _make_executor_with_kv_cache_manager(kv_cache_manager):
         ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager
     }
     return executor
+
+
+def test_shutdown_detaches_compression_before_kv_cache(monkeypatch):
+    """A registered cold-page codec must not outlive its KVCM owner."""
+    events = []
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.executor_request_queue = Mock()
+    executor.shutdown_event = Mock()
+    executor.hang_detector = Mock()
+    executor.hang_detector.detected.return_value = False
+    executor.worker_thread = Mock()
+    executor.dist = Mock(pp_size=1)
+    executor._shutdown_sleep_wakeup_listeners = Mock()
+    executor.model_engine = Mock()
+    executor.model_engine._release_cuda_graphs.side_effect = lambda: events.append(
+        "graphs")
+    executor.draft_model_engine = None
+    executor.virtual_memory_pools = None
+    executor.sampler = Mock()
+    executor.dwdp_manager = None
+
+    compression_manager = Mock()
+    compression_manager.shutdown.side_effect = lambda: events.append(
+        "compression")
+    kv_cache_manager = Mock()
+    kv_cache_manager.shutdown.side_effect = lambda: events.append("kv_cache")
+    executor.resource_manager = Mock()
+    executor.resource_manager.resource_managers = {
+        ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
+        ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER: compression_manager,
+    }
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    executor.shutdown()
+
+    assert events == ["graphs", "compression", "kv_cache"]
+    compression_manager.shutdown.assert_called_once_with()
 
 
 def test_get_kv_cache_capacity_without_manager():

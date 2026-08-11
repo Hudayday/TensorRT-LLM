@@ -642,18 +642,17 @@ void KvCache::_recordMigratedSlots(
         }
 
         PoolGroupIndex const poolGroup = mManager->storage().getPoolGroupIndex(lifeCycle);
-        int64_t pageSize = 0;
-        for (size_t const size : mManager->storage().slotSize(poolGroup))
-        {
-            pageSize += static_cast<int64_t>(size);
-        }
-
         KVCacheStatsDelta stats;
         KVCacheIterationStatsDelta iterationStats;
+        // Count the representation crossing the boundary: the cold destination
+        // for offload and the cold source for onboard.
         if (srcLevel == kGpuLevel && dstLevel > kGpuLevel)
         {
             iterationStats.iterOffloadBlocks = 1;
-            iterationStats.iterOffloadBytes = pageSize;
+            for (size_t const size : mManager->storage().slotSize(poolGroup, dstLevel))
+            {
+                iterationStats.iterOffloadBytes += static_cast<int64_t>(size);
+            }
         }
         else if (dstLevel == kGpuLevel)
         {
@@ -664,12 +663,18 @@ void KvCache::_recordMigratedSlots(
             if (srcLevel > kGpuLevel)
             {
                 iterationStats.iterOnboardBlocks = 1;
-                iterationStats.iterOnboardBytes = pageSize;
+                for (size_t const size : mManager->storage().slotSize(poolGroup, srcLevel))
+                {
+                    iterationStats.iterOnboardBytes += static_cast<int64_t>(size);
+                }
             }
             else if (srcLevel == kGpuLevel)
             {
                 iterationStats.iterIntraDeviceCopyBlocks = 1;
-                iterationStats.iterIntraDeviceCopyBytes = pageSize;
+                for (size_t const size : mManager->storage().slotSize(poolGroup, kGpuLevel))
+                {
+                    iterationStats.iterIntraDeviceCopyBytes += static_cast<int64_t>(size);
+                }
             }
         }
 
@@ -684,7 +689,6 @@ void KvCache::_recordMigratedSlots(
 
 void KvCache::_recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
 {
-    (void) cacheLevel;
     if (!_shouldRecordStats())
     {
         return;
@@ -698,7 +702,7 @@ void KvCache::_recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, Cac
         }
         PoolGroupIndex const poolGroup = mManager->storage().getPoolGroupIndex(lifeCycle);
         int64_t pageSize = 0;
-        for (size_t const size : mManager->storage().slotSize(poolGroup))
+        for (size_t const size : mManager->storage().slotSize(poolGroup, cacheLevel))
         {
             pageSize += static_cast<int64_t>(size);
         }

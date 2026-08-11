@@ -255,6 +255,10 @@ else:
         def __init__(self, obj=None):
             self._obj = obj
 
+        @property
+        def is_valid(self) -> bool:
+            return self._obj is not None
+
         def __call__(self):
             return self._obj
 

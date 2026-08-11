@@ -15,7 +15,7 @@
 import copy
 import dataclasses
 import os
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 
@@ -2444,6 +2444,10 @@ def validate_kv_cache_compression_compatibility(
     spec_config: Optional[SpeculativeConfig],
 ) -> None:
     """Reject unsupported KV-cache compression feature combinations."""
+    if (config.algorithm == "quantization_for_boundary"
+            and kv_cache_config.use_kv_cache_manager_v2 is not True):
+        raise ValueError("QuantizationCompression requires "
+                         "KvCacheConfig(use_kv_cache_manager_v2=True)")
     if kv_cache_config.enable_block_reuse and not config.supports_block_reuse():
         raise ValueError(
             f"KV-cache compression algorithm {config.algorithm!r} does not "
@@ -2467,9 +2471,6 @@ def create_kv_cache_compression_manager(
     config: KvCacheCompressionConfig,
     kv_cache_manager: KVCacheManagerV2,
     draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
-    *,
-    boundary_layer_configs: Optional[Sequence[object]] = None,
-    boundary_gpu_pool_group_descs: Optional[Sequence[object]] = None,
 ) -> Optional[KVCacheCompressionManager]:
     """Build the KV-cache compression manager for ``config.algorithm``, or return
     None if no algorithm matches.
@@ -2481,39 +2482,19 @@ def create_kv_cache_compression_manager(
     if config.algorithm == "quantization_for_boundary":
         # Architecture admission belongs to the selected quantization format,
         # not to the generic QuantizationCompression manager.
-        if getattr(config, "quant", None) == "nvfp4" and not is_sm_100f():
+        if config.quant == "nvfp4" and not is_sm_100f():
             raise RuntimeError(
                 "NVFP4 boundary compression requires an SM100-family device "
                 "(SM100 or SM103).")
-        from ..kv_cache_compression.quantization_for_boundary import (
-            QuantizationCompression,
-            build_uncalibrated_nvfp4_layer_configs_for_testing,
-        )
+        from ..kv_cache_compression.quantization_for_boundary import \
+            QuantizationCompression
 
-        if boundary_layer_configs is None:
-            if os.getenv("TLLM_KVCC_ALLOW_UNCALIBRATED_UNIT_SCALES") != "1":
-                raise RuntimeError(
-                    "QuantizationCompression requires the KVCM V2 boundary "
-                    "layer configuration handoff. Set "
-                    "TLLM_KVCC_ALLOW_UNCALIBRATED_UNIT_SCALES=1 only for the "
-                    "mechanism E2E test; it is not an accuracy configuration.")
-            logger.warning(
-                "QuantizationCompression is using unit NVFP4 global scales "
-                "for a mechanism-only test; accuracy conclusions are invalid")
-            boundary_layer_configs = (
-                build_uncalibrated_nvfp4_layer_configs_for_testing(
-                    kv_cache_manager))
-
+        gpu_pool_group_descs = kv_cache_manager.impl.pool_group_descs
         manager = QuantizationCompression(
             config,
             kv_cache_manager,
-            layer_configs=boundary_layer_configs,
+            gpu_pool_group_descs=gpu_pool_group_descs,
         )
-        gpu_pool_group_descs = boundary_gpu_pool_group_descs
-        if gpu_pool_group_descs is None:
-            gpu_pool_group_descs = kv_cache_manager.impl.pool_group_descs
-        manager.register_with_kv_cache_manager(
-            gpu_pool_group_descs=gpu_pool_group_descs)
         return manager
 
     if config.algorithm == "triattention":

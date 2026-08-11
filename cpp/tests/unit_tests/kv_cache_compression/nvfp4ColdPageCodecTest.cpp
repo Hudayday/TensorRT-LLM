@@ -160,6 +160,62 @@ TEST(Nvfp4ColdPageCodecTest, RejectedConfigurePreservesPublishedLayout)
     EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{3}), kColdSlotBytes);
 }
 
+TEST(Nvfp4ColdPageCodecTest, UsesKvcmsCurrentSlotIndicesAfterPoolResize)
+{
+    gOffloadTasks.clear();
+    gOnboardTasks.clear();
+
+    Nvfp4ColdPageCodec codec{makeLayers()};
+    ASSERT_TRUE(codec.configure(makeGpuDesc()));
+
+    // GPU Pool virtual addresses and Slot strides remain stable when KVCM
+    // expands a PoolGroup. KVCM owns the live allocator capacity, so the codec
+    // must accept a newly allocated index without requiring reconfiguration.
+    kv::PageIndexPair const offloadIndices[]{{0, 11}};
+    EXPECT_TRUE(codec.encode(
+        kv::LayerGroupId{3}, reinterpret_cast<void*>(kColdBase), offloadIndices, std::size(offloadIndices), nullptr));
+    ASSERT_EQ(gOffloadTasks.size(), 2U);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(gOffloadTasks.front().rawK), kGpuKBase + 11 * kGpuSlotBytes);
+
+    kv::PageIndexPair const onboardIndices[]{{11, 0}};
+    EXPECT_TRUE(codec.decode(kv::LayerGroupId{3}, reinterpret_cast<void const*>(kColdBase), onboardIndices,
+        std::size(onboardIndices), nullptr));
+    ASSERT_EQ(gOnboardTasks.size(), 2U);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(gOnboardTasks.front().rawK), kGpuKBase + 11 * kGpuSlotBytes);
+}
+
+TEST(Nvfp4ColdPageCodecTest, RejectsAttentionBufferWithMismatchedGeometry)
+{
+    Nvfp4ColdPageCodec codec{makeLayers()};
+    auto gpuDesc = makeGpuDesc();
+    gpuDesc.slotDesc.variants.front().coalescedBuffers[kv::PoolIndex{0}].singleBufferSize += 16U;
+
+    EXPECT_FALSE(codec.configure(gpuDesc));
+    EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{3}), 0U);
+}
+
+TEST(Nvfp4ColdPageCodecTest, DeclinesLayerGroupWithoutAttentionKvConfig)
+{
+    Nvfp4ColdPageCodec codec{makeLayers()};
+    auto gpuDesc = makeGpuDesc();
+    gpuDesc.slotDesc.variants.front().lifeCycleId = kv::LayerGroupId{4};
+
+    // A descriptor with no matching K/V layer is valid but is not owned by
+    // this codec. StorageManager treats its zero size query as raw fallback.
+    ASSERT_TRUE(codec.configure(gpuDesc));
+    EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{4}), 0U);
+}
+
+TEST(Nvfp4ColdPageCodecTest, RejectsUnrepresentedAttentionSideBuffer)
+{
+    Nvfp4ColdPageCodec codec{makeLayers()};
+    auto gpuDesc = makeGpuDesc();
+    gpuDesc.slotDesc.variants.front().coalescedBuffers[kv::PoolIndex{0}].bufferIds.push_back({0, "index_key"});
+
+    EXPECT_FALSE(codec.configure(gpuDesc));
+    EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{3}), 0U);
+}
+
 TEST(Nvfp4ColdPageCodecTest, ReturnsSmallestRepresentativeForIdenticalPhysicalTransforms)
 {
     Nvfp4ColdPageCodec codec{makeEquivalentLifeCycleLayers(

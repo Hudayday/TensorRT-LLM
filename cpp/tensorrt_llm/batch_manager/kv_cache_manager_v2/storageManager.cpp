@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <exception>
 #include <limits>
 #include <numeric>
 #include <set>
@@ -126,6 +127,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mSlotToPageIndices = computeSlotToPageIndices(config);
     mBufferAttr = config.bufferAttributes();
     mSlotDescList = config.slotDescList;
+    mColdPageModes = TypedVec<PoolGroupIndex, ColdPageMode>(numPoolGroups(), ColdPageMode::kRaw);
 
     // Compute layer attributes and slot utilization fractions for scratch support.
     mLayerAttributes = config.layerAttributes();
@@ -239,56 +241,108 @@ void StorageManager::setColdPageCodec(std::shared_ptr<IKvCacheColdPageCodec> cod
 {
     if (!codec)
     {
-        // Detaching during shutdown does not rewrite the configured Host
-        // layout. No further migration may use the cold boundary afterwards.
+        // Detaching during shutdown does not rewrite configured cold layouts.
+        // No further migration may use the cold boundary afterwards.
         mColdPageCodec.reset();
         return;
     }
     if (mColdPageCodec)
         throw std::runtime_error("A cold-Page codec is already installed");
-    if (mLevels.size() != CacheLevel{2} || mLevels.at(CacheLevel{1}).cacheTier != CacheTier::HOST_MEM)
-        throw std::runtime_error("Boundary compression P0 requires exactly GPU and Host cache tiers");
-
-    CacheLevel const hostLevel{1};
-    auto& level = mLevels.at(hostLevel);
-    for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
+    if (mLevels.size() < CacheLevel{2} || mLevels.at(CacheLevel{1}).cacheTier != CacheTier::HOST_MEM)
+        throw std::runtime_error("Boundary compression P0 requires a Host tier immediately below GPU");
+    for (CacheLevel level{2}; level < mLevels.size(); ++level)
     {
-        if (level.storage->numFreeSlots(pgIdx) != level.storage->numSlots(pgIdx)
-            || level.controller.numEvictablePages(pgIdx) != 0)
+        if (mLevels.at(level).cacheTier != CacheTier::DISK)
+            throw std::runtime_error("Boundary compression supports only Disk tiers below Host");
+    }
+
+    for (CacheLevel level{1}; level < mLevels.size(); ++level)
+    {
+        auto const& coldLevel = mLevels.at(level);
+        for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
         {
-            throw std::runtime_error("A cold-Page codec must be installed before any Page uses the Host tier");
+            if (coldLevel.storage->numFreeSlots(pgIdx) != coldLevel.storage->numSlots(pgIdx)
+                || coldLevel.controller.numEvictablePages(pgIdx) != 0)
+            {
+                throw std::runtime_error("A cold-Page codec must be installed before any Page uses a cold tier");
+            }
         }
     }
 
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> coldSlotSizeLists(numPoolGroups());
+    TypedVec<PoolGroupIndex, ColdPageMode> coldPageModes(numPoolGroups(), ColdPageMode::kRaw);
     for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
     {
         std::optional<size_t> stride;
+        bool hasRawLifeCycle = false;
+        bool hasCodecLifeCycle = false;
         for (auto const& variant : mSlotDescList.at(pgIdx).variants)
         {
             size_t const candidate = codec->queryColdPageBytes(variant.lifeCycleId);
-            if (candidate == 0 || (stride && *stride != candidate))
+            if (candidate == 0)
+            {
+                // A zero query is the codec ABI's intentional raw fallback for
+                // unknown/non-Attention lifecycles. The compression manager
+                // validates every expected Attention lifecycle before it
+                // registers the codec, so a missing required transform still
+                // fails closed outside this generic storage layer.
+                hasRawLifeCycle = true;
+                continue;
+            }
+            hasCodecLifeCycle = true;
+            if (stride && *stride != candidate)
             {
                 throw std::runtime_error(
-                    "Every lifecycle sharing a PoolGroup must have one identical, non-zero cold Page stride");
+                    "Every compressed lifecycle sharing a PoolGroup must have one identical cold Page stride");
             }
             stride = candidate;
         }
-        if (!stride)
+        if (mSlotDescList.at(pgIdx).variants.empty())
             throw std::runtime_error("A PoolGroup has no lifecycle variant");
-        coldSlotSizeLists.at(pgIdx).push_back(*stride);
+        if (hasRawLifeCycle && hasCodecLifeCycle)
+            throw std::runtime_error("One PoolGroup cannot mix raw and compressed lifecycle representations");
+        if (hasCodecLifeCycle)
+        {
+            coldSlotSizeLists.at(pgIdx).push_back(*stride);
+            coldPageModes.at(pgIdx) = ColdPageMode::kCodec;
+        }
+        else
+        {
+            // The codec deliberately declined this PoolGroup. Preserve its
+            // original multi-Pool layout (for example, Qwen3.5 GDN/SSM state).
+            coldSlotSizeLists.at(pgIdx) = mSlotDescList.at(pgIdx).slotSizeList();
+        }
     }
 
-    auto const ratio = level.storage->ratioList();
-    auto const& hostConfig = mStorageConfig.cacheTiers.at(hostLevel);
-    auto const slotCounts = computeSlotCountForLevel(hostConfig, coldSlotSizeLists, ratio);
+    // Host and Disk use the same cold representation, while keeping independent
+    // quotas and allocators. Preserve each level's existing workload-derived
+    // Slot-count proportions, then reweight bytes using the new per-PG layout.
+    // This prevents compact Attention Pages from inheriting raw-layout ratios
+    // that would starve a raw hybrid SSM PoolGroup.
+    for (CacheLevel level{1}; level < mLevels.size(); ++level)
+    {
+        auto& coldLevel = mLevels.at(level);
+        auto const granularity = coldLevel.storage->poolSizeGranularity();
+        auto const oldSlotCounts = coldLevel.storage->slotCountList();
+        auto const coldRatio = normalizeToRatio(slotsToBytes(oldSlotCounts, granularity, coldSlotSizeLists));
+        auto const& tierConfig = mStorageConfig.cacheTiers.at(level);
+        auto const slotCounts = computeSlotCountForLevel(tierConfig, coldSlotSizeLists, coldRatio);
 
-    // Registration happens before request admission. Destroy the unused raw
-    // Host allocation before reserving the compact one to avoid double quota.
-    // Allocation failure aborts manager startup rather than exposing a
-    // partially usable cache hierarchy.
-    level.storage->destroy();
-    level.storage = std::make_unique<HostCacheLevelStorage>(coldSlotSizeLists, slotCounts);
+        // Registration is initialization-only. Destroying the unused raw tier
+        // first avoids a transient double-quota reservation; allocation failure
+        // aborts manager startup, so no Page can observe a partial hierarchy.
+        coldLevel.storage->destroy();
+        if (coldLevel.cacheTier == CacheTier::HOST_MEM)
+        {
+            coldLevel.storage = std::make_unique<HostCacheLevelStorage>(coldSlotSizeLists, slotCounts);
+        }
+        else
+        {
+            coldLevel.storage = std::make_unique<DiskCacheLevelStorage>(
+                coldSlotSizeLists, slotCounts, std::get<DiskCacheTierConfig>(tierConfig).path);
+        }
+    }
+    mColdPageModes = std::move(coldPageModes);
     mColdPageCodec = std::move(codec);
 }
 
@@ -669,7 +723,7 @@ std::vector<Slot> StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLev
         throw OutOfPagesError("Not enough free slots for migration");
 
     auto dstSlots = dstPoolGroup.allocateMultiple(numSlots);
-    // A15: allocated slot count must match the request.
+    // Every admitted Page must have one destination Slot.
     TLLM_CHECK_DEBUG_WITH_INFO(slotCountValueFromSize(dstSlots.size()) == numSlots, "dst_slots size mismatch");
     try
     {
@@ -678,8 +732,9 @@ std::vector<Slot> StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLev
 
         PoolIndex const srcNumPools = numPools(pgIdx, srcLevel);
         PoolIndex const dstNumPools = numPools(pgIdx, dstLevel);
-        bool const useEncode = mColdPageCodec && srcLevel == kGpuLevel && dstTier == CacheTier::HOST_MEM;
-        bool const useDecode = mColdPageCodec && dstLevel == kGpuLevel && srcTier == CacheTier::HOST_MEM;
+        bool const useCodec = mColdPageCodec && mColdPageModes.at(pgIdx) == ColdPageMode::kCodec;
+        bool const useEncode = useCodec && srcLevel == kGpuLevel && dstLevel != kGpuLevel;
+        bool const useDecode = useCodec && dstLevel == kGpuLevel && srcLevel != kGpuLevel;
         if (!useEncode && !useDecode && srcNumPools != dstNumPools)
             throw std::runtime_error("Raw migration requires identical source/destination Pool counts");
 
@@ -691,7 +746,8 @@ std::vector<Slot> StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLev
         {
             auto const& src = srcPages.at(i);
             auto const& dst = dstSlots.at(i);
-            // Fix #8: assert non-defrag migrations only accept pages not scheduled for eviction.
+            // Non-defragmentation migrations cannot consume Pages already
+            // scheduled for eviction.
             TLLM_CHECK_DEBUG(defrag || !src->scheduledForEviction());
             for (PoolIndex poolIdx{0}; poolIdx < tasksPerPool.size(); ++poolIdx)
             {
@@ -713,14 +769,12 @@ std::vector<Slot> StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLev
         // Create a temporary CUDA stream that waits for all prior events before copying.
         TemporaryCudaStream tempStream(priorEvents);
         bool codecSubmissionFailed = false;
+        std::exception_ptr submissionError;
         {
             auto scope = tempStream.enter();
             CUstream stream = tempStream.get();
-            if (useEncode || useDecode)
+            try
             {
-                auto& coldPoolGroup = useEncode ? dstPoolGroup : srcPoolGroup;
-                auto const coldBase = std::get<MemAddress>(coldPoolGroup.slotAddress(SlotId{0}).at(PoolIndex{0}));
-                std::map<LifeCycleId, std::vector<PageIndexPair>> batches;
                 auto const toPageIndex = [](SlotId slotId)
                 {
                     auto const value = slotId.value();
@@ -728,61 +782,125 @@ std::vector<Slot> StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLev
                         "Cold-Page codec Page index exceeds int32_t");
                     return static_cast<std::int32_t>(value);
                 };
-                for (std::size_t i = 0; i < srcPages.size(); ++i)
+
+                auto const submitCodecRange
+                    = [&](MemAddress coldBase, std::size_t begin, std::size_t count, bool stagingIndices)
                 {
-                    auto const lifeCycle = srcPages.at(i)->lifeCycle;
-                    // The codec contract guarantees that equivalent groups
-                    // share this PoolGroup and cold-Page stride.
-                    auto const representative = mColdPageCodec->getBatchingLayerGroupId(lifeCycle);
-                    batches[representative].push_back(PageIndexPair{
-                        toPageIndex(dstSlots.at(i).slotId()), toPageIndex(srcPages.at(i)->slotId())});
-                }
-                for (auto const& [batchingLayerGroup, pageIndices] : batches)
-                {
-                    if (mColdPageCodec->queryPageIndexLocation(batchingLayerGroup) != PageIndexLocation::kHost)
+                    std::map<LifeCycleId, std::vector<PageIndexPair>> batches;
+                    for (std::size_t local = 0; local < count; ++local)
                     {
-                        throw std::runtime_error(
-                            "This KVCM integration currently provides Host Page-index pairs only");
+                        auto const page = begin + local;
+                        auto const lifeCycle = srcPages.at(page)->lifeCycle;
+                        auto const representative = mColdPageCodec->getBatchingLayerGroupId(lifeCycle);
+                        auto const stagingIndex = static_cast<std::int32_t>(local);
+                        batches[representative].push_back(PageIndexPair{
+                            useEncode && stagingIndices ? stagingIndex : toPageIndex(dstSlots.at(page).slotId()),
+                            useDecode && stagingIndices ? stagingIndex : toPageIndex(srcPages.at(page)->slotId())});
                     }
-                    bool submitted = false;
-                    if (useEncode)
+                    for (auto const& [batchingLayerGroup, pageIndices] : batches)
                     {
-                        submitted = mColdPageCodec->encode(batchingLayerGroup, reinterpret_cast<void*>(coldBase),
-                            pageIndices.data(), pageIndices.size(), reinterpret_cast<cudaStream_t>(stream));
+                        if (mColdPageCodec->queryPageIndexLocation(batchingLayerGroup) != PageIndexLocation::kHost)
+                        {
+                            throw std::runtime_error(
+                                "This KVCM integration currently provides Host Page-index pairs only");
+                        }
+                        bool const submitted = useEncode
+                            ? mColdPageCodec->encode(batchingLayerGroup, reinterpret_cast<void*>(coldBase),
+                                pageIndices.data(), pageIndices.size(), reinterpret_cast<cudaStream_t>(stream))
+                            : mColdPageCodec->decode(batchingLayerGroup, reinterpret_cast<void const*>(coldBase),
+                                pageIndices.data(), pageIndices.size(), reinterpret_cast<cudaStream_t>(stream));
+                        if (!submitted)
+                            return false;
+                    }
+                    return true;
+                };
+
+                if (useEncode || useDecode)
+                {
+                    CacheTier const coldTier = useEncode ? dstTier : srcTier;
+                    auto& coldPoolGroup = useEncode ? dstPoolGroup : srcPoolGroup;
+                    if (coldTier == CacheTier::HOST_MEM)
+                    {
+                        auto const coldBase
+                            = std::get<MemAddress>(coldPoolGroup.slotAddress(SlotId{0}).at(PoolIndex{0}));
+                        codecSubmissionFailed = !submitCodecRange(coldBase, 0U, srcPages.size(), false);
                     }
                     else
                     {
-                        submitted = mColdPageCodec->decode(batchingLayerGroup, reinterpret_cast<void const*>(coldBase),
-                            pageIndices.data(), pageIndices.size(),
-                            reinterpret_cast<cudaStream_t>(stream));
-                    }
-                    if (!submitted)
-                    {
-                        // Exit the stream scope normally so it records a fence
-                        // for any earlier lifecycle already queued. The Page
-                        // mapping is still unpublished; the fence is attached
-                        // before destination Slots are rolled back below.
-                        codecSubmissionFailed = true;
-                        break;
+                        auto const coldSlotSizes = slotSize(pgIdx, useEncode ? dstLevel : srcLevel);
+                        if (coldSlotSizes.size() != PoolIndex{1})
+                            throw std::runtime_error("A compressed Disk PoolGroup must contain one compact Pool");
+                        size_t const coldPageBytes = coldSlotSizes.front();
+                        std::size_t begin = 0U;
+                        while (begin < srcPages.size() && !codecSubmissionFailed)
+                        {
+                            auto const remaining = srcPages.size() - begin;
+                            auto const maxSize = remaining > std::numeric_limits<std::size_t>::max() / coldPageBytes
+                                ? std::numeric_limits<std::size_t>::max()
+                                : remaining * coldPageBytes;
+                            auto staging = globalCopyEngine().acquireStagingBuffer(coldPageBytes, maxSize, stream);
+                            auto const count = std::min(remaining, staging.size() / coldPageBytes);
+                            TLLM_CHECK_WITH_INFO(count > 0U, "One compact cold Page exceeds KVCM staging capacity");
+
+                            std::vector<CopyTask> diskTasks;
+                            diskTasks.reserve(count);
+                            for (std::size_t local = 0; local < count; ++local)
+                            {
+                                auto const page = begin + local;
+                                MemAddress const staged = staging.address() + local * coldPageBytes;
+                                if (useEncode)
+                                {
+                                    diskTasks.push_back(
+                                        {dstPoolGroup.slotAddress(dstSlots.at(page).slotId()).at(PoolIndex{0}),
+                                            staged});
+                                }
+                                else
+                                {
+                                    diskTasks.push_back({staged,
+                                        srcPoolGroup.slotAddress(srcPages.at(page)->slotId()).at(PoolIndex{0})});
+                                }
+                            }
+
+                            if (useEncode)
+                            {
+                                codecSubmissionFailed = !submitCodecRange(staging.address(), begin, count, true);
+                                if (!codecSubmissionFailed)
+                                    batchedCopy(CacheTier::DISK, CacheTier::HOST_MEM, coldPageBytes, diskTasks, stream);
+                            }
+                            else
+                            {
+                                batchedCopy(CacheTier::HOST_MEM, CacheTier::DISK, coldPageBytes, diskTasks, stream);
+                                codecSubmissionFailed = !submitCodecRange(staging.address(), begin, count, true);
+                            }
+                            begin += count;
+                        }
                     }
                 }
+                else
+                {
+                    auto const slotSizes = slotSize(pgIdx, srcLevel);
+                    for (PoolIndex poolIdx{0}; poolIdx < srcNumPools; ++poolIdx)
+                        batchedCopy(dstTier, srcTier, slotSizes.at(poolIdx), tasksPerPool.at(poolIdx), stream);
+                }
             }
-            else
+            catch (...)
             {
-                auto const slotSizes = slotSize(pgIdx, srcLevel);
-                for (PoolIndex poolIdx{0}; poolIdx < srcNumPools; ++poolIdx)
-                    batchedCopy(dstTier, srcTier, slotSizes.at(poolIdx), tasksPerPool.at(poolIdx), stream);
+                // Preserve the stream scope long enough to fence any earlier
+                // transform or I/O submitted before the synchronous failure.
+                submissionError = std::current_exception();
             }
         } // ~Scope records finish event
 
         CachedCudaEvent finishEvent = tempStream.takeFinishEvent();
-        if (codecSubmissionFailed)
+        if (codecSubmissionFailed || submissionError)
         {
             for (std::size_t i = 0; i < srcPages.size(); ++i)
             {
                 srcPages.at(i)->readyEvent = finishEvent;
                 dstSlots.at(i).readyEvent = finishEvent;
             }
+            if (submissionError)
+                std::rethrow_exception(submissionError);
             throw std::runtime_error("Cold-Page codec submission failed");
         }
         if (migrationRecorder && !defrag)
@@ -795,8 +913,9 @@ std::vector<Slot> StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLev
         for (std::size_t i = 0; i < srcPages.size(); ++i)
         {
             dstSlots.at(i).readyEvent = finishEvent;
-            // Fix #6: set src.ready_event unconditionally — compulsory for the next owner
-            // getting this slot from the pool. Mirrors Python: `src.ready_event = finish_event`.
+            // Always fence the source: its next owner must not overwrite it
+            // after getting this Slot from the Pool. Mirrors Python's source
+            // ready-event assignment.
             srcPages.at(i)->readyEvent = finishEvent;
             if (updateSrc)
             {
@@ -846,9 +965,9 @@ std::vector<Slot> StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLev
 Slot StorageManager::clonePageToLevel(SharedPtr<Page> const& srcPage, CacheLevel dstLevel)
 {
     PoolGroupIndex const pgIdx = getPoolGroupIndex(srcPage->lifeCycle);
-    auto slots = _batchedMigrate(
-        pgIdx, dstLevel, srcPage->cacheLevel, {srcPage}, /*updateSrc=*/false, MigrationRecorder{},
-        /*defrag=*/dstLevel == srcPage->cacheLevel);
+    auto slots
+        = _batchedMigrate(pgIdx, dstLevel, srcPage->cacheLevel, {srcPage}, /*updateSrc=*/false, MigrationRecorder{},
+            /*defrag=*/dstLevel == srcPage->cacheLevel);
     TLLM_CHECK_WITH_INFO(slots.size() == 1, "A one-Page clone must return exactly one destination Slot");
     return std::move(slots.front());
 }
@@ -1202,7 +1321,7 @@ TypedVec<PoolGroupIndex, float> StorageManager::getRatioList(CacheLevel level) c
 }
 
 TypedVec<PoolGroupIndex, float> StorageManager::ratioFromLength(
-    int tokensPerBlock, int historyLength, int capacity) const
+    CacheLevel level, int tokensPerBlock, int historyLength, int capacity) const
 {
     if (capacity < historyLength)
     {
@@ -1216,7 +1335,7 @@ TypedVec<PoolGroupIndex, float> StorageManager::ratioFromLength(
     for (LifeCycleId lcId{0}; lcId < lifecycles.size(); ++lcId)
     {
         PoolGroupIndex pgIdx = mLifeCycleGrouping[lcId];
-        auto ss = slotSize(pgIdx);
+        auto ss = slotSize(pgIdx, level);
         size_t slotSizeSum = 0;
         for (auto s : ss)
             slotSizeSum += s;
