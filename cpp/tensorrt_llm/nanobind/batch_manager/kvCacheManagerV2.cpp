@@ -1980,21 +1980,54 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("quota"), nb::arg("slot_size_lists"), nb::arg("ratio_list"), nb::arg("granularity"),
         nb::arg("min_slots"), nb::call_guard<nb::gil_scoped_release>());
 
+    // ---- Cold-page codec --------------------------------------------------
+    nb::class_<kv::IKvCacheColdPageCodec>(m, "IKvCacheColdPageCodec");
+    m.def("create_default_kv_cache_cold_page_codec", &kv::createDefaultKvCacheColdPageCodec,
+        "Create the default lossless cold-page codec. Passing cold_page_codec=None to KVCacheManager already selects "
+        "this codec, so normal users do not need to call this factory. It is primarily provided to demonstrate how a "
+        "native codec factory exposes an owning IKvCacheColdPageCodec object for transfer into KVCacheManager.");
+
     // ---- KvCacheManager ----------------------------------------------------
     nb::class_<kv::KvCacheManager>(m, "KVCacheManager")
         .def(
             "__init__",
-            [](kv::KvCacheManager* self, kv::KVCacheManagerConfig const& config, nb::object eventManager)
+            [](kv::KvCacheManager* self, kv::KVCacheManagerConfig const& config, nb::object eventManager,
+                nb::object codecObject)
             {
                 std::shared_ptr<kv::EventSink> eventSink;
                 if (!eventManager.is_none())
                 {
                     eventSink = nb::cast<std::shared_ptr<kv::EventManager>>(eventManager);
                 }
-                nb::gil_scoped_release release;
-                new (self) kv::KvCacheManager(config, std::move(eventSink));
+
+                std::unique_ptr<kv::IKvCacheColdPageCodec> codec;
+                try
+                {
+                    if (!codecObject.is_none())
+                    {
+                        codec = nb::cast<std::unique_ptr<kv::IKvCacheColdPageCodec>>(codecObject);
+                        if (!codec)
+                        {
+                            throw std::invalid_argument(
+                                "cold_page_codec must own a non-null IKvCacheColdPageCodec pointer");
+                        }
+                    }
+
+                    nb::gil_scoped_release release;
+                    new (self) kv::KvCacheManager(config, std::move(eventSink), std::move(codec));
+                }
+                catch (...)
+                {
+                    if (codec)
+                    {
+                        codec.release();
+                        nb::detail::nb_type_restore_ownership(codecObject.ptr(), true);
+                    }
+                    throw;
+                }
             },
-            nb::arg("config"), nb::arg("event_manager").none() = nb::none())
+            nb::arg("config"), nb::arg("event_manager").none() = nb::none(),
+            nb::arg("cold_page_codec").none() = nb::none())
         .def("shutdown", &kv::KvCacheManager::shutdown, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "clear_reusable_blocks", &kv::KvCacheManager::clearReusableBlocks, nb::call_guard<nb::gil_scoped_release>())

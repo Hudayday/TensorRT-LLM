@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/eventSink.h"
@@ -38,6 +39,8 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // Forward declarations.
 class Page;
 class KvCache;
+class CopyEngine;
+class StagingBufferManager;
 struct BatchedLockTarget;
 
 using MigrationRecorder
@@ -72,7 +75,7 @@ class CacheLevelManager
 {
 public:
     CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel,
-        CacheTierConfig const& tierConfig, StorageConfig const& storageConfig,
+        CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
 
     // Compute pool size granularity for a given cache tier and quota.
@@ -99,7 +102,7 @@ class StorageManager : public std::enable_shared_from_this<StorageManager>
 {
 public:
     StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfig const& config, int tokensPerBlock,
-        std::optional<SwaScratchReuseConfig> swaScratchReuse = std::nullopt,
+        IKvCacheColdPageCodec& coldPageCodec, std::optional<SwaScratchReuseConfig> swaScratchReuse = std::nullopt,
         std::optional<BatchDesc> const& typicalBatch = std::nullopt, std::vector<BatchDesc> const& constraints = {},
         std::optional<std::vector<float>> const& initialPoolRatio = std::nullopt,
         std::shared_ptr<EventSink> eventSink = nullptr, float maxUtilForResume = 1.0f);
@@ -109,6 +112,11 @@ public:
     StorageManager& operator=(StorageManager const&) = delete;
 
     void destroy();
+
+    void adoptColdPageCodec(std::unique_ptr<IKvCacheColdPageCodec>&& coldPageCodec) noexcept
+    {
+        mColdPageCodec = std::move(coldPageCodec);
+    }
 
     // ---- Allocation -------------------------------------------------------
 
@@ -165,7 +173,7 @@ public:
 
     // Best-effort migration of grouped pages to a destination cache level.
     void prefetch(
-        CacheLevel dstLevel, TypedVec<PoolGroupIndex, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
+        CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
 
     // ---- Query helpers -----------------------------------------------------
 
@@ -178,17 +186,32 @@ public:
 
     LifeCycleId numLifeCycles() const noexcept
     {
-        return mLifeCycleGrouping.size();
+        return mLifeCycleGroupings[kGpuLevel].size();
     }
 
-    PoolGroupIndex numPoolGroups() const noexcept
+    PoolGroupIndex numPoolGroups(CacheLevel level) const
     {
-        return mSlotDescList.size();
+        return mSlotDescLists.at(level).size();
     }
 
-    TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList() const noexcept
+    PoolGroupIndex numPoolGroups() const
     {
-        return mSlotDescList;
+        return numPoolGroups(kGpuLevel);
+    }
+
+    TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList(CacheLevel level) const
+    {
+        return mSlotDescLists.at(level);
+    }
+
+    TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList() const
+    {
+        return slotDescList(kGpuLevel);
+    }
+
+    TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping(CacheLevel level) const
+    {
+        return mLifeCycleGroupings.at(level);
     }
 
     CacheLevel numCacheLevels() const noexcept
@@ -201,10 +224,13 @@ public:
         return lvl == numCacheLevels() - 1;
     }
 
+    PoolGroupIndex getPoolGroupIndex(CacheLevel level, LifeCycleId lc) const;
     PoolGroupIndex getPoolGroupIndex(LifeCycleId lc) const;
+    PoolIndex numPools(CacheLevel level, PoolGroupIndex pgIdx) const;
     PoolIndex numPools(PoolGroupIndex pgIdx) const;
 
     // Return the byte size of each pool in a pool group.
+    TypedVec<PoolIndex, size_t> slotSize(CacheLevel level, PoolGroupIndex pgIdx) const;
     TypedVec<PoolIndex, size_t> slotSize(PoolGroupIndex pgIdx) const;
 
     // Current ratio list for a cache level (proportional to byte usage per pool group).
@@ -212,6 +238,8 @@ public:
 
     // Compute init ratio from an assumed average history length and capacity.
     TypedVec<PoolGroupIndex, float> ratioFromLength(int tokensPerBlock, int historyLength, int capacity) const;
+    TypedVec<PoolGroupIndex, float> ratioFromLength(
+        CacheLevel level, int tokensPerBlock, int historyLength, int capacity) const;
 
     // Compute ratio from a BatchDesc.
     TypedVec<PoolGroupIndex, float> ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
@@ -223,6 +251,8 @@ public:
     // Byte address of a slot's buffer in GPU memory (per-layer, with offset).
     MemAddress getMemPoolBaseAddress(LayerId layerId, DataRole role) const;
 
+    void copySlotData(LifeCycleId lifeCycle, CacheLevel dstLevel, CacheLevel srcLevel, SlotId dstSlotId,
+        SlotId srcSlotId, CUstream stream);
     // Pool group base address without per-layer offset.
     MemAddress getMemPoolBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
 
@@ -267,34 +297,45 @@ private:
     TypedVec<PoolGroupIndex, SlotCount> computeSlotsForBatch(
         BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
 
+    TypedVec<LifeCycleId, SlotCount> computeSlotsForBatchByLifeCycle(
+        BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
+
     // Constraint-based partitioning helpers.
-    TypedVec<PoolGroupIndex, SlotCount> computeMinSlotsFromConstraints(std::vector<BatchDesc> const& constraints,
-        int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse,
-        float maxUtilForResume = 1.0f) const;
+    TypedVec<LifeCycleId, SlotCount> computeMinSlotsByLifeCycleFromConstraints(
+        std::vector<BatchDesc> const& constraints, int tokensPerBlock,
+        std::optional<SwaScratchReuseConfig> const& swaScratchReuse, float maxUtilForResume = 1.0f) const;
     TypedVec<PoolGroupIndex, size_t> slotsToBytes(
         TypedVec<PoolGroupIndex, SlotCount> const& numSlots, size_t granularity) const;
     TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-        TypedVec<PoolGroupIndex, float> const& ratio) const;
-    size_t minQuotaForLevel(
-        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists, size_t granularity) const;
-
-    PoolIndex mNumPools(PoolGroupIndex pgIdx) const;
+        TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
+    size_t minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+        size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
 
     // Internal helpers.
     void _prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals, CacheLevel lvlId,
-        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>>& fallenPages,
+        TypedVec<LifeCycleId, std::vector<SharedPtr<Page>>>& fallenPages,
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
-    void _batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, CacheLevel srcLevel,
-        std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder = {},
-        bool defrag = false);
+    void _batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel, std::vector<SharedPtr<Page>> const& srcPages,
+        bool updateSrc, MigrationRecorder const& migrationRecorder = {}, bool defrag = false);
+    [[nodiscard]] LayerGroupId getMigrationBatchingLayerGroupId(
+        CacheLevel dstLevel, CacheLevel srcLevel, LifeCycleId lifeCycle) const;
+
+    template <typename Submit>
+    bool submitColdPageCodec(PageIndexLocation location, PageIndexPair const* pageIndices, size_t numPages,
+        CUstream stream, Submit&& submit);
 
     PoolGroupBase& poolGroup(CacheLevel lvl, PoolGroupIndex pgIdx);
 
     LifeCycleRegistry const& mLifeCycles;
     std::shared_ptr<EventSink> mEventSink;
-    TypedVec<LifeCycleId, PoolGroupIndex> mLifeCycleGrouping; // lcId → pgIdx
+    // lcId → pgIdx, independently for each cache level.
+    TypedVec<CacheLevel, TypedVec<LifeCycleId, PoolGroupIndex>> mLifeCycleGroupings;
+    // Codec batching representative for each lifecycle.
+    TypedVec<LifeCycleId, LayerGroupId> mBatchingLayerGroupIds;
+    // Codec-selected PageIndexPair memory location for each lifecycle.
+    TypedVec<LifeCycleId, PageIndexLocation> mPageIndexLocations;
     std::unordered_map<LayerId, LifeCycleId> mLayerToLifeCycleIds;
     StorageConfig mStorageConfig;
 
@@ -310,6 +351,10 @@ private:
     // Whether SWA scratch reuse is enabled.
     std::optional<SwaScratchReuseConfig> mSwaScratchReuse;
 
+    // Optional model-sized page staging is owned here and borrowed by CopyEngine.
+    std::unique_ptr<StagingBufferManager> mPageStagingManager;
+    std::unique_ptr<CopyEngine> mCopyEngine;
+
     // Get buffer attributes for a (LayerId, DataRole) pair. Throws std::out_of_range if not found.
     // Mirrors Python's get_buffer_attr().
     BufferAttr const& getBufferAttr(LayerId layerId, DataRole role) const
@@ -323,9 +368,18 @@ private:
     // Buffer attributes keyed by BufferId.
     std::map<BufferId, BufferAttr> mBufferAttr;
 
-    TypedVec<PoolGroupIndex, SlotDesc> mSlotDescList;
-    TypedVec<PoolGroupIndex, SlotCount> mMinSlots;
+    TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotDesc>> mSlotDescLists;
+    TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> mMinSlotsByLevel;
     TypedVec<CacheLevel, CacheLevelManager> mLevels;
+
+    static constexpr size_t kDefaultPageStagingBytes = 64u << 20u;
+    static constexpr size_t kPageStagingDepth = 3;
+    static constexpr size_t kMaxIndexBatchBytes = 64u << 10u;
+    static constexpr size_t kIndexStagingBytes = 256u << 10u;
+    // Allocated only when a codec requests device indices; protected through codec completion.
+    std::unique_ptr<StagingBufferManager> mIndexStagingManager;
+
+    std::unique_ptr<IKvCacheColdPageCodec> mColdPageCodec;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

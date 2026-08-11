@@ -18,6 +18,7 @@
 #pragma once
 
 #include "kv_cache_manager_v2/blockRadixTree.h"
+#include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/eventSink.h"
@@ -36,24 +37,6 @@
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
-
-// ---------------------------------------------------------------------------
-// PoolDesc / PoolGroupDesc — describe GPU memory pool layout.
-// ---------------------------------------------------------------------------
-struct PoolDesc
-{
-    PoolIndex poolIndex{0};
-    MemAddress baseAddress = 0;
-    size_t slotBytes = 0;
-};
-
-struct PoolGroupDesc
-{
-    PoolGroupIndex poolGroupIndex{0};
-    SlotCount numSlots = 0;
-    SlotDesc slotDesc;
-    TypedVec<PoolIndex, PoolDesc> pools;
-};
 
 // ---------------------------------------------------------------------------
 // ExpandedBuffer / AggregatedPageDesc — returned by getAggregatedPages().
@@ -117,7 +100,8 @@ struct PageIndexConverter
 class KvCacheManager : public std::enable_shared_from_this<KvCacheManager>
 {
 public:
-    explicit KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink = nullptr);
+    explicit KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink = nullptr,
+        std::unique_ptr<IKvCacheColdPageCodec>&& coldPageCodec = nullptr);
     ~KvCacheManager();
 
     KvCacheManager(KvCacheManager const&) = delete;

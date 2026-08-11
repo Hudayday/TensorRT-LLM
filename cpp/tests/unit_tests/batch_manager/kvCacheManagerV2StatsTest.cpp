@@ -26,6 +26,8 @@
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cstdint>
 #include <limits>
 #include <memory>
 
@@ -47,6 +49,13 @@ KVCacheManagerConfig makeConfig(bool enableStats = true)
     return config;
 }
 
+KVCacheManagerConfig makeDiskTieredConfig()
+{
+    auto config = makeConfig();
+    config.cacheTiers.emplace_back(DiskCacheTierConfig{4 << 20, "/tmp"});
+    return config;
+}
+
 KVCacheManagerConfig makeTieredConfig()
 {
     KVCacheManagerConfig config;
@@ -58,6 +67,319 @@ KVCacheManagerConfig makeTieredConfig()
     layer.buffers.push_back(BufferConfig{"key", 2 << 20, std::nullopt});
     config.layers.emplace_back(std::move(layer));
     return config;
+}
+
+KVCacheManagerConfig makeGpuTieredConfig()
+{
+    auto config = makeTieredConfig();
+    config.cacheTiers[1] = GpuCacheTierConfig{4 << 20};
+    return config;
+}
+
+KVCacheManagerConfig makeSplitColdGroupingConfig()
+{
+    KVCacheManagerConfig config;
+    config.tokensPerBlock = 4;
+    config.cacheTiers.emplace_back(GpuCacheTierConfig{4 << 20});
+    config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
+
+    AttentionLayerConfig first;
+    first.layerId = 0;
+    first.slidingWindowSize = 128;
+    first.buffers.push_back(BufferConfig{"key", 4096, std::nullopt});
+    config.layers.emplace_back(std::move(first));
+
+    AttentionLayerConfig second;
+    second.layerId = 1;
+    second.slidingWindowSize = 256;
+    second.buffers.push_back(BufferConfig{"key", 4096, std::nullopt});
+    config.layers.emplace_back(std::move(second));
+    return config;
+}
+
+class RejectingColdPageCodec final : public IKvCacheColdPageCodec
+{
+public:
+    bool configure(PoolGroupDesc const*, PoolGroupIndex) noexcept override
+    {
+        return false;
+    }
+
+    size_t queryColdPageBytes(LayerGroupId) const noexcept override
+    {
+        return 1;
+    }
+
+    PageIndexLocation queryPageIndexLocation(LayerGroupId) const noexcept override
+    {
+        return PageIndexLocation::kHost;
+    }
+
+    bool encode(LayerGroupId, void*, PageIndexPair const*, size_t, cudaStream_t) noexcept override
+    {
+        return false;
+    }
+
+    bool decode(LayerGroupId, void const*, PageIndexPair const*, size_t, cudaStream_t) noexcept override
+    {
+        return false;
+    }
+};
+
+class SplitColdPageCodec final : public IKvCacheColdPageCodec
+{
+public:
+    explicit SplitColdPageCodec(bool batchTogether = false)
+        : mBatchTogether(batchTogether)
+    {
+    }
+
+    bool configure(PoolGroupDesc const*, PoolGroupIndex) noexcept override
+    {
+        return true;
+    }
+
+    size_t queryColdPageBytes(LayerGroupId layerGroupId) const noexcept override
+    {
+        if (layerGroupId == LifeCycleId{0})
+            return 1024;
+        if (layerGroupId == LifeCycleId{1})
+            return 2048;
+        return 0;
+    }
+
+    LayerGroupId getBatchingLayerGroupId(LayerGroupId layerGroupId) const noexcept override
+    {
+        return mBatchTogether ? LifeCycleId{0} : layerGroupId;
+    }
+
+    PageIndexLocation queryPageIndexLocation(LayerGroupId) const noexcept override
+    {
+        return PageIndexLocation::kHost;
+    }
+
+    bool encode(LayerGroupId, void*, PageIndexPair const*, size_t, cudaStream_t) noexcept override
+    {
+        return false;
+    }
+
+    bool decode(LayerGroupId, void const*, PageIndexPair const*, size_t, cudaStream_t) noexcept override
+    {
+        return false;
+    }
+
+private:
+    bool mBatchTogether;
+};
+
+class OversizedColdPageCodec final : public IKvCacheColdPageCodec
+{
+public:
+    bool configure(PoolGroupDesc const*, PoolGroupIndex) noexcept override
+    {
+        return true;
+    }
+
+    size_t queryColdPageBytes(LayerGroupId) const noexcept override
+    {
+        return std::numeric_limits<size_t>::max() / 3 + 1;
+    }
+
+    PageIndexLocation queryPageIndexLocation(LayerGroupId) const noexcept override
+    {
+        return PageIndexLocation::kHost;
+    }
+
+    bool encode(LayerGroupId, void*, PageIndexPair const*, size_t, cudaStream_t) noexcept override
+    {
+        return false;
+    }
+
+    bool decode(LayerGroupId, void const*, PageIndexPair const*, size_t, cudaStream_t) noexcept override
+    {
+        return false;
+    }
+};
+
+class MixedIndexLocationColdPageCodec final : public IKvCacheColdPageCodec
+{
+public:
+    bool configure(PoolGroupDesc const*, PoolGroupIndex) noexcept override
+    {
+        return true;
+    }
+
+    size_t queryColdPageBytes(LayerGroupId) const noexcept override
+    {
+        return 1024;
+    }
+
+    LayerGroupId getBatchingLayerGroupId(LayerGroupId) const noexcept override
+    {
+        return LifeCycleId{0};
+    }
+
+    PageIndexLocation queryPageIndexLocation(LayerGroupId layerGroupId) const noexcept override
+    {
+        return layerGroupId == LifeCycleId{0} ? PageIndexLocation::kHost : PageIndexLocation::kDevice;
+    }
+
+    bool encode(LayerGroupId, void*, PageIndexPair const*, size_t, cudaStream_t) noexcept override
+    {
+        return false;
+    }
+
+    bool decode(LayerGroupId, void const*, PageIndexPair const*, size_t, cudaStream_t) noexcept override
+    {
+        return false;
+    }
+};
+
+TEST(KvCacheManagerV2StatsTest, ConstructionFailurePreservesCodecUniquePtr)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    std::unique_ptr<IKvCacheColdPageCodec> codec = std::make_unique<RejectingColdPageCodec>();
+    auto* codecPtr = codec.get();
+
+    EXPECT_THROW(
+        {
+            auto manager = std::make_shared<KvCacheManager>(makeConfig(), nullptr, std::move(codec));
+            (void) manager;
+        },
+        std::invalid_argument);
+
+    EXPECT_EQ(codec.get(), codecPtr);
+}
+
+TEST(KvCacheManagerV2StatsTest, RejectsColdPageStagingSizeOverflow)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    std::unique_ptr<IKvCacheColdPageCodec> codec = std::make_unique<OversizedColdPageCodec>();
+    auto* codecPtr = codec.get();
+
+    EXPECT_THROW(
+        {
+            auto manager = std::make_shared<KvCacheManager>(makeDiskTieredConfig(), nullptr, std::move(codec));
+            (void) manager;
+        },
+        std::overflow_error);
+
+    EXPECT_EQ(codec.get(), codecPtr);
+}
+
+TEST(KvCacheManagerV2StatsTest, DoesNotSizePageStagingWithoutColdTier)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    std::unique_ptr<IKvCacheColdPageCodec> codec = std::make_unique<OversizedColdPageCodec>();
+
+    EXPECT_NO_THROW({
+        auto manager = std::make_shared<KvCacheManager>(makeConfig(), nullptr, std::move(codec));
+        (void) manager;
+    });
+    EXPECT_EQ(codec, nullptr);
+}
+
+TEST(KvCacheManagerV2StatsTest, ColdGpuTierSupportsSingleSlotRoundTrip)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeGpuTieredConfig());
+    auto& storage = manager->storage();
+    LifeCycleId const lifeCycle{0};
+    CacheLevel const coldLevel{1};
+    TypedVec<LifeCycleId, SlotCount> oneSlot(LifeCycleId{1}, 1);
+    auto hotSlots = storage.newSlots(kGpuLevel, oneSlot);
+    auto coldSlots = storage.newSlots(coldLevel, oneSlot);
+    ASSERT_EQ(hotSlots[lifeCycle].size(), 1);
+    ASSERT_EQ(coldSlots[lifeCycle].size(), 1);
+
+    Slot& hotSlot = hotSlots[lifeCycle].front();
+    Slot& coldSlot = coldSlots[lifeCycle].front();
+    PoolGroupIndex const hotPoolGroup = storage.getPoolGroupIndex(kGpuLevel, lifeCycle);
+    size_t const hotPageBytes = storage.slotSize(hotPoolGroup).at(PoolIndex{0});
+    MemAddress const hotAddress
+        = std::get<MemAddress>(storage.slotAddress(kGpuLevel, hotPoolGroup, hotSlot.slotId(), PoolIndex{0}));
+    constexpr uint8_t kPattern = 0xA7;
+    ASSERT_EQ(cudaMemset(reinterpret_cast<void*>(hotAddress), kPattern, hotPageBytes), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    storage.copySlotData(lifeCycle, coldLevel, kGpuLevel, coldSlot.slotId(), hotSlot.slotId(), nullptr);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    ASSERT_EQ(cudaMemset(reinterpret_cast<void*>(hotAddress), 0, hotPageBytes), cudaSuccess);
+    storage.copySlotData(lifeCycle, kGpuLevel, coldLevel, hotSlot.slotId(), coldSlot.slotId(), nullptr);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    uint8_t firstByte = 0;
+    uint8_t lastByte = 0;
+    ASSERT_EQ(
+        cudaMemcpy(&firstByte, reinterpret_cast<void const*>(hotAddress), 1, cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpy(&lastByte, reinterpret_cast<void const*>(hotAddress + hotPageBytes - 1), 1, cudaMemcpyDeviceToHost),
+        cudaSuccess);
+    EXPECT_EQ(firstByte, kPattern);
+    EXPECT_EQ(lastByte, kPattern);
+
+    storage.releaseSlot(lifeCycle, coldLevel, std::move(coldSlot));
+    storage.releaseSlot(lifeCycle, kGpuLevel, std::move(hotSlot));
+}
+
+TEST(KvCacheManagerV2StatsTest, RejectsBatchingClassWithDifferentColdPageSizes)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    std::unique_ptr<IKvCacheColdPageCodec> codec = std::make_unique<SplitColdPageCodec>(true);
+    auto* codecPtr = codec.get();
+
+    EXPECT_THROW(
+        {
+            auto manager = std::make_shared<KvCacheManager>(makeSplitColdGroupingConfig(), nullptr, std::move(codec));
+            (void) manager;
+        },
+        std::invalid_argument);
+
+    EXPECT_EQ(codec.get(), codecPtr);
+}
+
+TEST(KvCacheManagerV2StatsTest, RejectsBatchingClassWithDifferentIndexLocations)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    std::unique_ptr<IKvCacheColdPageCodec> codec = std::make_unique<MixedIndexLocationColdPageCodec>();
+    auto* codecPtr = codec.get();
+
+    EXPECT_THROW(
+        {
+            auto manager = std::make_shared<KvCacheManager>(makeSplitColdGroupingConfig(), nullptr, std::move(codec));
+            (void) manager;
+        },
+        std::invalid_argument);
+
+    EXPECT_EQ(codec.get(), codecPtr);
+}
+
+TEST(KvCacheManagerV2StatsTest, ColdGroupingIsIndependentOfHotGrouping)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto codec = std::make_unique<SplitColdPageCodec>();
+    auto manager = std::make_shared<KvCacheManager>(makeSplitColdGroupingConfig(), nullptr, std::move(codec));
+    EXPECT_FALSE(codec);
+
+    StorageManager const& storage = manager->storage();
+    EXPECT_EQ(storage.numLifeCycles(), LifeCycleId{2});
+    EXPECT_EQ(storage.numPoolGroups(kGpuLevel), PoolGroupIndex{1});
+    EXPECT_EQ(storage.numPoolGroups(CacheLevel{1}), PoolGroupIndex{2});
+
+    PoolGroupIndex const hotGroup0 = storage.getPoolGroupIndex(kGpuLevel, LifeCycleId{0});
+    PoolGroupIndex const hotGroup1 = storage.getPoolGroupIndex(kGpuLevel, LifeCycleId{1});
+    EXPECT_EQ(hotGroup0, hotGroup1);
+
+    for (LifeCycleId lifeCycle{0}; lifeCycle < LifeCycleId{2}; ++lifeCycle)
+    {
+        PoolGroupIndex const coldGroup = storage.getPoolGroupIndex(CacheLevel{1}, lifeCycle);
+        EXPECT_NE(coldGroup, storage.getPoolGroupIndex(CacheLevel{1}, LifeCycleId{1 - lifeCycle.value()}));
+        EXPECT_EQ(storage.numPools(CacheLevel{1}, coldGroup), PoolIndex{1});
+        auto const coldSlotSizes = storage.slotSize(CacheLevel{1}, coldGroup);
+        ASSERT_EQ(coldSlotSizes.size(), PoolIndex{1});
+        size_t const expectedBytes = lifeCycle == LifeCycleId{0} ? 1024 : 2048;
+        EXPECT_EQ(coldSlotSizes.at(PoolIndex{0}), expectedBytes);
+    }
 }
 
 TEST(KvCacheManagerV2StatsTest, StatsDeltaArithmetic)
@@ -326,6 +648,15 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
     TypedVec<LifeCycleId, SlotCount> twoSlots(LifeCycleId{1}, 2);
     auto initialSlots = storage.newGpuSlots(twoSlots);
     auto firstPages = makeCommittedPages(std::move(initialSlots[lifeCycle]));
+    PoolGroupIndex const hotPoolGroup = storage.getPoolGroupIndex(kGpuLevel, lifeCycle);
+    size_t const hotPageBytes = storage.slotSize(hotPoolGroup).at(PoolIndex{0});
+    std::array<uint8_t, 2> const pagePatterns{0x3C, 0xA7};
+    for (size_t index = 0; index < firstPages.size(); ++index)
+    {
+        MemAddress const address = std::get<MemAddress>(
+            storage.slotAddress(kGpuLevel, hotPoolGroup, firstPages[index]->slotId(), PoolIndex{0}));
+        ASSERT_EQ(cudaMemset(reinterpret_cast<void*>(address), pagePatterns[index], hotPageBytes), cudaSuccess);
+    }
 
     auto temporarySlots = storage.newGpuSlots(twoSlots, migrationRecorder, dropRecorder);
     EXPECT_EQ(offloaded, 2);
@@ -347,6 +678,21 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
     }
     storage.batchedMigrateToGpu(targets, *cache, migrationRecorder);
     EXPECT_EQ(onboarded, 2);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    for (size_t index = 0; index < firstPages.size(); ++index)
+    {
+        MemAddress const address = std::get<MemAddress>(
+            storage.slotAddress(kGpuLevel, hotPoolGroup, firstPages[index]->slotId(), PoolIndex{0}));
+        uint8_t firstByte = 0;
+        uint8_t lastByte = 0;
+        ASSERT_EQ(
+            cudaMemcpy(&firstByte, reinterpret_cast<void const*>(address), 1, cudaMemcpyDeviceToHost), cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpy(&lastByte, reinterpret_cast<void const*>(address + hotPageBytes - 1), 1, cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        EXPECT_EQ(firstByte, pagePatterns[index]);
+        EXPECT_EQ(lastByte, pagePatterns[index]);
+    }
     for (auto const& page : firstPages)
     {
         storage.scheduleForEviction(*page);

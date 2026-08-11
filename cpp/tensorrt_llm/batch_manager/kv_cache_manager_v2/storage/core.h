@@ -491,8 +491,8 @@ protected:
 class GpuCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    GpuCacheLevelStorage(
-        StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, size_t physMemSize);
+    GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, size_t physMemSize);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -523,7 +523,8 @@ private:
 class HostCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    HostCacheLevelStorage(StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
+    HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -539,8 +540,8 @@ public:
 class DiskCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    DiskCacheLevelStorage(StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-        std::string directory);
+    DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -558,6 +559,6 @@ private:
 
 // Factory: create appropriate CacheLevelStorage for a given tier config.
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
-    StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
+    TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

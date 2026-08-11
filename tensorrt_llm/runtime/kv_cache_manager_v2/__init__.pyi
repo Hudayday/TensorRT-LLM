@@ -474,11 +474,22 @@ class PageIndexConverter:
         scratch: ScratchDesc | None = None,
     ) -> list[int]: ...
 
+class IKvCacheColdPageCodec: ...
+
+def create_default_kv_cache_cold_page_codec() -> IKvCacheColdPageCodec:
+    """Create the default lossless cold-page codec.
+
+    Passing ``cold_page_codec=None`` to ``KVCacheManager`` already selects this codec, so normal users do not need to
+    call this factory. It is primarily provided to demonstrate how a native codec factory exposes an owning
+    ``IKvCacheColdPageCodec`` object for transfer into ``KVCacheManager``.
+    """
+
 class KVCacheManager:
     def __init__(
         self,
         config: KVCacheManagerConfig,
         event_manager: KVCacheEventManager | None = None,
+        cold_page_codec: IKvCacheColdPageCodec | None = None,
     ) -> None: ...
     def __del__(self) -> None: ...
     def shutdown(self) -> None: ...
