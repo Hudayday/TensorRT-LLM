@@ -1268,7 +1268,8 @@ class KvCacheCreator:
         self,
         model_engine: PyTorchModelEngine,
         estimating_kv_cache: bool = False,
-        kv_cache_config_override: Optional[KvCacheConfig] = None
+        kv_cache_config_override: Optional[KvCacheConfig] = None,
+        enable_kv_cache_compression: bool = False,
     ) -> KVCacheManager:
         mapping = self._mapping
         assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
@@ -1287,6 +1288,25 @@ class KvCacheCreator:
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
+        boundary_compression_config = (
+            self._llm_args.kv_cache_compression_config
+            if enable_kv_cache_compression and not estimating_kv_cache else
+            None)
+        # TriAttention remains driven by the existing resource-manager cycle;
+        # only boundary quantization changes KVCM's cold Slot representation.
+        if (boundary_compression_config is not None and
+                boundary_compression_config.algorithm !=
+                "quantization_for_boundary"):
+            boundary_compression_config = None
+        boundary_compression_manager = None
+        if boundary_compression_config is not None:
+            # Algorithm dispatch belongs to the KV-cache compression layer.
+            # KVCM receives only a generic cold-page codec provider and never
+            # imports or constructs QuantizationCompression itself.
+            from ..kv_cache_compression.quantization_for_boundary import QuantizationCompression
+
+            boundary_compression_manager = QuantizationCompression(
+                boundary_compression_config)
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -1306,6 +1326,7 @@ class KvCacheCreator:
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
+            kv_cache_compression_manager=boundary_compression_manager,
         )
 
         if not self._skip_est:
@@ -1903,7 +1924,10 @@ class KvCacheCreator:
         kv_cache_manager = self._create_kv_cache_manager(
             self._model_engine,
             estimating_kv_cache,
-            kv_cache_config_override=self_kv_cache_config)
+            kv_cache_config_override=self_kv_cache_config,
+            # Only the final target KVCM owns the cold-page codec. Estimation,
+            # draft, and cross managers retain the default lossless codec.
+            enable_kv_cache_compression=True)
 
         # Carry the fp8 context-MLA workspace admission cap (computed in configure_kv_cache_capacity) onto
         # the real KV manager so the scheduler reads it directly instead of re-deriving from pool layout.
@@ -2041,11 +2065,20 @@ def _create_kv_cache_manager(
         num_kv_heads: Optional[Union[int, List[int]]] = None,
         head_dim: Optional[int] = None,
         kv_cache_type=None,
-        is_disagg: bool = False) -> KVCacheManager:
+        is_disagg: bool = False,
+        kv_cache_compression_manager: Optional[
+            KVCacheCompressionManager] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
     """
+    if (kv_cache_compression_manager is not None
+            and not issubclass(kv_cache_manager_cls, KVCacheManagerV2)):
+        raise ValueError(
+            "QuantizationCompression requires the resolved KV cache manager "
+            "to be KVCacheManagerV2; an incompatible option selected "
+            f"{kv_cache_manager_cls.__name__} instead")
+
     if (estimating_kv_cache
             and issubclass(kv_cache_manager_cls, KVCacheManagerV2)
             and kv_cache_config.pool_ratio is None
@@ -2172,6 +2205,8 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+        manager_extra_kwargs[
+            "kv_cache_compression_manager"] = kv_cache_compression_manager
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
@@ -2565,6 +2600,10 @@ def validate_kv_cache_compression_compatibility(
     spec_config: Optional[SpeculativeConfig],
 ) -> None:
     """Reject unsupported KV-cache compression feature combinations."""
+    if (config.algorithm == "quantization_for_boundary"
+            and kv_cache_config.use_kv_cache_manager_v2 is not True):
+        raise ValueError("QuantizationCompression requires "
+                         "KvCacheConfig(use_kv_cache_manager_v2=True)")
     if kv_cache_config.enable_block_reuse and not config.supports_block_reuse():
         raise ValueError(
             f"KV-cache compression algorithm {config.algorithm!r} does not "
@@ -2589,13 +2628,12 @@ def create_kv_cache_compression_manager(
     kv_cache_manager: KVCacheManagerV2,
     draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
 ) -> Optional[KVCacheCompressionManager]:
-    """Build the KV-cache compression manager for ``config.algorithm``, or return
-    None if no algorithm matches.
+    """Build an iteration-driven compression manager for ``config``.
 
-    Called from ``create_py_executor`` and registered as a resource manager,
-    like the KV cache manager itself. Concrete algorithms add a dispatch branch
-    here. Feature compatibility is checked before resource-manager construction.
+    Boundary compression is constructed before KVCM and retained by KVCM; it
+    deliberately never enters this ResourceManager factory or iteration cycle.
     """
+
     if config.algorithm == "triattention":
         if not is_sm_100f():
             raise RuntimeError(
@@ -2874,7 +2912,9 @@ def create_py_executor_instance(
     # set from the start. Reads its own config, not the sparse-attention one.
     kv_cache_compression_config = getattr(llm_args,
                                           "kv_cache_compression_config", None)
-    if kv_cache_compression_config is not None:
+    if (kv_cache_compression_config is not None
+            and kv_cache_compression_config.algorithm !=
+            "quantization_for_boundary"):
         draft_kv_cache_manager = resources.get(
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         compression_manager = create_kv_cache_compression_manager(
@@ -2898,7 +2938,9 @@ def create_py_executor_instance(
     if cross_kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.CROSS_KV_CACHE_MANAGER, last=True)
-    # Compression is the final reconciler after every native KV manager.
+    # Iteration-driven compression is the final reconciler after every native
+    # KV manager. Boundary quantization is retained by KVCM itself and runs
+    # only from native StorageManager encode/decode calls.
     if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
             in resource_manager.resource_managers):
         resource_manager.resource_managers.move_to_end(
