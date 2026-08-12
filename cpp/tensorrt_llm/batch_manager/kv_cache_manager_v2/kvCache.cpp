@@ -789,13 +789,38 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
         }
 
         CUstream stream = cudaStream();
-        newSlot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
-        storageMgr.copySlotData(lcIdx, lvl, srcPage->cacheLevel, newSlot.slotId(), srcPage->slotId(), stream);
+        bool streamWorkStarted = false;
+        SharedPtr<CommittedPage> committed;
+        try
+        {
+            // copySlotData may submit asynchronous work before reporting a
+            // failure. Keep ownership of newSlot locally until the copy is
+            // fenced and the CommittedPage has accepted the Slot.
+            streamWorkStarted = true;
+            newSlot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
+            storageMgr.copySlotData(lcIdx, lvl, srcPage->cacheLevel, newSlot.slotId(), srcPage->slotId(), stream);
 
-        newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
-        auto committed = makeShared<CommittedPage>(
-            &storageMgr, treeBlock, lcIdx, lvl, numTokensInBlock, getPriority(treeBlock->ordinal(), lcIdx));
-        committed->setSlot(newSlot);
+            newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
+            committed = makeShared<CommittedPage>(
+                &storageMgr, treeBlock, lcIdx, lvl, numTokensInBlock, getPriority(treeBlock->ordinal(), lcIdx));
+            committed->setSlot(newSlot);
+        }
+        catch (...)
+        {
+            if (newSlot.hasValidSlot())
+            {
+                if (streamWorkStarted)
+                {
+                    // Fence both operands before the destination Slot returns
+                    // to its allocator or the source can be reused elsewhere.
+                    CachedCudaEvent completion(reinterpret_cast<CudaStream>(stream));
+                    srcPage->readyEvent = completion;
+                    newSlot.readyEvent = completion;
+                }
+                storageMgr.releaseSlot(lcIdx, lvl, std::move(newSlot));
+            }
+            throw;
+        }
         // Drops the superseded page, deferred until the copy is issued: an
         // OutOfPagesError above must not destroy a usable shorter snapshot.
         treeBlock->replacePage(lcIdx, committed.get());

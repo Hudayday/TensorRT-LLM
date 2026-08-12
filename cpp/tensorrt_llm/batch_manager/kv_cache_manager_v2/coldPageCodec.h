@@ -106,7 +106,8 @@ public:
     //!
     //! The cold base pointer is GPU-accessible. The index-array location is selected by queryPageIndexLocation(). Host
     //! arrays remain valid until this method returns; device arrays remain valid until work enqueued on stream
-    //! completes. The pairs may have been concatenated from multiple codec-equivalent lifecycles.
+    //! completes. The pairs may have been concatenated from multiple codec-equivalent lifecycles. Returning false does
+    //! not imply that no asynchronous work was enqueued; KVCM fences the stream before recycling either page.
     virtual bool encode(LayerGroupId layerGroupId, void* dstBasePtr, PageIndexPair const* pageIndices,
         size_t numBasePages, cudaStream_t stream) noexcept
         = 0;
@@ -115,7 +116,8 @@ public:
     //!
     //! The cold base pointer is GPU-accessible. The index-array location is selected by queryPageIndexLocation(). Host
     //! arrays remain valid until this method returns; device arrays remain valid until work enqueued on stream
-    //! completes. The pairs may have been concatenated from multiple codec-equivalent lifecycles.
+    //! completes. The pairs may have been concatenated from multiple codec-equivalent lifecycles. Returning false does
+    //! not imply that no asynchronous work was enqueued; KVCM fences the stream before recycling either page.
     virtual bool decode(LayerGroupId layerGroupId, void const* srcBasePtr, PageIndexPair const* pageIndices,
         size_t numBasePages, cudaStream_t stream) noexcept
         = 0;
