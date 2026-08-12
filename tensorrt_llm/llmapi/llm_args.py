@@ -3656,9 +3656,10 @@ class KvCacheCompressionConfig(StrictBaseModel):
     algorithm (e.g. periodic token eviction) alongside KVCacheManagerV2.
 
     Kept separate from SparseAttentionConfig by design -- compression changes
-    which KV is stored, not the attention computation. The manager is registered
-    as a resource manager in create_py_executor (_util.py), like the KV cache
-    manager itself. Concrete algorithms subclass this and add their parameters.
+    which KV is stored, not the attention computation. Iteration-driven methods
+    use the resource-manager cycle; storage-boundary methods are retained and
+    invoked directly by KVCacheManagerV2. Concrete algorithms subclass this and
+    add their parameters.
     """
 
     changes_physical_kv_length: ClassVar[bool] = False
@@ -3677,6 +3678,52 @@ class KvCacheCompressionConfig(StrictBaseModel):
         return False
 
 
+_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY = TelemetryField.categorical(
+    "quantization_for_boundary", "triattention")
+
+
+class QuantizationCompressionConfig(KvCacheCompressionConfig):
+    """Compress KV with the quantization format selected by ``quant``.
+
+    This is the small initialization contract shared with KVCacheManagerV2.
+    The selected format determines the compressed layout and kernel dispatch;
+    NVFP4 is the first supported format, not part of the manager contract. P0
+    starts at the Host tier, while the active GPU level keeps the
+    runtime-selected KV dtype. Lower Disk tiers preserve the same compressed
+    record. KVCM uses these fields to construct per-level Slots/Pools. Page
+    addresses come from KVCM, while the per-layer calibration is loaded and
+    owned by this compression manager rather than by the runtime model.
+    """
+
+    # The discriminator names this storage-boundary lifecycle family; `quant`
+    # independently selects its format-specific layout and implementation.
+    algorithm: Literal["quantization_for_boundary"] = Field(
+        default="quantization_for_boundary",
+        # The discriminated union exposes one telemetry path for both arms.
+        # TriAttention's existing field remains the canonical manifest row and
+        # carries the shared allowlist; excluding this duplicate row preserves
+        # its established annotation while still capturing either algorithm.
+        telemetry=False,
+    )
+    quant: Literal["nvfp4"] = Field(
+        default="nvfp4",
+        description="Quantization format stored in the compressed cache tier.")
+    target_cache_tier: Literal["host"] = Field(
+        default="host",
+        description=
+        "First cache tier that uses the compressed layout. P0 begins at Host; "
+        "lower Disk tiers preserve the same compressed record.")
+    scale_checkpoint_path: str = Field(
+        min_length=1,
+        description=
+        "Path to a standard ModelOpt NVFP4-KV checkpoint containing calibrated "
+        "per-layer k_scale/v_scale tensors.")
+
+    def supports_block_reuse(self) -> bool:
+        # Compression changes representation and residency, not token identity.
+        return True
+
+
 class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
     """TriAttention KV-cache compression: periodic decode-time eviction.
 
@@ -3687,7 +3734,10 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
     changes_physical_kv_length: ClassVar[bool] = True
 
-    algorithm: Literal["triattention"] = "triattention"
+    algorithm: Literal["triattention"] = Field(
+        default="triattention",
+        telemetry=_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY,
+    )
     eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
         default="union",
         description=
@@ -3729,7 +3779,7 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
 
 KvCacheCompressionConfigType: TypeAlias = Annotated[
-    Union[TriAttentionKvCacheCompressionConfig],
+    Union[QuantizationCompressionConfig, TriAttentionKvCacheCompressionConfig],
     Field(discriminator="algorithm"),
 ]
 
