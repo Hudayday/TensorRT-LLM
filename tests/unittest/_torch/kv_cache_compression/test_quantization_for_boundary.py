@@ -13,12 +13,20 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary import (
     QuantizationCompression,
     _load_nvfp4_scales,
 )
+from tensorrt_llm._torch.pyexecutor import _util as util_mod
+from tensorrt_llm._torch.pyexecutor import kv_cache_manager_v2 as v2_mod
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
-from tensorrt_llm.llmapi.llm_args import QuantizationCompressionConfig
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    CacheTypeCpp,
+    DataType,
+    ResourceManagerType,
+)
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, QuantizationCompressionConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
+    GpuCacheTierConfig,
+    HostCacheTierConfig,
     SsmLayerConfig,
 )
 
@@ -157,6 +165,335 @@ def test_control_plane_manager_does_not_register_a_late_codec():
     assert manager.kv_cache_manager is v2_manager
     assert not hasattr(manager, "_native_codec")
     backend.set_cold_page_codec.assert_not_called()
+
+
+def test_codec_is_created_before_and_transferred_into_native_constructor():
+    calls = []
+    codec = object()
+    cache_config = object()
+    compression_manager = _manager()
+
+    def create_codec(*args, **kwargs):
+        calls.append(("codec", args, kwargs))
+        return codec
+
+    def create_manager(*args, **kwargs):
+        calls.append(("manager", args, kwargs))
+        assert kwargs["cold_page_codec"] is codec
+        return "native-manager"
+
+    with (
+        patch.object(
+            compression_manager,
+            "create_cold_page_codec",
+            side_effect=create_codec,
+        ),
+        patch.object(v2_mod, "KVCacheManagerPy", side_effect=create_manager),
+    ):
+        result = v2_mod._create_kv_cache_manager_v2_impl(
+            cache_config,
+            "event-manager",
+            compression_manager,
+            runtime_dtype=DataType.BF16,
+            pp_layers=(10,),
+            num_kv_heads_per_layer=(4,),
+            head_dim_per_layer=(128,),
+        )
+
+    assert result == "native-manager"
+    assert [call[0] for call in calls] == ["codec", "manager"]
+    assert calls[1][1] == (cache_config,)
+    assert calls[1][2]["event_manager"] == "event-manager"
+
+
+def test_normal_kvcm_constructor_path_is_unchanged_without_compression():
+    cache_config = object()
+    with patch.object(v2_mod, "KVCacheManagerPy", return_value="native-manager") as constructor:
+        result = v2_mod._create_kv_cache_manager_v2_impl(
+            cache_config,
+            "event-manager",
+            None,
+            runtime_dtype=DataType.BF16,
+            pp_layers=(10,),
+            num_kv_heads_per_layer=(4,),
+            head_dim_per_layer=(128,),
+        )
+
+    assert result == "native-manager"
+    constructor.assert_called_once_with(cache_config, event_manager="event-manager")
+
+
+def test_resolved_v1_manager_cannot_drop_boundary_compression():
+    with pytest.raises(ValueError, match="resolved KV cache manager.*KVCacheManagerV2"):
+        util_mod._create_kv_cache_manager(
+            model_engine=None,
+            kv_cache_manager_cls=object,
+            mapping=None,
+            kv_cache_config=None,
+            tokens_per_block=0,
+            max_seq_len=0,
+            max_batch_size=0,
+            spec_config=None,
+            sparse_attention_config=None,
+            max_num_tokens=0,
+            max_beam_width=1,
+            kv_connector_manager=None,
+            kv_cache_compression_manager=_manager(),
+        )
+
+
+def test_boundary_codec_requires_cpp_backend_and_host_tier(monkeypatch):
+    manager = _manager()
+    gpu = GpuCacheTierConfig(quota=1 << 20)
+    host = HostCacheTierConfig(quota=1 << 20)
+
+    # Backend selection occurs when the runtime module is imported. A later
+    # environment change must not make admission disagree with the loaded API.
+    monkeypatch.setattr(v2_mod, "KV_CACHE_MANAGER_V2_BACKEND", "python")
+    monkeypatch.setenv("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp")
+    with pytest.raises(ValueError, match=r"require.*C\+\+ KVCacheManagerV2"):
+        v2_mod._validate_cold_page_codec_storage(manager, [gpu, host])
+
+    monkeypatch.setattr(v2_mod, "KV_CACHE_MANAGER_V2_BACKEND", "cpp")
+    monkeypatch.setenv("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "python")
+    with pytest.raises(ValueError, match="positive KVCM V2 Host cache"):
+        v2_mod._validate_cold_page_codec_storage(manager, [gpu])
+
+    v2_mod._validate_cold_page_codec_storage(manager, [gpu, host])
+
+
+def test_build_managers_scopes_boundary_compression_to_final_target():
+    target_engine = SimpleNamespace(
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(
+                is_generation=True,
+                pretrained_config=SimpleNamespace(num_hidden_layers=2),
+            )
+        ),
+        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
+    )
+    draft_engine = SimpleNamespace(
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(
+                is_generation=True,
+                pretrained_config=SimpleNamespace(num_hidden_layers=2),
+            )
+        ),
+        kv_cache_manager_key=ResourceManagerType.DRAFT_KV_CACHE_MANAGER,
+    )
+    boundary_manager = object()
+
+    def run_build(estimating):
+        with patch.object(
+            util_mod.KvCacheCreator,
+            "_get_model_kv_cache_manager_cls",
+            return_value=KVCacheManagerV2,
+        ):
+            creator = util_mod.KvCacheCreator(
+                model_engine=target_engine,
+                draft_model_engine=draft_engine,
+                mapping=object(),
+                net_max_seq_len=512,
+                kv_connector_manager=None,
+                max_num_tokens=1024,
+                max_beam_width=1,
+                tokens_per_block=64,
+                max_seq_len=512,
+                max_batch_size=2,
+                kv_cache_config=KvCacheConfig(),
+                llm_args=SimpleNamespace(
+                    kv_cache_compression_config=_config(),
+                    cache_transceiver_config=None,
+                ),
+                speculative_config=None,
+                sparse_attention_config=None,
+                profiling_stage_data=None,
+                is_disagg=False,
+            )
+
+        manager_calls = []
+
+        def create_manager(**kwargs):
+            manager_calls.append(kwargs)
+            return SimpleNamespace(max_seq_len=512)
+
+        with (
+            patch.object(creator, "_is_encoder_decoder", return_value=True),
+            patch.object(
+                creator,
+                "_split_kv_cache_budget_for_cross",
+                return_value=(creator._kv_cache_config, KvCacheConfig()),
+            ),
+            patch.object(creator, "_needs_gpu_kv_cache_budget_split", return_value=False),
+            patch.object(creator, "_should_create_separate_draft_kv_cache", return_value=False),
+            patch.object(
+                creator,
+                "_get_model_kv_cache_manager_cls",
+                return_value=KVCacheManagerV2,
+            ),
+            patch.object(creator, "_get_cross_kv_cache_layout", return_value=(2, 8, 128, 256)),
+            patch.object(creator, "_enable_kv_cache_stats", return_value=False),
+            patch.object(util_mod, "_create_kv_cache_manager", side_effect=create_manager),
+            patch(
+                "tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary."
+                "QuantizationCompression",
+                return_value=boundary_manager,
+            ) as manager_constructor,
+        ):
+            creator.build_managers({}, estimating_kv_cache=estimating)
+
+        return manager_calls, manager_constructor
+
+    final_calls, final_constructor = run_build(estimating=False)
+    assert len(final_calls) == 3
+    assert final_calls[0]["model_engine"] is target_engine
+    assert final_calls[1]["model_engine"] is draft_engine
+    assert final_calls[2]["kv_cache_type"] == CacheTypeCpp.CROSS
+    assert final_calls[0]["kv_cache_compression_manager"] is boundary_manager
+    assert final_calls[1]["kv_cache_compression_manager"] is None
+    assert final_calls[2].get("kv_cache_compression_manager") is None
+    final_constructor.assert_called_once()
+
+    estimation_calls, estimation_constructor = run_build(estimating=True)
+    assert len(estimation_calls) == 3
+    assert all(call.get("kv_cache_compression_manager") is None for call in estimation_calls)
+    estimation_constructor.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("compression_config", "registers_iteration_manager"),
+    [
+        (_config(), False),
+        (SimpleNamespace(algorithm="triattention"), True),
+    ],
+)
+def test_executor_registers_only_iteration_driven_compression(
+    compression_config,
+    registers_iteration_manager,
+):
+    kv_cache_manager = MagicMock()
+    resources = {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager}
+    iteration_manager = MagicMock()
+    llm_args = SimpleNamespace(
+        enable_low_latency_host_dispatch=False,
+        extra_resource_managers={},
+        kv_cache_compression_config=compression_config,
+        disable_overlap_scheduler=True,
+        reorder_policy_config=None,
+        enable_early_first_token_response=False,
+        kv_cache_config=SimpleNamespace(enable_kv_pool_rebalance=False),
+    )
+    mapping = SimpleNamespace(
+        pp_size=1,
+        enable_attention_dp=False,
+        has_pp=lambda: False,
+    )
+    model_engine = SimpleNamespace(
+        spec_config=None,
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(
+                pretrained_config=SimpleNamespace(),
+                is_encoder_decoder=False,
+            )
+        ),
+    )
+    scheduler_config = SimpleNamespace(
+        use_python_scheduler=True,
+        capacity_scheduler_policy="max-utilization",
+        enable_prefix_aware_scheduling=True,
+        waiting_queue_policy="fcfs",
+    )
+
+    with (
+        patch.object(util_mod, "set_low_latency_dispatch"),
+        patch.object(util_mod, "SeqSlotManager", return_value=MagicMock()),
+        patch.object(util_mod, "SimpleUnifiedScheduler", return_value=MagicMock()),
+        patch.object(util_mod, "create_kv_cache_transceiver", return_value=None),
+        patch.object(util_mod, "is_mla", return_value=False),
+        patch.object(
+            util_mod,
+            "create_kv_cache_compression_manager",
+            return_value=iteration_manager,
+        ) as compression_factory,
+        patch.object(util_mod, "PyExecutor", return_value=MagicMock()) as executor_constructor,
+    ):
+        util_mod.create_py_executor_instance(
+            dist=MagicMock(),
+            resources=resources,
+            mapping=mapping,
+            llm_args=llm_args,
+            ctx_chunk_config=None,
+            model_engine=model_engine,
+            start_worker=False,
+            sampler=MagicMock(),
+            drafter=None,
+            max_seq_len=512,
+            max_batch_size=2,
+            max_beam_width=1,
+            max_num_tokens=1024,
+            max_num_sequences=2,
+            scheduler_config=scheduler_config,
+        )
+
+    registered = executor_constructor.call_args.args[0].resource_managers
+    if registers_iteration_manager:
+        compression_factory.assert_called_once_with(
+            compression_config,
+            kv_cache_manager,
+            draft_kv_cache_manager=None,
+        )
+        assert registered[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] is iteration_manager
+    else:
+        compression_factory.assert_not_called()
+        assert ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in registered
+
+
+def test_codec_enabled_host_construction_failure_is_not_retried_gpu_only(monkeypatch):
+    class NativeConstructionError(Exception):
+        pass
+
+    cache_config = KvCacheConfig(
+        max_gpu_total_bytes=1 << 20,
+        host_cache_size=1 << 20,
+    )
+    mapping = SimpleNamespace(
+        cp_config={},
+        tp_size=1,
+        enable_attention_dp=False,
+        world_size=1,
+        pp_partition=None,
+        pp_layers=lambda num_layers: list(range(num_layers)),
+        is_last_pp_rank=lambda: True,
+    )
+
+    monkeypatch.setattr(v2_mod, "KV_CACHE_MANAGER_V2_BACKEND", "cpp")
+    monkeypatch.setattr(v2_mod, "KVCacheOutOfMemoryError", NativeConstructionError)
+    with (
+        patch.object(KVCacheManagerV2, "_build_base_config", return_value=object()),
+        patch.object(KVCacheManagerV2, "_build_cache_config", return_value=object()),
+        patch.object(
+            v2_mod,
+            "_create_kv_cache_manager_v2_impl",
+            side_effect=NativeConstructionError("host codec construction failed"),
+        ) as native_constructor,
+        pytest.raises(NativeConstructionError, match="host codec construction failed"),
+    ):
+        KVCacheManagerV2(
+            cache_config,
+            CacheTypeCpp.SELF,
+            num_layers=1,
+            num_kv_heads=8,
+            head_dim=128,
+            tokens_per_block=64,
+            max_seq_len=512,
+            max_batch_size=2,
+            mapping=mapping,
+            dtype=DataType.BF16,
+            execution_stream=object(),
+            kv_cache_compression_manager=_manager(),
+        )
+
+    native_constructor.assert_called_once()
 
 
 @pytest.mark.parametrize(
