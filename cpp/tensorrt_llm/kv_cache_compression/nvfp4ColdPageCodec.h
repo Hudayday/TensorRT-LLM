@@ -54,8 +54,8 @@ struct Nvfp4ColdPageLayerConfig
 //! NVFP4 implementation behind QuantizationCompression's native data plane.
 //!
 //! QuantizationCompression owns the algorithm choice and calibrated
-//! configuration. Python constructs this concrete codec before KVCM; nanobind
-//! then transfers its unique ownership into KVCM's constructor. Native
+//! configuration. A native factory constructs this codec before KVCM;
+//! nanobind then transfers its unique ownership into KVCM's constructor. Native
 //! StorageManager owns the codec lifetime, selects Pages, allocates Slots,
 //! invokes encode()/decode(), fences work, and publishes mappings. Synchronous
 //! launch rejection is rolled back before publication; an asynchronous CUDA
