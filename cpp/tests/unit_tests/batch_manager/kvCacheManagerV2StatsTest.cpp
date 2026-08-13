@@ -27,9 +27,13 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <stdexcept>
+#include <thread>
 
 namespace
 {
@@ -69,6 +73,20 @@ KVCacheManagerConfig makeTieredConfig()
     return config;
 }
 
+KVCacheManagerConfig makePartialSnapshotTieredConfig()
+{
+    auto config = makeTieredConfig();
+    config.commitMinSnapshot = true;
+    return config;
+}
+
+KVCacheManagerConfig makeHostDiskTieredConfig()
+{
+    auto config = makeTieredConfig();
+    config.cacheTiers.emplace_back(DiskCacheTierConfig{4 << 20, "/tmp"});
+    return config;
+}
+
 KVCacheManagerConfig makeGpuTieredConfig()
 {
     auto config = makeTieredConfig();
@@ -95,6 +113,26 @@ KVCacheManagerConfig makeSplitColdGroupingConfig()
     second.buffers.push_back(BufferConfig{"key", 4096, std::nullopt});
     config.layers.emplace_back(std::move(second));
     return config;
+}
+
+SharedPtr<CommittedPage> makeCommittedPage(KvCacheManager& manager, StorageManager& storage, NodeBase* previous,
+    LifeCycleId lifeCycle, CacheLevel cacheLevel, Slot& slot, int tokenBase, bool scheduleForEviction)
+{
+    std::vector<TokenIdExt> tokens;
+    for (int i = 0; i < manager.tokensPerBlock(); ++i)
+    {
+        tokens.emplace_back(TokenId{tokenBase + i});
+    }
+    auto block = addOrGetExistingBlock(previous, std::move(tokens), /*knownNoDigest=*/true);
+    auto page = makeShared<CommittedPage>(
+        &storage, block, lifeCycle, cacheLevel, static_cast<int>(block->tokens.size()), kPriorityDefault);
+    page->setSlot(slot);
+    block->storage[lifeCycle] = page.get();
+    if (scheduleForEviction)
+    {
+        storage.scheduleForEviction(*page);
+    }
+    return page;
 }
 
 class RejectingColdPageCodec final : public IKvCacheColdPageCodec
@@ -124,6 +162,171 @@ public:
     {
         return false;
     }
+};
+
+class AsyncRejectingColdPageCodec final : public IKvCacheColdPageCodec
+{
+public:
+    enum class Direction
+    {
+        kEncode,
+        kDecode,
+    };
+
+    explicit AsyncRejectingColdPageCodec(Direction direction)
+        : mDirection(direction)
+    {
+        if (cudaEventCreateWithFlags(&mCallbackDone, cudaEventDisableTiming) != cudaSuccess)
+        {
+            throw std::runtime_error("failed to create async-rejection test event");
+        }
+    }
+
+    ~AsyncRejectingColdPageCodec() override
+    {
+        releaseCallback();
+        if (mSubmitted.load(std::memory_order_acquire))
+        {
+            static_cast<void>(cudaEventSynchronize(mCallbackDone));
+        }
+        static_cast<void>(cudaEventDestroy(mCallbackDone));
+    }
+
+    bool configure(PoolGroupDesc const*, PoolGroupIndex) noexcept override
+    {
+        return true;
+    }
+
+    size_t queryColdPageBytes(LayerGroupId) const noexcept override
+    {
+        return 1 << 20;
+    }
+
+    PageIndexLocation queryPageIndexLocation(LayerGroupId) const noexcept override
+    {
+        return PageIndexLocation::kHost;
+    }
+
+    bool encode(LayerGroupId, void*, PageIndexPair const*, size_t numBasePages, cudaStream_t stream) noexcept override
+    {
+        mEncodedPages += numBasePages;
+        return mDirection == Direction::kEncode ? enqueueAndReject(stream) : true;
+    }
+
+    bool decode(
+        LayerGroupId, void const*, PageIndexPair const*, size_t numBasePages, cudaStream_t stream) noexcept override
+    {
+        mDecodedPages += numBasePages;
+        return mDirection == Direction::kDecode ? enqueueAndReject(stream) : true;
+    }
+
+    bool submitted() const noexcept
+    {
+        return mSubmitted.load(std::memory_order_acquire);
+    }
+
+    void releaseCallback() noexcept
+    {
+        mReleaseCallback.store(true, std::memory_order_release);
+    }
+
+    bool callbackTimedOut() const noexcept
+    {
+        return mCallbackTimedOut.load(std::memory_order_acquire);
+    }
+
+    size_t encodedPages() const noexcept
+    {
+        return mEncodedPages;
+    }
+
+    size_t decodedPages() const noexcept
+    {
+        return mDecodedPages;
+    }
+
+private:
+    bool enqueueAndReject(cudaStream_t stream) noexcept
+    {
+        cudaError_t const status = cudaLaunchHostFunc(
+            stream,
+            [](void* opaque)
+            {
+                auto& self = *static_cast<AsyncRejectingColdPageCodec*>(opaque);
+                auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+                while (!self.mReleaseCallback.load(std::memory_order_acquire))
+                {
+                    if (std::chrono::steady_clock::now() >= deadline)
+                    {
+                        self.mCallbackTimedOut.store(true, std::memory_order_release);
+                        return;
+                    }
+                    std::this_thread::yield();
+                }
+            },
+            this);
+        mSubmitted.store(status == cudaSuccess, std::memory_order_release);
+        if (status == cudaSuccess && cudaEventRecord(mCallbackDone, stream) != cudaSuccess)
+        {
+            releaseCallback();
+            static_cast<void>(cudaStreamSynchronize(stream));
+        }
+        return false;
+    }
+
+    Direction mDirection;
+    cudaEvent_t mCallbackDone = nullptr;
+    std::atomic_bool mSubmitted{false};
+    std::atomic_bool mReleaseCallback{false};
+    std::atomic_bool mCallbackTimedOut{false};
+    size_t mEncodedPages = 0;
+    size_t mDecodedPages = 0;
+};
+
+class SameRepresentationGuardColdPageCodec final : public IKvCacheColdPageCodec
+{
+public:
+    bool configure(PoolGroupDesc const*, PoolGroupIndex) noexcept override
+    {
+        return true;
+    }
+
+    size_t queryColdPageBytes(LayerGroupId) const noexcept override
+    {
+        return 1 << 20;
+    }
+
+    PageIndexLocation queryPageIndexLocation(LayerGroupId layerGroupId) const noexcept override
+    {
+        mQueriedInvalidLayerGroup |= layerGroupId == LayerGroupId{-1};
+        return PageIndexLocation::kHost;
+    }
+
+    bool encode(LayerGroupId, void*, PageIndexPair const*, size_t, cudaStream_t) noexcept override
+    {
+        ++mTransformCalls;
+        return false;
+    }
+
+    bool decode(LayerGroupId, void const*, PageIndexPair const*, size_t, cudaStream_t) noexcept override
+    {
+        ++mTransformCalls;
+        return false;
+    }
+
+    bool queriedInvalidLayerGroup() const noexcept
+    {
+        return mQueriedInvalidLayerGroup;
+    }
+
+    int transformCalls() const noexcept
+    {
+        return mTransformCalls;
+    }
+
+private:
+    mutable bool mQueriedInvalidLayerGroup = false;
+    int mTransformCalls = 0;
 };
 
 class SplitColdPageCodec final : public IKvCacheColdPageCodec
@@ -302,11 +505,15 @@ TEST(KvCacheManagerV2StatsTest, ColdGpuTierSupportsSingleSlotRoundTrip)
     ASSERT_EQ(cudaMemset(reinterpret_cast<void*>(hotAddress), kPattern, hotPageBytes), cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
-    storage.copySlotData(lifeCycle, coldLevel, kGpuLevel, coldSlot.slotId(), hotSlot.slotId(), nullptr);
-    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    storage.copySlotData(
+        lifeCycle, coldLevel, kGpuLevel, coldSlot.slotId(), hotSlot.slotId(), reinterpret_cast<CUstream>(stream));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
     ASSERT_EQ(cudaMemset(reinterpret_cast<void*>(hotAddress), 0, hotPageBytes), cudaSuccess);
-    storage.copySlotData(lifeCycle, kGpuLevel, coldLevel, hotSlot.slotId(), coldSlot.slotId(), nullptr);
-    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    storage.copySlotData(
+        lifeCycle, kGpuLevel, coldLevel, hotSlot.slotId(), coldSlot.slotId(), reinterpret_cast<CUstream>(stream));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     uint8_t firstByte = 0;
     uint8_t lastByte = 0;
@@ -320,6 +527,7 @@ TEST(KvCacheManagerV2StatsTest, ColdGpuTierSupportsSingleSlotRoundTrip)
 
     storage.releaseSlot(lifeCycle, coldLevel, std::move(coldSlot));
     storage.releaseSlot(lifeCycle, kGpuLevel, std::move(hotSlot));
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 
 TEST(KvCacheManagerV2StatsTest, RejectsBatchingClassWithDifferentColdPageSizes)
@@ -380,6 +588,271 @@ TEST(KvCacheManagerV2StatsTest, ColdGroupingIsIndependentOfHotGrouping)
         size_t const expectedBytes = lifeCycle == LifeCycleId{0} ? 1024 : 2048;
         EXPECT_EQ(coldSlotSizes.at(PoolIndex{0}), expectedBytes);
     }
+}
+
+TEST(KvCacheManagerV2StatsTest, AsyncEncodeRejectionFencesRecycledColdSlots)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto codec = std::make_unique<AsyncRejectingColdPageCodec>(AsyncRejectingColdPageCodec::Direction::kEncode);
+    auto* codecPtr = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(makeTieredConfig(), nullptr, std::move(codec));
+    auto& storage = manager->storage();
+    LifeCycleId const lifeCycle{0};
+    CacheLevel const hostLevel{1};
+
+    TypedVec<LifeCycleId, SlotCount> twoSlots(LifeCycleId{1}, 2);
+    SlotCount const hostBlockers = storage.getStatistics(hostLevel).total - 2;
+    ASSERT_GE(hostBlockers, 0);
+    TypedVec<LifeCycleId, SlotCount> hostBlockerCount(LifeCycleId{1}, hostBlockers);
+    auto occupiedHostSlots = storage.newSlots(hostLevel, hostBlockerCount);
+
+    auto gpuSlots = storage.newGpuSlots(twoSlots);
+    RootBlock& root = manager->radixTree().addOrGetExisting({});
+    std::vector<SharedPtr<Page>> pages;
+    NodeBase* previous = &root;
+    int tokenBase = 0;
+    for (auto& slot : gpuSlots[lifeCycle])
+    {
+        auto page = makeCommittedPage(
+            *manager, storage, previous, lifeCycle, kGpuLevel, slot, tokenBase, /*scheduleForEviction=*/true);
+        previous = page->block;
+        pages.push_back(std::move(page));
+        tokenBase += manager->tokensPerBlock();
+    }
+
+    EXPECT_THROW(storage.newGpuSlots(twoSlots), LogicError);
+    ASSERT_TRUE(codecPtr->submitted());
+    EXPECT_EQ(codecPtr->encodedPages(), 2);
+    EXPECT_EQ(codecPtr->decodedPages(), 0);
+    for (auto const& page : pages)
+    {
+        EXPECT_EQ(page->cacheLevel, kGpuLevel);
+        EXPECT_TRUE(page->scheduledForEviction());
+        EXPECT_FALSE(page->readyEvent.isClosed());
+    }
+
+    auto recycledHostSlots = storage.newSlots(hostLevel, twoSlots);
+    ASSERT_EQ(recycledHostSlots[lifeCycle].size(), 2);
+    for (auto const& slot : recycledHostSlots[lifeCycle])
+    {
+        EXPECT_FALSE(slot.readyEvent.isClosed());
+    }
+    codecPtr->releaseCallback();
+    for (auto& slot : recycledHostSlots[lifeCycle])
+    {
+        slot.readyEvent.synchronize();
+        storage.releaseSlot(lifeCycle, hostLevel, std::move(slot));
+    }
+    EXPECT_FALSE(codecPtr->callbackTimedOut());
+    for (auto& slot : occupiedHostSlots[lifeCycle])
+    {
+        storage.releaseSlot(lifeCycle, hostLevel, std::move(slot));
+    }
+}
+
+TEST(KvCacheManagerV2StatsTest, AsyncDecodeRejectionFencesRecycledGpuSlot)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto codec = std::make_unique<AsyncRejectingColdPageCodec>(AsyncRejectingColdPageCodec::Direction::kDecode);
+    auto* codecPtr = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(makeTieredConfig(), nullptr, std::move(codec));
+    auto& storage = manager->storage();
+    LifeCycleId const lifeCycle{0};
+    CacheLevel const hostLevel{1};
+
+    SlotCount const gpuBlockers = storage.getStatistics(kGpuLevel).total - 1;
+    ASSERT_GE(gpuBlockers, 0);
+    SlotId const expectedRolledBackSlot{gpuBlockers};
+    auto occupiedGpuSlots = storage.newSlotsForPoolGroup(kGpuLevel, PoolGroupIndex{0}, gpuBlockers);
+
+    TypedVec<LifeCycleId, SlotCount> oneSlot(LifeCycleId{1}, 1);
+    auto hostSlots = storage.newSlots(hostLevel, oneSlot);
+    RootBlock& root = manager->radixTree().addOrGetExisting({});
+    auto page = makeCommittedPage(*manager, storage, &root, lifeCycle, hostLevel, hostSlots[lifeCycle].front(),
+        /*tokenBase=*/0, /*scheduleForEviction=*/false);
+    SlotId const sourceSlot = page->slotId();
+
+    auto cache = manager->createKvCache();
+    std::vector<BatchedLockTarget> targets{{page, kDefaultBeamIndex, BlockOrdinal{0}, lifeCycle}};
+    EXPECT_THROW(storage.batchedMigrateToGpu(targets, *cache, MigrationRecorder{}), LogicError);
+    ASSERT_TRUE(codecPtr->submitted());
+    EXPECT_EQ(codecPtr->encodedPages(), 0);
+    EXPECT_EQ(codecPtr->decodedPages(), 1);
+    EXPECT_EQ(page->cacheLevel, hostLevel);
+    EXPECT_EQ(page->slotId(), sourceSlot);
+    EXPECT_FALSE(page->readyEvent.isClosed());
+
+    auto recycledGpuSlot = storage.newSlots(kGpuLevel, oneSlot);
+    ASSERT_EQ(recycledGpuSlot[lifeCycle].size(), 1);
+    EXPECT_EQ(recycledGpuSlot[lifeCycle].front().slotId(), expectedRolledBackSlot);
+    EXPECT_FALSE(recycledGpuSlot[lifeCycle].front().readyEvent.isClosed());
+    codecPtr->releaseCallback();
+    recycledGpuSlot[lifeCycle].front().readyEvent.synchronize();
+    EXPECT_FALSE(codecPtr->callbackTimedOut());
+
+    storage.releaseSlot(lifeCycle, kGpuLevel, std::move(recycledGpuSlot[lifeCycle].front()));
+    for (auto& slot : occupiedGpuSlots)
+    {
+        storage.releaseSlot(lifeCycle, kGpuLevel, std::move(slot));
+    }
+    cache->close();
+}
+
+TEST(KvCacheManagerV2StatsTest, PartialSnapshotCodecRejectionFencesAndReleasesColdCloneSlot)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto codec = std::make_unique<AsyncRejectingColdPageCodec>(AsyncRejectingColdPageCodec::Direction::kEncode);
+    auto* codecPtr = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(makePartialSnapshotTieredConfig(), nullptr, std::move(codec));
+    auto& storage = manager->storage();
+    LifeCycleId const lifeCycle{0};
+    CacheLevel const hostLevel{1};
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    auto cache = manager->createKvCache();
+    ASSERT_TRUE(cache->resume(reinterpret_cast<CUstream>(stream)));
+    cache->setCapacity(manager->tokensPerBlock());
+    ASSERT_EQ(cache->blocks().size(), BlockOrdinal{1});
+    auto sourcePage = blockPageGetPage(cache->blocks().front().pages[kDefaultBeamIndex][lifeCycle]);
+    ASSERT_TRUE(sourcePage);
+    SlotId const sourceSlot = sourcePage->slotId();
+
+    SlotCount const gpuBlockers = storage.getStatistics(kGpuLevel).total - 1;
+    ASSERT_GE(gpuBlockers, 0);
+    auto occupiedGpuSlots = storage.newSlotsForPoolGroup(kGpuLevel, PoolGroupIndex{0}, gpuBlockers);
+    SlotCount const hostBlockers = storage.getStatistics(hostLevel).total - 1;
+    ASSERT_GE(hostBlockers, 0);
+    SlotId const expectedRolledBackSlot{hostBlockers};
+    TypedVec<LifeCycleId, SlotCount> hostBlockerCount(LifeCycleId{1}, hostBlockers);
+    auto occupiedHostSlots = storage.newSlots(hostLevel, hostBlockerCount);
+    auto const hostBefore = storage.getStatistics(hostLevel);
+
+    std::vector<TokenIdExt> partialTokens{TokenIdExt{TokenId{7}}};
+    EXPECT_THROW(cache->commit(toSpan(partialTokens), /*isEnd=*/false), LogicError);
+    ASSERT_TRUE(codecPtr->submitted());
+    EXPECT_EQ(codecPtr->encodedPages(), 1);
+    EXPECT_EQ(codecPtr->decodedPages(), 0);
+    EXPECT_EQ(sourcePage->cacheLevel, kGpuLevel);
+    EXPECT_EQ(sourcePage->slotId(), sourceSlot);
+    EXPECT_FALSE(sourcePage->readyEvent.isClosed());
+    EXPECT_EQ(storage.getStatistics(hostLevel).free, hostBefore.free);
+
+    TypedVec<LifeCycleId, SlotCount> oneSlot(LifeCycleId{1}, 1);
+    auto recycledHostSlot = storage.newSlots(hostLevel, oneSlot);
+    ASSERT_EQ(recycledHostSlot[lifeCycle].size(), 1);
+    EXPECT_EQ(recycledHostSlot[lifeCycle].front().slotId(), expectedRolledBackSlot);
+    EXPECT_FALSE(recycledHostSlot[lifeCycle].front().readyEvent.isClosed());
+    codecPtr->releaseCallback();
+    recycledHostSlot[lifeCycle].front().readyEvent.synchronize();
+    EXPECT_FALSE(codecPtr->callbackTimedOut());
+
+    storage.releaseSlot(lifeCycle, hostLevel, std::move(recycledHostSlot[lifeCycle].front()));
+    for (auto& slot : occupiedHostSlots[lifeCycle])
+    {
+        storage.releaseSlot(lifeCycle, hostLevel, std::move(slot));
+    }
+    for (auto& slot : occupiedGpuSlots)
+    {
+        storage.releaseSlot(lifeCycle, kGpuLevel, std::move(slot));
+    }
+    cache->close();
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+TEST(KvCacheManagerV2StatsTest, HostToDiskMigrationBypassesColdPageCodec)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto codec = std::make_unique<SameRepresentationGuardColdPageCodec>();
+    auto* codecPtr = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(makeHostDiskTieredConfig(), nullptr, std::move(codec));
+    auto& storage = manager->storage();
+    LifeCycleId const lifeCycle{0};
+    CacheLevel const hostLevel{1};
+    CacheLevel const diskLevel{2};
+
+    StorageStatistics const hostStats = storage.getStatistics(hostLevel);
+    TypedVec<LifeCycleId, SlotCount> allHostSlots(LifeCycleId{1}, hostStats.total);
+    auto occupiedHostSlots = storage.newSlots(hostLevel, allHostSlots);
+    RootBlock& root = manager->radixTree().addOrGetExisting({});
+    auto page = makeCommittedPage(*manager, storage, &root, lifeCycle, hostLevel, occupiedHostSlots[lifeCycle].front(),
+        /*tokenBase=*/0, /*scheduleForEviction=*/true);
+
+    int migrations = 0;
+    MigrationRecorder recorder = [&](auto const& pages, auto const&, CacheLevel srcLevel, CacheLevel dstLevel)
+    {
+        EXPECT_EQ(pages.size(), 1);
+        EXPECT_EQ(srcLevel, hostLevel);
+        EXPECT_EQ(dstLevel, diskLevel);
+        ++migrations;
+    };
+    TypedVec<LifeCycleId, SlotCount> oneSlot(LifeCycleId{1}, 1);
+    auto replacementHostSlot = storage.newSlots(hostLevel, oneSlot, recorder);
+    page->readyEvent.synchronize();
+
+    EXPECT_EQ(migrations, 1);
+    EXPECT_EQ(page->cacheLevel, diskLevel);
+    EXPECT_FALSE(codecPtr->queriedInvalidLayerGroup());
+    EXPECT_EQ(codecPtr->transformCalls(), 0);
+
+    storage.releaseSlot(lifeCycle, hostLevel, std::move(replacementHostSlot[lifeCycle].front()));
+    for (auto& slot : occupiedHostSlots[lifeCycle])
+    {
+        if (slot.hasValidSlot())
+        {
+            storage.releaseSlot(lifeCycle, hostLevel, std::move(slot));
+        }
+    }
+}
+
+TEST(KvCacheManagerV2StatsTest, GpuDefragmentationBypassesColdPageCodec)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto codec = std::make_unique<SameRepresentationGuardColdPageCodec>();
+    auto* codecPtr = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(makeConfig(), nullptr, std::move(codec));
+    auto& storage = manager->storage();
+    LifeCycleId const lifeCycle{0};
+    PoolGroupIndex const poolGroup = storage.getPoolGroupIndex(kGpuLevel, lifeCycle);
+
+    TypedVec<LifeCycleId, SlotCount> threeSlots(LifeCycleId{1}, 3);
+    auto gpuSlots = storage.newGpuSlots(threeSlots);
+    ASSERT_EQ(gpuSlots[lifeCycle][0].slotId(), SlotId{0});
+    ASSERT_EQ(gpuSlots[lifeCycle][2].slotId(), SlotId{2});
+    storage.releaseSlot(lifeCycle, kGpuLevel, std::move(gpuSlots[lifeCycle][0]));
+
+    RootBlock& root = manager->radixTree().addOrGetExisting({});
+    auto page = makeCommittedPage(*manager, storage, &root, lifeCycle, kGpuLevel, gpuSlots[lifeCycle][2],
+        /*tokenBase=*/0, /*scheduleForEviction=*/false);
+    size_t const pageBytes = storage.slotSize(kGpuLevel, poolGroup).at(PoolIndex{0});
+    MemAddress const sourceAddress
+        = std::get<MemAddress>(storage.slotAddress(kGpuLevel, poolGroup, page->slotId(), PoolIndex{0}));
+    constexpr uint8_t kPattern = 0xA7;
+    ASSERT_EQ(cudaMemset(reinterpret_cast<void*>(sourceAddress), kPattern, pageBytes), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    std::vector<SharedPtr<Page>> persistentPages{page};
+    storage.shrinkPoolGroup(kGpuLevel, poolGroup, SlotCount{2}, persistentPages);
+    page->readyEvent.synchronize();
+
+    EXPECT_EQ(page->cacheLevel, kGpuLevel);
+    EXPECT_EQ(page->slotId(), SlotId{0});
+    EXPECT_FALSE(codecPtr->queriedInvalidLayerGroup());
+    EXPECT_EQ(codecPtr->transformCalls(), 0);
+
+    MemAddress const destinationAddress
+        = std::get<MemAddress>(storage.slotAddress(kGpuLevel, poolGroup, page->slotId(), PoolIndex{0}));
+    uint8_t firstByte = 0;
+    uint8_t lastByte = 0;
+    ASSERT_EQ(cudaMemcpy(&firstByte, reinterpret_cast<void const*>(destinationAddress), 1, cudaMemcpyDeviceToHost),
+        cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&lastByte, reinterpret_cast<void const*>(destinationAddress + pageBytes - 1), 1,
+                  cudaMemcpyDeviceToHost),
+        cudaSuccess);
+    EXPECT_EQ(firstByte, kPattern);
+    EXPECT_EQ(lastByte, kPattern);
+
+    storage.releaseSlot(lifeCycle, kGpuLevel, std::move(gpuSlots[lifeCycle][1]));
 }
 
 TEST(KvCacheManagerV2StatsTest, StatsDeltaArithmetic)

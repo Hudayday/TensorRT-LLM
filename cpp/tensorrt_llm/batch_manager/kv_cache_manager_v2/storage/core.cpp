@@ -463,7 +463,15 @@ SlotCount PoolGroupBase::getNumSlotsFromPools() const noexcept
 
 PoolGroupBase::~PoolGroupBase()
 {
-    destroy();
+    try
+    {
+        destroy();
+    }
+    catch (...)
+    {
+        // Explicit destroy() reports cleanup failures. Destructors must not
+        // throw while another construction or migration error is unwinding.
+    }
 }
 
 SlotCount PoolGroupBase::numSlots() const noexcept
@@ -497,6 +505,9 @@ void PoolGroupBase::destroy()
 {
     if (mDestroyed)
         return;
+    // Mark first so a later member destructor does not retry a failed CUDA
+    // cleanup while stack unwinding is already in progress.
+    mDestroyed = true;
     if (mSlotAllocator.numSlots() != 0)
     {
         mSlotAllocator.synchronize();
@@ -505,7 +516,6 @@ void PoolGroupBase::destroy()
     }
     for (auto& p : mPools)
         p->destroy();
-    mDestroyed = true;
 }
 
 void PoolGroupBase::resizePools(std::optional<SlotCount> newNumSlots)
@@ -629,11 +639,50 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
         "GpuCacheLevelStorage: slotCountList and slotDescList must have the same length");
     mPhysMemAllocator = std::make_unique<PooledPhysMemAllocator>(physMemSize);
 
-    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
+    try
     {
-        mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(
-            slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), *mPhysMemAllocator));
+        for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
+        {
+            mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(
+                slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), *mPhysMemAllocator));
+        }
     }
+    catch (...)
+    {
+        // A failed derived constructor does not run
+        // ~GpuCacheLevelStorage(). Tear down every already-created PoolGroup
+        // while the physical allocator member is still alive, then let normal
+        // partial-construction unwinding destroy the now-empty mappings.
+        try
+        {
+            CacheLevelStorage::destroy();
+        }
+        catch (...)
+        {
+            // Preserve the construction error. Pool member destructors below
+            // provide their own no-throw cleanup fallback.
+        }
+        mPoolGroups.clear();
+        throw;
+    }
+}
+
+GpuCacheLevelStorage::~GpuCacheLevelStorage()
+{
+    // PoolGroups contain VirtMem objects that borrow mPhysMemAllocator. Close
+    // those mappings from the derived destructor, before C++ destroys the
+    // allocator member and then the base-class PoolGroups. This covers a later
+    // StorageManager/codec rejection after this object finished construction.
+    try
+    {
+        destroy();
+    }
+    catch (...)
+    {
+        // Keep destruction no-throw. Clearing while mPhysMemAllocator is
+        // alive lets each VirtMem destructor finish best-effort cleanup.
+    }
+    mPoolGroups.clear();
 }
 
 // ---------------------------------------------------------------------------

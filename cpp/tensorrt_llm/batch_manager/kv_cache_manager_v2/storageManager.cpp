@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <exception>
 #include <limits>
 #include <numeric>
 #include <set>
@@ -150,7 +151,7 @@ bool StorageManager::submitColdPageCodec(
         attributes.dstLocHint.type = CU_MEM_LOCATION_TYPE_DEVICE;
         attributes.flags = CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE;
         size_t firstCopy = 0;
-        TLLM_CU_CHECK(cuMemcpyBatchAsync(&dst, &src, &chunkBytes, 1, &attributes, &firstCopy, 1, stream));
+        cuCheck(cuMemcpyBatchAsync(&dst, &src, &chunkBytes, 1, &attributes, &firstCopy, 1, stream));
 
         if (!submit(reinterpret_cast<PageIndexPair const*>(device.address()), chunkPages, stream))
         {
@@ -805,7 +806,8 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     }
 
     TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(fallenPages.begin(), fallenPages.end(),
-                                   [lvlId](auto const& pages) {
+                                   [lvlId](auto const& pages)
+                                   {
                                        return std::all_of(pages.begin(), pages.end(),
                                            [lvlId](auto const& p) { return p->cacheLevel < lvlId; });
                                    }),
@@ -817,6 +819,52 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     bool const isLast = isLastLevel(lvlId);
 
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> fallenByPoolGroup(numPoolGroups(lvlId));
+    TypedVec<PoolGroupIndex, SlotCount> numToEvict(numPoolGroups(lvlId), 0);
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> heldPages(numPoolGroups(lvlId));
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> evicted(numPoolGroups(lvlId));
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> acceptedPages(numPoolGroups(lvlId));
+
+    bool completed = false;
+    auto rollbackGuard = FuncGuard(
+        [this, &completed, &fallenPages, &fallenByPoolGroup, &heldPages, &evicted, &acceptedPages]() noexcept
+        {
+            if (completed)
+            {
+                return;
+            }
+
+            try
+            {
+                // Eviction temporarily removes the controller's strong owner. Restore every still-resident evictable
+                // Page that has not already been published and scheduled at its destination.
+                auto restoreEvictionOwnership = [this](auto const& groupedPages)
+                {
+                    for (auto const& pages : groupedPages)
+                    {
+                        for (auto it = pages.rbegin(); it != pages.rend(); ++it)
+                        {
+                            auto const& page = *it;
+                            if (page && !page->scheduledForEviction() && isEvictable(*page))
+                            {
+                                mLevels.at(page->cacheLevel).controller.scheduleForEviction(*page, /*evictFirst=*/true);
+                            }
+                        }
+                    }
+                };
+                restoreEvictionOwnership(fallenPages);
+                restoreEvictionOwnership(fallenByPoolGroup);
+                restoreEvictionOwnership(heldPages);
+                restoreEvictionOwnership(evicted);
+                restoreEvictionOwnership(acceptedPages);
+            }
+            catch (...)
+            {
+                // Losing the controller's only strong Page owner would corrupt the cache. A guard destructor cannot
+                // propagate, so fail closed if re-queuing itself cannot complete.
+                std::terminate();
+            }
+        });
+
     for (LifeCycleId lifeCycle{0}; lifeCycle < fallenPages.size(); ++lifeCycle)
     {
         auto& pages = fallenPages[lifeCycle];
@@ -827,9 +875,6 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         poolGroupPages.insert(poolGroupPages.end(), pages.begin(), pages.end());
         pages.clear();
     }
-
-    TypedVec<PoolGroupIndex, SlotCount> numToEvict(numPoolGroups(lvlId), 0);
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> heldPages(numPoolGroups(lvlId));
 
     for (PoolGroupIndex pgIdx{0}; pgIdx < numToEvict.size(); ++pgIdx)
     {
@@ -863,8 +908,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         }
     }
 
-    auto evicted = ctrl.evict(numToEvict);
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> acceptedPages(numPoolGroups(lvlId));
+    evicted = ctrl.evict(numToEvict);
 
     if (isLast)
     {
@@ -904,7 +948,6 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     }
     else
     {
-        CacheLevel const nextLvl = lvlId + 1;
         for (PoolGroupIndex pgIdx{0}; pgIdx < evicted.size(); ++pgIdx)
         {
             auto& ev = evicted.at(pgIdx);
@@ -929,7 +972,11 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             }
             fp.clear();
         }
-        _prepareFreeSlots(goals, nextLvl, fallenPages, migrationRecorder, dropRecorder);
+    }
+
+    if (!isLast)
+    {
+        _prepareFreeSlots(goals, lvlId + 1, fallenPages, migrationRecorder, dropRecorder);
     }
 
     TLLM_CHECK_DEBUG_WITH_INFO(
@@ -958,6 +1005,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             }
         }
     }
+    completed = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,30 +1068,6 @@ void StorageManager::_batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
                 slotIdToPageIndexValue(dstSlots.at(i).slotId()), slotIdToPageIndexValue(srcPages.at(i)->slotId())});
         }
 
-        PageIndexLocation const pageIndexLocation = mPageIndexLocations.at(batchingLayerGroupId);
-        auto encodeBatch = [this, batchingLayerGroupId, pageIndexLocation](
-                               void* dstBasePtr, PageIndexPair const* indices, size_t numPages, CUstream stream)
-        {
-            return submitColdPageCodec(pageIndexLocation, indices, numPages, stream,
-                [this, batchingLayerGroupId, dstBasePtr](
-                    PageIndexPair const* submittedIndices, size_t submittedPages, CUstream submittedStream)
-                {
-                    return mColdPageCodec->encode(batchingLayerGroupId, dstBasePtr, submittedIndices, submittedPages,
-                        reinterpret_cast<cudaStream_t>(submittedStream));
-                });
-        };
-        auto decodeBatch = [this, batchingLayerGroupId, pageIndexLocation](
-                               void const* srcBasePtr, PageIndexPair const* indices, size_t numPages, CUstream stream)
-        {
-            return submitColdPageCodec(pageIndexLocation, indices, numPages, stream,
-                [this, batchingLayerGroupId, srcBasePtr](
-                    PageIndexPair const* submittedIndices, size_t submittedPages, CUstream submittedStream)
-                {
-                    return mColdPageCodec->decode(batchingLayerGroupId, srcBasePtr, submittedIndices, submittedPages,
-                        reinterpret_cast<cudaStream_t>(submittedStream));
-                });
-        };
-
         std::vector<CachedCudaEvent const*> priorEvents;
         priorEvents.reserve(2 * srcPages.size());
         for (std::size_t i = 0; i < srcPages.size(); ++i)
@@ -1056,6 +1080,23 @@ void StorageManager::_batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
         {
             auto scope = tempStream.enter();
             CUstream const stream = tempStream.get();
+            int const exceptionCount = std::uncaught_exceptions();
+            auto fenceOnFailure = FuncGuard(
+                [&srcPages, &dstSlots, stream, exceptionCount]() noexcept
+                {
+                    if (std::uncaught_exceptions() == exceptionCount)
+                    {
+                        return;
+                    }
+                    // A codec or copy engine may enqueue asynchronous work before reporting failure. Fence both
+                    // owners before the outer catch returns destination Slots to their allocator.
+                    CachedCudaEvent completion(reinterpret_cast<CudaStream>(stream));
+                    for (std::size_t i = 0; i < srcPages.size(); ++i)
+                    {
+                        srcPages.at(i)->readyEvent = completion;
+                        dstSlots.at(i).readyEvent = completion;
+                    }
+                });
             bool const srcIsHot = srcLevel == kGpuLevel;
             bool const dstIsHot = dstLevel == kGpuLevel;
 
@@ -1094,6 +1135,32 @@ void StorageManager::_batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
             }
             else
             {
+                // LayerGroupId{-1} is only a grouping sentinel for same-representation copies. Codec metadata exists
+                // exclusively for hot-to-cold and cold-to-hot conversions, so query it only in this branch.
+                PageIndexLocation const pageIndexLocation = mPageIndexLocations.at(batchingLayerGroupId);
+                auto encodeBatch = [this, batchingLayerGroupId, pageIndexLocation](void* dstBasePtr,
+                                       PageIndexPair const* indices, size_t numPages, CUstream codecStream)
+                {
+                    return submitColdPageCodec(pageIndexLocation, indices, numPages, codecStream,
+                        [this, batchingLayerGroupId, dstBasePtr](
+                            PageIndexPair const* submittedIndices, size_t submittedPages, CUstream submittedStream)
+                        {
+                            return mColdPageCodec->encode(batchingLayerGroupId, dstBasePtr, submittedIndices,
+                                submittedPages, reinterpret_cast<cudaStream_t>(submittedStream));
+                        });
+                };
+                auto decodeBatch = [this, batchingLayerGroupId, pageIndexLocation](void const* srcBasePtr,
+                                       PageIndexPair const* indices, size_t numPages, CUstream codecStream)
+                {
+                    return submitColdPageCodec(pageIndexLocation, indices, numPages, codecStream,
+                        [this, batchingLayerGroupId, srcBasePtr](
+                            PageIndexPair const* submittedIndices, size_t submittedPages, CUstream submittedStream)
+                        {
+                            return mColdPageCodec->decode(batchingLayerGroupId, srcBasePtr, submittedIndices,
+                                submittedPages, reinterpret_cast<cudaStream_t>(submittedStream));
+                        });
+                };
+
                 CacheLevel const coldLevel = srcIsHot ? dstLevel : srcLevel;
                 PoolGroupIndex const coldPgIdx = srcIsHot ? dstPgIdx : srcPgIdx;
                 size_t const coldPageBytes = slotSize(coldLevel, coldPgIdx).at(PoolIndex{0});
@@ -1106,7 +1173,7 @@ void StorageManager::_batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
                     bool const submitted = srcIsHot
                         ? encodeBatch(reinterpret_cast<void*>(coldBase), pageIndices.data(), pageIndices.size(), stream)
                         : decodeBatch(
-                            reinterpret_cast<void const*>(coldBase), pageIndices.data(), pageIndices.size(), stream);
+                              reinterpret_cast<void const*>(coldBase), pageIndices.data(), pageIndices.size(), stream);
                     if (!submitted)
                     {
                         throw LogicError("Cold-page codec rejected a GPU-accessible migration batch");
@@ -1183,6 +1250,15 @@ void StorageManager::_batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
             }
         } // ~Scope records finish event
 
+        CachedCudaEvent finishEvent = tempStream.takeFinishEvent();
+        // From this point on, every owner carries the completion fence. This also protects rollback if a recorder or
+        // later bookkeeping step throws after the asynchronous migration was successfully submitted.
+        for (std::size_t i = 0; i < srcPages.size(); ++i)
+        {
+            srcPages.at(i)->readyEvent = finishEvent;
+            dstSlots.at(i).readyEvent = finishEvent;
+        }
+
         constexpr size_t kMaxRetainedPageIndexPairs = (1u << 20u) / sizeof(PageIndexPair);
         if (pageIndices.capacity() > kMaxRetainedPageIndexPairs)
         {
@@ -1193,7 +1269,6 @@ void StorageManager::_batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
             std::vector<PageIndexPair>().swap(stagingPageIndices);
         }
 
-        CachedCudaEvent finishEvent = tempStream.takeFinishEvent();
         if (migrationRecorder && !defrag)
         {
             migrationRecorder(srcPages, dstSlots, srcLevel, dstLevel);
@@ -1203,10 +1278,6 @@ void StorageManager::_batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
             = updateSrc && !defrag && srcLevel != dstLevel && static_cast<bool>(mEventSink);
         for (std::size_t i = 0; i < srcPages.size(); ++i)
         {
-            dstSlots.at(i).readyEvent = finishEvent;
-            // Fix #6: set src.ready_event unconditionally — compulsory for the next owner
-            // getting this slot from the pool. Mirrors Python: `src.ready_event = finish_event`.
-            srcPages.at(i)->readyEvent = finishEvent;
             if (updateSrc)
             {
                 bool wasScheduled = srcPages.at(i)->scheduledForEviction();
@@ -1481,10 +1552,9 @@ void StorageManager::shrinkPoolGroup(
     // A16: persistent_pages preconditions.
     TLLM_CHECK_DEBUG_WITH_INFO(
         persistentPages.size() <= slotCountToSizeT(newNumSlots), "Not enough slots to hold all persistent pages");
-    TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(persistentPages.begin(), persistentPages.end(),
-                                   [this, level, pgIdx](auto const& p) {
-                                       return p->cacheLevel == level && getPoolGroupIndex(level, p->lifeCycle) == pgIdx;
-                                   }),
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        std::all_of(persistentPages.begin(), persistentPages.end(), [this, level, pgIdx](auto const& p)
+            { return p->cacheLevel == level && getPoolGroupIndex(level, p->lifeCycle) == pgIdx; }),
         "Persistent page cache level or pool group mismatch");
 
     // Fast path: when no slot id has ever been issued in the to-be-removed
