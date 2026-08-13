@@ -789,13 +789,27 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
         }
 
         CUstream stream = cudaStream();
-        newSlot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
-        storageMgr.copySlotData(lcIdx, lvl, srcPage->cacheLevel, newSlot.slotId(), srcPage->slotId(), stream);
+        SharedPtr<CommittedPage> committed;
+        try
+        {
+            newSlot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
+            storageMgr.copySlotData(lcIdx, lvl, srcPage->cacheLevel, newSlot.slotId(), srcPage->slotId(), stream);
 
-        newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
-        auto committed = makeShared<CommittedPage>(
-            &storageMgr, treeBlock, lcIdx, lvl, numTokensInBlock, getPriority(treeBlock->ordinal(), lcIdx));
-        committed->setSlot(newSlot);
+            newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
+            committed = makeShared<CommittedPage>(
+                &storageMgr, treeBlock, lcIdx, lvl, numTokensInBlock, getPriority(treeBlock->ordinal(), lcIdx));
+            committed->setSlot(newSlot);
+        }
+        catch (...)
+        {
+            // copySlotData may enqueue codec work before reporting failure. Preserve its completion fence on both
+            // owners before the failed destination Slot is returned to the allocator.
+            CachedCudaEvent completion(reinterpret_cast<CudaStream>(stream));
+            srcPage->readyEvent = completion;
+            newSlot.readyEvent = completion;
+            storageMgr.releaseSlot(lcIdx, lvl, std::move(newSlot));
+            throw;
+        }
         // Drops the superseded page, deferred until the copy is issued: an
         // OutOfPagesError above must not destroy a usable shorter snapshot.
         treeBlock->replacePage(lcIdx, committed.get());
@@ -2329,11 +2343,8 @@ int KvCache::updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc,
 Span<int const> KvCache::getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx) const
 {
     auto const& buf = mBasePageIndices.at(beamIdx).at(lgId);
-    auto result = std::visit(
-        [](auto const& b) -> Span<int const> {
-            return {b.data(), static_cast<int32_t>(b.size())};
-        },
-        buf);
+    auto result
+        = std::visit([](auto const& b) -> Span<int const> { return {b.data(), static_cast<int32_t>(b.size())}; }, buf);
     // Cross-validate cached indices against freshly computed reference (mirrors Python lines ~350-354).
     if (TLLM_UNLIKELY(gDebug) && isActive())
     {

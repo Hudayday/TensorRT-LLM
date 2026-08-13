@@ -493,6 +493,7 @@ class GpuCacheLevelStorage : public CacheLevelStorage
 public:
     GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, size_t physMemSize);
+    ~GpuCacheLevelStorage() override;
 
     CacheTier cacheTier() const noexcept override
     {
