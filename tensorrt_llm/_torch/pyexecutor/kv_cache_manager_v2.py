@@ -40,6 +40,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    _BACKEND as KV_CACHE_MANAGER_V2_BACKEND,
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
     BAD_PAGE_INDEX,
     CACHE_LEVEL1,
@@ -740,6 +741,50 @@ def _copy_swa_block_offsets_with_scratch_compiled(
     output.copy_(converted.permute(0, 2, 1, 3))
 
 
+def _create_kv_cache_manager_v2_impl(
+    cache_config,
+    event_manager,
+    compression_manager,
+    *,
+    runtime_dtype,
+    pp_layers,
+    num_kv_heads_per_layer,
+    head_dim_per_layer,
+):
+    """Construct native KVCM with its immutable cold-page codec."""
+
+    if compression_manager is None:
+        return KVCacheManagerPy(cache_config, event_manager=event_manager)
+
+    codec = compression_manager.create_cold_page_codec(
+        cache_config,
+        runtime_dtype=runtime_dtype,
+        pp_layers=pp_layers,
+        num_kv_heads_per_layer=num_kv_heads_per_layer,
+        head_dim_per_layer=head_dim_per_layer,
+    )
+    return KVCacheManagerPy(
+        cache_config,
+        event_manager=event_manager,
+        cold_page_codec=codec,
+    )
+
+
+def _validate_cold_page_codec_storage(compression_manager, cache_tiers) -> None:
+    """Reject a boundary codec before native construction when Host is absent."""
+
+    if compression_manager is None:
+        return
+    if KV_CACHE_MANAGER_V2_BACKEND == "python":
+        raise ValueError(
+            "QuantizationCompression requires the C++ KVCacheManagerV2 backend"
+        )
+    if not any(isinstance(tier, HostCacheTierConfig) for tier in cache_tiers):
+        raise ValueError(
+            "QuantizationCompression requires a positive KVCM V2 Host cache tier"
+        )
+
+
 class KVCacheManagerV2(BaseResourceManager):
     def __init__(
         self,
@@ -769,6 +814,7 @@ class KVCacheManagerV2(BaseResourceManager):
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
         is_estimating_kv_cache: bool = False,
+        kv_cache_compression_manager=None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -1045,6 +1091,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
             )
 
+        _validate_cold_page_codec_storage(
+            kv_cache_compression_manager,
+            cache_tiers,
+        )
+
         self.vocab_size = vocab_size
 
         config = self._build_base_config(
@@ -1056,10 +1107,21 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_manager_py_config = config
 
+        def create_impl(cache_config):
+            return _create_kv_cache_manager_v2_impl(
+                cache_config,
+                self.event_manager,
+                kv_cache_compression_manager,
+                runtime_dtype=self.dtype,
+                pp_layers=self.pp_layers,
+                num_kv_heads_per_layer=self.num_kv_heads_per_layer,
+                head_dim_per_layer=self.head_dim_per_layer,
+            )
+
         try:
-            self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
+            self.impl = create_impl(config)
         except (CuError, KVCacheOutOfMemoryError):
-            if len(cache_tiers) > 1:
+            if len(cache_tiers) > 1 and kv_cache_compression_manager is None:
                 logger.warning(
                     "Failed to initialize KV cache manager with host cache "
                     "tier (cuMemHostRegister may have failed). "
@@ -1069,9 +1131,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 config = replace(config, cache_tiers=cache_tiers_gpu_only)
                 cache_tiers = cache_tiers_gpu_only
                 self.kv_cache_manager_py_config = config
-                self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
+                self.impl = create_impl(config)
             else:
                 raise
+        self.kv_cache_compression_manager = kv_cache_compression_manager
+        if kv_cache_compression_manager is not None:
+            kv_cache_compression_manager.bind_kv_cache_manager(self)
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
                 self._get_event_window_sizes_by_layer_group()
