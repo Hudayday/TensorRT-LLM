@@ -63,11 +63,8 @@ void initBindings(nb::module_& module)
         "create_nvfp4_cold_page_codec",
         [](std::vector<compression::Nvfp4ColdPageLayerConfig> layerConfigs)
             -> std::unique_ptr<kv::IKvCacheColdPageCodec>
-        {
-            return std::make_unique<compression::Nvfp4ColdPageCodec>(std::move(layerConfigs));
-        },
-        nb::arg("layer_configs"),
-        "Create an owning NVFP4 cold-page codec for one-time transfer into KVCacheManager.");
+        { return std::make_unique<compression::Nvfp4ColdPageCodec>(std::move(layerConfigs)); },
+        nb::arg("layer_configs"), "Create an owning NVFP4 cold-page codec for one-time transfer into KVCacheManager.");
 }
 
 } // namespace tensorrt_llm::nanobind::kv_cache_compression
