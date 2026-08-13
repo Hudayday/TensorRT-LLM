@@ -20,8 +20,11 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/array.h>
+#include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
 
+#include <memory>
+#include <utility>
 #include <vector>
 
 namespace nb = nanobind;
@@ -51,12 +54,20 @@ void initBindings(nb::module_& module)
         .def_rw("fp8_scale_orig_quant", &compression::Nvfp4ColdPageLayerConfig::fp8ScaleOrigQuant)
         .def_rw("fp8_scale_quant_orig", &compression::Nvfp4ColdPageLayerConfig::fp8ScaleQuantOrig);
 
-    // IKvCacheColdPageCodec is registered once by KVCM V2. Python creates this
-    // concrete subclass, then KVCacheManager's constructor takes its unique_ptr
-    // ownership and calls configure(all PoolGroupDesc) internally. No codec
-    // data-plane method is exposed back through Python.
-    nb::class_<compression::Nvfp4ColdPageCodec, kv::IKvCacheColdPageCodec>(module, "Nvfp4ColdPageCodec")
-        .def(nb::init<std::vector<compression::Nvfp4ColdPageLayerConfig>>(), nb::arg("layer_configs"));
+    // IKvCacheColdPageCodec is registered once by KVCM V2. The factory must
+    // allocate the codec in C++: an nb::init object is co-allocated inside its
+    // Python wrapper and cannot safely become a std::unique_ptr<Base> with the
+    // default deleter. Return the already-registered interface type, leaving
+    // no constructible or otherwise unused concrete Python type.
+    module.def(
+        "create_nvfp4_cold_page_codec",
+        [](std::vector<compression::Nvfp4ColdPageLayerConfig> layerConfigs)
+            -> std::unique_ptr<kv::IKvCacheColdPageCodec>
+        {
+            return std::make_unique<compression::Nvfp4ColdPageCodec>(std::move(layerConfigs));
+        },
+        nb::arg("layer_configs"),
+        "Create an owning NVFP4 cold-page codec for one-time transfer into KVCacheManager.");
 }
 
 } // namespace tensorrt_llm::nanobind::kv_cache_compression

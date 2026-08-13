@@ -85,7 +85,11 @@ def _create_nvfp4_codec(layer_configs: Sequence[Nvfp4BoundaryLayerConfig]):
         native_config.fp8_scale_orig_quant = config.fp8_scale_orig_quant or (1.0, 1.0)
         native_config.fp8_scale_quant_orig = config.fp8_scale_quant_orig or (1.0, 1.0)
         native_configs.append(native_config)
-    return native.Nvfp4ColdPageCodec(native_configs)
+    # The factory allocates the codec with C++ ``new`` and returns an owning
+    # unique_ptr. That ownership can be safely relinquished when the native
+    # KVCacheManager constructor consumes it; a Python-allocated ``nb::init``
+    # instance cannot make that transfer with std::default_delete.
+    return native.create_nvfp4_cold_page_codec(native_configs)
 
 
 def _positive_scale(value, name: str) -> float:

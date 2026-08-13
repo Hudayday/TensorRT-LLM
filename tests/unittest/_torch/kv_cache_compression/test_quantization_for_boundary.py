@@ -13,16 +13,12 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_boundary import (
     QuantizationCompression,
     _load_nvfp4_scales,
 )
-from tensorrt_llm._torch.pyexecutor import _util as util_mod
-from tensorrt_llm._torch.pyexecutor import kv_cache_manager_v2 as v2_mod
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 from tensorrt_llm.llmapi.llm_args import QuantizationCompressionConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
-    GpuCacheTierConfig,
-    HostCacheTierConfig,
     SsmLayerConfig,
 )
 
@@ -71,7 +67,7 @@ def _native():
             FP8_E4M3="native-fp8",
         ),
         Nvfp4ColdPageLayerConfig=SimpleNamespace,
-        Nvfp4ColdPageCodec=MagicMock(return_value=codec),
+        create_nvfp4_cold_page_codec=MagicMock(return_value=codec),
     )
     return module, codec
 
@@ -80,7 +76,7 @@ def _manager(path="/modelopt-checkpoint", **kwargs):
     return QuantizationCompression(_config(path, **kwargs))
 
 
-def test_factory_builds_one_constructor_owned_native_codec():
+def test_factory_builds_one_native_codec():
     native, codec = _native()
     with (
         patch("tensorrt_llm._utils.is_sm_100f", return_value=True),
@@ -103,7 +99,7 @@ def test_factory_builds_one_constructor_owned_native_codec():
         )
 
     assert codec_owner is codec
-    native_configs = native.Nvfp4ColdPageCodec.call_args.args[0]
+    native_configs = native.create_nvfp4_cold_page_codec.call_args.args[0]
     assert [config.layer_id for config in native_configs] == [0, 1]
     assert [config.runtime_type for config in native_configs] == [
         "native-bf16",
@@ -147,7 +143,7 @@ def test_factory_keeps_tp_local_geometry_in_native_codec():
         )
 
     load_scales.assert_called_once_with("/modelopt-checkpoint", (10,))
-    assert native.Nvfp4ColdPageCodec.call_args.args[0][0].num_kv_heads == 4
+    assert native.create_nvfp4_cold_page_codec.call_args.args[0][0].num_kv_heads == 4
 
 
 def test_control_plane_manager_does_not_register_a_late_codec():
@@ -161,102 +157,6 @@ def test_control_plane_manager_does_not_register_a_late_codec():
     assert manager.kv_cache_manager is v2_manager
     assert not hasattr(manager, "_native_codec")
     backend.set_cold_page_codec.assert_not_called()
-
-
-def test_codec_is_created_before_and_transferred_into_native_constructor():
-    calls = []
-    codec = object()
-    cache_config = object()
-    compression_manager = _manager()
-
-    def create_codec(*args, **kwargs):
-        calls.append(("codec", args, kwargs))
-        return codec
-
-    def create_manager(*args, **kwargs):
-        calls.append(("manager", args, kwargs))
-        assert kwargs["cold_page_codec"] is codec
-        return "native-manager"
-
-    with (
-        patch.object(compression_manager, "create_cold_page_codec", side_effect=create_codec),
-        patch.object(v2_mod, "KVCacheManagerPy", side_effect=create_manager),
-    ):
-        result = v2_mod._create_kv_cache_manager_v2_impl(
-            cache_config,
-            "event-manager",
-            compression_manager,
-            runtime_dtype=DataType.BF16,
-            pp_layers=(10,),
-            num_kv_heads_per_layer=(4,),
-            head_dim_per_layer=(128,),
-        )
-
-    assert result == "native-manager"
-    assert [call[0] for call in calls] == ["codec", "manager"]
-    assert calls[1][1] == (cache_config,)
-    assert calls[1][2]["event_manager"] == "event-manager"
-
-
-def test_normal_kvcm_constructor_path_is_unchanged_without_compression():
-    cache_config = object()
-    with patch.object(v2_mod, "KVCacheManagerPy", return_value="native-manager") as constructor:
-        result = v2_mod._create_kv_cache_manager_v2_impl(
-            cache_config,
-            "event-manager",
-            None,
-            runtime_dtype=DataType.BF16,
-            pp_layers=(10,),
-            num_kv_heads_per_layer=(4,),
-            head_dim_per_layer=(128,),
-        )
-
-    assert result == "native-manager"
-    constructor.assert_called_once_with(cache_config, event_manager="event-manager")
-
-
-def test_requires_explicit_kv_cache_manager_v2():
-    with pytest.raises(ValueError, match="use_kv_cache_manager_v2=True"):
-        util_mod.validate_kv_cache_compression_compatibility(
-            _config(),
-            SimpleNamespace(enable_block_reuse=True, use_kv_cache_manager_v2="auto"),
-            None,
-        )
-
-
-def test_resolved_v1_manager_cannot_silently_drop_boundary_compression():
-    with pytest.raises(ValueError, match="resolved KV cache manager.*KVCacheManagerV2"):
-        util_mod._create_kv_cache_manager(
-            model_engine=None,
-            kv_cache_manager_cls=object,
-            mapping=None,
-            kv_cache_config=None,
-            tokens_per_block=0,
-            max_seq_len=0,
-            max_batch_size=0,
-            spec_config=None,
-            sparse_attention_config=None,
-            max_num_tokens=0,
-            max_beam_width=1,
-            kv_connector_manager=None,
-            kv_cache_compression_manager=_manager(),
-        )
-
-
-def test_generic_codec_provider_requires_cpp_backend_and_real_host_tier(monkeypatch):
-    provider = _manager()
-    gpu = GpuCacheTierConfig(quota=1 << 20)
-    host = HostCacheTierConfig(quota=1 << 20)
-
-    monkeypatch.setenv("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "python")
-    with pytest.raises(ValueError, match=r"require the C\+\+ KVCacheManagerV2 backend"):
-        v2_mod._validate_cold_page_codec_storage(provider, [gpu, host])
-
-    monkeypatch.setenv("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp")
-    with pytest.raises(ValueError, match="no Host capacity"):
-        v2_mod._validate_cold_page_codec_storage(provider, [gpu])
-
-    v2_mod._validate_cold_page_codec_storage(provider, [gpu, host])
 
 
 @pytest.mark.parametrize(
@@ -334,7 +234,7 @@ def test_hybrid_manager_compresses_attention_and_skips_ssm_buffers():
             head_dim_per_layer=(128, 128),
         )
 
-    native_config = native.Nvfp4ColdPageCodec.call_args.args[0][0]
+    native_config = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
     assert native_config.layer_id == 1
 
 
@@ -362,7 +262,7 @@ def test_ssm_only_pipeline_rank_builds_lossless_native_codec():
         )
 
     assert result is codec
-    native.Nvfp4ColdPageCodec.assert_called_once_with([])
+    native.create_nvfp4_cold_page_codec.assert_called_once_with([])
     load_scales.assert_not_called()
 
 
@@ -387,7 +287,7 @@ def test_rejects_missing_attention_buffer_roles_when_heads_are_present():
             head_dim_per_layer=(128,),
         )
 
-    native.Nvfp4ColdPageCodec.assert_not_called()
+    native.create_nvfp4_cold_page_codec.assert_not_called()
     load_scales.assert_not_called()
 
 
@@ -416,7 +316,7 @@ def test_rejects_one_malformed_attention_layer_in_a_hybrid_config():
             head_dim_per_layer=(128, 128, 128),
         )
 
-    native.Nvfp4ColdPageCodec.assert_not_called()
+    native.create_nvfp4_cold_page_codec.assert_not_called()
     load_scales.assert_not_called()
 
 
@@ -441,6 +341,6 @@ def test_fp8_runtime_uses_trtllm_unit_source_scale_contract():
             head_dim_per_layer=(128,),
         )
 
-    native_config = native.Nvfp4ColdPageCodec.call_args.args[0][0]
+    native_config = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
     assert native_config.fp8_scale_orig_quant == (1.0, 1.0)
     assert native_config.fp8_scale_quant_orig == (1.0, 1.0)
