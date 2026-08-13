@@ -170,9 +170,9 @@ __device__ __forceinline__ void copyAsyncGlobalToShared(T* shared, T const* glob
     if (valid)
     {
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
-                     :
-                     : "l"(__cvta_generic_to_shared(shared)), "l"(global)
-                     : "memory");
+            :
+            : "l"(__cvta_generic_to_shared(shared)), "l"(global)
+            : "memory");
     }
 }
 
@@ -1898,8 +1898,7 @@ void invokeNvfp4BoundaryOnboardDecompress(std::vector<Nvfp4BoundaryOnboardPageTa
             [&] { launchOnboardTo16Bit<half>(pages, plan, static_cast<std::uint8_t const*>(coldBase), stream); });
         break;
     case Nvfp4BoundaryRuntimeType::kBfloat16:
-        launchAndDrainOnFailure(stream,
-            [&]
+        launchAndDrainOnFailure(stream, [&]
             { launchOnboardTo16Bit<__nv_bfloat16>(pages, plan, static_cast<std::uint8_t const*>(coldBase), stream); });
         break;
     case Nvfp4BoundaryRuntimeType::kFp8E4m3:
