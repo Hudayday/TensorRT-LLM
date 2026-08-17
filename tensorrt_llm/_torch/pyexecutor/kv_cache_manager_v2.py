@@ -770,7 +770,7 @@ def _copy_swa_block_offsets_with_scratch_compiled(
 def _create_kv_cache_manager_v2_impl(
     cache_config,
     event_manager,
-    compression_manager,
+    cold_page_codec_provider,
     *,
     runtime_dtype,
     pp_layers,
@@ -779,10 +779,10 @@ def _create_kv_cache_manager_v2_impl(
 ):
     """Construct native KVCM with its immutable cold-page codec."""
 
-    if compression_manager is None:
+    if cold_page_codec_provider is None:
         return KVCacheManagerPy(cache_config, event_manager=event_manager)
 
-    codec = compression_manager.create_cold_page_codec(
+    codec = cold_page_codec_provider.create_cold_page_codec(
         cache_config,
         runtime_dtype=runtime_dtype,
         pp_layers=pp_layers,
@@ -796,18 +796,14 @@ def _create_kv_cache_manager_v2_impl(
     )
 
 
-def _validate_cold_page_codec_storage(compression_manager, cache_tiers) -> None:
-    """Reject a boundary codec before native construction when Host is absent."""
+def _validate_cold_page_codec_backend(cold_page_codec_provider) -> None:
+    """Reject a native cold-page codec on the pure-Python backend."""
 
-    if compression_manager is None:
+    if cold_page_codec_provider is None:
         return
     if KV_CACHE_MANAGER_V2_BACKEND == "python":
         raise ValueError(
             "QuantizationCompression requires the C++ KVCacheManagerV2 backend"
-        )
-    if not any(isinstance(tier, HostCacheTierConfig) for tier in cache_tiers):
-        raise ValueError(
-            "QuantizationCompression requires a positive KVCM V2 Host cache tier"
         )
 
 
@@ -844,7 +840,7 @@ class KVCacheManagerV2(BaseResourceManager):
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
         is_estimating_kv_cache: bool = False,
-        kv_cache_compression_manager=None,
+        cold_page_codec_provider=None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -1124,10 +1120,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
             )
 
-        _validate_cold_page_codec_storage(
-            kv_cache_compression_manager,
-            cache_tiers,
-        )
+        _validate_cold_page_codec_backend(cold_page_codec_provider)
 
         self.vocab_size = vocab_size
 
@@ -1144,7 +1137,7 @@ class KVCacheManagerV2(BaseResourceManager):
             return _create_kv_cache_manager_v2_impl(
                 cache_config,
                 self.event_manager,
-                kv_cache_compression_manager,
+                cold_page_codec_provider,
                 runtime_dtype=self.dtype,
                 pp_layers=self.pp_layers,
                 num_kv_heads_per_layer=self.num_kv_heads_per_layer,
@@ -1154,7 +1147,7 @@ class KVCacheManagerV2(BaseResourceManager):
         try:
             self.impl = create_impl(config)
         except (CuError, KVCacheOutOfMemoryError):
-            if len(cache_tiers) > 1 and kv_cache_compression_manager is None:
+            if len(cache_tiers) > 1 and cold_page_codec_provider is None:
                 logger.warning(
                     "Failed to initialize KV cache manager with host cache "
                     "tier (cuMemHostRegister may have failed). "
@@ -1167,9 +1160,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.impl = create_impl(config)
             else:
                 raise
-        self.kv_cache_compression_manager = kv_cache_compression_manager
-        if kv_cache_compression_manager is not None:
-            kv_cache_compression_manager.bind_kv_cache_manager(self)
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
                 self._get_event_window_sizes_by_layer_group()

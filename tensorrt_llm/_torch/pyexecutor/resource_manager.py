@@ -2715,12 +2715,13 @@ class BlockManager:
 
 
 class KVCacheCompressionManager(BaseResourceManager):
-    """Shared base class for KV-cache compression managers.
+    """Framework-level base class for all KV-cache compression managers.
 
-    Iteration-driven algorithms use the inherited PyExecutor callbacks.
-    Storage-boundary algorithms may instead create a native codec that KVCM V2
-    invokes during migration; those managers are not registered in the
-    per-iteration resource-manager cycle.
+    Inherits :class:`BaseResourceManager` so PyExecutor's main loop
+    auto-invokes ``prepare_resources`` / ``update_resources`` /
+    ``free_resources`` each iteration without any PyExecutor code changes; the
+    base implementations below translate those callbacks into the lifecycle
+    hooks.
 
     Concrete compression methods subclass this directly. The hooks default to
     no-op; subclasses override what they need. The manager never inherits from

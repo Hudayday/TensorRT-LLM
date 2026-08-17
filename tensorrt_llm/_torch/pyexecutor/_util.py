@@ -526,20 +526,6 @@ def _derive_draft_max_attention_window(
     return None
 
 
-def _select_boundary_compression_config(
-    llm_args,
-    *,
-    enabled: bool,
-    estimating: bool,
-):
-    """Select boundary compression only for the final target KVCM."""
-
-    config = llm_args.kv_cache_compression_config if enabled and not estimating else None
-    if config is None or config.algorithm != "quantization_for_boundary":
-        return None
-    return config
-
-
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
@@ -1327,7 +1313,7 @@ class KvCacheCreator:
         model_engine: PyTorchModelEngine,
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
-        enable_kv_cache_compression: bool = False,
+        enable_boundary_compression: bool = False,
     ) -> KVCacheManager:
         mapping = self._mapping
         assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
@@ -1346,19 +1332,22 @@ class KvCacheCreator:
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
-        compression_config = _select_boundary_compression_config(
-            self._llm_args,
-            enabled=enable_kv_cache_compression,
-            estimating=estimating_kv_cache,
+        compression_config = (
+            self._llm_args.kv_cache_compression_config
+            if enable_boundary_compression and not estimating_kv_cache
+            else None
         )
-        boundary_compression_manager = None
-        if compression_config is not None:
+        cold_page_codec_provider = None
+        if (
+            compression_config is not None
+            and compression_config.algorithm == "quantization_for_boundary"
+        ):
             # QuantizationCompression owns the algorithm and calibration. It
             # constructs one native codec before KVCM allocates cold Slots;
             # the migration path never calls back into Python.
             from ..kv_cache_compression.quantization_for_boundary import QuantizationCompression
 
-            boundary_compression_manager = QuantizationCompression(compression_config)
+            cold_page_codec_provider = QuantizationCompression(compression_config)
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -1378,7 +1367,7 @@ class KvCacheCreator:
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
-            kv_cache_compression_manager=boundary_compression_manager,
+            cold_page_codec_provider=cold_page_codec_provider,
         )
 
         if not self._skip_est:
@@ -1995,7 +1984,7 @@ class KvCacheCreator:
             kv_cache_config_override=self_kv_cache_config,
             # Estimation, draft, and cross managers keep the lossless codec.
             # Only the final target KVCM owns boundary compression.
-            enable_kv_cache_compression=True,
+            enable_boundary_compression=True,
         )
 
         # Carry the fp8 context-MLA workspace admission cap (computed in configure_kv_cache_capacity) onto
@@ -2159,15 +2148,13 @@ def _create_kv_cache_manager(
         head_dim: Optional[int] = None,
         kv_cache_type=None,
         is_disagg: bool = False,
-        kv_cache_compression_manager: Optional[
-            KVCacheCompressionManager
-        ] = None,
+        cold_page_codec_provider: Optional[object] = None,
     ) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
     """
-    if kv_cache_compression_manager is not None and not issubclass(
+    if cold_page_codec_provider is not None and not issubclass(
         kv_cache_manager_cls, KVCacheManagerV2
     ):
         raise ValueError(
@@ -2301,9 +2288,7 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
-        manager_extra_kwargs["kv_cache_compression_manager"] = (
-            kv_cache_compression_manager
-        )
+        manager_extra_kwargs["cold_page_codec_provider"] = cold_page_codec_provider
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 

@@ -3687,12 +3687,11 @@ class QuantizationCompressionConfig(KvCacheCompressionConfig):
 
     This is the small initialization contract shared with KVCacheManagerV2.
     The selected format determines the compressed layout and kernel dispatch;
-    NVFP4 is the first supported format, not part of the manager contract. P0
-    starts at the Host tier, while the active GPU level keeps the
-    runtime-selected KV dtype. Lower Disk tiers preserve the same compressed
-    record. KVCM uses these fields to construct per-level Slots/Pools. Page
-    addresses come from KVCM, while the per-layer calibration is loaded and
-    owned by this compression manager rather than by the runtime model.
+    NVFP4 is the first supported format, not part of the manager contract. The
+    active GPU level keeps the runtime-selected KV dtype; every lower Host or
+    Disk level uses KVCM's common cold-page representation. Page addresses come
+    from KVCM, while per-layer calibration is loaded by this provider rather
+    than by the runtime model.
     """
 
     # The discriminator names this storage-boundary lifecycle family; `quant`
@@ -3708,11 +3707,6 @@ class QuantizationCompressionConfig(KvCacheCompressionConfig):
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",
         description="Quantization format stored in the compressed cache tier.")
-    target_cache_tier: Literal["host"] = Field(
-        default="host",
-        description=
-        "First cache tier that uses the compressed layout. P0 begins at Host; "
-        "lower Disk tiers preserve the same compressed record.")
     scale_checkpoint_path: str = Field(
         min_length=1,
         description=

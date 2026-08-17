@@ -25,24 +25,8 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig, QuantizationCompressionC
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
-    GpuCacheTierConfig,
-    HostCacheTierConfig,
     SsmLayerConfig,
 )
-
-
-def _v2_manager(backend, *, num_layers=2, dtype=DataType.BF16, local_heads=8):
-    """Build a real V2 instance without invoking its heavyweight constructor."""
-    manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
-    manager.impl = backend
-    manager.dtype = dtype
-    manager.num_local_layers = num_layers
-    manager.pp_layers = (10, 4)[:num_layers]
-    manager.num_kv_heads_per_layer = (local_heads,) * num_layers
-    manager.head_dim_per_layer = (128,) * num_layers
-    manager.tokens_per_block = 64
-    manager.kv_compression_manages_history = False
-    return manager
 
 
 def _config(path="/modelopt-checkpoint", **kwargs):
@@ -125,7 +109,6 @@ def test_factory_builds_one_native_codec():
     # native KVCM owns those values and calls codec.configure() after ownership
     # transfer in its constructor.
     assert not hasattr(native_configs[0], "layer_group_id")
-    assert manager.layer_configs
     assert manager.config.scale_checkpoint_path == "/modelopt-checkpoint"
 
 
@@ -159,17 +142,11 @@ def test_factory_keeps_tp_local_geometry_in_native_codec():
     assert native_config.head_dim == 128
 
 
-def test_control_plane_manager_does_not_register_a_late_codec():
-    backend = MagicMock()
-    v2_manager = _v2_manager(backend)
+def test_control_plane_provider_is_construction_only():
     manager = _manager()
-    manager.bind_kv_cache_manager(v2_manager)
-
     assert manager.config.quant == "nvfp4"
-    assert manager.config.target_cache_tier == "host"
-    assert manager.kv_cache_manager is v2_manager
     assert not hasattr(manager, "_native_codec")
-    backend.set_cold_page_codec.assert_not_called()
+    assert not hasattr(manager, "kv_cache_manager")
 
 
 def test_codec_is_created_before_and_transferred_into_native_constructor():
@@ -243,28 +220,23 @@ def test_resolved_v1_manager_cannot_drop_boundary_compression():
             max_num_tokens=0,
             max_beam_width=1,
             kv_connector_manager=None,
-            kv_cache_compression_manager=_manager(),
+            cold_page_codec_provider=_manager(),
         )
 
 
-def test_boundary_codec_requires_cpp_backend_and_host_tier(monkeypatch):
+def test_boundary_codec_requires_cpp_backend(monkeypatch):
     manager = _manager()
-    gpu = GpuCacheTierConfig(quota=1 << 20)
-    host = HostCacheTierConfig(quota=1 << 20)
 
     # Backend selection occurs when the runtime module is imported. A later
     # environment change must not make admission disagree with the loaded API.
     monkeypatch.setattr(v2_mod, "KV_CACHE_MANAGER_V2_BACKEND", "python")
     monkeypatch.setenv("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp")
     with pytest.raises(ValueError, match=r"require.*C\+\+ KVCacheManagerV2"):
-        v2_mod._validate_cold_page_codec_storage(manager, [gpu, host])
+        v2_mod._validate_cold_page_codec_backend(manager)
 
     monkeypatch.setattr(v2_mod, "KV_CACHE_MANAGER_V2_BACKEND", "cpp")
     monkeypatch.setenv("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "python")
-    with pytest.raises(ValueError, match="positive KVCM V2 Host cache"):
-        v2_mod._validate_cold_page_codec_storage(manager, [gpu])
-
-    v2_mod._validate_cold_page_codec_storage(manager, [gpu, host])
+    v2_mod._validate_cold_page_codec_backend(manager)
 
 
 def test_build_managers_scopes_boundary_compression_to_final_target():
@@ -354,14 +326,14 @@ def test_build_managers_scopes_boundary_compression_to_final_target():
     assert final_calls[0]["model_engine"] is target_engine
     assert final_calls[1]["model_engine"] is draft_engine
     assert final_calls[2]["kv_cache_type"] == CacheTypeCpp.CROSS
-    assert final_calls[0]["kv_cache_compression_manager"] is boundary_manager
-    assert final_calls[1]["kv_cache_compression_manager"] is None
-    assert final_calls[2].get("kv_cache_compression_manager") is None
+    assert final_calls[0]["cold_page_codec_provider"] is boundary_manager
+    assert final_calls[1]["cold_page_codec_provider"] is None
+    assert final_calls[2].get("cold_page_codec_provider") is None
     final_constructor.assert_called_once()
 
     estimation_calls, estimation_constructor = run_build(estimating=True)
     assert len(estimation_calls) == 3
-    assert all(call.get("kv_cache_compression_manager") is None for call in estimation_calls)
+    assert all(call.get("cold_page_codec_provider") is None for call in estimation_calls)
     estimation_constructor.assert_not_called()
 
 
@@ -453,7 +425,7 @@ def test_executor_registers_only_iteration_driven_compression(
         assert ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in registered
 
 
-def test_codec_enabled_host_construction_failure_is_not_retried_gpu_only(monkeypatch):
+def test_codec_enabled_construction_failure_is_not_retried_gpu_only(monkeypatch):
     class NativeConstructionError(Exception):
         pass
 
@@ -479,9 +451,9 @@ def test_codec_enabled_host_construction_failure_is_not_retried_gpu_only(monkeyp
         patch.object(
             v2_mod,
             "_create_kv_cache_manager_v2_impl",
-            side_effect=NativeConstructionError("host codec construction failed"),
+            side_effect=NativeConstructionError("codec construction failed"),
         ) as native_constructor,
-        pytest.raises(NativeConstructionError, match="host codec construction failed"),
+        pytest.raises(NativeConstructionError, match="codec construction failed"),
     ):
         KVCacheManagerV2(
             cache_config,
@@ -495,7 +467,7 @@ def test_codec_enabled_host_construction_failure_is_not_retried_gpu_only(monkeyp
             mapping=mapping,
             dtype=DataType.BF16,
             execution_stream=object(),
-            kv_cache_compression_manager=_manager(),
+            cold_page_codec_provider=_manager(),
         )
 
     native_constructor.assert_called_once()

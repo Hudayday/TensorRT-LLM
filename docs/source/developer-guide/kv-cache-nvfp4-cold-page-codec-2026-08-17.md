@@ -39,7 +39,8 @@ The exact port must:
 - work for Host cold storage and for Disk storage through KVCM2's existing pinned staging path;
 - retain raw cold-to-cold copies, including Host-to-Disk and Disk-to-Host;
 - add no new representation-specific KVCM2 path and no additional CUDA kernel family;
-- keep the final diff under `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/` empty; and
+- keep the final diff under native `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/` and pure-runtime
+  `tensorrt_llm/runtime/kv_cache_manager_v2/` empty; and
 - document, rather than patch, any KVCM2 incompatibility discovered during the port.
 
 ### Non-goals
@@ -70,8 +71,9 @@ TorchLlmArgs.kv_cache_compression_config
   -> attention consumes the restored hot representation with no metadata change
 ```
 
-`QuantizationCompression` owns only algorithm selection, calibration, and construction-time layer metadata. The
-native codec owns the immutable lowered plans after construction. KVCM2 owns all storage and migration state.
+`QuantizationCompression` is a construction-only provider for algorithm selection, calibration, and layer metadata.
+It need not survive native construction. The native codec owns the immutable lowered plans after construction. KVCM2
+owns all storage and migration state.
 
 ## Evidence state
 
@@ -92,7 +94,7 @@ native codec owns the immutable lowered plans after construction. KVCM2 owns all
 | State or operation | Canonical owner | Lifetime | Producer | Consumer | Mutation/reuse edge |
 |---|---|---|---|---|---|
 | Compression config | `TorchLlmArgs` | executor construction | user/YAML | `KvCacheCreator` | immutable after validation |
-| ModelOpt K/V scales | `QuantizationCompression` | manager construction | checkpoint loader | native layer configs | read once; finite positive scalars |
+| ModelOpt K/V scales | `QuantizationCompression` | native construction | checkpoint loader | native layer configs | read once; finite positive scalars |
 | Hot pool layout and addresses | KVCM2 | manager | KVCM2 storage setup | codec `configure()` | authoritative; never duplicated by Python |
 | Lowered layer plan | `Nvfp4ColdPageCodec` | native manager | codec `configure()` | boundary kernels | immutable after one successful configure |
 | Cold page size | codec, consumed by KVCM2 | manager | `queryColdPageBytes()` | cold pool construction/staging | fixed per lifecycle |
@@ -135,7 +137,7 @@ never consumed by decode.
 | Attention layout | conventional per-layer K and V buffers, `headDim % 16 == 0` | unrecognized or incomplete K/V; MLA layouts not matching this contract | codec `configure()` | negative tests pending |
 | Full/SWA/hybrid | full and SWA attention; non-attention lifecycles lossless | compressing SSM/conv state | KVCM2 lifecycle + codec | focused tests pending |
 | TP/PP/attention-DP | local K/V geometry; target manager only | unverified distributed combinations are not claimed | executor adapter | single-rank E2E first |
-| Speculative target/draft | final target manager compressed; estimation/draft/cross managers lossless | compressing draft/cross managers in this port | `KvCacheCreator` | Python unit tests |
+| Speculative target/draft | none in the initial support surface | speculative decoding is rejected by the config compatibility check | LLM args | Python unit tests |
 | Overlap / CUDA Graph | no attention-path change; migration stays stream-ordered | independent performance claim | KVCM2 | E2E correctness only |
 | Block reuse | supported; logical tokens and page identity do not change | lossy-byte equality claim | compression config | replay E2E pending |
 
@@ -162,7 +164,8 @@ Compatibility/migration: unresolved provider bugs go to the compatibility ledger
 
 ```text
 Status: accepted
-Choice: Python loads calibration and creates one native codec before the final target KVCM2 constructor consumes it.
+Choice: A construction-only Python provider loads calibration and creates one native codec before the final target
+  KVCM2 constructor consumes it. The provider is not retained afterward.
 Rationale and evidence: Cold slot sizes are needed during KVCM2 construction and the migration path must not call Python.
 Rejected alternatives and why: late setter/unregister (unsafe lifetime); Python callbacks (hot-path/GIL ownership); global
   registry (cross-manager lifetime ambiguity).
@@ -275,6 +278,7 @@ These entries are observations for alignment with the KVCM2 owner. They authoriz
 |---|---|---|---|
 | K-001 | The previously recorded single-page `_copyPageToTreeBlock` false-return fence/release concern requires a fresh audit on `984183e`. | not currently demonstrated on the main codec migration path | document only; do not patch KVCM2 |
 | K-002 | Exact same-representation Host-to-Disk coverage in upstream unit tests requires confirmation. | Disk correctness will be covered by this branch's E2E evidence | document/test from consumer side only |
+| K-003 | The native binding consumes `cold_page_codec`, but the high-level PyExecutor adapter has no construction-time codec-provider hook. | without a hook, LLMAPI E2E silently uses the default lossless codec | add only a generic provider handoff in the PyExecutor adapter; align the missing upstream hook with the KVCM2 owner |
 
 ## Decision log
 
@@ -310,14 +314,18 @@ state fields, native calls, or support restrictions.
 | existing NVFP4 boundary kernel pair | D-004, D-005, D-007 | yes | pending |
 | default lossless codec member | D-006 | yes | pending |
 | SM100 and dtype admission | support matrix, D-007 | yes | pending |
-| Python control-plane retention after native handoff | D-002 | audit for deletion | pending |
+| Python control-plane retention after native handoff | D-002 | no | deleted |
 | any Host-only or token/scale divisibility guard | none | no | must be absent |
 | any provider-side KVCM2 change | none | no | must be absent |
 
 ## Deviations
 
-None accepted. Any KVCM2 contract mismatch stops consumer-side implementation and is added to the compatibility ledger
-for owner alignment.
+One temporary integration deviation is recorded as K-003. This branch adds a generic construction-time
+`cold_page_codec_provider` handoff in the high-level PyExecutor adapter because the latest PR exposes only the native
+ownership ABI. It contains no NVFP4 layout, migration, mapping, or event logic. The KVCM2 owner is Yao Yao; the local
+hook should be removed when the upstream high-level adapter exposes an equivalent provider/factory parameter. The
+construction-order and final-target scoping tests identify when replacement is safe. No native or pure-runtime KVCM2
+source is changed.
 
 ## Validation and handoff
 

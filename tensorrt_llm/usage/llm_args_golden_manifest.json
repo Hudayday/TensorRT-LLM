@@ -681,15 +681,6 @@
       "path": "kv_cache_compression_config.quant"
     },
     {
-      "allowed_values": [
-        "host"
-      ],
-      "annotation": "Literal['host']",
-      "converter": "",
-      "kind": "categorical",
-      "path": "kv_cache_compression_config.target_cache_tier"
-    },
-    {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",

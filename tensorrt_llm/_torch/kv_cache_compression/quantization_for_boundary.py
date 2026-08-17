@@ -6,27 +6,26 @@
 created before KVCM, loads its calibration, and creates the native codec selected
 by ``config.quant``. Codec ownership then moves into KVCM V2's C++
 ``StorageManager`` before any cold Slots are allocated; C++ never calls back into
-Python from ``_batchedMigrate``. The manager is retained by KVCM, not registered
-in the per-iteration resource-manager cycle, because its two hooks are native
-storage-boundary calls rather than scheduler-step callbacks.
+Python from ``_batchedMigrate``. The provider is construction-only and is not
+registered in the per-iteration resource-manager cycle because its two hooks are
+native storage-boundary calls rather than scheduler-step callbacks.
 
 KVCM passes all authoritative GPU ``PoolGroupDesc`` objects to the codec once,
-reports the resulting compact Host Slot sizes, and later supplies only a Host
-Pool base pointer, possibly non-contiguous base-Page indices, and the migration
-CUDA stream. Page selection, Slot admission, events, publication, rollback, and
-eviction remain KVCM responsibilities. No Attention object or Attention
-metadata is used.
+reports the resulting compact cold Slot sizes, and later supplies only a
+GPU-accessible cold base pointer, possibly non-contiguous base-Page indices, and
+the migration CUDA stream. Page selection, Slot admission, staging, events,
+publication, rollback, and eviction remain KVCM responsibilities. No Attention
+object or Attention metadata is used.
 """
 
 import json
 import math
 import re
-import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
-from ..pyexecutor.resource_manager import DataType, KVCacheCompressionManager
+from ..pyexecutor.resource_manager import DataType
 
 ScalePair = Tuple[float, float]
 
@@ -260,13 +259,13 @@ def _build_nvfp4_layer_configs(
     return tuple(layer_configs)
 
 
-class QuantizationCompression(KVCacheCompressionManager):
+class QuantizationCompression:
     """Control-plane owner for quantization at cold storage boundaries.
 
     This manager owns the quantization choice, checkpoint path, calibrated
     layer configuration, and native-codec construction. KVCM V2 invokes the
-    transferred codec's native ``encode`` for GPU-to-Host offload and ``decode``
-    for Host-to-GPU onboard. Keeping the data hooks native avoids a
+    transferred codec's native ``encode`` for hot-to-cold offload and ``decode``
+    for cold-to-hot onboard. Keeping the data hooks native avoids a
     C++-to-Python callback in ``_batchedMigrate`` while leaving algorithm policy
     in this manager.
 
@@ -279,22 +278,6 @@ class QuantizationCompression(KVCacheCompressionManager):
         # KVCM does not exist yet: the codec must be available to its native
         # constructor so StorageManager can size cold Slots from the codec.
         self.config = config
-        self.layer_configs: tuple[Nvfp4BoundaryLayerConfig, ...] = ()
-        self._kv_cache_manager_ref = None
-        self.draft_kv_cache_manager = None
-
-    @property
-    def kv_cache_manager(self):
-        """Return the bound KVCM without creating an ownership cycle."""
-
-        return None if self._kv_cache_manager_ref is None else self._kv_cache_manager_ref()
-
-    @kv_cache_manager.setter
-    def kv_cache_manager(self, value) -> None:
-        # Base KVCacheCompressionManager initializes this attribute. Boundary
-        # compression is retained by KVCM itself, so a strong reverse edge
-        # would make KVCM <-> manager a reference cycle at executor shutdown.
-        self._kv_cache_manager_ref = None if value is None else weakref.ref(value)
 
     def create_cold_page_codec(
         self,
@@ -327,26 +310,13 @@ class QuantizationCompression(KVCacheCompressionManager):
                 "NVFP4 boundary compression requires an SM100-family device (SM100 or SM103)."
             )
 
-        layer_configs = _build_nvfp4_layer_configs(
-            self.config,
-            cache_config,
-            runtime_dtype=runtime_dtype,
-            pp_layers=pp_layers,
-            num_kv_heads_per_layer=num_kv_heads_per_layer,
-            head_dim_per_layer=head_dim_per_layer,
-        )
-        if self.layer_configs and self.layer_configs != layer_configs:
-            raise RuntimeError("KVCM construction attempts produced different NVFP4 layouts")
-        self.layer_configs = layer_configs
-        return _create_nvfp4_codec(layer_configs)
-
-    def bind_kv_cache_manager(self, kv_cache_manager) -> None:
-        """Bind the manager after native KVCM has consumed its codec."""
-
-        if self.kv_cache_manager is not None:
-            raise RuntimeError("QuantizationCompression is already bound to KVCM")
-        super().__init__(
-            self.config,
-            kv_cache_manager,
-            draft_kv_cache_manager=None,
+        return _create_nvfp4_codec(
+            _build_nvfp4_layer_configs(
+                self.config,
+                cache_config,
+                runtime_dtype=runtime_dtype,
+                pp_layers=pp_layers,
+                num_kv_heads_per_layer=num_kv_heads_per_layer,
+                head_dim_per_layer=head_dim_per_layer,
+            )
         )
