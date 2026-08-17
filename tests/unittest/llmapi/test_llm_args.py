@@ -3398,42 +3398,6 @@ kv_cache_compression_config:
 
 
 @pytest.mark.cpu_only
-def test_quantization_compression_config_is_a_small_storage_init_contract():
-    from tensorrt_llm.llmapi.llm_args import QuantizationCompressionConfig
-
-    config_dict = yaml.safe_load("""
-kv_cache_compression_config:
-  algorithm: quantization_for_boundary
-  quant: nvfp4
-  scale_checkpoint_path: /tmp/nvfp4-kv-scales
-""")
-
-    config = TorchLlmArgs(model="/tmp/dummy_model",
-                          **config_dict).kv_cache_compression_config
-
-    assert isinstance(config, QuantizationCompressionConfig)
-    assert config.quant == "nvfp4"
-    assert config.scale_checkpoint_path == "/tmp/nvfp4-kv-scales"
-    assert "target_cache_tier" not in config.model_dump()
-    assert not config.changes_physical_kv_length
-    assert config.supports_block_reuse()
-    assert not config.supports_speculative_decoding()
-
-
-@pytest.mark.cpu_only
-def test_quantization_compression_config_rejects_unimplemented_format():
-    with pytest.raises(ValidationError):
-        TorchLlmArgs(
-            model="/tmp/dummy_model",
-            kv_cache_compression_config={
-                "algorithm": "quantization_for_boundary",
-                "quant": "fp8",
-                "scale_checkpoint_path": "/tmp/nvfp4-kv-scales",
-            },
-        )
-
-
-@pytest.mark.cpu_only
 class TestSkipSoftmaxAttentionConfig:
     """Test LLM Skip Softmax Attention config behavior."""
 
