@@ -418,6 +418,7 @@ def test_executor_registers_only_iteration_driven_compression(
             compression_config,
             kv_cache_manager,
             draft_kv_cache_manager=None,
+            pretrained_config=model_engine.model.model_config.pretrained_config,
         )
         assert registered[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] is iteration_manager
     else:

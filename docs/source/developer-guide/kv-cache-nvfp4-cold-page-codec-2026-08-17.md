@@ -122,10 +122,12 @@ owns all storage and migration state.
 | I-010 | Unsupported non-attention lifecycles use PR #17512's default lossless codec, without format-specific branches. | codec composition | hybrid-state corruption | lossless fallback test |
 | I-011 | Each layer starts at a 16-byte-aligned cold offset. Padding is only inter-record/trailing padding, at most 15 bytes per layer, and is never interpreted. | codec layout | misaligned vector path | layout tests |
 | I-012 | `tokensPerPage` follows KVCM2 `tokens_per_block` exactly. | KVCM2/config adapter | incompatible indexing | config/unit test and E2E manifest |
+| I-013 | One native launch contains at most 128 local Attention layers. This is a descriptor-ABI bound, not a model-geometry divisibility rule. | boundary kernel plan | launch-argument overflow | admission test and model-scope audit |
 
 The logical layout contains no padding inside the four payload segments. Alignment padding is outside a layer's
 payload and does not create another KVCM2 pool, slot, or buffer. It is copied as part of the opaque cold page but is
-never consumed by decode.
+never consumed by decode. The current encoder does not initialize those padding bytes; they are therefore outside the
+serialized payload contract and must not be hashed or compared as deterministic data.
 
 ### Supported combinations
 
@@ -134,7 +136,7 @@ never consumed by decode.
 | Backend / architecture | C++ KVCM2 on SM100-family; B200 validation target | pure-Python KVCM2; pre-SM100 | Python/native factory | unit + B200 E2E pending |
 | Runtime KV dtype | FP16, BF16, FP8 E4M3 | other types | compression manager/codec | native tests pending |
 | Cold levels | Host, Disk, or both through the common cold representation | custom tier with no GPU-accessible codec staging | KVCM2 contract | Disk E2E pending |
-| Attention layout | conventional per-layer K and V buffers, `headDim % 16 == 0` | unrecognized or incomplete K/V; MLA layouts not matching this contract | codec `configure()` | negative tests pending |
+| Attention layout | conventional per-layer K and V buffers, `headDim % 16 == 0`, at most 128 local Attention layers per lifecycle | unrecognized or incomplete K/V; MLA layouts not matching this contract; larger per-rank layer counts | codec `configure()` / kernel plan | negative tests pending |
 | Full/SWA/hybrid | full and SWA attention; non-attention lifecycles lossless | compressing SSM/conv state | KVCM2 lifecycle + codec | focused tests pending |
 | TP/PP/attention-DP | local K/V geometry; target manager only | unverified distributed combinations are not claimed | executor adapter | single-rank E2E first |
 | Speculative target/draft | none in the initial support surface | speculative decoding is rejected by the config compatibility check | LLM args | Python unit tests |
@@ -279,6 +281,7 @@ These entries are observations for alignment with the KVCM2 owner. They authoriz
 | K-001 | The previously recorded single-page `_copyPageToTreeBlock` false-return fence/release concern requires a fresh audit on `984183e`. | not currently demonstrated on the main codec migration path | document only; do not patch KVCM2 |
 | K-002 | Exact same-representation Host-to-Disk coverage in upstream unit tests requires confirmation. | Disk correctness will be covered by this branch's E2E evidence | document/test from consumer side only |
 | K-003 | The native binding consumes `cold_page_codec`, but the high-level PyExecutor adapter has no construction-time codec-provider hook. | without a hook, LLMAPI E2E silently uses the default lossless codec | add only a generic provider handoff in the PyExecutor adapter; align the missing upstream hook with the KVCM2 owner |
+| K-004 | Disk codec staging currently requests alignment `1`, while the NVFP4 codec requires a 16-byte cold base. A pure-Attention NVFP4 lifecycle has a 16-byte stride and remains aligned from the staging base; an earlier non-16-byte lossless lifecycle can make a later mixed-lifecycle reservation unaligned. | no impact to the single-lifecycle dense-Attention E2E scope; hybrid Attention/SSM Disk ordering is not safely claimed | document only; ask the KVCM2 owner to expose/aggregate codec staging alignment, then add a mixed-lifecycle Disk test |
 
 ## Decision log
 
