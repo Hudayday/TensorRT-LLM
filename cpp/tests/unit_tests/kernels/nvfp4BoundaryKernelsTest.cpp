@@ -60,7 +60,11 @@ struct PageGeometry
 };
 
 constexpr PageGeometry kDefaultGeometry{2, 8, 32};
-constexpr PageGeometry kMinimumNativeGeometry{1, 4, 16};
+constexpr PageGeometry kMinimumCompactGeometry{1, 1, 16};
+constexpr PageGeometry kPackedBodyAndTailGeometry{1, 3, 16};
+constexpr PageGeometry kSmallVectorGeometry{1, 4, 16};
+constexpr PageGeometry kLinearScaleTailGeometry{1, 5, 32};
+constexpr PageGeometry kTiledLinearScaleTailGeometry{1, 4097, 16};
 constexpr PageGeometry kSecondCtaTailGeometry{2, 20, 64};
 constexpr PageGeometry kModelLikeGeometry{8, 64, 128};
 constexpr PageGeometry kLargeGeometry{64, 64, 128};
@@ -331,14 +335,10 @@ float loadRawValue(std::vector<std::uint8_t> const& bytes, RawKind kind, std::si
     return 0.0F;
 }
 
-std::uint32_t scaleOffset(std::uint32_t role, std::uint32_t row, std::uint32_t scaleInRow, PageGeometry const& geometry)
+std::uint32_t linearScaleOffset(std::uint32_t row, std::uint32_t scaleInRow, PageGeometry const& geometry)
 {
     std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(geometry.headDim) / 16;
-    if (role == 0)
-    {
-        return row * scalesPerRow + scaleInRow;
-    }
-    return (row / 4) * (4 * scalesPerRow) + scaleInRow * 4 + row % 4;
+    return row * scalesPerRow + scaleInRow;
 }
 
 float e2m1Value(std::uint8_t nibble)
@@ -442,7 +442,7 @@ ReferenceNvfp4 compressReference(std::vector<std::uint8_t> const& raw, RawKind k
             }
 
             __nv_fp8_e4m3 blockScale(params.nvfp4ScaleOrigQuant[role] * amax / 6.0F);
-            result.scales[scaleOffset(role, row, scaleInRow, geometry)] = blockScale.__x;
+            result.scales[linearScaleOffset(row, scaleInRow, geometry)] = blockScale.__x;
             float const blockScaleFloat = static_cast<float>(blockScale);
             float const outputScale
                 = blockScaleFloat == 0.0F ? 0.0F : params.nvfp4ScaleOrigQuant[role] / blockScaleFloat;
@@ -470,7 +470,7 @@ std::vector<std::uint8_t> decompressReference(ReferenceNvfp4 const& compressed, 
         for (std::uint32_t scaleInRow = 0; scaleInRow < scalesPerRow; ++scaleInRow)
         {
             __nv_fp8_e4m3 blockScale;
-            blockScale.__x = compressed.scales[scaleOffset(role, row, scaleInRow, geometry)];
+            blockScale.__x = compressed.scales[linearScaleOffset(row, scaleInRow, geometry)];
             float const dequantScale = static_cast<float>(blockScale) * params.nvfp4ScaleQuantOrig[role];
             std::size_t const blockStart = static_cast<std::size_t>(row) * geometry.headDim + scaleInRow * 16;
             for (std::uint32_t i = 0; i < 16; ++i)
@@ -499,7 +499,7 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
     // Nvfp4ColdPageCodec preserves the exact compact payload but rounds each
     // cold Slot stride to the uint4 alignment required by the mapped-Host
     // vector path. Keep the standalone kernel fixture identical to that
-    // production layout, especially for the legal 72-byte minimum payload.
+    // production layout, including small records with alignment padding.
     std::size_t const compactSlotBytes = roundUp(2U * (packedBytes(geometry) + scaleBytes(geometry)), alignof(uint4));
     // Use every other Slot to prove that one launch handles non-contiguous KVCM
     // Page indices. The Layer plan owns bases/strides; Page tasks carry only the
@@ -561,6 +561,9 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
             EXPECT_EQ(region(packed, packed), references[page][1].packed);
             EXPECT_EQ(region(2 * packed, scale), references[page][0].scales);
             EXPECT_EQ(region(2 * packed + scale, scale), references[page][1].scales);
+            auto const padding = region(2U * (packed + scale), compactSlotBytes - 2U * (packed + scale));
+            EXPECT_TRUE(
+                std::all_of(padding.begin(), padding.end(), [](std::uint8_t value) { return value == kCanary; }));
         }
     };
 
@@ -646,7 +649,7 @@ class Nvfp4Boundary16BitTest : public testing::TestWithParam<RawKind>
 {
 };
 
-TEST_P(Nvfp4Boundary16BitTest, BatchesDisjointPagesAndMatchesNativeLayout)
+TEST_P(Nvfp4Boundary16BitTest, BatchesDisjointPagesAndMatchesLinearCompactLayout)
 {
     runBoundaryRoundTrip(GetParam());
 }
@@ -751,8 +754,8 @@ void expectWholePageLaunchTopology(std::size_t numPages, std::vector<std::uint32
 {
     constexpr std::size_t numLayers = 2;
     RawKind constexpr kind = RawKind::kBfloat16;
-    std::size_t const rawSlotBytes = rawBytes(kind, kMinimumNativeGeometry);
-    std::size_t const recordBytes = 2U * (packedBytes(kMinimumNativeGeometry) + scaleBytes(kMinimumNativeGeometry));
+    std::size_t const rawSlotBytes = rawBytes(kind, kSmallVectorGeometry);
+    std::size_t const recordBytes = 2U * (packedBytes(kSmallVectorGeometry) + scaleBytes(kSmallVectorGeometry));
     std::size_t const recordStride = roundUp(recordBytes, alignof(uint4));
     std::size_t const coldPageBytes = numLayers * recordStride;
 
@@ -764,7 +767,7 @@ void expectWholePageLaunchTopology(std::size_t numPages, std::vector<std::uint32
     {
         rawK[layer] = std::make_unique<DeviceRegion>(numPages * rawSlotBytes);
         rawV[layer] = std::make_unique<DeviceRegion>(numPages * rawSlotBytes);
-        auto params = makeParams(kMinimumNativeGeometry);
+        auto params = makeParams(kSmallVectorGeometry);
         params.nvfp4ScaleOrigQuant[0] *= static_cast<float>(layer + 1U);
         params.nvfp4ScaleQuantOrig[0] /= static_cast<float>(layer + 1U);
         layers.push_back({reinterpret_cast<std::uintptr_t>(rawK[layer]->data()),
@@ -847,9 +850,39 @@ TEST(Nvfp4BoundaryWholePageTest, TwoHundredFiftySevenPagesUseExactlyTwoWholePage
     expectWholePageLaunchTopology(257, {1, 256});
 }
 
-TEST(Nvfp4BoundaryGeometryTest, SupportsMinimumNativeGeometryAndWarpTail)
+TEST(Nvfp4BoundaryGeometryTest, SupportsSmallVectorGeometryAndWarpTail)
 {
-    runBoundaryRoundTrip(RawKind::kFloat16, kMinimumNativeGeometry, 1);
+    runBoundaryRoundTrip(RawKind::kFloat16, kSmallVectorGeometry, 1);
+}
+
+TEST(Nvfp4BoundaryGeometryTest, SupportsMinimumTightCompactGeometry)
+{
+    EXPECT_EQ(packedBytes(kMinimumCompactGeometry), 8U);
+    EXPECT_EQ(scaleBytes(kMinimumCompactGeometry), 1U);
+    EXPECT_EQ(2U * (packedBytes(kMinimumCompactGeometry) + scaleBytes(kMinimumCompactGeometry)), 18U);
+    EXPECT_EQ(roundUp(18U, alignof(uint4)), 32U);
+    runBoundaryRoundTrip(RawKind::kFloat16, kMinimumCompactGeometry, 1);
+    runBoundaryRoundTrip(RawKind::kBfloat16, kMinimumCompactGeometry, 1);
+    runBoundaryRoundTrip(RawKind::kFp8, kMinimumCompactGeometry, 1);
+}
+
+TEST(Nvfp4BoundaryGeometryTest, SupportsPackedVectorBodyWithLeadingAndTrailingScaleGroups)
+{
+    runBoundaryRoundTrip(RawKind::kFloat16, kPackedBodyAndTailGeometry, 1);
+    runBoundaryRoundTrip(RawKind::kFp8, kPackedBodyAndTailGeometry, 1);
+}
+
+TEST(Nvfp4BoundaryGeometryTest, SupportsOddTokenCountAndNonVectorScaleTail)
+{
+    runBoundaryRoundTrip(RawKind::kFloat16, kLinearScaleTailGeometry, 1);
+    runBoundaryRoundTrip(RawKind::kBfloat16, kLinearScaleTailGeometry, 1);
+    runBoundaryRoundTrip(RawKind::kFp8, kLinearScaleTailGeometry, 1);
+}
+
+TEST(Nvfp4BoundaryGeometryTest, SupportsTiledPackedAndScaleTails)
+{
+    runBoundaryRoundTrip(RawKind::kFloat16, kTiledLinearScaleTailGeometry, 1);
+    runBoundaryRoundTrip(RawKind::kFp8, kTiledLinearScaleTailGeometry, 1);
 }
 
 TEST(Nvfp4BoundaryGeometryTest, SupportsSecondCtaWithPartialThreadTail)
@@ -911,42 +944,42 @@ TEST(Nvfp4BoundaryRoundingTest, QuantizesValuesSafelyAwayFromE2m1Ties)
 
 TEST(Nvfp4BoundaryBatchingTest, AcceptsMinimumThirtyTwoPageDescriptorSpecialization)
 {
-    runBoundaryRoundTrip(RawKind::kFloat16, kMinimumNativeGeometry, 32);
+    runBoundaryRoundTrip(RawKind::kFloat16, kSmallVectorGeometry, 32);
 }
 
 TEST(Nvfp4BoundaryBatchingTest, SelectsSixtyFourPageDescriptorSpecialization)
 {
-    runBoundaryRoundTrip(RawKind::kFloat16, kMinimumNativeGeometry, 33);
+    runBoundaryRoundTrip(RawKind::kFloat16, kSmallVectorGeometry, 33);
 }
 
 TEST(Nvfp4BoundaryBatchingTest, Bfloat16SelectsOneHundredTwentyEightPageDescriptorSpecialization)
 {
-    runBoundaryRoundTrip(RawKind::kBfloat16, kMinimumNativeGeometry, 65);
+    runBoundaryRoundTrip(RawKind::kBfloat16, kSmallVectorGeometry, 65);
 }
 
 TEST(Nvfp4BoundaryBatchingTest, Fp8SelectsTwoHundredFiftySixPageDescriptorSpecialization)
 {
-    runBoundaryRoundTrip(RawKind::kFp8, kMinimumNativeGeometry, 129);
+    runBoundaryRoundTrip(RawKind::kFp8, kSmallVectorGeometry, 129);
 }
 
 TEST(Nvfp4BoundaryBatchingTest, Bfloat16CrossesTheTwoHundredFiftySixPageChunkBoundary)
 {
-    runBoundaryRoundTrip(RawKind::kBfloat16, kMinimumNativeGeometry, kCrossLaunchNumPages);
+    runBoundaryRoundTrip(RawKind::kBfloat16, kSmallVectorGeometry, kCrossLaunchNumPages);
 }
 
 TEST(Nvfp4BoundaryBatchingTest, Fp8CrossesTheTwoHundredFiftySixPageChunkBoundary)
 {
-    runBoundaryRoundTrip(RawKind::kFp8, kMinimumNativeGeometry, kCrossLaunchNumPages);
+    runBoundaryRoundTrip(RawKind::kFp8, kSmallVectorGeometry, kCrossLaunchNumPages);
 }
 
 TEST(Nvfp4BoundaryPdlTest, ChainsBfloat16OffloadAndOnboardWithoutIntermediateHostSync)
 {
-    runBoundaryRoundTrip(RawKind::kBfloat16, kMinimumNativeGeometry, 65, InputPattern::kDense, false);
+    runBoundaryRoundTrip(RawKind::kBfloat16, kSmallVectorGeometry, 65, InputPattern::kDense, false);
 }
 
 TEST(Nvfp4BoundaryPdlTest, ChainsFp8OffloadAndOnboardWithoutIntermediateHostSync)
 {
-    runBoundaryRoundTrip(RawKind::kFp8, kMinimumNativeGeometry, 65, InputPattern::kDense, false);
+    runBoundaryRoundTrip(RawKind::kFp8, kSmallVectorGeometry, 65, InputPattern::kDense, false);
 }
 
 TEST(Nvfp4BoundaryValidationTest, EmptyBatchIsAnAsyncNoOp)
@@ -991,7 +1024,9 @@ TEST(Nvfp4BoundaryValidationTest, RejectsInvalidGeometryAndScalesBeforeLaunch)
     EXPECT_ANY_THROW(prepare16Bit(invalid));
     invalid = makeParams();
     invalid.tokensPerPage = 6;
-    EXPECT_ANY_THROW(prepare16Bit(invalid));
+    EXPECT_NO_THROW(prepare16Bit(invalid));
+    invalid = makeParams(PageGeometry{1, 1, 16});
+    EXPECT_NO_THROW(prepare16Bit(invalid));
     invalid = makeParams();
     invalid.headDim = 0;
     EXPECT_ANY_THROW(prepare16Bit(invalid));

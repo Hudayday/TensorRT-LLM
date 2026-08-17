@@ -72,12 +72,11 @@ struct Nvfp4BoundaryOnboardPageTask
 //! Each raw K/V pointer describes one HND Page with
 //! `numKvHeads * tokensPerPage * headDim` elements. If that count is `N`, the
 //! compact record contains `N/2`, `N/2`, `N/16`, and `N/16` bytes in the order
-//! documented above, for `9N/8` bytes total. Packed K/V retain HND order. K
-//! scales are linear `[H, P, D / 16]`; V scales retain the native token-4 order
-//! over flattened `(head, token)` rows. Therefore `tokensPerPage` must be
-//! divisible by four and `headDim` by 16. Packed regions are 16-byte aligned;
-//! scale regions use vector transfers when their derived offset is aligned and
-//! retain a byte path for smaller legal geometries.
+//! documented above, for `9N/8` bytes total. Packed K/V retain HND order and
+//! both scale regions are linear `[H, P, D / 16]`. `headDim` must be divisible
+//! by 16. One complete scale group contributes eight packed bytes; the CUDA
+//! backend uses aligned 16-byte bodies plus an exact eight-byte tail. Scale
+//! regions use vector transfers when aligned and retain a byte path otherwise.
 //!
 //! `*OrigQuant` multiplies an original-domain value before storing the named
 //! quantized representation. `*QuantOrig` restores a stored quantized value to

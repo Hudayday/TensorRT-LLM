@@ -42,8 +42,8 @@ RecordedLaunch gLaunch;
 constexpr std::uintptr_t kGpuKBase = 0x100000;
 constexpr std::uintptr_t kGpuVBase = 0x200000;
 constexpr std::uintptr_t kColdBase = 0x300000;
-constexpr std::size_t kLayerRawBytes = 128;
-constexpr std::size_t kLayerColdBytesAligned = 80;
+constexpr std::size_t kLayerRawBytes = 320;
+constexpr std::size_t kLayerColdBytesAligned = 192;
 constexpr std::size_t kNumAttentionLayers = 8;
 constexpr std::size_t kGpuSlotBytes = kNumAttentionLayers * kLayerRawBytes;
 constexpr std::size_t kColdSlotBytes = kNumAttentionLayers * kLayerColdBytesAligned;
@@ -64,8 +64,8 @@ std::vector<Nvfp4ColdPageLayerConfig> makeLayers(std::size_t count = kNumAttenti
         layer.layerId = firstLayer + static_cast<int>(index);
         layer.runtimeType = kernels::Nvfp4BoundaryRuntimeType::kFloat16;
         layer.numKvHeads = 1;
-        layer.tokensPerPage = 4;
-        layer.headDim = 16;
+        layer.tokensPerPage = 5;
+        layer.headDim = 32;
         auto const scale = static_cast<float>(index + 2U);
         layer.nvfp4ScaleOrigQuant = {scale, scale + 0.5F};
         layer.nvfp4ScaleQuantOrig = {1.0F / scale, 1.0F / (scale + 0.5F)};
@@ -140,6 +140,8 @@ TEST(Nvfp4ColdPageCodecTest, OneCompletePageTaskCoversAllLayersWithDistinctScale
         EXPECT_EQ(gLaunch.plan.layers[layer].rawKSlotBytes, kGpuSlotBytes);
         EXPECT_EQ(gLaunch.plan.layers[layer].rawVSlotBytes, kGpuSlotBytes);
         EXPECT_EQ(gLaunch.plan.layers[layer].coldOffset, layer * kLayerColdBytesAligned);
+        EXPECT_EQ(gLaunch.plan.layers[layer].params.tokensPerPage, 5);
+        EXPECT_EQ(gLaunch.plan.layers[layer].params.headDim, 32);
         EXPECT_FLOAT_EQ(gLaunch.plan.layers[layer].params.nvfp4ScaleOrigQuant[0], static_cast<float>(layer + 2U));
     }
     EXPECT_EQ(gLaunch.coldBase, reinterpret_cast<void*>(kColdBase));

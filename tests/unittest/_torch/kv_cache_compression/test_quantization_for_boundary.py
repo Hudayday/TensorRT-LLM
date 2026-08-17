@@ -131,6 +131,8 @@ def test_factory_builds_one_native_codec():
 
 def test_factory_keeps_tp_local_geometry_in_native_codec():
     native, _ = _native()
+    cache_config = _cache_config((0, ("key", "value")))
+    cache_config.tokens_per_block = 5
     with (
         patch("tensorrt_llm._utils.is_sm_100f", return_value=True),
         patch(
@@ -143,7 +145,7 @@ def test_factory_keeps_tp_local_geometry_in_native_codec():
         ) as load_scales,
     ):
         _manager().create_cold_page_codec(
-            _cache_config((0, ("key", "value"))),
+            cache_config,
             runtime_dtype=DataType.BF16,
             pp_layers=(10,),
             num_kv_heads_per_layer=(4,),
@@ -151,7 +153,10 @@ def test_factory_keeps_tp_local_geometry_in_native_codec():
         )
 
     load_scales.assert_called_once_with("/modelopt-checkpoint", (10,))
-    assert native.create_nvfp4_cold_page_codec.call_args.args[0][0].num_kv_heads == 4
+    native_config = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
+    assert native_config.num_kv_heads == 4
+    assert native_config.tokens_per_page == 5
+    assert native_config.head_dim == 128
 
 
 def test_control_plane_manager_does_not_register_a_late_codec():
