@@ -143,6 +143,46 @@ serialized payload contract and must not be hashed or compared as deterministic 
 | Overlap / CUDA Graph | no attention-path change; migration stays stream-ordered | independent performance claim | KVCM2 | E2E correctness only |
 | Block reuse | supported; logical tokens and page identity do not change | lossy-byte equality claim | compression config | replay E2E pending |
 
+### Audited model scope
+
+The following classification is based on the checked-in runtime routes and the model configs available on
+2026-08-17. A layer-count or `headDim % 16` match alone is insufficient: the codec also requires distinct `key` and
+`value` buffers in the lifecycle.
+
+| Family/config evidence | Current status | Reason |
+|---|---|---|
+| Qwen3 (`Qwen3-8B`: 36 layers, head dimension 128) | in scope | conventional K/V Attention layout and valid NVFP4 block geometry |
+| Qwen3.5 dense/MoE (`Qwen3.5-4B`, `35B-A3B`, `397B-A17B`: head dimension 256) | in scope for full-Attention layers | full-Attention K/V is compressed; linear-Attention/conv state is delegated byte-exactly to the default codec |
+| DeepSeek-V4 Flash/Pro (`deepseek_v4`) | out of this initial codec | runtime uses MLA and the `SELFKONLY` latent-cache route, not two conventional K/V buffers |
+| GLM-5.2 (`glm_moe_dsa`, `kv_lora_rank=512`) | out of this initial codec | DeepSeek-style MLA/DSA latent cache and sparse side-buffer layout do not satisfy the two-buffer contract |
+
+Qwen3.5 Host migration is part of the intended hybrid path. Its Disk support remains conditional on K-004 until the
+mixed-lifecycle staging-alignment contract is resolved or a forcing E2E proves the concrete allocation order safe.
+DeepSeek-V4 and GLM-5.2 can use NVFP4 for other independently supported tensors, but this does not turn their
+single-latent MLA KV record into the four-segment K/V cold-page format defined here.
+
+### Minimal configuration contract
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  dtype: bfloat16               # explicit hot GPU KV dtype
+  host_cache_size: 17179869184  # optional; use 0 for Disk-only
+  disk_cache_size: 68719476736  # optional
+  disk_cache_path: /real/local/disk/kv-cache
+
+kv_cache_compression_config:
+  algorithm: quantization_for_boundary
+  quant: nvfp4
+  scale_checkpoint_path: /separate/modelopt/nvfp4-kv-scales
+```
+
+`scale_checkpoint_path` supplies calibration only and must be physically separate from the serving model. If the
+serving checkpoint itself declares NVFP4 KV and `dtype: auto` is left in effect, LLM args can select native hot NVFP4;
+that is not one of this boundary codec's FP16/BF16/FP8 source representations and construction fails closed. Set the
+hot dtype explicitly as above (or `float16`/`fp8`). `tokensPerPage` is never configured here; it follows KVCM2's
+`tokens_per_block`.
+
 ## Decisions
 
 ### D-001: Treat current PR #17512 as an immutable provider contract
