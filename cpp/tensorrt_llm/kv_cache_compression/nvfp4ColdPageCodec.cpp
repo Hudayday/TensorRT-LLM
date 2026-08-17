@@ -64,11 +64,9 @@ std::size_t scalarCount(Nvfp4ColdPageLayerConfig const& config)
     {
         throw std::invalid_argument("NVFP4 cold Page geometry must be positive");
     }
-    if (config.tokensPerPage % 4 != 0 || config.headDim % static_cast<std::int32_t>(kElementsPerBlockScale) != 0)
+    if (config.headDim % static_cast<std::int32_t>(kElementsPerBlockScale) != 0)
     {
-        throw std::invalid_argument(
-            "NVFP4 cold Pages require tokensPerPage "
-            "divisible by 4 and headDim by 16");
+        throw std::invalid_argument("NVFP4 cold Pages require headDim divisible by 16");
     }
     auto const headsTimesTokens = checkedMul(static_cast<std::size_t>(config.numKvHeads),
         static_cast<std::size_t>(config.tokensPerPage), "NVFP4 Page geometry overflows size_t");
@@ -279,7 +277,7 @@ bool Nvfp4ColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolGr
                             throw std::invalid_argument("GPU K/V buffer exceeds its Pool Slot");
                         }
 
-                        auto const coldOffset = alignUp(state.coldPageBytes, kCompactAlignment);
+                        auto const coldOffset = state.coldPageBytes;
                         layers.push_back(kernels::Nvfp4BoundaryLayerPlan{keyPool.baseAddress + buffers.key.offset,
                             valuePool.baseAddress + buffers.value.offset, keyPool.slotBytes, valuePool.slotBytes,
                             coldOffset, makeKernelParams(config)});

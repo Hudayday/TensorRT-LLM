@@ -69,7 +69,6 @@ constexpr std::uint32_t kMaxTasksPerLaunch = 256;
 constexpr std::uint32_t kMaxLayersPerLaunch = kNvfp4BoundaryMaxLayersPerLaunch;
 constexpr std::uint32_t kElementsPerLane = 8;
 constexpr std::uint32_t kElementsPerBlockScale = 16;
-constexpr std::uint32_t kNativeVScaleRows = 4;
 // A 1-KiB scale interval bounds the ping-pong shared working set without
 // changing compact bytes, arithmetic, or the public task contract.
 constexpr std::uint32_t kTargetScaleTransferBytes = 1024;
@@ -143,11 +142,10 @@ bool isCurrentDeviceSm100FamilyCached()
 //!   and commit/wait order are adapted from KVCM V2's `batchedCopy<N>`.
 //! * `cp_async_commit_group()` and `cp_async_wait_group<N>()` are reused from
 //!   TensorRT-LLM's shared `cudaAsyncOps.cuh` primitives.
-//! * Every raw/packed main-payload source load uses batchedCopy's 16-byte
-//!   `cp.async.cg` grain. The retained tiled FP8 offload path consumes one
-//!   complete 16-value scale group per lane; onboard consumes four packed
-//!   words per grain. The tiled whole-Page paths retain their original
-//!   two-round mapping.
+//! * Raw and aligned packed bodies use batchedCopy's 16-byte `cp.async.cg`
+//!   grain. A tight packed interval may have one leading or trailing 8-byte
+//!   scale group; the existing kernels handle it in place. The tiled whole-Page
+//!   paths retain their original two-round mapping.
 //! * Offload uses compressed-output tiles for the standard H=8/P=64/D=128
 //!   geometry and for non-standard Pages that exceed the whole-Page staging
 //!   bound. Other non-standard Pages use the direct mapped-Host path. Onboard
@@ -226,7 +224,7 @@ __host__ __device__ constexpr std::uint32_t scaleBytesPerRole(std::uint32_t half
 }
 
 //! Resolve one logical BufferId inside the single compact lower-tier record.
-//! Keeping this arithmetic in one helper makes the native task ABI one base
+//! Keeping this arithmetic in one helper makes the boundary task ABI one base
 //! address per Page while preserving the existing packed and scale ordering.
 __host__ __device__ constexpr std::uint32_t packedOffset(std::uint32_t role, std::uint32_t halfGroups)
 {
@@ -266,9 +264,16 @@ __device__ T* selectRawOutput(OnboardLayerTask const& task, std::uint32_t role)
     return reinterpret_cast<T*>(role == 0 ? task.rawK : task.rawV);
 }
 
+//! Shared staging may add internal alignment so the following scale interval
+//! remains vector-addressable. This padding never appears in the cold record.
+__host__ __device__ constexpr std::uint32_t packedStagingBytesPerRole(std::uint32_t halfGroups)
+{
+    return (packedBytesPerRole(halfGroups) + sizeof(uint4) - 1U) / sizeof(uint4) * sizeof(uint4);
+}
+
 __host__ __device__ constexpr std::uint32_t compactStagingBytesPerRole(std::uint32_t halfGroups)
 {
-    return packedBytesPerRole(halfGroups) + scaleBytesPerRole(halfGroups);
+    return packedStagingBytesPerRole(halfGroups) + scaleBytesPerRole(halfGroups);
 }
 
 __host__ __device__ constexpr std::uint32_t greatestCommonDivisor(std::uint32_t lhs, std::uint32_t rhs)
@@ -294,21 +299,19 @@ __host__ __device__ constexpr std::uint32_t roundUpTo(std::uint32_t value, std::
 //! bytes. Block scales are the smaller region, so they determine the tile: one
 //! tile contains at least one complete batchedCopy wave (128 lanes * 16 B) of
 //! scales. Packed data is exactly eight times larger and therefore contributes
-//! eight full waves. Rows are rounded so every tile starts on both a native
-//! token-4 V-scale boundary and a 16-byte multiple inside the scale region.
-//! Model-like region bases are aligned; tiny legal records use the scalar
-//! scale-transfer path. For
+//! eight full waves. Rows are rounded so every tile starts on a 16-byte
+//! multiple inside both the packed and scale regions. Model-like region bases
+//! are aligned; tiny legal scale regions use the byte-transfer path. For
 //! H=8/P=64/D=128 this selects 256 rows: 64 KiB FP16/BF16 input -> 16 KiB
 //! packed + 2 KiB scales.
 __host__ __device__ constexpr std::uint32_t compressedTransferRows(Nvfp4BoundaryKernelParams const& params)
 {
     std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
     std::uint32_t const scaleAlignmentRows = sizeof(uint4) / greatestCommonDivisor(sizeof(uint4), scalesPerRow);
-    std::uint32_t const rowAlignment = scaleAlignmentRows < kNativeVScaleRows ? kNativeVScaleRows : scaleAlignmentRows;
     std::uint32_t const targetRows = (kTargetScaleTransferBytes + scalesPerRow - 1U) / scalesPerRow;
     std::uint32_t const totalRows
         = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
-    return std::min(roundUpTo(targetRows, rowAlignment), totalRows);
+    return std::min(roundUpTo(targetRows, scaleAlignmentRows), totalRows);
 }
 
 __host__ __device__ constexpr std::uint32_t compressedTransferHalfGroups(Nvfp4BoundaryKernelParams const& params)
@@ -331,7 +334,18 @@ __device__ __forceinline__ uint4 collectFourPackedWords(std::uint32_t packed)
         __shfl_sync(groupMask, packed, firstLane + 2U), __shfl_sync(groupMask, packed, firstLane + 3U));
 }
 
-//! Flush one native NVFP4 Page/role range from CTA-local shared memory to its
+//! Collect one complete 16-value scale group's two packed words. `headDim %
+//! 16 == 0` guarantees that this natural 8-byte unit never has a partial tail.
+__device__ __forceinline__ uint2 collectTwoPackedWords(std::uint32_t packed)
+{
+    std::uint32_t const lane = threadIdx.x & 31U;
+    std::uint32_t const firstLane = lane & ~1U;
+    std::uint32_t const groupMask = 0x3U << firstLane;
+    return make_uint2(
+        __shfl_sync(groupMask, packed, firstLane), __shfl_sync(groupMask, packed, firstLane + 1U));
+}
+
+//! Flush one compact NVFP4 Page/role range from CTA-local shared memory to its
 //! concatenated region in the final mapped-Host compact Slot.
 //!
 //! BATCHEDCOPY ADAPTATION: the quantization loop produces one 32-bit packed
@@ -339,24 +353,32 @@ __device__ __forceinline__ uint4 collectFourPackedWords(std::uint32_t packed)
 //! immediately made only one quarter / one half of the lanes issue stores and
 //! coupled every quant warp to system-memory backpressure. This final phase
 //! instead has all lanes stream aligned uint4 grains, just like batchedCopy.
-//! The rare scale tail (only for tiny test geometries) remains byte-exact and
-//! never writes beyond the logical scale allocation.
+//! A packed interval that is only 8-byte aligned uses its natural uint2 scale
+//! groups; scale tails remain byte-exact. Neither path writes cold padding.
 __device__ void flushCompactRangeToHostForGroup(std::uint8_t const* compactStages, OffloadLayerTask const& task,
     std::uint32_t role, std::uint32_t halfGroupsPerRole, std::uint32_t packedStageCapacityBytes,
     std::uint32_t packedDestinationOffset, std::uint32_t packedBytes, std::uint32_t scaleDestinationOffset,
     std::uint32_t scaleBytes, std::uint32_t groupThread, std::uint32_t groupThreads)
 {
-    auto const* packedSource = reinterpret_cast<uint4 const*>(compactStages);
-    auto* packedDestination
-        = reinterpret_cast<uint4*>(selectPackedOutput(task, role, halfGroupsPerRole) + packedDestinationOffset);
-    for (std::uint32_t grain = groupThread; grain < packedBytes / sizeof(uint4); grain += groupThreads)
+    auto const* packedSource = compactStages;
+    auto* packedDestination = selectPackedOutput(task, role, halfGroupsPerRole) + packedDestinationOffset;
+    bool const alignedPacked = reinterpret_cast<std::uintptr_t>(packedSource) % sizeof(uint4) == 0
+        && reinterpret_cast<std::uintptr_t>(packedDestination) % sizeof(uint4) == 0;
+    std::uint32_t const packedVectorBytes = alignedPacked ? packedBytes - packedBytes % sizeof(uint4) : 0;
+    for (std::uint32_t grain = groupThread; grain < packedVectorBytes / sizeof(uint4); grain += groupThreads)
     {
-        packedDestination[grain] = packedSource[grain];
+        reinterpret_cast<uint4*>(packedDestination)[grain] = reinterpret_cast<uint4 const*>(packedSource)[grain];
+    }
+    for (std::uint32_t pair = packedVectorBytes / sizeof(uint2) + groupThread;
+         pair < packedBytes / sizeof(uint2); pair += groupThreads)
+    {
+        reinterpret_cast<uint2*>(packedDestination)[pair] = reinterpret_cast<uint2 const*>(packedSource)[pair];
     }
 
     auto const* scaleSource = compactStages + packedStageCapacityBytes;
     auto* scaleDestination = selectScaleOutput(task, role, halfGroupsPerRole) + scaleDestinationOffset;
-    bool const alignedScale = reinterpret_cast<std::uintptr_t>(scaleDestination) % sizeof(uint4) == 0;
+    bool const alignedScale = reinterpret_cast<std::uintptr_t>(scaleSource) % sizeof(uint4) == 0
+        && reinterpret_cast<std::uintptr_t>(scaleDestination) % sizeof(uint4) == 0;
     std::uint32_t const scaleVectorBytes = alignedScale ? scaleBytes - scaleBytes % sizeof(uint4) : 0;
     for (std::uint32_t grain = groupThread; grain < scaleVectorBytes / sizeof(uint4); grain += groupThreads)
     {
@@ -381,8 +403,8 @@ __device__ void flushCompactToHost(
     std::uint8_t const* compactStages, OffloadLayerTask const& task, std::uint32_t role, std::uint32_t halfGroups)
 {
     std::uint32_t const packedBytes = packedBytesPerRole(halfGroups);
-    flushCompactRangeToHost(
-        compactStages, task, role, halfGroups, packedBytes, 0, packedBytes, 0, scaleBytesPerRole(halfGroups));
+    flushCompactRangeToHost(compactStages, task, role, halfGroups, packedStagingBytesPerRole(halfGroups), 0,
+        packedBytes, 0, scaleBytesPerRole(halfGroups));
 }
 
 //! Join two consecutive eight-value FP8 words into one 16-byte GPU store.
@@ -390,21 +412,6 @@ __device__ __forceinline__ uint4 collectTwoFp8Words(std::uint64_t first, std::ui
 {
     return make_uint4(static_cast<std::uint32_t>(first), static_cast<std::uint32_t>(first >> 32U),
         static_cast<std::uint32_t>(second), static_cast<std::uint32_t>(second >> 32U));
-}
-
-// K scales are linear. V scales use the token-4 order consumed by the native
-// TRTLLM-gen NVFP4 KV path. `row` is the flattened [head, token] index; a
-// normal tokens-per-Page value divisible by four therefore never mixes heads.
-// Native writer (`quantizeAndWriteFP4KVCache`) source:
-// https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/unfusedAttentionKernels/unfusedAttentionKernels_2_template.h
-__device__ std::uint32_t scaleOffset(
-    std::uint32_t role, std::uint32_t row, std::uint32_t scaleInRow, std::uint32_t scalesPerRow)
-{
-    if (role == 0)
-    {
-        return row * scalesPerRow + scaleInRow;
-    }
-    return (row / 4) * (4 * scalesPerRow) + scaleInRow * 4 + row % 4;
 }
 
 // Unpack one lane's eight E2M1 values into four float2 values. "Eight" is the
@@ -543,6 +550,59 @@ __device__ uint2 quantizeFp8GrainToNvfp4(PackedVec<__nv_fp8_e4m3> const& grain, 
 #endif
 }
 
+//! Restore the natural 16-value NVFP4 scale group shared by every onboard
+//! path. Transport may batch two groups in a uint4, but correctness is defined
+//! by this exact uint2 unit.
+template <typename T>
+__device__ float onboardDequantScale(
+    std::uint8_t encodedScale, Nvfp4BoundaryKernelParams const& params, std::uint32_t role)
+{
+    __nv_fp8_e4m3 blockScale;
+    blockScale.__x = encodedScale;
+    float scale = static_cast<float>(blockScale) * params.nvfp4ScaleQuantOrig[role];
+    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+    {
+        scale *= params.fp8ScaleOrigQuant[role];
+    }
+    return scale;
+}
+
+template <typename T>
+__device__ void restoreNvfp4Pair(uint2 packedPair, T* output, std::uint32_t firstHalfGroup, float dequantScale)
+{
+    std::uint32_t const packedWords[2] = {packedPair.x, packedPair.y};
+    if constexpr (!std::is_same_v<T, __nv_fp8_e4m3>)
+    {
+#pragma unroll
+        for (std::uint32_t laneInScale = 0; laneInScale < 2; ++laneInScale)
+        {
+            float2 values[4];
+            unpackE2m1ToFloat(packedWords[laneInScale], values);
+            store16BitValues(
+                output, (firstHalfGroup + laneInScale) * kElementsPerLane, values, dequantScale);
+        }
+    }
+    else
+    {
+        std::uint64_t packedFp8[2];
+#pragma unroll
+        for (std::uint32_t laneInScale = 0; laneInScale < 2; ++laneInScale)
+        {
+            float2 values[4];
+            unpackE2m1ToFloat(packedWords[laneInScale], values);
+#pragma unroll
+            for (std::uint32_t i = 0; i < 4; ++i)
+            {
+                values[i].x *= dequantScale;
+                values[i].y *= dequantScale;
+            }
+            packedFp8[laneInScale] = fp32_vec_to_e4m3(values);
+        }
+        reinterpret_cast<uint4*>(output)[firstHalfGroup / 2U]
+            = collectTwoFp8Words(packedFp8[0], packedFp8[1]);
+    }
+}
+
 // FP16/BF16 GPU Page -> Host NVFP4: fused quantization plus D2H.
 //
 // Exact call/data flow:
@@ -552,7 +612,7 @@ __device__ uint2 quantizeFp8GrainToNvfp4(PackedVec<__nv_fp8_e4m3> const& grain, 
 //        -> 4-stage cp.async GPU raw -> shared          [BATCHEDCOPY
 // ADAPTATION]
 //        -> cvt_warp_fp16_to_fp4                        [NVFP4 DIRECT REUSE]
-//        -> native scale offset + mapped-Host stores    [BOUNDARY ADAPTATION]
+//        -> linear scale offset + mapped-Host stores    [BOUNDARY ADAPTATION]
 //
 // The generic quantization hierarchy is invokeFP4Quantization ->
 // quantize_with_block_size -> cvt_warp_fp16_to_fp4. This Page-specialized
@@ -590,6 +650,8 @@ __global__ void offloadFrom16BitKernel(std::array<Nvfp4BoundaryOffloadPageTask, 
         * static_cast<std::uint32_t>(params.tokensPerPage)
         * static_cast<std::uint32_t>(params.headDim / kElementsPerLane);
     auto const task = resolveTask(pages[blockIdx.z], layer, coldBase, coldPageBytes);
+    auto* packedOutput = selectPackedOutput(task, role, halfGroupsPerRole);
+    bool const alignedPackedOutput = reinterpret_cast<std::uintptr_t>(packedOutput) % sizeof(uint4) == 0;
 
     // BATCHEDCOPY ADAPTATION: this is the same split/iteration arithmetic and
     // four-stage ring used by batchedCopy<N>. PackedVec<T> is exactly 16 B, so
@@ -615,17 +677,13 @@ __global__ void offloadFrom16BitKernel(std::array<Nvfp4BoundaryOffloadPageTask, 
             cp_async_wait_group<kAsyncStages - 1>();
             bool const valid = halfGroup < endHalfGroup;
 
-            // NVFP4 CORRECTNESS: geometry validation makes every tail end on a
-            // complete 8-half-group boundary. Therefore all lanes named by the
-            // primitive's two-lane mask and collectFourPackedWords' four-lane
-            // mask take this branch together; invalid groups do no quant work.
+            // NVFP4 CORRECTNESS: headDim validation makes every tail end on a
+            // complete two-half-group scale boundary. Invalid groups do no
+            // quantization or mapped-Host stores.
             if (valid)
             {
                 std::uint32_t const laneInScale = halfGroup & 1U;
                 std::uint32_t const scaleGroup = halfGroup >> 1U;
-                std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
-                std::uint32_t const row = scaleGroup / scalesPerRow;
-                std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
 
                 // NVFP4 DIRECT REUSE: the production primitive performs the
                 // two-lane amax reduction, E4M3 block-scale generation, and
@@ -633,15 +691,25 @@ __global__ void offloadFrom16BitKernel(std::array<Nvfp4BoundaryOffloadPageTask, 
                 // land directly in their CUDA-mapped Host destinations.
                 PackedVec<T> input = rawStages[stage][threadIdx.x];
                 std::uint8_t* scale = laneInScale == 0 ? selectScaleOutput(task, role, halfGroupsPerRole)
-                        + scaleOffset(role, row, scaleInRow, scalesPerRow)
+                        + scaleGroup
                                                        : nullptr;
                 std::uint32_t const packed = cvt_warp_fp16_to_fp4<T, kElementsPerBlockScale, false>(
                     input, params.nvfp4ScaleOrigQuant[role], scale);
-                uint4 const packedGrain = collectFourPackedWords(packed);
-                if ((threadIdx.x & 3U) == 0)
+                if (alignedPackedOutput && (halfGroup | 3U) < halfGroupsPerRole)
                 {
-                    reinterpret_cast<uint4*>(selectPackedOutput(task, role, halfGroupsPerRole))[halfGroup / 4U]
-                        = packedGrain;
+                    uint4 const packedGrain = collectFourPackedWords(packed);
+                    if ((threadIdx.x & 3U) == 0)
+                    {
+                        reinterpret_cast<uint4*>(packedOutput)[halfGroup / 4U] = packedGrain;
+                    }
+                }
+                else
+                {
+                    uint2 const packedPair = collectTwoPackedWords(packed);
+                    if (laneInScale == 0)
+                    {
+                        reinterpret_cast<uint2*>(packedOutput)[scaleGroup] = packedPair;
+                    }
                 }
             }
         }
@@ -672,7 +740,7 @@ __global__ void offloadFrom16BitKernel(std::array<Nvfp4BoundaryOffloadPageTask, 
 // ADAPTATION]
 //        -> source FP8 restore in registers             [BOUNDARY ADAPTATION]
 //        -> cvt_warp_fp16_to_fp4                        [NVFP4 DIRECT REUSE]
-//        -> native scale offset + mapped-Host stores    [BOUNDARY ADAPTATION]
+//        -> linear scale offset + mapped-Host stores    [BOUNDARY ADAPTATION]
 //
 // The source-FP8 inverse scale and target-NVFP4 scale are independent, so this
 // kernel does not call the differently shaped cvt_warp_fp8_to_fp4 helper.
@@ -710,7 +778,7 @@ __global__ void offloadFromFp8Kernel(std::array<Nvfp4BoundaryOffloadPageTask, N>
     __shared__ __align__(16) uint4 rawStages[kAsyncStages][kThreadsPerBlock];
     extern __shared__ __align__(16) std::uint8_t compactStages[];
     auto* packedStages = reinterpret_cast<std::uint32_t*>(compactStages);
-    auto* scaleStages = compactStages + packedBytesPerRole(halfGroupsPerRole);
+    auto* scaleStages = compactStages + packedStagingBytesPerRole(halfGroupsPerRole);
     std::uint32_t const totalGrains = halfGroupsPerRole / 2U;
     std::uint32_t const totalIterations = (totalGrains + kThreadsPerBlock - 1U) / kThreadsPerBlock;
     std::uint32_t const maxIterationsPerCta = (totalIterations + gridDim.x - 1U) / gridDim.x;
@@ -751,10 +819,6 @@ __global__ void offloadFromFp8Kernel(std::array<Nvfp4BoundaryOffloadPageTask, N>
 
                     std::uint32_t const laneInScale = halfGroup & 1U;
                     std::uint32_t const scaleGroup = halfGroup >> 1U;
-                    std::uint32_t const scalesPerRow
-                        = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
-                    std::uint32_t const row = scaleGroup / scalesPerRow;
-                    std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
 
                     // BOUNDARY ADAPTATION: restore eight source FP8 values with
                     // their independent inverse scale before invoking the
@@ -774,8 +838,7 @@ __global__ void offloadFromFp8Kernel(std::array<Nvfp4BoundaryOffloadPageTask, N>
 
                     // NVFP4 DIRECT REUSE: production two-lane block
                     // quantization with independent boundary scales.
-                    std::uint8_t* scale
-                        = laneInScale == 0 ? scaleStages + scaleOffset(role, row, scaleInRow, scalesPerRow) : nullptr;
+                    std::uint8_t* scale = laneInScale == 0 ? scaleStages + scaleGroup : nullptr;
                     std::uint32_t const packed = cvt_warp_fp16_to_fp4<half, kElementsPerBlockScale, false>(
                         restored, params.nvfp4ScaleOrigQuant[role], scale);
                     packedStages[halfGroup] = packed;
@@ -794,7 +857,7 @@ __global__ void offloadFromFp8Kernel(std::array<Nvfp4BoundaryOffloadPageTask, N>
     }
 
     // FUSED D2H FINISH: FP8 restoration/quantization also uses the same
-    // CTA-local native-layout tile and all-lane uint4 Host flush.
+    // CTA-local linear-layout tile and all-lane uint4 Host flush.
     __syncthreads();
     flushCompactToHost(compactStages, task, role, halfGroupsPerRole);
 #endif
@@ -831,7 +894,7 @@ __global__ void offloadFrom16BitTiledKernel(std::array<Nvfp4BoundaryOffloadPageT
         = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
     std::uint32_t const tileRows = compressedTransferRows(params);
     std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
-    std::uint32_t const packedStageCapacityBytes = packedBytesPerRole(tileHalfGroups);
+    std::uint32_t const packedStageCapacityBytes = packedStagingBytesPerRole(tileHalfGroups);
 
     // BATCHEDCOPY REUSE: the raw source retains the same four-stage 16-byte
     // cp.async ring. BOUNDARY ADAPTATION: compact shared storage is bounded by
@@ -862,14 +925,11 @@ __global__ void offloadFrom16BitTiledKernel(std::array<Nvfp4BoundaryOffloadPageT
                     std::uint32_t const globalHalfGroup = firstHalfGroup + localHalfGroup;
                     std::uint32_t const laneInScale = globalHalfGroup & 1U;
                     std::uint32_t const scaleGroup = globalHalfGroup >> 1U;
-                    std::uint32_t const row = scaleGroup / scalesPerRow;
-                    std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
 
                     // NVFP4 DIRECT REUSE: unchanged production block quant.
-                    // TILED ADAPTATION: translate the native global scale
+                    // TILED ADAPTATION: translate the linear global scale
                     // offset into this tile's compact shared interval.
-                    std::uint32_t const localScaleOffset
-                        = scaleOffset(role, row, scaleInRow, scalesPerRow) - firstRow * scalesPerRow;
+                    std::uint32_t const localScaleOffset = scaleGroup - firstRow * scalesPerRow;
                     std::uint8_t* scale = laneInScale == 0 ? scaleStages + localScaleOffset : nullptr;
                     PackedVec<T> input = rawStages[stage][threadIdx.x];
                     packedStages[localHalfGroup] = cvt_warp_fp16_to_fp4<T, kElementsPerBlockScale, false>(
@@ -927,7 +987,7 @@ __global__ void offloadFromFp8TiledKernel(std::array<Nvfp4BoundaryOffloadPageTas
         = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
     std::uint32_t const tileRows = compressedTransferRows(params);
     std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
-    std::uint32_t const packedStageCapacityBytes = packedBytesPerRole(tileHalfGroups);
+    std::uint32_t const packedStageCapacityBytes = packedStagingBytesPerRole(tileHalfGroups);
 
     // BATCHEDCOPY ADAPTATION: cp.async still moves one 16-byte grain. Naming
     // the shared object as production PackedVec exposes its eight FP8x2 pairs
@@ -961,10 +1021,7 @@ __global__ void offloadFromFp8TiledKernel(std::array<Nvfp4BoundaryOffloadPageTas
                 if (localGrain < grains)
                 {
                     std::uint32_t const scaleGroup = firstGrain + localGrain;
-                    std::uint32_t const row = scaleGroup / scalesPerRow;
-                    std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
-                    std::uint32_t const localScaleOffset
-                        = scaleOffset(role, row, scaleInRow, scalesPerRow) - firstRow * scalesPerRow;
+                    std::uint32_t const localScaleOffset = scaleGroup - firstRow * scalesPerRow;
                     uint2 const packed
                         = quantizeFp8GrainToNvfp4(rawStages[stage][threadIdx.x], params.fp8ScaleQuantOrig[role],
                             params.nvfp4ScaleOrigQuant[role], scaleStages + localScaleOffset);
@@ -991,12 +1048,12 @@ __global__ void offloadFromFp8TiledKernel(std::array<Nvfp4BoundaryOffloadPageTas
 #endif
 }
 
-//! Densely load one native packed+scale interval from mapped Host memory into
+//! Densely load one compact packed+scale interval from mapped Host memory into
 //! CTA-local shared memory.
 //!
-//! Packed bytes are always a complete set of aligned uint4 grains. Scale bytes
-//! use the same path when the compact-region address is aligned; the generic
-//! byte tail preserves the pre-existing native one-byte scale contract. This
+//! Packed bytes use aligned uint4 grains plus natural uint2 scale-group tails.
+//! Scale bytes use the vector path when both endpoints are aligned; the generic
+//! byte tail preserves the compact format's one-byte scale contract. This
 //! helper is the H2D counterpart of `flushCompactRangeToHost` and deliberately
 //! finishes with a CTA barrier before any dequantization reads the tile.
 __device__ void loadCompactRangeFromHostForGroup(std::uint8_t* compactStages, OnboardLayerTask const& task,
@@ -1005,10 +1062,16 @@ __device__ void loadCompactRangeFromHostForGroup(std::uint8_t* compactStages, On
     std::uint32_t scaleBytes, std::uint32_t groupThread, std::uint32_t groupThreads)
 {
     auto const* packedSource = selectPackedInput(task, role, halfGroupsPerRole) + packedSourceOffset;
+    auto* packedDestination = compactStages;
     auto const* scaleSource = selectScaleInput(task, role, halfGroupsPerRole) + scaleSourceOffset;
-    bool const alignedScale = reinterpret_cast<std::uintptr_t>(scaleSource) % sizeof(uint4) == 0;
+    auto* scaleDestination = compactStages + packedStageCapacityBytes;
+    bool const alignedPacked = reinterpret_cast<std::uintptr_t>(packedSource) % sizeof(uint4) == 0
+        && reinterpret_cast<std::uintptr_t>(packedDestination) % sizeof(uint4) == 0;
+    std::uint32_t const packedVectorBytes = alignedPacked ? packedBytes - packedBytes % sizeof(uint4) : 0;
+    bool const alignedScale = reinterpret_cast<std::uintptr_t>(scaleSource) % sizeof(uint4) == 0
+        && reinterpret_cast<std::uintptr_t>(scaleDestination) % sizeof(uint4) == 0;
     std::uint32_t const scaleVectorBytes = alignedScale ? scaleBytes - scaleBytes % sizeof(uint4) : 0;
-    std::uint32_t const packedGrains = packedBytes / sizeof(uint4);
+    std::uint32_t const packedGrains = packedVectorBytes / sizeof(uint4);
     std::uint32_t const scaleGrains = scaleVectorBytes / sizeof(uint4);
     std::uint32_t const totalGrains = packedGrains + scaleGrains;
     std::uint32_t const iterations = (totalGrains + groupThreads - 1U) / groupThreads;
@@ -1022,7 +1085,7 @@ __device__ void loadCompactRangeFromHostForGroup(std::uint8_t* compactStages, On
         std::uint32_t const grain = groupThreads * iteration + groupThread;
         bool const valid = grain < totalGrains;
         auto const* source = reinterpret_cast<uint4 const*>(packedSource);
-        auto* destination = reinterpret_cast<uint4*>(compactStages);
+        auto* destination = reinterpret_cast<uint4*>(packedDestination);
         if (valid && grain < packedGrains)
         {
             source += grain;
@@ -1031,16 +1094,20 @@ __device__ void loadCompactRangeFromHostForGroup(std::uint8_t* compactStages, On
         else if (valid)
         {
             source = reinterpret_cast<uint4 const*>(scaleSource) + grain - packedGrains;
-            destination = reinterpret_cast<uint4*>(compactStages + packedStageCapacityBytes) + grain - packedGrains;
+            destination = reinterpret_cast<uint4*>(scaleDestination) + grain - packedGrains;
         }
         copyAsyncGlobalToShared(destination, source, valid);
         cp_async_commit_group();
     }
     cp_async_wait_group<0>();
 
-    // Only a non-vector tail or a byte-aligned scale region reaches this loop.
-    // Model-like concatenated KVCM Slots take the uint4 path.
-    auto* scaleDestination = compactStages + packedStageCapacityBytes;
+    // D%16 makes packed intervals an exact number of uint2 scale groups.
+    // Model-like concatenated KVCM Slots take the uint4 path exclusively.
+    for (std::uint32_t pair = packedVectorBytes / sizeof(uint2) + groupThread;
+         pair < packedBytes / sizeof(uint2); pair += groupThreads)
+    {
+        reinterpret_cast<uint2*>(packedDestination)[pair] = reinterpret_cast<uint2 const*>(packedSource)[pair];
+    }
     for (std::uint32_t byte = scaleVectorBytes + groupThread; byte < scaleBytes; byte += groupThreads)
     {
         scaleDestination[byte] = scaleSource[byte];
@@ -1056,31 +1123,32 @@ __device__ void loadCompactRangeFromHost(std::uint8_t* compactStages, OnboardLay
     __syncthreads();
 }
 
-// Host NVFP4 -> FP16/BF16 GPU Page: fused H2D plus dequantization.
+// Host NVFP4 -> runtime GPU Page: fused H2D plus dequantization.
 //
 // Exact call/data flow:
 //   invokeNvfp4BoundaryOnboardDecompress                [BOUNDARY API]
-//     -> launchOnboardTo16Bit                           [BOUNDARY BATCHING]
-//     -> onboardTo16BitKernel                           [BOUNDARY FUSED KERNEL]
+//     -> launchOnboard                                  [BOUNDARY BATCHING]
+//     -> onboardKernel                                  [BOUNDARY FUSED KERNEL]
 //        -> 4-stage cp.async Host packed -> shared      [BATCHEDCOPY
 // ADAPTATION]
-//        -> native K/V scale load                       [BOUNDARY ADAPTATION]
+//        -> linear K/V scale load                       [BOUNDARY ADAPTATION]
 //        -> unpackE2m1ToFloat                           [ARCQUANT/MOE
 // ADAPTATION]
 //        -> scaled 16-byte FP16/BF16 GPU store          [BOUNDARY ADAPTATION]
 //
 // unpackE2m1ToFloat adapts the cvt.rn.f16x2.e2m1x2 sequence from
-// ARCQuant/fused-MoE; it does not call a MoE kernel. Every lane pipelines one
-// 16-byte mapped-Host grain and expands its four packed words. Each adjacent
-// word pair shares one scalar scale load. Packed and scale segments coexist in
-// one concatenated Host Slot; K and V scale segments keep their native order.
+// ARCQuant/fused-MoE; it does not call a MoE kernel. Every body lane pipelines
+// one 16-byte mapped-Host grain and expands its four packed words; at most one
+// leading/trailing uint2 uses the same scale-group restore helper. Packed and
+// scale segments coexist in one concatenated Host Slot; K and V scale segments
+// use the same linear order.
 // Dequant PTX sources:
 // https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/arcquantFP4.cu
 // https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/fusedMoeCommKernels.cu
 // H2D/D2H pipeline source:
 // https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/batch_manager/kvCacheManagerV2Utils.cu
 template <std::uint32_t N, typename T>
-__global__ void onboardTo16BitKernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ pages,
+__global__ void onboardKernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ pages,
     std::array<Nvfp4BoundaryLayerPlan, kMaxLayersPerLaunch> const __grid_constant__ layers,
     std::uint8_t const* coldBase, std::size_t coldPageBytes, std::uint32_t numLayers)
 {
@@ -1100,11 +1168,19 @@ __global__ void onboardTo16BitKernel(std::array<Nvfp4BoundaryOnboardPageTask, N>
         * static_cast<std::uint32_t>(params.tokensPerPage)
         * static_cast<std::uint32_t>(params.headDim / kElementsPerLane);
     auto const task = resolveTask(pages[blockIdx.z], layer, coldBase, coldPageBytes);
+    auto const* packedInputBytes = selectPackedInput(task, role, halfGroupsPerRole);
+    auto const* scaleInput = selectScaleInput(task, role, halfGroupsPerRole);
+    auto* rawOutput = selectRawOutput<T>(task, role);
 
-    // BATCHEDCOPY DIRECT REUSE: one 16-byte grain contains four packed E2M1
-    // words, and all four pass through the same four-stage ring.
+    // Partition the tightly packed interval by actual address: at most one
+    // leading and one trailing uint2 surround the aligned uint4 body. Common
+    // model geometries therefore retain the unchanged 16-byte async path.
+    std::uint32_t const totalScaleGroups = halfGroupsPerRole / 2U;
+    std::uint32_t const leadingScaleGroups
+        = reinterpret_cast<std::uintptr_t>(packedInputBytes) % sizeof(uint4) == 0 ? 0U : 1U;
+    std::uint32_t const totalGrains = (totalScaleGroups - leadingScaleGroups) / 2U;
+    std::uint32_t const trailingScaleGroups = totalScaleGroups - leadingScaleGroups - totalGrains * 2U;
     __shared__ __align__(16) uint4 packedStages[kAsyncStages][kThreadsPerBlock];
-    std::uint32_t const totalGrains = halfGroupsPerRole / 4U;
     std::uint32_t const totalIterations = (totalGrains + kThreadsPerBlock - 1U) / kThreadsPerBlock;
     std::uint32_t const maxIterationsPerCta = (totalIterations + gridDim.x - 1U) / gridDim.x;
     std::uint32_t const firstGrainBase = kThreadsPerBlock * maxIterationsPerCta * blockIdx.x;
@@ -1112,6 +1188,12 @@ __global__ void onboardTo16BitKernel(std::array<Nvfp4BoundaryOnboardPageTask, N>
     std::uint32_t const endGrain = std::min(firstGrainBase + kThreadsPerBlock * maxIterationsPerCta, totalGrains);
 
     asm volatile("griddepcontrol.wait;\n" : : : "memory");
+    if (leadingScaleGroups != 0U && blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        uint2 const packedPair = reinterpret_cast<uint2 const*>(packedInputBytes)[0];
+        restoreNvfp4Pair(
+            packedPair, rawOutput, 0U, onboardDequantScale<T>(scaleInput[0], params, role));
+    }
     for (std::uint32_t iteration = 0; iteration < maxIterationsPerCta + kAsyncStages; ++iteration)
     {
         std::uint32_t const stage = iteration % kAsyncStages;
@@ -1127,172 +1209,42 @@ __global__ void onboardTo16BitKernel(std::array<Nvfp4BoundaryOnboardPageTask, N>
 #pragma unroll
                 for (std::uint32_t pair = 0; pair < 2; ++pair)
                 {
-                    std::uint32_t const firstHalfGroup = grain * 4U + pair * 2U;
+                    std::uint32_t const firstHalfGroup
+                        = leadingScaleGroups * 2U + grain * 4U + pair * 2U;
                     std::uint32_t const scaleGroup = firstHalfGroup >> 1U;
-                    std::uint32_t const scalesPerRow
-                        = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
-                    std::uint32_t const row = scaleGroup / scalesPerRow;
-                    std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
 
                     // BOUNDARY ADAPTATION: two adjacent packed words represent
-                    // the same 16-value block and therefore reuse one native
-                    // K-linear/V-token-4 scale lookup.
-                    __nv_fp8_e4m3 blockScale;
-                    blockScale.__x = selectScaleInput(
-                        task, role, halfGroupsPerRole)[scaleOffset(role, row, scaleInRow, scalesPerRow)];
-                    float const dequantScale = static_cast<float>(blockScale) * params.nvfp4ScaleQuantOrig[role];
-
-#pragma unroll
-                    for (std::uint32_t laneInScale = 0; laneInScale < 2; ++laneInScale)
-                    {
-                        std::uint32_t const halfGroup = firstHalfGroup + laneInScale;
-                        std::uint32_t const elementOffset = halfGroup * kElementsPerLane;
-                        float2 values[4];
-                        // NVFP4 DEQUANT: expand one packed word to registers.
-                        unpackE2m1ToFloat(packedWords[pair * 2U + laneInScale], values);
-                        // FUSED H2D FINISH: apply the shared scale and store
-                        // directly into the final FP16/BF16 GPU Slot.
-                        store16BitValues(selectRawOutput<T>(task, role), elementOffset, values, dequantScale);
-                    }
+                    // the same 16-value block and therefore reuse one linear
+                    // block-scale lookup.
+                    restoreNvfp4Pair(make_uint2(packedWords[pair * 2U], packedWords[pair * 2U + 1U]), rawOutput,
+                        firstHalfGroup, onboardDequantScale<T>(scaleInput[scaleGroup], params, role));
                 }
             }
         }
 
         std::uint32_t const loadGrain = firstGrain + kThreadsPerBlock * iteration;
         bool const valid = loadGrain < endGrain;
-        auto const* packedInput = reinterpret_cast<uint4 const*>(selectPackedInput(task, role, halfGroupsPerRole));
+        auto const* packedInput
+            = reinterpret_cast<uint4 const*>(packedInputBytes + leadingScaleGroups * sizeof(uint2));
         auto const* source = valid ? packedInput + loadGrain : packedInput;
         // FUSED H2D START: move four compact E2M1 words directly from mapped
         // Host memory with batchedCopy's exact 16-byte async grain.
         copyAsyncGlobalToShared(&packedStages[stage][threadIdx.x], source, valid);
         cp_async_commit_group();
     }
-#endif
-}
-
-// Host NVFP4 -> FP8 E4M3 GPU Page: fused H2D, dequantization, and
-// requantization.
-//
-// Exact call/data flow:
-//   invokeNvfp4BoundaryOnboardDecompress                [BOUNDARY API]
-//     -> launchOnboardToFp8                             [BOUNDARY BATCHING]
-//     -> onboardToFp8Kernel                             [BOUNDARY FUSED KERNEL]
-//        -> 4-stage cp.async Host packed -> shared      [BATCHEDCOPY
-// ADAPTATION]
-//        -> native K/V scale load                       [BOUNDARY ADAPTATION]
-//        -> unpackE2m1ToFloat                           [ARCQUANT/MOE
-// ADAPTATION]
-//        -> fp32_vec_to_e4m3 + 16-byte GPU store        [NVFP4/BOUNDARY]
-//
-// The 16-byte mapped-Host source pipeline and paired scale reuse match the
-// FP16/BF16 onboard path. The numerical tail composes the NVFP4 inverse scale
-// with destination FP8 quantization, then reuses fp32_vec_to_e4m3.
-// Dequant PTX and FP8 packer sources:
-// https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/fusedMoeCommKernels.cu
-// https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/quantization.cuh
-// H2D/D2H pipeline source:
-// https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/batch_manager/kvCacheManagerV2Utils.cu
-template <std::uint32_t N>
-__global__ void onboardToFp8Kernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ pages,
-    std::array<Nvfp4BoundaryLayerPlan, kMaxLayersPerLaunch> const __grid_constant__ layers,
-    std::uint8_t const* coldBase, std::size_t coldPageBytes, std::uint32_t numLayers)
-{
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    // BATCHEDCOPY DIRECT REUSE: use the same programmatic grid dependency
-    // protocol for the FP8 destination specialization.
-    asm volatile("griddepcontrol.launch_dependents;\n");
-
-    // BOUNDARY ADAPTATION: select one disjoint Page and one K/V role while
-    // retaining batchedCopy's split dimension.
-    std::uint32_t const layerIndex = blockIdx.y / 2U;
-    assert(layerIndex < numLayers);
-    std::uint32_t const role = blockIdx.y % 2U;
-    auto const& layer = layers[layerIndex];
-    auto const params = layer.params;
-    std::uint32_t const halfGroupsPerRole = static_cast<std::uint32_t>(params.numKvHeads)
-        * static_cast<std::uint32_t>(params.tokensPerPage)
-        * static_cast<std::uint32_t>(params.headDim / kElementsPerLane);
-    auto const task = resolveTask(pages[blockIdx.z], layer, coldBase, coldPageBytes);
-
-    // BATCHEDCOPY DIRECT REUSE: four-stage ring over exact 16-byte grains.
-    __shared__ __align__(16) uint4 packedStages[kAsyncStages][kThreadsPerBlock];
-    std::uint32_t const totalGrains = halfGroupsPerRole / 4U;
-    std::uint32_t const totalIterations = (totalGrains + kThreadsPerBlock - 1U) / kThreadsPerBlock;
-    std::uint32_t const maxIterationsPerCta = (totalIterations + gridDim.x - 1U) / gridDim.x;
-    std::uint32_t const firstGrainBase = kThreadsPerBlock * maxIterationsPerCta * blockIdx.x;
-    std::uint32_t const firstGrain = firstGrainBase + threadIdx.x;
-    std::uint32_t const endGrain = std::min(firstGrainBase + kThreadsPerBlock * maxIterationsPerCta, totalGrains);
-
-    asm volatile("griddepcontrol.wait;\n" : : : "memory");
-    for (std::uint32_t iteration = 0; iteration < maxIterationsPerCta + kAsyncStages; ++iteration)
+    if (trailingScaleGroups != 0U && blockIdx.x + 1U == gridDim.x && threadIdx.x == 0)
     {
-        std::uint32_t const stage = iteration % kAsyncStages;
-        if (iteration >= kAsyncStages)
-        {
-            std::uint32_t const transformIteration = iteration - kAsyncStages;
-            std::uint32_t const grain = firstGrain + kThreadsPerBlock * transformIteration;
-            cp_async_wait_group<kAsyncStages - 1>();
-            if (grain < endGrain)
-            {
-                uint4 const packedGrain = packedStages[stage][threadIdx.x];
-                std::uint32_t const packedWords[4] = {packedGrain.x, packedGrain.y, packedGrain.z, packedGrain.w};
-#pragma unroll
-                for (std::uint32_t pair = 0; pair < 2; ++pair)
-                {
-                    std::uint32_t const firstHalfGroup = grain * 4U + pair * 2U;
-                    std::uint32_t const scaleGroup = firstHalfGroup >> 1U;
-                    std::uint32_t const scalesPerRow
-                        = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
-                    std::uint32_t const row = scaleGroup / scalesPerRow;
-                    std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
-
-                    __nv_fp8_e4m3 blockScale;
-                    blockScale.__x = selectScaleInput(
-                        task, role, halfGroupsPerRole)[scaleOffset(role, row, scaleInRow, scalesPerRow)];
-                    float const dequantScale = static_cast<float>(blockScale) * params.nvfp4ScaleQuantOrig[role]
-                        * params.fp8ScaleOrigQuant[role];
-
-                    std::uint64_t packedFp8[2];
-#pragma unroll
-                    for (std::uint32_t laneInScale = 0; laneInScale < 2; ++laneInScale)
-                    {
-                        float2 values[4];
-                        unpackE2m1ToFloat(packedWords[pair * 2U + laneInScale], values);
-#pragma unroll
-                        for (std::uint32_t i = 0; i < 4; ++i)
-                        {
-                            values[i].x *= dequantScale;
-                            values[i].y *= dequantScale;
-                        }
-                        // FP8 REQUANT: reuse TRT-LLM's E4M3 packer. The two
-                        // consecutive results are joined below before the GPU
-                        // destination is touched.
-                        packedFp8[laneInScale] = fp32_vec_to_e4m3(values);
-                    }
-                    // FUSED H2D FINISH + BATCHEDCOPY VECTOR WIDTH: one aligned
-                    // 16-byte store publishes sixteen restored FP8 values to
-                    // the final runtime Slot.
-                    reinterpret_cast<uint4*>(selectRawOutput<__nv_fp8_e4m3>(task, role))[firstHalfGroup / 2U]
-                        = collectTwoFp8Words(packedFp8[0], packedFp8[1]);
-                }
-            }
-        }
-
-        std::uint32_t const loadGrain = firstGrain + kThreadsPerBlock * iteration;
-        bool const valid = loadGrain < endGrain;
-        auto const* packedInput = reinterpret_cast<uint4 const*>(selectPackedInput(task, role, halfGroupsPerRole));
-        auto const* source = valid ? packedInput + loadGrain : packedInput;
-        // FUSED H2D START: mapped Host NVFP4 data -> CTA shared ring with the
-        // exact 16-byte batchedCopy async-load mechanism.
-        copyAsyncGlobalToShared(&packedStages[stage][threadIdx.x], source, valid);
-        cp_async_commit_group();
+        std::uint32_t const scaleGroup = leadingScaleGroups + totalGrains * 2U;
+        uint2 const packedPair = reinterpret_cast<uint2 const*>(packedInputBytes)[scaleGroup];
+        restoreNvfp4Pair(packedPair, rawOutput, scaleGroup * 2U,
+            onboardDequantScale<T>(scaleInput[scaleGroup], params, role));
     }
 #endif
 }
 
-//! Host NVFP4 -> FP16/BF16 GPU Page with tiled transfer/dequant phases.
+//! Host NVFP4 -> runtime GPU Page with tiled transfer/dequant phases.
 template <std::uint32_t N, typename T>
-__global__ void onboardTo16BitTiledKernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ pages,
+__global__ void onboardTiledKernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ pages,
     std::array<Nvfp4BoundaryLayerPlan, kMaxLayersPerLaunch> const __grid_constant__ layers,
     std::uint8_t const* coldBase, std::size_t coldPageBytes, std::uint32_t numLayers)
 {
@@ -1314,8 +1266,9 @@ __global__ void onboardTo16BitTiledKernel(std::array<Nvfp4BoundaryOnboardPageTas
         = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
     std::uint32_t const tileRows = compressedTransferRows(params);
     std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
-    std::uint32_t const packedStageCapacityBytes = packedBytesPerRole(tileHalfGroups);
+    std::uint32_t const packedStageCapacityBytes = packedStagingBytesPerRole(tileHalfGroups);
     extern __shared__ __align__(16) std::uint8_t compactStages[];
+    auto* rawOutput = selectRawOutput<T>(task, role);
 
     asm volatile("griddepcontrol.wait;\n" : : : "memory");
     for (std::uint32_t firstRow = blockIdx.x * tileRows; firstRow < totalRows; firstRow += gridDim.x * tileRows)
@@ -1338,30 +1291,24 @@ __global__ void onboardTo16BitTiledKernel(std::array<Nvfp4BoundaryOnboardPageTas
         {
             uint4 const packedGrain = packedStages[localGrain];
             std::uint32_t const packedWords[4] = {packedGrain.x, packedGrain.y, packedGrain.z, packedGrain.w};
-            std::uint32_t const globalGrain = firstHalfGroup / 4U + localGrain;
 #pragma unroll
             for (std::uint32_t pair = 0; pair < 2; ++pair)
             {
-                std::uint32_t const firstPairHalfGroup = globalGrain * 4U + pair * 2U;
+                std::uint32_t const localScaleGroup = localGrain * 2U + pair;
+                std::uint32_t const firstPairHalfGroup = firstHalfGroup + localScaleGroup * 2U;
                 std::uint32_t const scaleGroup = firstPairHalfGroup >> 1U;
-                std::uint32_t const row = scaleGroup / scalesPerRow;
-                std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
-                std::uint32_t const localScaleOffset
-                    = scaleOffset(role, row, scaleInRow, scalesPerRow) - firstRow * scalesPerRow;
+                std::uint32_t const localScaleOffset = scaleGroup - firstRow * scalesPerRow;
 
-                __nv_fp8_e4m3 blockScale;
-                blockScale.__x = scaleStages[localScaleOffset];
-                float const dequantScale = static_cast<float>(blockScale) * params.nvfp4ScaleQuantOrig[role];
-#pragma unroll
-                for (std::uint32_t laneInScale = 0; laneInScale < 2; ++laneInScale)
-                {
-                    std::uint32_t const halfGroup = firstPairHalfGroup + laneInScale;
-                    float2 values[4];
-                    unpackE2m1ToFloat(packedWords[pair * 2U + laneInScale], values);
-                    store16BitValues(
-                        selectRawOutput<T>(task, role), halfGroup * kElementsPerLane, values, dequantScale);
-                }
+                restoreNvfp4Pair(make_uint2(packedWords[pair * 2U], packedWords[pair * 2U + 1U]), rawOutput,
+                    firstPairHalfGroup, onboardDequantScale<T>(scaleStages[localScaleOffset], params, role));
             }
+        }
+        if (packedBytes % sizeof(uint4) != 0U && threadIdx.x == 0)
+        {
+            std::uint32_t const localScaleGroup = packedGrains * 2U;
+            std::uint32_t const firstPairHalfGroup = firstHalfGroup + localScaleGroup * 2U;
+            restoreNvfp4Pair(reinterpret_cast<uint2 const*>(compactStages)[localScaleGroup], rawOutput,
+                firstPairHalfGroup, onboardDequantScale<T>(scaleStages[localScaleGroup], params, role));
         }
 
         // All consumers must finish before the next compact tile overwrites shared
@@ -1371,97 +1318,10 @@ __global__ void onboardTo16BitTiledKernel(std::array<Nvfp4BoundaryOnboardPageTas
 #endif
 }
 
-//! Host NVFP4 -> FP8 GPU Page with tiled transfer/dequant/requant phases.
-template <std::uint32_t N>
-__global__ void onboardToFp8TiledKernel(std::array<Nvfp4BoundaryOnboardPageTask, N> const __grid_constant__ pages,
-    std::array<Nvfp4BoundaryLayerPlan, kMaxLayersPerLaunch> const __grid_constant__ layers,
-    std::uint8_t const* coldBase, std::size_t coldPageBytes, std::uint32_t numLayers)
-{
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    asm volatile("griddepcontrol.launch_dependents;\n");
-
-    std::uint32_t const layerIndex = blockIdx.y / 2U;
-    assert(layerIndex < numLayers);
-    std::uint32_t const role = blockIdx.y % 2U;
-    auto const& layer = layers[layerIndex];
-    auto const params = layer.params;
-    std::uint32_t const halfGroupsPerRole = static_cast<std::uint32_t>(params.numKvHeads)
-        * static_cast<std::uint32_t>(params.tokensPerPage)
-        * static_cast<std::uint32_t>(params.headDim / kElementsPerLane);
-    auto const task = resolveTask(pages[blockIdx.z], layer, coldBase, coldPageBytes);
-    std::uint32_t const scalesPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerBlockScale;
-    std::uint32_t const halfGroupsPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerLane;
-    std::uint32_t const totalRows
-        = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
-    std::uint32_t const tileRows = compressedTransferRows(params);
-    std::uint32_t const tileHalfGroups = compressedTransferHalfGroups(params);
-    std::uint32_t const packedStageCapacityBytes = packedBytesPerRole(tileHalfGroups);
-    extern __shared__ __align__(16) std::uint8_t compactStages[];
-
-    asm volatile("griddepcontrol.wait;\n" : : : "memory");
-    for (std::uint32_t firstRow = blockIdx.x * tileRows; firstRow < totalRows; firstRow += gridDim.x * tileRows)
-    {
-        std::uint32_t const rows = std::min(tileRows, totalRows - firstRow);
-        std::uint32_t const firstHalfGroup = firstRow * halfGroupsPerRow;
-        std::uint32_t const halfGroups = rows * halfGroupsPerRow;
-        std::uint32_t const packedBytes = packedBytesPerRole(halfGroups);
-        std::uint32_t const scaleBytes = rows * scalesPerRow;
-        loadCompactRangeFromHost(compactStages, task, role, halfGroupsPerRole, packedStageCapacityBytes,
-            packedBytesPerRole(firstHalfGroup), packedBytes, firstRow * scalesPerRow, scaleBytes);
-
-        auto const* packedStages = reinterpret_cast<uint4 const*>(compactStages);
-        auto const* scaleStages = compactStages + packedStageCapacityBytes;
-        std::uint32_t const packedGrains = packedBytes / sizeof(uint4);
-        for (std::uint32_t localGrain = threadIdx.x; localGrain < packedGrains; localGrain += blockDim.x)
-        {
-            uint4 const packedGrain = packedStages[localGrain];
-            std::uint32_t const packedWords[4] = {packedGrain.x, packedGrain.y, packedGrain.z, packedGrain.w};
-            std::uint32_t const globalGrain = firstHalfGroup / 4U + localGrain;
-#pragma unroll
-            for (std::uint32_t pair = 0; pair < 2; ++pair)
-            {
-                std::uint32_t const firstPairHalfGroup = globalGrain * 4U + pair * 2U;
-                std::uint32_t const scaleGroup = firstPairHalfGroup >> 1U;
-                std::uint32_t const row = scaleGroup / scalesPerRow;
-                std::uint32_t const scaleInRow = scaleGroup - row * scalesPerRow;
-                std::uint32_t const localScaleOffset
-                    = scaleOffset(role, row, scaleInRow, scalesPerRow) - firstRow * scalesPerRow;
-
-                __nv_fp8_e4m3 blockScale;
-                blockScale.__x = scaleStages[localScaleOffset];
-                float const dequantScale = static_cast<float>(blockScale) * params.nvfp4ScaleQuantOrig[role]
-                    * params.fp8ScaleOrigQuant[role];
-                std::uint64_t packedFp8[2];
-#pragma unroll
-                for (std::uint32_t laneInScale = 0; laneInScale < 2; ++laneInScale)
-                {
-                    float2 values[4];
-                    unpackE2m1ToFloat(packedWords[pair * 2U + laneInScale], values);
-#pragma unroll
-                    for (std::uint32_t i = 0; i < 4; ++i)
-                    {
-                        values[i].x *= dequantScale;
-                        values[i].y *= dequantScale;
-                    }
-                    packedFp8[laneInScale] = fp32_vec_to_e4m3(values);
-                }
-                reinterpret_cast<uint4*>(selectRawOutput<__nv_fp8_e4m3>(task, role))[firstPairHalfGroup / 2U]
-                    = collectTwoFp8Words(packedFp8[0], packedFp8[1]);
-            }
-        }
-        __syncthreads();
-    }
-#endif
-}
-
 void validateParams(Nvfp4BoundaryKernelParams const& params, bool useFp8)
 {
     TLLM_CHECK_WITH_INFO(params.numKvHeads > 0, "numKvHeads must be positive");
     TLLM_CHECK_WITH_INFO(params.tokensPerPage > 0, "tokensPerPage must be positive");
-    TLLM_CHECK_WITH_INFO(params.tokensPerPage % 4 == 0,
-        "tokensPerPage must be divisible by 4 for the native "
-        "V-scale layout, got %d",
-        params.tokensPerPage);
     TLLM_CHECK_WITH_INFO(params.headDim > 0 && params.headDim % kElementsPerBlockScale == 0,
         "headDim must be positive and divisible by 16, got %d", params.headDim);
 
@@ -1476,18 +1336,12 @@ void validateParams(Nvfp4BoundaryKernelParams const& params, bool useFp8)
         "Page geometry exceeds the 32-bit compact-offset range: "
         "heads=%d, tokens=%d, headDim=%d",
         params.numKvHeads, params.tokensPerPage, params.headDim);
-    std::uint64_t const halfGroups = rows * halfGroupsPerRow;
-    TLLM_CHECK_WITH_INFO(halfGroups % 8 == 0,
-        "Page geometry must produce complete 16-byte FP8 and "
-        "NVFP4 transfer grains, got %llu half-groups",
-        static_cast<unsigned long long>(halfGroups));
-
-    // A token-4 V-scale interval is the smallest legal compact tile. For
-    // normal model head dimensions it stays far below this accepted bound;
+    // One aligned linear-scale interval is the smallest legal compact tile.
+    // For normal model head dimensions it stays far below this accepted bound;
     // reject an extreme geometry synchronously if even that minimum tile would
     // exceed the shared-memory contract used by every automatic fallback.
     std::uint64_t const tileHalfGroups = compressedTransferHalfGroups(params);
-    std::uint64_t const tileBytes = tileHalfGroups * sizeof(std::uint32_t) + tileHalfGroups / 2U;
+    std::uint64_t const tileBytes = compactStagingBytesPerRole(static_cast<std::uint32_t>(tileHalfGroups));
     TLLM_CHECK_WITH_INFO(tileBytes <= kMaxWholePageCompactStagingBytes,
         "Minimum NVFP4 boundary tile requires %llu "
         "shared-memory bytes; maximum supported is %u",
@@ -1742,7 +1596,7 @@ void launchOffloadFromFp8(std::vector<Nvfp4BoundaryOffloadPageTask> const& pages
 }
 
 template <typename T>
-void launchOnboardTo16Bit(std::vector<Nvfp4BoundaryOnboardPageTask> const& pages, Nvfp4BoundaryPreparedPlan const& plan,
+void launchOnboard(std::vector<Nvfp4BoundaryOnboardPageTask> const& pages, Nvfp4BoundaryPreparedPlan const& plan,
     std::uint8_t const* coldBase, cudaStream_t stream)
 {
     dim3 const block(kThreadsPerBlock);
@@ -1753,36 +1607,13 @@ void launchOnboardTo16Bit(std::vector<Nvfp4BoundaryOnboardPageTask> const& pages
             dim3 const grid(kHostMemorySplits, 2U * plan.numLayers, count);
             if (plan.allStandardGeometry)
             {
-                launchBoundaryBatch<taskCapacity>(onboardTo16BitTiledKernel<taskCapacity, T>, taskData, count, grid,
-                    block, compactStagingBytesPerRole(plan.maxTileHalfGroups), plan.layers, coldBase,
-                    plan.coldPageBytes, plan.numLayers, stream);
-            }
-            else
-            {
-                launchBoundaryBatch<taskCapacity>(onboardTo16BitKernel<taskCapacity, T>, taskData, count, grid, block,
-                    0, plan.layers, coldBase, plan.coldPageBytes, plan.numLayers, stream);
-            }
-        });
-}
-
-void launchOnboardToFp8(std::vector<Nvfp4BoundaryOnboardPageTask> const& pages, Nvfp4BoundaryPreparedPlan const& plan,
-    std::uint8_t const* coldBase, cudaStream_t stream)
-{
-    dim3 const block(kThreadsPerBlock);
-    launchTaskBatches(pages,
-        [&](auto capacity, Nvfp4BoundaryOnboardPageTask const* taskData, std::uint32_t count)
-        {
-            constexpr std::uint32_t taskCapacity = decltype(capacity)::value;
-            dim3 const grid(kHostMemorySplits, 2U * plan.numLayers, count);
-            if (plan.allStandardGeometry)
-            {
-                launchBoundaryBatch<taskCapacity>(onboardToFp8TiledKernel<taskCapacity>, taskData, count, grid, block,
+                launchBoundaryBatch<taskCapacity>(onboardTiledKernel<taskCapacity, T>, taskData, count, grid, block,
                     compactStagingBytesPerRole(plan.maxTileHalfGroups), plan.layers, coldBase, plan.coldPageBytes,
                     plan.numLayers, stream);
             }
             else
             {
-                launchBoundaryBatch<taskCapacity>(onboardToFp8Kernel<taskCapacity>, taskData, count, grid, block, 0,
+                launchBoundaryBatch<taskCapacity>(onboardKernel<taskCapacity, T>, taskData, count, grid, block, 0,
                     plan.layers, coldBase, plan.coldPageBytes, plan.numLayers, stream);
             }
         });
@@ -1895,15 +1726,15 @@ void invokeNvfp4BoundaryOnboardDecompress(std::vector<Nvfp4BoundaryOnboardPageTa
     {
     case Nvfp4BoundaryRuntimeType::kFloat16:
         launchAndDrainOnFailure(stream,
-            [&] { launchOnboardTo16Bit<half>(pages, plan, static_cast<std::uint8_t const*>(coldBase), stream); });
+            [&] { launchOnboard<half>(pages, plan, static_cast<std::uint8_t const*>(coldBase), stream); });
         break;
     case Nvfp4BoundaryRuntimeType::kBfloat16:
         launchAndDrainOnFailure(stream, [&]
-            { launchOnboardTo16Bit<__nv_bfloat16>(pages, plan, static_cast<std::uint8_t const*>(coldBase), stream); });
+            { launchOnboard<__nv_bfloat16>(pages, plan, static_cast<std::uint8_t const*>(coldBase), stream); });
         break;
     case Nvfp4BoundaryRuntimeType::kFp8E4m3:
-        launchAndDrainOnFailure(
-            stream, [&] { launchOnboardToFp8(pages, plan, static_cast<std::uint8_t const*>(coldBase), stream); });
+        launchAndDrainOnFailure(stream,
+            [&] { launchOnboard<__nv_fp8_e4m3>(pages, plan, static_cast<std::uint8_t const*>(coldBase), stream); });
         break;
     default: TLLM_THROW("Unsupported NVFP4 boundary runtime type");
     }
