@@ -313,7 +313,6 @@ def test_kv_cache_compression_discriminator_captures_both_algorithms():
     configs = (
         QuantizationCompressionConfig(scale_checkpoint_path="/modelopt"),
         TriAttentionKvCacheCompressionConfig(
-            model_path="/model",
             calibration_path="/triattention.pt",
         ),
     )
