@@ -975,15 +975,6 @@ void launchBoundaryBatch(Kernel kernel, Task const* tasks, std::uint32_t count, 
     config.attrs = &attribute;
     config.numAttrs = 1;
 
-    // Opt in explicitly to the configure-time bounded compact-tile size so a
-    // legal geometry is not silently limited by CUDA's default shared-memory
-    // carveout.
-    if (dynamicSmemBytes != 0)
-    {
-        TLLM_CUDA_CHECK(cudaFuncSetAttribute(
-            reinterpret_cast<void const*>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, dynamicSmemBytes));
-    }
-
     void* arguments[] = {const_cast<void*>(taskArgument), const_cast<Nvfp4BoundaryLayerPlan*>(layers.data()), &coldBase,
         &coldPageBytes, &numLayers};
     TLLM_CUDA_CHECK(cudaLaunchKernelExC(&config, reinterpret_cast<void const*>(kernel), arguments));
