@@ -33,7 +33,6 @@
 #include <cuda_fp8.h>
 #include <exception>
 #include <limits>
-#include <mutex>
 #include <type_traits>
 #include <vector>
 
@@ -89,48 +88,6 @@ static_assert(sizeof(std::array<Nvfp4BoundaryOnboardPageTask, kMaxTasksPerLaunch
         + sizeof(std::array<Nvfp4BoundaryLayerPlan, kMaxLayersPerLaunch>) + 2U * sizeof(std::uintptr_t)
         + 3U * sizeof(std::uint32_t)
     <= kModernKernelParameterLimit);
-
-struct Sm100CapabilityEntry
-{
-    std::once_flag initialized;
-    bool supported{false};
-};
-
-//! Query the current device on every call, but cache its immutable compute
-//! capability by CUDA device ordinal. A single function-static `bool` would be
-//! incorrect: `cudaSetDevice` is thread-local, so different host threads in one
-//! process may launch on different GPU families. `call_once` makes the first
-//! major/minor query for each ordinal race-free; later validation calls perform
-//! only `cudaGetDevice` plus the cheap initialized check.
-bool isCurrentDeviceSm100FamilyCached()
-{
-    int device{-1};
-    TLLM_CUDA_CHECK(cudaGetDevice(&device));
-
-    static std::vector<Sm100CapabilityEntry> entries = []
-    {
-        int deviceCount{0};
-        TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
-        return std::vector<Sm100CapabilityEntry>(static_cast<std::size_t>(deviceCount));
-    }();
-
-    TLLM_CHECK_WITH_INFO(device >= 0 && static_cast<std::size_t>(device) < entries.size(),
-        "Current CUDA device ordinal %d is outside the cached "
-        "device range [0, %zu)",
-        device, entries.size());
-    auto& entry = entries[static_cast<std::size_t>(device)];
-    std::call_once(entry.initialized,
-        [device, &entry]
-        {
-            int major{0};
-            int minor{0};
-            TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
-            TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
-            int const sm = major * 10 + minor;
-            entry.supported = sm == 100 || sm == 103;
-        });
-    return entry.supported;
-}
 
 //! Reuse boundary for the fused implementation:
 //!
@@ -303,11 +260,10 @@ __host__ __device__ constexpr std::uint32_t compressedTransferHalfGroups(Nvfp4Bo
 //! instead has all lanes stream aligned uint4 grains, just like batchedCopy.
 //! A packed interval that is only 8-byte aligned uses its natural uint2 scale
 //! groups; an arbitrary staging offset and every scale tail remain byte-exact.
-//! No path writes cold padding.
-__device__ void flushCompactRangeToHostForGroup(std::uint8_t const* compactStages, OffloadLayerTask const& task,
+__device__ void flushCompactRangeToHost(std::uint8_t const* compactStages, OffloadLayerTask const& task,
     std::uint32_t role, std::uint32_t halfGroupsPerRole, std::uint32_t packedStageCapacityBytes,
     std::uint32_t packedDestinationOffset, std::uint32_t packedBytes, std::uint32_t scaleDestinationOffset,
-    std::uint32_t scaleBytes, std::uint32_t groupThread, std::uint32_t groupThreads)
+    std::uint32_t scaleBytes)
 {
     auto const* packedSource = compactStages;
     auto* packedDestination = selectPackedOutput(task, role, halfGroupsPerRole) + packedDestinationOffset;
@@ -317,16 +273,16 @@ __device__ void flushCompactRangeToHostForGroup(std::uint8_t const* compactStage
         && reinterpret_cast<std::uintptr_t>(packedDestination) % sizeof(uint2) == 0;
     std::uint32_t const packedVectorBytes = alignedPacked ? packedBytes - packedBytes % sizeof(uint4) : 0;
     std::uint32_t const packedPairBytes = alignedPackedPair ? packedBytes - packedBytes % sizeof(uint2) : 0;
-    for (std::uint32_t grain = groupThread; grain < packedVectorBytes / sizeof(uint4); grain += groupThreads)
+    for (std::uint32_t grain = threadIdx.x; grain < packedVectorBytes / sizeof(uint4); grain += blockDim.x)
     {
         reinterpret_cast<uint4*>(packedDestination)[grain] = reinterpret_cast<uint4 const*>(packedSource)[grain];
     }
-    for (std::uint32_t pair = packedVectorBytes / sizeof(uint2) + groupThread; pair < packedPairBytes / sizeof(uint2);
-         pair += groupThreads)
+    for (std::uint32_t pair = packedVectorBytes / sizeof(uint2) + threadIdx.x;
+         pair < packedPairBytes / sizeof(uint2); pair += blockDim.x)
     {
         reinterpret_cast<uint2*>(packedDestination)[pair] = reinterpret_cast<uint2 const*>(packedSource)[pair];
     }
-    for (std::uint32_t byte = packedPairBytes + groupThread; byte < packedBytes; byte += groupThreads)
+    for (std::uint32_t byte = packedPairBytes + threadIdx.x; byte < packedBytes; byte += blockDim.x)
     {
         packedDestination[byte] = packedSource[byte];
     }
@@ -336,23 +292,36 @@ __device__ void flushCompactRangeToHostForGroup(std::uint8_t const* compactStage
     bool const alignedScale = reinterpret_cast<std::uintptr_t>(scaleSource) % sizeof(uint4) == 0
         && reinterpret_cast<std::uintptr_t>(scaleDestination) % sizeof(uint4) == 0;
     std::uint32_t const scaleVectorBytes = alignedScale ? scaleBytes - scaleBytes % sizeof(uint4) : 0;
-    for (std::uint32_t grain = groupThread; grain < scaleVectorBytes / sizeof(uint4); grain += groupThreads)
+    for (std::uint32_t grain = threadIdx.x; grain < scaleVectorBytes / sizeof(uint4); grain += blockDim.x)
     {
         reinterpret_cast<uint4*>(scaleDestination)[grain] = reinterpret_cast<uint4 const*>(scaleSource)[grain];
     }
-    for (std::uint32_t byte = scaleVectorBytes + groupThread; byte < scaleBytes; byte += groupThreads)
+    for (std::uint32_t byte = scaleVectorBytes + threadIdx.x; byte < scaleBytes; byte += blockDim.x)
     {
         scaleDestination[byte] = scaleSource[byte];
     }
 }
 
-__device__ void flushCompactRangeToHost(std::uint8_t const* compactStages, OffloadLayerTask const& task,
-    std::uint32_t role, std::uint32_t halfGroupsPerRole, std::uint32_t packedStageCapacityBytes,
-    std::uint32_t packedDestinationOffset, std::uint32_t packedBytes, std::uint32_t scaleDestinationOffset,
-    std::uint32_t scaleBytes)
+//! Make the bytes between this compact record and the next aligned record
+//! deterministic before the opaque cold Slot can be persisted to Disk. The
+//! codec places every record at alignUp(previous record end, 16), so the last
+//! layer's same bounded tail is also the whole-Page trailing padding. The V
+//! block owns this range and clears it only after flushing V scales, the final
+//! payload segment. The adjacent payload and padding writes are therefore
+//! sequenced by one CTA; every other CTA owns a disjoint byte range. No new
+//! kernel or StorageManager path is required.
+__device__ void clearCompactRecordPadding(
+    OffloadLayerTask const& task, std::uint32_t halfGroupsPerRole, std::uint32_t role)
 {
-    flushCompactRangeToHostForGroup(compactStages, task, role, halfGroupsPerRole, packedStageCapacityBytes,
-        packedDestinationOffset, packedBytes, scaleDestinationOffset, scaleBytes, threadIdx.x, blockDim.x);
+    constexpr std::uint32_t alignment = alignof(uint4);
+    std::uint32_t const recordBytes
+        = 2U * (packedBytesPerRole(halfGroupsPerRole) + scaleBytesPerRole(halfGroupsPerRole));
+    std::uint32_t const paddingBytes = (alignment - recordBytes % alignment) % alignment;
+    if (blockIdx.x != 0U || role != 1U || threadIdx.x >= paddingBytes)
+    {
+        return;
+    }
+    task.compactPage[recordBytes + threadIdx.x] = 0U;
 }
 
 //! Join two consecutive eight-value FP8 words into one 16-byte GPU store.
@@ -630,6 +599,7 @@ __global__ void offloadFrom16BitTiledKernel(
             packedBytesPerRole(firstHalfGroup), packedBytesPerRole(halfGroups), firstHalfGroup / 2U, halfGroups / 2U);
         __syncthreads();
     }
+    clearCompactRecordPadding(task, halfGroupsPerRole, role);
 #endif
 }
 
@@ -707,6 +677,7 @@ __global__ void offloadFromFp8TiledKernel(
             packedBytesPerRole(firstHalfGroup), packedBytesPerRole(halfGroups), firstHalfGroup / 2U, halfGroups / 2U);
         __syncthreads();
     }
+    clearCompactRecordPadding(task, halfGroupsPerRole, role);
 #endif
 }
 
@@ -719,10 +690,10 @@ __global__ void offloadFromFp8TiledKernel(
 //! format's one-byte scale contract. This is the H2D counterpart of
 //! `flushCompactRangeToHost` and deliberately finishes with a CTA barrier before
 //! any dequantization reads the tile.
-__device__ void loadCompactRangeFromHostForGroup(std::uint8_t* compactStages, OnboardLayerTask const& task,
+__device__ void loadCompactRangeFromHost(std::uint8_t* compactStages, OnboardLayerTask const& task,
     std::uint32_t role, std::uint32_t halfGroupsPerRole, std::uint32_t packedStageCapacityBytes,
     std::uint32_t packedSourceOffset, std::uint32_t packedBytes, std::uint32_t scaleSourceOffset,
-    std::uint32_t scaleBytes, std::uint32_t groupThread, std::uint32_t groupThreads)
+    std::uint32_t scaleBytes)
 {
     auto const* packedSource = selectPackedInput(task, role, halfGroupsPerRole) + packedSourceOffset;
     auto* packedDestination = compactStages;
@@ -740,7 +711,7 @@ __device__ void loadCompactRangeFromHostForGroup(std::uint8_t* compactStages, On
     std::uint32_t const packedGrains = packedVectorBytes / sizeof(uint4);
     std::uint32_t const scaleGrains = scaleVectorBytes / sizeof(uint4);
     std::uint32_t const totalGrains = packedGrains + scaleGrains;
-    std::uint32_t const iterations = (totalGrains + groupThreads - 1U) / groupThreads;
+    std::uint32_t const iterations = (totalGrains + blockDim.x - 1U) / blockDim.x;
 
     for (std::uint32_t iteration = 0; iteration < iterations; ++iteration)
     {
@@ -748,7 +719,7 @@ __device__ void loadCompactRangeFromHostForGroup(std::uint8_t* compactStages, On
         {
             cp_async_wait_group<kHostLoadAsyncStages - 1>();
         }
-        std::uint32_t const grain = groupThreads * iteration + groupThread;
+        std::uint32_t const grain = blockDim.x * iteration + threadIdx.x;
         bool const valid = grain < totalGrains;
         auto const* source = reinterpret_cast<uint4 const*>(packedSource);
         auto* destination = reinterpret_cast<uint4*>(packedDestination);
@@ -770,27 +741,19 @@ __device__ void loadCompactRangeFromHostForGroup(std::uint8_t* compactStages, On
     // D%16 makes packed intervals an exact number of uint2 scale groups.
     // Aligned Slots use uint4/uint2; an arbitrary staging suballocation uses
     // the byte tail without changing the compact record.
-    for (std::uint32_t pair = packedVectorBytes / sizeof(uint2) + groupThread; pair < packedPairBytes / sizeof(uint2);
-         pair += groupThreads)
+    for (std::uint32_t pair = packedVectorBytes / sizeof(uint2) + threadIdx.x;
+         pair < packedPairBytes / sizeof(uint2); pair += blockDim.x)
     {
         reinterpret_cast<uint2*>(packedDestination)[pair] = reinterpret_cast<uint2 const*>(packedSource)[pair];
     }
-    for (std::uint32_t byte = packedPairBytes + groupThread; byte < packedBytes; byte += groupThreads)
+    for (std::uint32_t byte = packedPairBytes + threadIdx.x; byte < packedBytes; byte += blockDim.x)
     {
         packedDestination[byte] = packedSource[byte];
     }
-    for (std::uint32_t byte = scaleVectorBytes + groupThread; byte < scaleBytes; byte += groupThreads)
+    for (std::uint32_t byte = scaleVectorBytes + threadIdx.x; byte < scaleBytes; byte += blockDim.x)
     {
         scaleDestination[byte] = scaleSource[byte];
     }
-}
-
-__device__ void loadCompactRangeFromHost(std::uint8_t* compactStages, OnboardLayerTask const& task, std::uint32_t role,
-    std::uint32_t halfGroupsPerRole, std::uint32_t packedStageCapacityBytes, std::uint32_t packedSourceOffset,
-    std::uint32_t packedBytes, std::uint32_t scaleSourceOffset, std::uint32_t scaleBytes)
-{
-    loadCompactRangeFromHostForGroup(compactStages, task, role, halfGroupsPerRole, packedStageCapacityBytes,
-        packedSourceOffset, packedBytes, scaleSourceOffset, scaleBytes, threadIdx.x, blockDim.x);
     __syncthreads();
 }
 
@@ -1083,7 +1046,7 @@ void launchAndDrainOnFailure(cudaStream_t stream, Launch const& launch)
 Nvfp4BoundaryPreparedPlan prepareNvfp4BoundaryPlan(
     std::vector<Nvfp4BoundaryLayerPlan> const& layers, std::size_t coldPageBytes, Nvfp4BoundaryRuntimeType runtimeType)
 {
-    TLLM_CHECK_WITH_INFO(isCurrentDeviceSm100FamilyCached(), "NVFP4 boundary kernels require an SM100-family GPU");
+    TLLM_CHECK_WITH_INFO(common::isSM100Family(), "NVFP4 boundary kernels require an SM100-family GPU");
     TLLM_CHECK_WITH_INFO(!layers.empty(), "NVFP4 boundary launch requires at least one Attention layer");
     TLLM_CHECK_WITH_INFO(layers.size() <= kMaxLayersPerLaunch,
         "NVFP4 boundary launch supports at most %u local "

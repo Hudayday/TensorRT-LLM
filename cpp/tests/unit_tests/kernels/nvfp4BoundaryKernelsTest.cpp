@@ -573,8 +573,12 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
             EXPECT_EQ(region(2 * packed, scale), references[page][0].scales);
             EXPECT_EQ(region(2 * packed + scale, scale), references[page][1].scales);
             auto const padding = region(2U * (packed + scale), compactSlotBytes - 2U * (packed + scale));
-            EXPECT_TRUE(
-                std::all_of(padding.begin(), padding.end(), [](std::uint8_t value) { return value == kCanary; }));
+            EXPECT_TRUE(std::all_of(padding.begin(), padding.end(), [](std::uint8_t value) { return value == 0U; }));
+
+            std::size_t const unusedBase = coldBaseOffset + (2U * page + 1U) * compactSlotBytes;
+            EXPECT_TRUE(std::all_of(payload.begin() + static_cast<std::ptrdiff_t>(unusedBase),
+                payload.begin() + static_cast<std::ptrdiff_t>(unusedBase + compactSlotBytes),
+                [](std::uint8_t value) { return value == kCanary; }));
         }
     };
 
@@ -590,6 +594,24 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         ASSERT_EQ(cudaEventSynchronize(offloadComplete), cudaSuccess);
         ASSERT_EQ(cudaEventDestroy(offloadComplete), cudaSuccess);
         verifyCompressedPages();
+
+        std::size_t const compactPayloadBytes = 2U * (packedBytes(geometry) + scaleBytes(geometry));
+        if (compactPayloadBytes != compactSlotBytes)
+        {
+            // A cold Slot may be recycled from another lifecycle before a raw
+            // Host-to-Disk copy. Poison every selected Slot, encode the same
+            // input again, and require the complete serialized bytes—including
+            // padding—to be identical. Unselected Slots remain guarded above.
+            auto const firstSerialization = compactPages.payload();
+            for (std::size_t page = 0; page < numPages; ++page)
+            {
+                std::memset(compactBase + 2U * page * compactSlotBytes, 0x5A, compactSlotBytes);
+            }
+            tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(offloadTasks, inputPlan, compactBase, stream);
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            EXPECT_EQ(compactPages.payload(), firstSerialization);
+            verifyCompressedPages();
+        }
     }
 
     std::vector<Nvfp4BoundaryOnboardPageTask> onboardTasks;
@@ -826,15 +848,17 @@ TEST(Nvfp4BoundaryWholePageTest, DifferentLayerScalesRemainInOneCompletePageBatc
 
     constexpr std::size_t numLayers = 2;
     RawKind constexpr kind = RawKind::kBfloat16;
-    std::size_t const rawSlotBytes = rawBytes(kind, kDefaultGeometry);
-    std::size_t const layerRecordBytes = 2U * (packedBytes(kDefaultGeometry) + scaleBytes(kDefaultGeometry));
-    std::size_t const coldPageBytes = numLayers * layerRecordBytes;
+    PageGeometry constexpr geometry = kMinimumCompactGeometry;
+    std::size_t const rawSlotBytes = rawBytes(kind, geometry);
+    std::size_t const layerRecordBytes = 2U * (packedBytes(geometry) + scaleBytes(geometry));
+    std::size_t const layerRecordStride = roundUp(layerRecordBytes, alignof(uint4));
+    std::size_t const coldPageBytes = numLayers * layerRecordStride;
 
     std::array<std::unique_ptr<DeviceRegion>, numLayers> rawInputK;
     std::array<std::unique_ptr<DeviceRegion>, numLayers> rawInputV;
     std::array<std::unique_ptr<DeviceRegion>, numLayers> rawOutputK;
     std::array<std::unique_ptr<DeviceRegion>, numLayers> rawOutputV;
-    std::array<Nvfp4BoundaryKernelParams, numLayers> params{makeParams(), makeParams()};
+    std::array<Nvfp4BoundaryKernelParams, numLayers> params{makeParams(geometry), makeParams(geometry)};
     // Deliberately give the second layer a different calibrated K/V convention.
     // A correct whole-Page launch selects these values through blockIdx.y; a
     // per-layer host loop is neither required nor permitted by the kernel ABI.
@@ -858,18 +882,17 @@ TEST(Nvfp4BoundaryWholePageTest, DifferentLayerScalesRemainInOneCompletePageBatc
         for (std::uint32_t role = 0; role < 2; ++role)
         {
             rawHost[layer][role]
-                = makeRawPage(kind, layer, role, params[layer], kDefaultGeometry, InputPattern::kDense);
-            references[layer][role]
-                = compressReference(rawHost[layer][role], kind, role, params[layer], kDefaultGeometry);
+                = makeRawPage(kind, layer, role, params[layer], geometry, InputPattern::kDense);
+            references[layer][role] = compressReference(rawHost[layer][role], kind, role, params[layer], geometry);
         }
         rawInputK[layer]->copyFrom(rawHost[layer][0]);
         rawInputV[layer]->copyFrom(rawHost[layer][1]);
         inputPlans.push_back({reinterpret_cast<std::uintptr_t>(rawInputK[layer]->data()),
             reinterpret_cast<std::uintptr_t>(rawInputV[layer]->data()), rawSlotBytes, rawSlotBytes,
-            layer * layerRecordBytes, params[layer]});
+            layer * layerRecordStride, params[layer]});
         outputPlans.push_back({reinterpret_cast<std::uintptr_t>(rawOutputK[layer]->data()),
             reinterpret_cast<std::uintptr_t>(rawOutputV[layer]->data()), rawSlotBytes, rawSlotBytes,
-            layer * layerRecordBytes, params[layer]});
+            layer * layerRecordStride, params[layer]});
     }
 
     MappedHostRegion compactPage(coldPageBytes);
@@ -883,8 +906,8 @@ TEST(Nvfp4BoundaryWholePageTest, DifferentLayerScalesRemainInOneCompletePageBatc
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     auto const compact = compactPage.payload();
-    std::size_t const packed = packedBytes(kDefaultGeometry);
-    std::size_t const scale = scaleBytes(kDefaultGeometry);
+    std::size_t const packed = packedBytes(geometry);
+    std::size_t const scale = scaleBytes(geometry);
     auto const compactRegion = [&](std::size_t offset, std::size_t bytes)
     {
         return std::vector<std::uint8_t>(compact.begin() + static_cast<std::ptrdiff_t>(offset),
@@ -892,15 +915,17 @@ TEST(Nvfp4BoundaryWholePageTest, DifferentLayerScalesRemainInOneCompletePageBatc
     };
     for (std::size_t layer = 0; layer < numLayers; ++layer)
     {
-        std::size_t const base = layer * layerRecordBytes;
+        std::size_t const base = layer * layerRecordStride;
         EXPECT_EQ(compactRegion(base, packed), references[layer][0].packed);
         EXPECT_EQ(compactRegion(base + packed, packed), references[layer][1].packed);
         EXPECT_EQ(compactRegion(base + 2U * packed, scale), references[layer][0].scales);
         EXPECT_EQ(compactRegion(base + 2U * packed + scale, scale), references[layer][1].scales);
+        auto const padding = compactRegion(base + layerRecordBytes, layerRecordStride - layerRecordBytes);
+        EXPECT_TRUE(std::all_of(padding.begin(), padding.end(), [](std::uint8_t value) { return value == 0U; }));
         EXPECT_EQ(rawOutputK[layer]->copyToHost(),
-            decompressReference(references[layer][0], kind, 0, params[layer], kDefaultGeometry));
+            decompressReference(references[layer][0], kind, 0, params[layer], geometry));
         EXPECT_EQ(rawOutputV[layer]->copyToHost(),
-            decompressReference(references[layer][1], kind, 1, params[layer], kDefaultGeometry));
+            decompressReference(references[layer][1], kind, 1, params[layer], geometry));
     }
     compactPage.expectCanaries();
 }

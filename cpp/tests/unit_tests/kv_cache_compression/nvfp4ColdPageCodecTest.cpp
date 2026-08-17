@@ -202,6 +202,17 @@ TEST(Nvfp4ColdPageCodecTest, NonEmptyAttentionBatchRejectsNullStream)
     EXPECT_EQ(gLaunch.onboardCalls, 0);
 }
 
+TEST(Nvfp4ColdPageCodecTest, OnlyFp8RuntimeRequiresFp8Scales)
+{
+    auto layers = makeLayers(1);
+    layers.front().fp8ScaleOrigQuant = {0.0F, 0.0F};
+    layers.front().fp8ScaleQuantOrig = {0.0F, 0.0F};
+    EXPECT_NO_THROW({ Nvfp4ColdPageCodec codec{layers}; });
+
+    layers.front().runtimeType = kernels::Nvfp4BoundaryRuntimeType::kFp8E4m3;
+    EXPECT_THROW({ Nvfp4ColdPageCodec codec{layers}; }, std::invalid_argument);
+}
+
 TEST(Nvfp4ColdPageCodecTest, ConfigureConsumesAllPoolGroupsOnceAndDiscoversLifecycleMembership)
 {
     auto layers = makeLayers(2);

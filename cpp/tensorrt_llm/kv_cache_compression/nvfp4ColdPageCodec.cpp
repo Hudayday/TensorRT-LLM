@@ -22,7 +22,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <iterator>
 #include <limits>
 #include <map>
 #include <set>
@@ -128,14 +127,17 @@ Nvfp4ColdPageCodec::Nvfp4ColdPageCodec(std::vector<Nvfp4ColdPageLayerConfig> lay
         {
             throw std::invalid_argument("Nvfp4ColdPageCodec received an unsupported runtime type");
         }
-        for (auto const& scales : {config.nvfp4ScaleOrigQuant, config.nvfp4ScaleQuantOrig, config.fp8ScaleOrigQuant,
-                 config.fp8ScaleQuantOrig})
+        auto const validScales = [](auto const& scales)
         {
-            if (!std::all_of(
-                    scales.begin(), scales.end(), [](float value) { return std::isfinite(value) && value > 0; }))
-            {
-                throw std::invalid_argument("Nvfp4ColdPageCodec scales must be finite and positive");
-            }
+            return std::all_of(
+                scales.begin(), scales.end(), [](float value) { return std::isfinite(value) && value > 0; });
+        };
+        if (!validScales(config.nvfp4ScaleOrigQuant) || !validScales(config.nvfp4ScaleQuantOrig)
+            || (config.runtimeType == kernels::Nvfp4BoundaryRuntimeType::kFp8E4m3
+                && (!validScales(config.fp8ScaleOrigQuant) || !validScales(config.fp8ScaleQuantOrig))))
+        {
+            throw std::invalid_argument(
+                "Nvfp4ColdPageCodec scales used by the runtime dtype must be finite and positive");
         }
     }
 }
