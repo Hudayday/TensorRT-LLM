@@ -83,8 +83,10 @@ struct Nvfp4BoundaryOnboardPageTask
 //! the original domain. K and V are independent and indexed as [0] and [1].
 //!
 //! Pointer address spaces are a caller-side admission contract: raw buffers are
-//! GPU allocations and compact buffers are CUDA-mapped Host allocations. The
-//! hot path intentionally does not query every pointer with CUDA at launch.
+//! aligned GPU allocations and compact buffers are CUDA-mapped Host
+//! allocations. A compact base may be only byte-aligned; aligned records retain
+//! vector transfers and other staging offsets use the same kernel's byte path.
+//! The hot path intentionally does not query every pointer with CUDA at launch.
 struct Nvfp4BoundaryKernelParams
 {
     std::int32_t numKvHeads;
@@ -134,11 +136,9 @@ struct Nvfp4BoundaryPreparedPlan
 {
     std::array<Nvfp4BoundaryLayerPlan, kNvfp4BoundaryMaxLayersPerLaunch> layers{};
     std::uint32_t numLayers = 0;
-    std::uint32_t maxHalfGroups = 0;
     std::uint32_t maxTileHalfGroups = 0;
     std::size_t coldPageBytes = 0;
     Nvfp4BoundaryRuntimeType runtimeType = Nvfp4BoundaryRuntimeType::kFloat16;
-    bool allStandardGeometry = false;
 };
 
 //! Validate and freeze one lifecycle's immutable boundary-transform plan.

@@ -86,8 +86,8 @@ public:
     //! layer group. Zero indicates failure or an unknown layer group.
     [[nodiscard]] std::size_t queryColdPageBytes(kv::LayerGroupId layerGroupId) const noexcept override;
 
-    //! Merge lifecycle calls only when their complete physical NVFP4 transform
-    //! is identical. KVCM still verifies same-PoolGroup membership and stride.
+    //! Keep batching lifecycle-keyed. KVCM may share physical cold PoolGroups
+    //! without promising that two lifecycle transforms are interchangeable.
     [[nodiscard]] kv::LayerGroupId getBatchingLayerGroupId(kv::LayerGroupId layerGroupId) const noexcept override;
 
     //! Request Host Page-index pairs. encode()/decode() lower every pair into
@@ -112,7 +112,6 @@ private:
 
     struct LayerGroupState
     {
-        kv::PoolGroupIndex poolGroupIndex{0};
         Transform transform = Transform::kLosslessConcat;
         kernels::Nvfp4BoundaryPreparedPlan preparedPlan;
         std::size_t coldPageBytes = 0;
@@ -122,7 +121,6 @@ private:
 
     std::vector<Nvfp4ColdPageLayerConfig> mLayerConfigs;
     std::map<kv::LayerGroupId, LayerGroupState> mLayerGroups;
-    std::map<kv::LayerGroupId, kv::LayerGroupId> mBatchingLayerGroups;
     std::unique_ptr<kv::IKvCacheColdPageCodec> mLosslessCodec;
     bool mConfigured = false;
 };

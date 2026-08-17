@@ -213,6 +213,8 @@ TEST(Nvfp4ColdPageCodecTest, ConfigureConsumesAllPoolGroupsOnceAndDiscoversLifec
     ASSERT_TRUE(codec.configure(descs.data(), kv::PoolGroupIndex{2}));
     EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{0}), 2U * kLayerColdBytesAligned);
     EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{1}), 2U * kLayerColdBytesAligned);
+    EXPECT_EQ(codec.getBatchingLayerGroupId(kv::LayerGroupId{0}), kv::LayerGroupId{0});
+    EXPECT_EQ(codec.getBatchingLayerGroupId(kv::LayerGroupId{1}), kv::LayerGroupId{1});
     EXPECT_FALSE(codec.configure(descs.data(), kv::PoolGroupIndex{2}));
 }
 

@@ -62,22 +62,6 @@ target_include_directories(
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
 target_link_libraries(nvfp4BoundaryKernelsTest PRIVATE CUDA::cudart
                                                        CUDA::cuda_driver)
-set(NVFP4_BOUNDARY_PARTIAL_PAGE_TEST_SRC
-    nvfp4BoundaryPartialPageTest.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/kernels/nvfp4BoundaryKernels.cu
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/assert.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/envUtils.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/logger.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/stringUtils.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/tllmException.cpp)
-add_gtest(nvfp4BoundaryPartialPageTest
-          "${NVFP4_BOUNDARY_PARTIAL_PAGE_TEST_SRC}" NO_TLLM_LINKAGE)
-target_include_directories(
-  nvfp4BoundaryPartialPageTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-target_link_libraries(nvfp4BoundaryPartialPageTest PRIVATE CUDA::cudart
-                                                          CUDA::cuda_driver)
 add_gtest(shiftKCacheKernelTest shiftKCacheKernelTest.cu)
 add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
 add_gtest(stopCriteriaKernelsTest stopCriteriaKernelsTest.cpp)

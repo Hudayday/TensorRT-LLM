@@ -65,9 +65,10 @@ constexpr PageGeometry kPackedBodyAndTailGeometry{1, 3, 16};
 constexpr PageGeometry kSmallVectorGeometry{1, 4, 16};
 constexpr PageGeometry kLinearScaleTailGeometry{1, 5, 32};
 constexpr PageGeometry kTiledLinearScaleTailGeometry{1, 4097, 16};
-constexpr PageGeometry kSecondCtaTailGeometry{2, 20, 64};
+constexpr PageGeometry kCrossRowTileGeometry{1, 343, 48};
+constexpr PageGeometry kLargeHeadDimTailGeometry{1, 1, 65552};
 constexpr PageGeometry kModelLikeGeometry{8, 64, 128};
-constexpr PageGeometry kLargeGeometry{64, 64, 128};
+constexpr std::array<std::int32_t, 5> kValidTokenCounts{1, 16, 17, 63, 64};
 
 enum class RawKind
 {
@@ -270,6 +271,11 @@ std::size_t rawBytes(RawKind kind, PageGeometry const& geometry)
     return numElements(geometry) * (kind == RawKind::kFp8 ? 1 : 2);
 }
 
+std::size_t rawElementBytes(RawKind kind)
+{
+    return kind == RawKind::kFp8 ? 1U : 2U;
+}
+
 std::size_t packedBytes(PageGeometry const& geometry)
 {
     return numElements(geometry) / 2;
@@ -295,6 +301,17 @@ Nvfp4BoundaryKernelParams makeParams(PageGeometry const& geometry = kDefaultGeom
     params.fp8ScaleQuantOrig[0] = 0.5F;
     params.fp8ScaleQuantOrig[1] = 0.25F;
     return params;
+}
+
+Nvfp4BoundaryRuntimeType runtimeType(RawKind kind)
+{
+    switch (kind)
+    {
+    case RawKind::kFloat16: return Nvfp4BoundaryRuntimeType::kFloat16;
+    case RawKind::kBfloat16: return Nvfp4BoundaryRuntimeType::kBfloat16;
+    case RawKind::kFp8: return Nvfp4BoundaryRuntimeType::kFp8E4m3;
+    }
+    return Nvfp4BoundaryRuntimeType::kFloat16;
 }
 
 template <typename T>
@@ -486,7 +503,7 @@ std::vector<std::uint8_t> decompressReference(ReferenceNvfp4 const& compressed, 
 
 void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultGeometry,
     std::size_t numPages = kDefaultNumPages, InputPattern inputPattern = InputPattern::kDense,
-    bool synchronizeBetweenDirections = true, bool repeatRoundTrip = false)
+    bool synchronizeBetweenDirections = true, bool repeatRoundTrip = false, std::size_t coldBaseOffset = 0)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
     if (!tensorrt_llm::common::isSM100Family())
@@ -497,9 +514,9 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
     CudaStream stream;
     std::size_t const rawSlotBytes = rawBytes(kind, geometry);
     // Nvfp4ColdPageCodec preserves the exact compact payload but rounds each
-    // cold Slot stride to the uint4 alignment required by the mapped-Host
-    // vector path. Keep the standalone kernel fixture identical to that
-    // production layout, including small records with alignment padding.
+    // cold Slot stride to keep every relative record start vector-friendly.
+    // The base itself may be an arbitrary staging offset; the test below
+    // exercises that byte path without changing the production Slot layout.
     std::size_t const compactSlotBytes = roundUp(2U * (packedBytes(geometry) + scaleBytes(geometry)), alignof(uint4));
     // Use every other Slot to prove that one launch handles non-contiguous KVCM
     // Page indices. The Layer plan owns bases/strides; Page tasks carry only the
@@ -509,7 +526,8 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
     DeviceRegion rawInputV(slotCapacity * rawSlotBytes);
     DeviceRegion rawOutputK(slotCapacity * rawSlotBytes);
     DeviceRegion rawOutputV(slotCapacity * rawSlotBytes);
-    MappedHostRegion compactPages(slotCapacity * compactSlotBytes);
+    MappedHostRegion compactPages(coldBaseOffset + slotCapacity * compactSlotBytes);
+    auto* compactBase = compactPages.bytes() + coldBaseOffset;
     std::vector<std::array<std::vector<std::uint8_t>, 2>> rawHost(numPages);
     std::vector<Nvfp4BoundaryOffloadPageTask> offloadTasks;
     offloadTasks.reserve(numPages);
@@ -527,16 +545,7 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         reinterpret_cast<std::uintptr_t>(rawInputV.data()), rawSlotBytes, rawSlotBytes, 0U, params};
     std::vector<Nvfp4BoundaryLayerPlan> const layers{layer};
 
-    auto runtimeType = Nvfp4BoundaryRuntimeType::kFp8E4m3;
-    if (kind == RawKind::kFloat16)
-    {
-        runtimeType = Nvfp4BoundaryRuntimeType::kFloat16;
-    }
-    else if (kind == RawKind::kBfloat16)
-    {
-        runtimeType = Nvfp4BoundaryRuntimeType::kBfloat16;
-    }
-    auto const inputPlan = tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(layers, compactSlotBytes, runtimeType);
+    auto const inputPlan = tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(layers, compactSlotBytes, runtimeType(kind));
     std::vector<std::array<ReferenceNvfp4, 2>> references(numPages);
     for (std::size_t page = 0; page < numPages; ++page)
     {
@@ -546,14 +555,16 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
 
     auto const verifyCompressedPages = [&]
     {
+        auto const payload = compactPages.payload();
+        EXPECT_TRUE(std::all_of(payload.begin(), payload.begin() + static_cast<std::ptrdiff_t>(coldBaseOffset),
+            [](std::uint8_t value) { return value == kCanary; }));
         for (std::size_t page = 0; page < numPages; ++page)
         {
             std::size_t const packed = packedBytes(geometry);
             std::size_t const scale = scaleBytes(geometry);
-            std::size_t const base = 2U * page * compactSlotBytes;
+            std::size_t const base = coldBaseOffset + 2U * page * compactSlotBytes;
             auto const region = [&](std::size_t offset, std::size_t bytes)
             {
-                auto const payload = compactPages.payload();
                 return std::vector<std::uint8_t>(payload.begin() + static_cast<std::ptrdiff_t>(base + offset),
                     payload.begin() + static_cast<std::ptrdiff_t>(base + offset + bytes));
             };
@@ -567,7 +578,7 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         }
     };
 
-    tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(offloadTasks, inputPlan, compactPages.data(), stream);
+    tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(offloadTasks, inputPlan, compactBase, stream);
 
     if (synchronizeBetweenDirections)
     {
@@ -591,8 +602,8 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
     Nvfp4BoundaryLayerPlan const outputLayer{reinterpret_cast<std::uintptr_t>(rawOutputK.data()),
         reinterpret_cast<std::uintptr_t>(rawOutputV.data()), rawSlotBytes, rawSlotBytes, 0U, params};
     auto const outputPlan
-        = tensorrt_llm::kernels::prepareNvfp4BoundaryPlan({outputLayer}, compactSlotBytes, runtimeType);
-    tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(onboardTasks, outputPlan, compactPages.data(), stream);
+        = tensorrt_llm::kernels::prepareNvfp4BoundaryPlan({outputLayer}, compactSlotBytes, runtimeType(kind));
+    tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(onboardTasks, outputPlan, compactBase, stream);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     if (!synchronizeBetweenDirections)
@@ -620,10 +631,8 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
                 references[page][role] = compressReference(restored, kind, role, params, geometry);
             }
         }
-        tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
-            offloadTasks, outputPlan, compactPages.data(), stream);
-        tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(
-            onboardTasks, inputPlan, compactPages.data(), stream);
+        tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(offloadTasks, outputPlan, compactBase, stream);
+        tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(onboardTasks, inputPlan, compactBase, stream);
         ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
         verifyCompressedPages();
     }
@@ -638,6 +647,152 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         EXPECT_EQ(finalV.copyToHost(slotOffset, rawSlotBytes),
             decompressReference(references[page][1], kind, 1, params, geometry));
     }
+    rawInputK.expectCanaries();
+    rawInputV.expectCanaries();
+    rawOutputK.expectCanaries();
+    rawOutputV.expectCanaries();
+    compactPages.expectCanaries();
+}
+
+std::vector<std::uint8_t> makePartialRawPage(RawKind kind, std::int32_t validTokens, bool zeroTail, std::uint32_t role,
+    Nvfp4BoundaryKernelParams const& params, PageGeometry const& geometry)
+{
+    std::vector<std::uint8_t> bytes(rawBytes(kind, geometry));
+    for (std::int32_t head = 0; head < geometry.numHeads; ++head)
+    {
+        for (std::int32_t token = 0; token < geometry.tokensPerPage; ++token)
+        {
+            for (std::int32_t dim = 0; dim < geometry.headDim; ++dim)
+            {
+                std::size_t const index
+                    = (static_cast<std::size_t>(head) * geometry.tokensPerPage + token) * geometry.headDim + dim;
+                float value = 0.0F;
+                if (token < validTokens)
+                {
+                    // The zero-tail and stale-tail Pages have identical valid
+                    // rows. K and V deliberately retain different values and
+                    // global scales.
+                    value = static_cast<float>((dim % 13) - 6) * 0.125F + static_cast<float>(head) * 0.03125F
+                        + static_cast<float>(token) * 0.0078125F + static_cast<float>(role) * 0.0625F;
+                }
+                else if (!zeroTail)
+                {
+                    // Model a recycled Slot with arbitrary inactive rows. A
+                    // 16-value scale group is contained within one token row,
+                    // so these values must not affect the valid prefix.
+                    if (dim % 31 == 0)
+                    {
+                        value = std::numeric_limits<float>::quiet_NaN();
+                    }
+                    else if (dim % 29 == 0)
+                    {
+                        value = std::numeric_limits<float>::infinity();
+                    }
+                    else
+                    {
+                        value = static_cast<float>((dim % 9) - 4) * 0.25F + static_cast<float>(token) * 0.015625F
+                            + static_cast<float>(head + 3 * role) * 0.046875F;
+                    }
+                }
+                storeRawValue(bytes, kind, index, value, params, role);
+            }
+        }
+    }
+    return bytes;
+}
+
+void expectSameValidPrefix(std::vector<std::uint8_t> const& lhs, std::vector<std::uint8_t> const& rhs, RawKind kind,
+    std::int32_t validTokens, PageGeometry const& geometry)
+{
+    std::size_t const rowBytes = static_cast<std::size_t>(geometry.headDim) * rawElementBytes(kind);
+    for (std::int32_t head = 0; head < geometry.numHeads; ++head)
+    {
+        for (std::int32_t token = 0; token < validTokens; ++token)
+        {
+            std::size_t const offset = (static_cast<std::size_t>(head) * geometry.tokensPerPage + token) * rowBytes;
+            EXPECT_EQ(std::memcmp(lhs.data() + offset, rhs.data() + offset, rowBytes), 0)
+                << "valid prefix differs at head=" << head << " token=" << token;
+        }
+    }
+}
+
+void expectZeroTail(
+    std::vector<std::uint8_t> const& bytes, RawKind kind, std::int32_t validTokens, PageGeometry const& geometry)
+{
+    std::size_t const rowBytes = static_cast<std::size_t>(geometry.headDim) * rawElementBytes(kind);
+    std::vector<std::uint8_t> const zero(rowBytes, 0);
+    for (std::int32_t head = 0; head < geometry.numHeads; ++head)
+    {
+        for (std::int32_t token = validTokens; token < geometry.tokensPerPage; ++token)
+        {
+            std::size_t const offset = (static_cast<std::size_t>(head) * geometry.tokensPerPage + token) * rowBytes;
+            EXPECT_EQ(std::memcmp(bytes.data() + offset, zero.data(), rowBytes), 0)
+                << "zero tail changed at head=" << head << " token=" << token;
+        }
+    }
+}
+
+void runPartialPageTailIsolation(RawKind kind)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    if (!tensorrt_llm::common::isSM100Family())
+    {
+        GTEST_SKIP() << "NVFP4 boundary kernels require an SM100-family GPU";
+    }
+
+    PageGeometry constexpr geometry = kModelLikeGeometry;
+    std::size_t constexpr pageVariants = 2U;
+    std::size_t const numPages = pageVariants * kValidTokenCounts.size();
+    Nvfp4BoundaryKernelParams const params = makeParams(geometry);
+    std::size_t const rawSlotBytes = rawBytes(kind, geometry);
+    std::size_t const compactSlotBytes = roundUp(2U * (packedBytes(geometry) + scaleBytes(geometry)), alignof(uint4));
+
+    DeviceRegion rawInputK(numPages * rawSlotBytes);
+    DeviceRegion rawInputV(numPages * rawSlotBytes);
+    DeviceRegion rawOutputK(numPages * rawSlotBytes);
+    DeviceRegion rawOutputV(numPages * rawSlotBytes);
+    MappedHostRegion compactPages(numPages * compactSlotBytes);
+    std::vector<Nvfp4BoundaryOffloadPageTask> offloadTasks;
+    std::vector<Nvfp4BoundaryOnboardPageTask> onboardTasks;
+    offloadTasks.reserve(numPages);
+    onboardTasks.reserve(numPages);
+    for (std::size_t page = 0; page < numPages; ++page)
+    {
+        std::int32_t const validTokens = kValidTokenCounts[page / pageVariants];
+        bool const zeroTail = page % pageVariants == 0U;
+        rawInputK.copyFrom(page * rawSlotBytes, makePartialRawPage(kind, validTokens, zeroTail, 0, params, geometry));
+        rawInputV.copyFrom(page * rawSlotBytes, makePartialRawPage(kind, validTokens, zeroTail, 1, params, geometry));
+        auto const pageIndex = static_cast<std::int32_t>(page);
+        offloadTasks.push_back({pageIndex, pageIndex});
+        onboardTasks.push_back({pageIndex, pageIndex});
+    }
+
+    Nvfp4BoundaryLayerPlan const inputLayer{reinterpret_cast<std::uintptr_t>(rawInputK.data()),
+        reinterpret_cast<std::uintptr_t>(rawInputV.data()), rawSlotBytes, rawSlotBytes, 0U, params};
+    Nvfp4BoundaryLayerPlan const outputLayer{reinterpret_cast<std::uintptr_t>(rawOutputK.data()),
+        reinterpret_cast<std::uintptr_t>(rawOutputV.data()), rawSlotBytes, rawSlotBytes, 0U, params};
+    auto const inputPlan
+        = tensorrt_llm::kernels::prepareNvfp4BoundaryPlan({inputLayer}, compactSlotBytes, runtimeType(kind));
+    auto const outputPlan
+        = tensorrt_llm::kernels::prepareNvfp4BoundaryPlan({outputLayer}, compactSlotBytes, runtimeType(kind));
+    CudaStream stream;
+    tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(offloadTasks, inputPlan, compactPages.data(), stream);
+    tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(onboardTasks, outputPlan, compactPages.data(), stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    for (std::size_t pair = 0; pair < kValidTokenCounts.size(); ++pair)
+    {
+        std::int32_t const validTokens = kValidTokenCounts[pair];
+        for (std::uint32_t role = 0; role < 2U; ++role)
+        {
+            auto const& output = role == 0U ? rawOutputK : rawOutputV;
+            auto const zeroOutput = output.copyToHost(pageVariants * pair * rawSlotBytes, rawSlotBytes);
+            auto const staleOutput = output.copyToHost((pageVariants * pair + 1U) * rawSlotBytes, rawSlotBytes);
+            expectSameValidPrefix(zeroOutput, staleOutput, kind, validTokens, geometry);
+            expectZeroTail(zeroOutput, kind, validTokens, geometry);
+        }
+    }
+
     rawInputK.expectCanaries();
     rawInputV.expectCanaries();
     rawOutputK.expectCanaries();
@@ -830,16 +985,6 @@ void expectWholePageLaunchTopology(std::size_t numPages, std::vector<std::uint32
         { tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(onboardPages, plan, coldPages.data(), stream); });
 }
 
-TEST(Nvfp4BoundaryWholePageTest, TwoHundredFiftySixPagesAndAllLayersUseOneKernelPerDirection)
-{
-    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    if (!tensorrt_llm::common::isSM100Family())
-    {
-        GTEST_SKIP() << "NVFP4 boundary kernels require an SM100-family GPU";
-    }
-    expectWholePageLaunchTopology(256, {256});
-}
-
 TEST(Nvfp4BoundaryWholePageTest, TwoHundredFiftySevenPagesUseExactlyTwoWholePageKernelsPerDirection)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
@@ -872,6 +1017,12 @@ TEST(Nvfp4BoundaryGeometryTest, SupportsPackedVectorBodyWithLeadingAndTrailingSc
     runBoundaryRoundTrip(RawKind::kFp8, kPackedBodyAndTailGeometry, 1);
 }
 
+TEST(Nvfp4BoundaryGeometryTest, SupportsByteAlignedColdBase)
+{
+    runBoundaryRoundTrip(RawKind::kBfloat16, kPackedBodyAndTailGeometry, 1, InputPattern::kDense, true, false, 1);
+    runBoundaryRoundTrip(RawKind::kFp8, kPackedBodyAndTailGeometry, 1, InputPattern::kDense, true, false, 1);
+}
+
 TEST(Nvfp4BoundaryGeometryTest, SupportsOddTokenCountAndNonVectorScaleTail)
 {
     runBoundaryRoundTrip(RawKind::kFloat16, kLinearScaleTailGeometry, 1);
@@ -885,9 +1036,14 @@ TEST(Nvfp4BoundaryGeometryTest, SupportsTiledPackedAndScaleTails)
     runBoundaryRoundTrip(RawKind::kFp8, kTiledLinearScaleTailGeometry, 1);
 }
 
-TEST(Nvfp4BoundaryGeometryTest, SupportsSecondCtaWithPartialThreadTail)
+TEST(Nvfp4BoundaryGeometryTest, SupportsTileBoundaryInsideOneRowWithByteAlignedColdBase)
 {
-    runBoundaryRoundTrip(RawKind::kFloat16, kSecondCtaTailGeometry, 1);
+    runBoundaryRoundTrip(RawKind::kBfloat16, kCrossRowTileGeometry, 1, InputPattern::kDense, true, false, 1);
+}
+
+TEST(Nvfp4BoundaryGeometryTest, SupportsLargeHeadDimWithATwoHalfGroupTail)
+{
+    runBoundaryRoundTrip(RawKind::kFp8, kLargeHeadDimTailGeometry, 1);
 }
 
 TEST(Nvfp4BoundaryGeometryTest, SupportsModelLikeBfloat16Page)
@@ -900,19 +1056,14 @@ TEST(Nvfp4BoundaryGeometryTest, SupportsModelLikeFp8Page)
     runBoundaryRoundTrip(RawKind::kFp8, kModelLikeGeometry, 1);
 }
 
-TEST(Nvfp4BoundaryGeometryTest, BoundsAutoStagingForLargeBfloat16Page)
-{
-    runBoundaryRoundTrip(RawKind::kBfloat16, kLargeGeometry, 1);
-}
-
-TEST(Nvfp4BoundaryGeometryTest, BoundsAutoStagingForLargeFp8Page)
-{
-    runBoundaryRoundTrip(RawKind::kFp8, kLargeGeometry, 1);
-}
-
 class Nvfp4BoundaryInputPatternTest : public testing::TestWithParam<RawKind>
 {
 };
+
+TEST_P(Nvfp4BoundaryInputPatternTest, InactiveTailRowsDoNotAffectTheValidPrefix)
+{
+    runPartialPageTailIsolation(GetParam());
+}
 
 TEST_P(Nvfp4BoundaryInputPatternTest, HandlesAllZeroScaleGroups)
 {
@@ -940,26 +1091,6 @@ INSTANTIATE_TEST_SUITE_P(AllRuntimeTypes, Nvfp4BoundaryInputPatternTest,
 TEST(Nvfp4BoundaryRoundingTest, QuantizesValuesSafelyAwayFromE2m1Ties)
 {
     runBoundaryRoundTrip(RawKind::kFloat16, kDefaultGeometry, 1, InputPattern::kRoundingMargins);
-}
-
-TEST(Nvfp4BoundaryBatchingTest, AcceptsMinimumThirtyTwoPageDescriptorSpecialization)
-{
-    runBoundaryRoundTrip(RawKind::kFloat16, kSmallVectorGeometry, 32);
-}
-
-TEST(Nvfp4BoundaryBatchingTest, SelectsSixtyFourPageDescriptorSpecialization)
-{
-    runBoundaryRoundTrip(RawKind::kFloat16, kSmallVectorGeometry, 33);
-}
-
-TEST(Nvfp4BoundaryBatchingTest, Bfloat16SelectsOneHundredTwentyEightPageDescriptorSpecialization)
-{
-    runBoundaryRoundTrip(RawKind::kBfloat16, kSmallVectorGeometry, 65);
-}
-
-TEST(Nvfp4BoundaryBatchingTest, Fp8SelectsTwoHundredFiftySixPageDescriptorSpecialization)
-{
-    runBoundaryRoundTrip(RawKind::kFp8, kSmallVectorGeometry, 129);
 }
 
 TEST(Nvfp4BoundaryBatchingTest, Bfloat16CrossesTheTwoHundredFiftySixPageChunkBoundary)
@@ -1034,9 +1165,6 @@ TEST(Nvfp4BoundaryValidationTest, RejectsInvalidGeometryAndScalesBeforeLaunch)
     invalid.headDim = 24;
     EXPECT_ANY_THROW(prepare16Bit(invalid));
     invalid = makeParams();
-    invalid.headDim = 262144;
-    EXPECT_ANY_THROW(prepare16Bit(invalid));
-    invalid = makeParams();
     invalid.numKvHeads = std::numeric_limits<std::int32_t>::max();
     EXPECT_ANY_THROW(prepare16Bit(invalid));
 
@@ -1060,7 +1188,7 @@ TEST(Nvfp4BoundaryValidationTest, RejectsInvalidGeometryAndScalesBeforeLaunch)
     EXPECT_ANY_THROW(prepareFp8(invalid));
 }
 
-TEST(Nvfp4BoundaryValidationTest, RejectsNullMisalignedAndUnsupportedDescriptors)
+TEST(Nvfp4BoundaryValidationTest, RejectsNullInvalidAndUnsupportedDescriptors)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
     if (!tensorrt_llm::common::isSM100Family())
@@ -1088,8 +1216,8 @@ TEST(Nvfp4BoundaryValidationTest, RejectsNullMisalignedAndUnsupportedDescriptors
     invalidLayer.rawKBase += 1U;
     EXPECT_ANY_THROW(static_cast<void>(tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(
         {invalidLayer}, coldPageBytes, Nvfp4BoundaryRuntimeType::kFloat16)));
-    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
-        {validOffload}, validPlan, buffers.compactPage.bytes() + 1, nullptr));
+    EXPECT_ANY_THROW(
+        tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress({validOffload}, validPlan, nullptr, nullptr));
 
     invalidLayer = validLayer;
     invalidLayer.rawKSlotBytes += alignof(uint4) / 2U;

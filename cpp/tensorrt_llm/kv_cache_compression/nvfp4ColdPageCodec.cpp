@@ -58,6 +58,15 @@ std::size_t checkedMul(std::size_t lhs, std::size_t rhs, char const* label)
     return lhs * rhs;
 }
 
+std::size_t checkedAdd(std::size_t lhs, std::size_t rhs, char const* label)
+{
+    if (lhs > std::numeric_limits<std::size_t>::max() - rhs)
+    {
+        throw std::overflow_error(label);
+    }
+    return lhs + rhs;
+}
+
 std::size_t scalarCount(Nvfp4ColdPageLayerConfig const& config)
 {
     if (config.numKvHeads <= 0 || config.tokensPerPage <= 0 || config.headDim <= 0)
@@ -79,8 +88,9 @@ std::size_t compactLayerBytes(Nvfp4ColdPageLayerConfig const& config)
     auto const elements = scalarCount(config);
     auto const packedBytes = elements / kPackedElementsPerByte;
     auto const scaleBytes = elements / kElementsPerBlockScale;
-    return checkedMul(packedBytes, 2U, "NVFP4 packed Page size overflows size_t")
-        + checkedMul(scaleBytes, 2U, "NVFP4 scale Page size overflows size_t");
+    return checkedAdd(checkedMul(packedBytes, 2U, "NVFP4 packed Page size overflows size_t"),
+        checkedMul(scaleBytes, 2U, "NVFP4 scale Page size overflows size_t"),
+        "NVFP4 compact Page size overflows size_t");
 }
 
 kernels::Nvfp4BoundaryKernelParams makeKernelParams(Nvfp4ColdPageLayerConfig const& config)
@@ -233,7 +243,6 @@ bool Nvfp4ColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolGr
                 }
 
                 LayerGroupState state;
-                state.poolGroupIndex = poolGroupIndex;
                 if (!attentionBuffers.empty() && allBuffersAreConfiguredKv)
                 {
                     state.transform = Transform::kNvfp4Attention;
@@ -281,7 +290,9 @@ bool Nvfp4ColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolGr
                         layers.push_back(kernels::Nvfp4BoundaryLayerPlan{keyPool.baseAddress + buffers.key.offset,
                             valuePool.baseAddress + buffers.value.offset, keyPool.slotBytes, valuePool.slotBytes,
                             coldOffset, makeKernelParams(config)});
-                        state.coldPageBytes = alignUp(coldOffset + compactLayerBytes(config), kCompactAlignment);
+                        state.coldPageBytes = alignUp(
+                            checkedAdd(coldOffset, compactLayerBytes(config), "NVFP4 cold Page size overflows size_t"),
+                            kCompactAlignment);
                         if (!configuredAttentionLayers.emplace(layerId).second)
                         {
                             throw std::invalid_argument("One Attention layer belongs to multiple lifecycles");
@@ -321,70 +332,7 @@ bool Nvfp4ColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolGr
             throw std::invalid_argument("Not every configured Attention layer was found in KVCM GPU layouts");
         }
 
-        auto const sameCodecBehavior = [](LayerGroupState const& lhs, LayerGroupState const& rhs)
-        {
-            if (lhs.poolGroupIndex != rhs.poolGroupIndex || lhs.transform != rhs.transform
-                || lhs.coldPageBytes != rhs.coldPageBytes)
-            {
-                return false;
-            }
-            if (lhs.transform == Transform::kLosslessConcat)
-            {
-                return true;
-            }
-
-            auto const& leftPlan = lhs.preparedPlan;
-            auto const& rightPlan = rhs.preparedPlan;
-            if (leftPlan.runtimeType != rightPlan.runtimeType || leftPlan.numLayers != rightPlan.numLayers)
-            {
-                return false;
-            }
-            for (std::size_t i = 0; i < leftPlan.numLayers; ++i)
-            {
-                auto const& left = leftPlan.layers[i];
-                auto const& right = rightPlan.layers[i];
-                auto const sameParams = left.params.numKvHeads == right.params.numKvHeads
-                    && left.params.tokensPerPage == right.params.tokensPerPage
-                    && left.params.headDim == right.params.headDim
-                    && std::equal(std::begin(left.params.nvfp4ScaleOrigQuant),
-                        std::end(left.params.nvfp4ScaleOrigQuant), std::begin(right.params.nvfp4ScaleOrigQuant))
-                    && std::equal(std::begin(left.params.nvfp4ScaleQuantOrig),
-                        std::end(left.params.nvfp4ScaleQuantOrig), std::begin(right.params.nvfp4ScaleQuantOrig))
-                    && std::equal(std::begin(left.params.fp8ScaleOrigQuant), std::end(left.params.fp8ScaleOrigQuant),
-                        std::begin(right.params.fp8ScaleOrigQuant))
-                    && std::equal(std::begin(left.params.fp8ScaleQuantOrig), std::end(left.params.fp8ScaleQuantOrig),
-                        std::begin(right.params.fp8ScaleQuantOrig));
-                if (left.rawKBase != right.rawKBase || left.rawVBase != right.rawVBase
-                    || left.rawKSlotBytes != right.rawKSlotBytes || left.rawVSlotBytes != right.rawVSlotBytes
-                    || left.coldOffset != right.coldOffset || !sameParams)
-                {
-                    return false;
-                }
-            }
-            return true;
-        };
-
-        std::map<kv::LayerGroupId, kv::LayerGroupId> pendingBatchingLayerGroups;
-        for (auto const& [layerGroupId, state] : pending)
-        {
-            auto representative = layerGroupId;
-            for (auto const& [candidateId, candidateState] : pending)
-            {
-                if (candidateId >= layerGroupId)
-                {
-                    break;
-                }
-                if (sameCodecBehavior(candidateState, state))
-                {
-                    representative = candidateId;
-                    break;
-                }
-            }
-            pendingBatchingLayerGroups.emplace(layerGroupId, representative);
-        }
-
         mLayerGroups = std::move(pending);
-        mBatchingLayerGroups = std::move(pendingBatchingLayerGroups);
         mLosslessCodec = std::move(losslessCodec);
         mConfigured = true;
         return true;
@@ -404,8 +352,7 @@ std::size_t Nvfp4ColdPageCodec::queryColdPageBytes(kv::LayerGroupId layerGroupId
 
 kv::LayerGroupId Nvfp4ColdPageCodec::getBatchingLayerGroupId(kv::LayerGroupId layerGroupId) const noexcept
 {
-    auto const found = mBatchingLayerGroups.find(layerGroupId);
-    return found == mBatchingLayerGroups.end() ? kv::LayerGroupId{-1} : found->second;
+    return findLayerGroup(layerGroupId) == nullptr ? kv::LayerGroupId{-1} : layerGroupId;
 }
 
 kv::PageIndexLocation Nvfp4ColdPageCodec::queryPageIndexLocation(kv::LayerGroupId layerGroupId) const noexcept
