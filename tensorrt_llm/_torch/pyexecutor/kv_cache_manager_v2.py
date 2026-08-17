@@ -40,7 +40,6 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
-    _BACKEND as KV_CACHE_MANAGER_V2_BACKEND,
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
     BAD_PAGE_INDEX,
     CACHE_LEVEL1,
@@ -801,10 +800,10 @@ def _validate_cold_page_codec_backend(cold_page_codec_provider) -> None:
 
     if cold_page_codec_provider is None:
         return
-    if KV_CACHE_MANAGER_V2_BACKEND == "python":
-        raise ValueError(
-            "QuantizationCompression requires the C++ KVCacheManagerV2 backend"
-        )
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import _BACKEND
+
+    if _BACKEND == "python":
+        raise ValueError("QuantizationCompression requires the C++ KVCacheManagerV2 backend")
 
 
 class KVCacheManagerV2(BaseResourceManager):

@@ -1332,22 +1332,20 @@ class KvCacheCreator:
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
-        compression_config = (
-            self._llm_args.kv_cache_compression_config
-            if enable_boundary_compression and not estimating_kv_cache
-            else None
-        )
+        compression_config = (self._llm_args.kv_cache_compression_config
+                              if enable_boundary_compression
+                              and not estimating_kv_cache else None)
         cold_page_codec_provider = None
-        if (
-            compression_config is not None
-            and compression_config.algorithm == "quantization_for_boundary"
-        ):
+        if (compression_config is not None and compression_config.algorithm
+                == "quantization_for_boundary"):
             # QuantizationCompression owns the algorithm and calibration. It
             # constructs one native codec before KVCM allocates cold Slots;
             # the migration path never calls back into Python.
-            from ..kv_cache_compression.quantization_for_boundary import QuantizationCompression
+            from ..kv_cache_compression.quantization_for_boundary import \
+                QuantizationCompression
 
-            cold_page_codec_provider = QuantizationCompression(compression_config)
+            cold_page_codec_provider = QuantizationCompression(
+                compression_config)
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -2123,44 +2121,42 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
 
 
 def _create_kv_cache_manager(
-        model_engine: Optional[PyTorchModelEngine],
-        kv_cache_manager_cls,
-        mapping: Mapping,
-        kv_cache_config: KvCacheConfig,
-        tokens_per_block: int,
-        max_seq_len: int,
-        max_batch_size: int,
-        spec_config: Optional[SpeculativeConfig],
-        sparse_attention_config: Optional[SparseAttentionConfig],
-        max_num_tokens: int,
-        max_beam_width: int,
-        kv_connector_manager: Optional[KvCacheConnectorManager],
-        estimating_kv_cache: bool = False,
-        enable_kv_cache_stats: bool = False,
-        execution_stream: Optional[torch.cuda.Stream] = None,
-        # Optional overrides for one-model draft case (when model_engine is None)
-        model_config: Optional[ModelConfig] = None,
-        dtype: Optional[torch.dtype] = None,
-        is_draft: Optional[bool] = None,
-        layer_mask: Optional[List[bool]] = None,
-        num_layers: Optional[int] = None,
-        num_kv_heads: Optional[Union[int, List[int]]] = None,
-        head_dim: Optional[int] = None,
-        kv_cache_type=None,
-        is_disagg: bool = False,
-        cold_page_codec_provider: Optional[object] = None,
-    ) -> KVCacheManager:
+    model_engine: Optional[PyTorchModelEngine],
+    kv_cache_manager_cls,
+    mapping: Mapping,
+    kv_cache_config: KvCacheConfig,
+    tokens_per_block: int,
+    max_seq_len: int,
+    max_batch_size: int,
+    spec_config: Optional[SpeculativeConfig],
+    sparse_attention_config: Optional[SparseAttentionConfig],
+    max_num_tokens: int,
+    max_beam_width: int,
+    kv_connector_manager: Optional[KvCacheConnectorManager],
+    estimating_kv_cache: bool = False,
+    enable_kv_cache_stats: bool = False,
+    execution_stream: Optional[torch.cuda.Stream] = None,
+    # Optional overrides for one-model draft case (when model_engine is None)
+    model_config: Optional[ModelConfig] = None,
+    dtype: Optional[torch.dtype] = None,
+    is_draft: Optional[bool] = None,
+    layer_mask: Optional[List[bool]] = None,
+    num_layers: Optional[int] = None,
+    num_kv_heads: Optional[Union[int, List[int]]] = None,
+    head_dim: Optional[int] = None,
+    kv_cache_type=None,
+    is_disagg: bool = False,
+    cold_page_codec_provider: Optional[object] = None,
+) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
     """
     if cold_page_codec_provider is not None and not issubclass(
-        kv_cache_manager_cls, KVCacheManagerV2
-    ):
+            kv_cache_manager_cls, KVCacheManagerV2):
         raise ValueError(
             "QuantizationCompression requires the resolved KV cache manager "
-            f"to be KVCacheManagerV2; selected {kv_cache_manager_cls.__name__}"
-        )
+            f"to be KVCacheManagerV2; selected {kv_cache_manager_cls.__name__}")
 
     if (estimating_kv_cache
             and issubclass(kv_cache_manager_cls, KVCacheManagerV2)
@@ -2288,7 +2284,8 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
-        manager_extra_kwargs["cold_page_codec_provider"] = cold_page_codec_provider
+        manager_extra_kwargs[
+            "cold_page_codec_provider"] = cold_page_codec_provider
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
@@ -3010,10 +3007,9 @@ def create_py_executor_instance(
     # set from the start. Reads its own config, not the sparse-attention one.
     kv_cache_compression_config = getattr(llm_args,
                                           "kv_cache_compression_config", None)
-    if (
-        kv_cache_compression_config is not None
-        and kv_cache_compression_config.algorithm != "quantization_for_boundary"
-    ):
+    if (kv_cache_compression_config is not None
+            and kv_cache_compression_config.algorithm
+            != "quantization_for_boundary"):
         draft_kv_cache_manager = resources.get(
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         compression_manager = create_kv_cache_compression_manager(
