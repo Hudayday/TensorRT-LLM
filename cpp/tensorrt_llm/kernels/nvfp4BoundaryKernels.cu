@@ -285,7 +285,12 @@ __host__ __device__ constexpr std::uint32_t totalHalfGroupsPerRole(Nvfp4Boundary
 //! packed values and scales are linear in the same HND order.
 __host__ __device__ constexpr std::uint32_t compressedTransferHalfGroups(Nvfp4BoundaryKernelParams const& params)
 {
-    return std::min(kHalfGroupsPerTransfer, totalHalfGroupsPerRole(params));
+    // Do not use std::min here. Its reference-returning overload ODR-uses the
+    // namespace-scope constant in device code, which requires a device-side
+    // definition even though the value is constexpr. The conditional keeps the
+    // bound an immediate constant in both host and device compilation passes.
+    auto const halfGroups = totalHalfGroupsPerRole(params);
+    return halfGroups < kHalfGroupsPerTransfer ? halfGroups : kHalfGroupsPerTransfer;
 }
 
 //! Flush one compact NVFP4 Page/role range from CTA-local shared memory to its
