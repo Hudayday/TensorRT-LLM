@@ -22,6 +22,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, QuantizationCompressionConfig
+from tensorrt_llm.runtime import kv_cache_manager_v2 as runtime_v2_mod
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
@@ -229,12 +230,12 @@ def test_boundary_codec_requires_cpp_backend(monkeypatch):
 
     # Backend selection occurs when the runtime module is imported. A later
     # environment change must not make admission disagree with the loaded API.
-    monkeypatch.setattr(v2_mod, "KV_CACHE_MANAGER_V2_BACKEND", "python")
+    monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "python")
     monkeypatch.setenv("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp")
     with pytest.raises(ValueError, match=r"require.*C\+\+ KVCacheManagerV2"):
         v2_mod._validate_cold_page_codec_backend(manager)
 
-    monkeypatch.setattr(v2_mod, "KV_CACHE_MANAGER_V2_BACKEND", "cpp")
+    monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
     monkeypatch.setenv("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "python")
     v2_mod._validate_cold_page_codec_backend(manager)
 
@@ -444,7 +445,7 @@ def test_codec_enabled_construction_failure_is_not_retried_gpu_only(monkeypatch)
         is_last_pp_rank=lambda: True,
     )
 
-    monkeypatch.setattr(v2_mod, "KV_CACHE_MANAGER_V2_BACKEND", "cpp")
+    monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
     monkeypatch.setattr(v2_mod, "KVCacheOutOfMemoryError", NativeConstructionError)
     with (
         patch.object(KVCacheManagerV2, "_build_base_config", return_value=object()),
