@@ -215,6 +215,7 @@ def test_explicit_scale_checkpoint_requires_safetensors(tmp_path):
 
 @pytest.mark.parametrize("present_kind", ["k", "v"])
 def test_scale_checkpoint_requires_kv_pair(tmp_path, present_kind):
+    _write_scales(tmp_path, {7: (0.5, 0.5)})
     base = "model.layers.7.self_attn"
     name = f"{base}.{present_kind}_proj.{present_kind}_scale"
     save_file({name: torch.tensor(0.5)}, str(tmp_path / "model.safetensors"))
