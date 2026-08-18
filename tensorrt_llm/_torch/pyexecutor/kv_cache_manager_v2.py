@@ -766,47 +766,6 @@ def _copy_swa_block_offsets_with_scratch_compiled(
     output.copy_(converted.permute(0, 2, 1, 3))
 
 
-def _create_kv_cache_manager_v2_impl(
-    cache_config,
-    event_manager,
-    cold_page_codec_provider,
-    *,
-    runtime_dtype,
-    pp_layers,
-    num_kv_heads_per_layer,
-    head_dim_per_layer,
-):
-    """Construct native KVCM with its immutable cold-page codec."""
-
-    if cold_page_codec_provider is None:
-        return KVCacheManagerPy(cache_config, event_manager=event_manager)
-
-    codec = cold_page_codec_provider.create_cold_page_codec(
-        cache_config,
-        runtime_dtype=runtime_dtype,
-        pp_layers=pp_layers,
-        num_kv_heads_per_layer=num_kv_heads_per_layer,
-        head_dim_per_layer=head_dim_per_layer,
-    )
-    return KVCacheManagerPy(
-        cache_config,
-        event_manager=event_manager,
-        cold_page_codec=codec,
-    )
-
-
-def _validate_cold_page_codec_provider(cold_page_codec_provider) -> None:
-    """Validate a cold-page provider before KVCM performs any setup."""
-
-    if cold_page_codec_provider is None:
-        return
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import _BACKEND
-
-    if _BACKEND == "python":
-        raise ValueError("Cold-page quantization requires the C++ KVCacheManagerV2 backend")
-    cold_page_codec_provider.validate_runtime_support()
-
-
 class KVCacheManagerV2(BaseResourceManager):
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
@@ -843,8 +802,6 @@ class KVCacheManagerV2(BaseResourceManager):
         cold_page_codec_provider=None,
         **kwargs,
     ) -> None:
-        _validate_cold_page_codec_provider(cold_page_codec_provider)
-
         self.mapping = mapping
         self.dtype = dtype
         self.is_disagg = is_disagg
@@ -1133,11 +1090,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_manager_py_config = config
 
-        def create_impl(cache_config):
-            return _create_kv_cache_manager_v2_impl(
-                cache_config,
-                self.event_manager,
-                cold_page_codec_provider,
+        manager_kwargs = {}
+        if cold_page_codec_provider is not None:
+            manager_kwargs["cold_page_codec"] = cold_page_codec_provider.create_cold_page_codec(
+                config,
                 runtime_dtype=self.dtype,
                 pp_layers=self.pp_layers,
                 num_kv_heads_per_layer=self.num_kv_heads_per_layer,
@@ -1145,7 +1101,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
         try:
-            self.impl = create_impl(config)
+            self.impl = KVCacheManagerPy(config, event_manager=self.event_manager, **manager_kwargs)
         except (CuError, KVCacheOutOfMemoryError):
             if len(cache_tiers) > 1 and cold_page_codec_provider is None:
                 logger.warning(
@@ -1157,7 +1113,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 config = replace(config, cache_tiers=cache_tiers_gpu_only)
                 cache_tiers = cache_tiers_gpu_only
                 self.kv_cache_manager_py_config = config
-                self.impl = create_impl(config)
+                self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
             else:
                 raise
         if self.event_manager is not None:

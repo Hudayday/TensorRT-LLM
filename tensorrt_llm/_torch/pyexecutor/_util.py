@@ -1338,31 +1338,17 @@ class KvCacheCreator:
         cold_page_codec_provider = None
         if (compression_config is not None and compression_config.algorithm
                 == "quantization_for_cold_page"):
-            hot_kv_quant_algo = getattr(
-                model_engine.model.model_config.quant_config,
-                "kv_cache_quant_algo", None)
-            hot_kv_quant_algo = getattr(hot_kv_quant_algo, "value",
-                                        hot_kv_quant_algo)
-            if hot_kv_quant_algo == "NVFP4":
+            if _uses_nvfp4_kv_cache(model_engine):
                 logger.info(
                     "Skipping cold-page NVFP4 quantization because the active "
                     "KV cache already uses NVFP4; KVCM will migrate its native "
                     "data and block-scale buffers losslessly.")
             else:
-                model_source = getattr(model_engine.model, "llm_checkpoint_dir",
-                                       None)
-                if not model_source:
-                    model_source = getattr(
-                        model_engine.model.model_config.pretrained_config,
-                        "_name_or_path", None)
-                if not model_source or not os.path.exists(
-                        os.fspath(model_source)):
-                    configured_model = self._llm_args.model
-                    model_source = (configured_model
-                                    if configured_model and os.path.exists(
-                                        os.fspath(configured_model)) else None)
-                cold_page_codec_provider = create_cold_page_codec_provider(
-                    compression_config, model_source)
+                from ..kv_cache_compression.quantization_for_cold_page import \
+                    ColdPageQuantizationCompression
+
+                cold_page_codec_provider = ColdPageQuantizationCompression(
+                    compression_config)
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -2703,6 +2689,18 @@ def validate_kv_cache_compression_compatibility(
     spec_config: Optional[SpeculativeConfig],
 ) -> None:
     """Reject unsupported KV-cache compression feature combinations."""
+    if config.algorithm == "quantization_for_cold_page":
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import _BACKEND
+
+        if _BACKEND == "python":
+            raise ValueError(
+                "Cold-page quantization requires the C++ KVCacheManagerV2 backend"
+            )
+        if not is_sm_100f():
+            raise RuntimeError(
+                "NVFP4 cold-page compression requires an SM100-family device "
+                "(SM100 or SM103).")
+
     if kv_cache_config.enable_block_reuse and not config.supports_block_reuse():
         raise ValueError(
             f"KV-cache compression algorithm {config.algorithm!r} does not "
@@ -2722,13 +2720,10 @@ def validate_kv_cache_compression_compatibility(
             f"mode {mode.name}; use one-model MTP or EAGLE3")
 
 
-def create_cold_page_codec_provider(config: KvCacheCompressionConfig,
-                                    checkpoint_dir: Optional[str]):
-    """Build a storage-boundary codec provider before KVCM construction."""
-    from ..kv_cache_compression.quantization_for_cold_page import \
-        ColdPageQuantizationCompression
-
-    return ColdPageQuantizationCompression(config, checkpoint_dir)
+def _uses_nvfp4_kv_cache(model_engine: PyTorchModelEngine) -> bool:
+    quant_config = model_engine.model.model_config.quant_config
+    return (quant_config is not None
+            and getattr(quant_config, "kv_cache_quant_algo", None) == "NVFP4")
 
 
 def create_kv_cache_compression_manager(
@@ -3033,8 +3028,7 @@ def create_py_executor_instance(
     kv_cache_compression_config = getattr(llm_args,
                                           "kv_cache_compression_config", None)
     if (kv_cache_compression_config is not None
-            and kv_cache_compression_config.algorithm
-            != "quantization_for_cold_page"):
+            and kv_cache_compression_config.algorithm == "triattention"):
         draft_kv_cache_manager = resources.get(
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         compression_manager = create_kv_cache_compression_manager(
@@ -3547,7 +3541,11 @@ def _adjust_torch_mem_fraction():
 def validate_feature_combination(llm_args, model_engine, sampler_type):
     # Validate the flags for features' combination
     compression_config = llm_args.kv_cache_compression_config
-    if compression_config is not None:
+    cold_compression_is_redundant = (compression_config is not None
+                                     and compression_config.algorithm
+                                     == "quantization_for_cold_page"
+                                     and _uses_nvfp4_kv_cache(model_engine))
+    if compression_config is not None and not cold_compression_is_redundant:
         validate_kv_cache_compression_compatibility(
             compression_config,
             llm_args.kv_cache_config,

@@ -3386,21 +3386,21 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
     assert cold_config.model_dump() == {
         "algorithm": "quantization_for_cold_page",
         "quant": "nvfp4",
+        "scale_checkpoint_path": None,
     }
-    assert not hasattr(cold_config, "scale_checkpoint_path")
     assert not cold_config.changes_physical_kv_length
     assert cold_config.supports_block_reuse()
     assert not cold_config.supports_speculative_decoding()
 
-    with pytest.raises(ValidationError, match="scale_checkpoint_path"):
-        TorchLlmArgs(
-            model="/tmp/dummy_model",
-            kv_cache_compression_config={
-                "algorithm": "quantization_for_cold_page",
-                "quant": "nvfp4",
-                "scale_checkpoint_path": "/tmp/nvfp4-kv-scales",
-            },
-        )
+    cold_config_with_scales = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        kv_cache_compression_config={
+            "algorithm": "quantization_for_cold_page",
+            "quant": "nvfp4",
+            "scale_checkpoint_path": "/tmp/nvfp4-kv-scales",
+        },
+    ).kv_cache_compression_config
+    assert cold_config_with_scales.scale_checkpoint_path == "/tmp/nvfp4-kv-scales"
 
     with pytest.raises(ValidationError):
         TorchLlmArgs(

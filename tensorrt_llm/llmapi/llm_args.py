@@ -3693,10 +3693,10 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     NVFP4 is the first supported format, not part of the manager contract. The
     active GPU level keeps the runtime-selected KV dtype; every lower Host or
     Disk level uses KVCM's common cold-page representation. Page addresses come
-    from KVCM. Per-layer global scale multipliers come from optional
-    ModelOpt-compatible checkpoint metadata owned by this compression method;
-    the conversion kernel always computes dynamic per-block scales from each
-    group of 16 values.
+    from KVCM. Per-layer global scale multipliers optionally come from a
+    ModelOpt NVFP4 checkpoint owned by this compression method. Without one,
+    global K/V scales are one. The conversion kernel always computes dynamic
+    per-block scales from each group of 16 values.
     """
 
     # The discriminator names this cold-page lifecycle family; `quant`
@@ -3708,6 +3708,13 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",
         description="Quantization format stored in the compressed cache tier.")
+    scale_checkpoint_path: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        telemetry=False,
+        description=
+        "Optional local ModelOpt NVFP4 checkpoint directory supplying per-layer "
+        "K/V global scales. Omit it to use identity global scales.")
 
     def supports_block_reuse(self) -> bool:
         # Compression changes representation and residency, not token identity.
