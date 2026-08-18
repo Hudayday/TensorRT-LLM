@@ -803,7 +803,7 @@ def _validate_cold_page_codec_backend(cold_page_codec_provider) -> None:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import _BACKEND
 
     if _BACKEND == "python":
-        raise ValueError("QuantizationCompression requires the C++ KVCacheManagerV2 backend")
+        raise ValueError("Cold-page quantization requires the C++ KVCacheManagerV2 backend")
 
 
 class KVCacheManagerV2(BaseResourceManager):

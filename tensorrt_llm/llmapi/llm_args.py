@@ -3679,39 +3679,31 @@ class KvCacheCompressionConfig(StrictBaseModel):
 
 
 _KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY = TelemetryField.categorical(
-    "quantization_for_boundary", "triattention")
+    "quantization_for_cold_page", "triattention")
 
 
-class QuantizationCompressionConfig(KvCacheCompressionConfig):
-    """Compress KV with the quantization format selected by ``quant``.
+class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
+    """Compress cold KV pages with the format selected by ``quant``.
 
     This is the small initialization contract shared with KVCacheManagerV2.
     The selected format determines the compressed layout and kernel dispatch;
     NVFP4 is the first supported format, not part of the manager contract. The
     active GPU level keeps the runtime-selected KV dtype; every lower Host or
     Disk level uses KVCM's common cold-page representation. Page addresses come
-    from KVCM, while per-layer calibration is loaded by this provider rather
-    than by the runtime model.
+    from KVCM. Per-layer global scale multipliers come from the already-loaded
+    runtime model; the conversion kernel always computes dynamic per-block
+    scales from each group of 16 values.
     """
 
-    # The discriminator names this storage-boundary lifecycle family; `quant`
+    # The discriminator names this cold-page lifecycle family; `quant`
     # independently selects its format-specific layout and implementation.
-    algorithm: Literal["quantization_for_boundary"] = Field(
-        default="quantization_for_boundary",
-        # The discriminated union exposes one telemetry path for both arms.
-        # TriAttention's existing field remains the canonical manifest row and
-        # carries the shared allowlist; excluding this duplicate row preserves
-        # its established annotation while still capturing either algorithm.
-        telemetry=False,
+    algorithm: Literal["quantization_for_cold_page"] = Field(
+        default="quantization_for_cold_page",
+        telemetry=_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY,
     )
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",
         description="Quantization format stored in the compressed cache tier.")
-    scale_checkpoint_path: str = Field(
-        min_length=1,
-        description=
-        "Path to a standard ModelOpt NVFP4-KV checkpoint containing calibrated "
-        "per-layer k_scale/v_scale tensors.")
 
     def supports_block_reuse(self) -> bool:
         # Compression changes representation and residency, not token identity.
@@ -3773,7 +3765,8 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
 
 KvCacheCompressionConfigType: TypeAlias = Annotated[
-    Union[QuantizationCompressionConfig, TriAttentionKvCacheCompressionConfig],
+    Union[ColdPageQuantizationCompressionConfig,
+          TriAttentionKvCacheCompressionConfig],
     Field(discriminator="algorithm"),
 ]
 

@@ -631,10 +631,10 @@
     },
     {
       "allowed_values": [
-        "quantization_for_boundary",
+        "quantization_for_cold_page",
         "triattention"
       ],
-      "annotation": "Literal['triattention']",
+      "annotation": "Literal['quantization_for_cold_page']",
       "converter": "allowlist",
       "kind": "categorical",
       "path": "kv_cache_compression_config.algorithm"

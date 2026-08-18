@@ -289,7 +289,7 @@ def test_build_capture_manifest_matches_committed_golden():
 def test_kv_cache_compression_discriminator_captures_both_algorithms():
     """One field-local allowlist preserves both union arms without special cases."""
     from tensorrt_llm.llmapi.llm_args import (
-        QuantizationCompressionConfig,
+        ColdPageQuantizationCompressionConfig,
         TorchLlmArgs,
         TriAttentionKvCacheCompressionConfig,
     )
@@ -304,14 +304,14 @@ def test_kv_cache_compression_discriminator_captures_both_algorithms():
         if item.path == "kv_cache_compression_config.algorithm"
     )
     assert entry.converter == "allowlist"
-    assert repr(entry.annotation) == "typing.Literal['triattention']"
+    assert repr(entry.annotation) == "typing.Literal['quantization_for_cold_page']"
     assert set(entry.allowed_values) == {
-        "quantization_for_boundary",
+        "quantization_for_cold_page",
         "triattention",
     }
 
     configs = (
-        QuantizationCompressionConfig(scale_checkpoint_path="/modelopt"),
+        ColdPageQuantizationCompressionConfig(),
         TriAttentionKvCacheCompressionConfig(
             calibration_path="/triattention.pt",
         ),

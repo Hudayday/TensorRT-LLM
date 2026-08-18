@@ -1313,7 +1313,7 @@ class KvCacheCreator:
         model_engine: PyTorchModelEngine,
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
-        enable_boundary_compression: bool = False,
+        enable_cold_page_compression: bool = False,
     ) -> KVCacheManager:
         mapping = self._mapping
         assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
@@ -1333,19 +1333,22 @@ class KvCacheCreator:
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         compression_config = (self._llm_args.kv_cache_compression_config
-                              if enable_boundary_compression
+                              if enable_cold_page_compression
                               and not estimating_kv_cache else None)
         cold_page_codec_provider = None
         if (compression_config is not None and compression_config.algorithm
-                == "quantization_for_boundary"):
-            # QuantizationCompression owns the algorithm and calibration. It
-            # constructs one native codec before KVCM allocates cold Slots;
-            # the migration path never calls back into Python.
-            from ..kv_cache_compression.quantization_for_boundary import \
-                QuantizationCompression
+                == "quantization_for_cold_page"):
+            # The provider reuses scales already loaded into Attention QKV
+            # modules and constructs one native codec before KVCM allocates
+            # cold Slots; migration never calls back into Python.
+            from ..kv_cache_compression.quantization_for_cold_page import \
+                ColdPageQuantizationCompression
 
-            cold_page_codec_provider = QuantizationCompression(
-                compression_config)
+            attention_layers = getattr(model_engine.model.model_config,
+                                       "extra_attrs",
+                                       {}).get("attn_layers", {})
+            cold_page_codec_provider = ColdPageQuantizationCompression(
+                compression_config, attention_layers)
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -1981,8 +1984,8 @@ class KvCacheCreator:
             estimating_kv_cache,
             kv_cache_config_override=self_kv_cache_config,
             # Estimation, draft, and cross managers keep the lossless codec.
-            # Only the final target KVCM owns boundary compression.
-            enable_boundary_compression=True,
+            # Only the final target KVCM owns cold-page compression.
+            enable_cold_page_compression=True,
         )
 
         # Carry the fp8 context-MLA workspace admission cap (computed in configure_kv_cache_capacity) onto
@@ -2155,7 +2158,7 @@ def _create_kv_cache_manager(
     if cold_page_codec_provider is not None and not issubclass(
             kv_cache_manager_cls, KVCacheManagerV2):
         raise ValueError(
-            "QuantizationCompression requires the resolved KV cache manager "
+            "Cold-page quantization requires the resolved KV cache manager "
             f"to be KVCacheManagerV2; selected {kv_cache_manager_cls.__name__}")
 
     if (estimating_kv_cache
@@ -2714,7 +2717,7 @@ def create_kv_cache_compression_manager(
 ) -> Optional[KVCacheCompressionManager]:
     """Build an iteration-driven compression manager for ``config``.
 
-    Boundary quantization is constructed before KVCM and retained by KVCM, so
+    Cold-page quantization is constructed before KVCM and retained by KVCM, so
     it deliberately does not enter this per-iteration ResourceManager factory.
     """
     if config.algorithm == "triattention":
@@ -3009,7 +3012,7 @@ def create_py_executor_instance(
                                           "kv_cache_compression_config", None)
     if (kv_cache_compression_config is not None
             and kv_cache_compression_config.algorithm
-            != "quantization_for_boundary"):
+            != "quantization_for_cold_page"):
         draft_kv_cache_manager = resources.get(
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         compression_manager = create_kv_cache_compression_manager(
