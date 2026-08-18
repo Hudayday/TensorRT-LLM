@@ -287,7 +287,7 @@ def test_build_capture_manifest_matches_committed_golden():
 
 
 def test_kv_cache_compression_discriminator_captures_both_algorithms():
-    """One shared allowlist preserves both flattened union arms."""
+    """Flattened telemetry preserves both discriminator Literal values."""
     from tensorrt_llm.llmapi.llm_args import (
         ColdPageQuantizationCompressionConfig,
         TorchLlmArgs,
@@ -303,7 +303,10 @@ def test_kv_cache_compression_discriminator_captures_both_algorithms():
         for item in build_capture_manifest(TorchLlmArgs)
         if item.path == "kv_cache_compression_config.algorithm"
     )
-    assert entry.converter == "allowlist"
+    assert repr(entry.annotation) == (
+        "typing.Literal['quantization_for_cold_page', 'triattention']"
+    )
+    assert entry.converter == ""
     assert set(entry.allowed_values) == {
         "quantization_for_cold_page",
         "triattention",
@@ -317,9 +320,6 @@ def test_kv_cache_compression_discriminator_captures_both_algorithms():
     ):
         field = config_cls.model_fields["algorithm"]
         assert repr(field.annotation) == annotation
-        telemetry = field.json_schema_extra["telemetry"]
-        assert telemetry["converter"] == "allowlist"
-        assert set(telemetry["allowed_values"]) == set(entry.allowed_values)
 
     configs = (
         ColdPageQuantizationCompressionConfig(),

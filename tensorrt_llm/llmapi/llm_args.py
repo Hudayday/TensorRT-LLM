@@ -3678,13 +3678,6 @@ class KvCacheCompressionConfig(StrictBaseModel):
         return False
 
 
-# Telemetry flattens discriminated-union arms onto one path and retains one
-# representative annotation. The shared allowlist keeps either discriminator
-# value capturable regardless of which arm supplies that annotation.
-_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY = TelemetryField.categorical(
-    "quantization_for_cold_page", "triattention")
-
-
 class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     """Compress cold KV pages with the format selected by ``quant``.
 
@@ -3701,10 +3694,7 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
 
     # The discriminator names this cold-page lifecycle family; `quant`
     # independently selects its format-specific layout and implementation.
-    algorithm: Literal["quantization_for_cold_page"] = Field(
-        default="quantization_for_cold_page",
-        telemetry=_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY,
-    )
+    algorithm: Literal["quantization_for_cold_page"] = "quantization_for_cold_page"
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",
         description="Quantization format stored in the compressed cache tier.")
@@ -3731,10 +3721,7 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
     changes_physical_kv_length: ClassVar[bool] = True
 
-    algorithm: Literal["triattention"] = Field(
-        default="triattention",
-        telemetry=_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY,
-    )
+    algorithm: Literal["triattention"] = "triattention"
     eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
         default="union",
         description=
