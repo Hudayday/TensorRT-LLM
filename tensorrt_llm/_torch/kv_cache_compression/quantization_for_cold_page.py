@@ -3,37 +3,121 @@
 """Quantize KVCM V2 cold pages.
 
 ``ColdPageQuantizationCompression`` is the lifecycle and configuration authority.
-It is created before KVCM, reuses model-owned K/V global scale multipliers, and
-creates the native codec selected by ``config.quant``. Codec ownership then
-moves into KVCM V2's C++ ``StorageManager`` before any cold Slots are allocated;
-C++ never calls back into Python from ``_batchedMigrate``. The provider is
-construction-only, so it is not registered in the per-iteration
-resource-manager cycle because its two hooks are native storage-boundary calls
-rather than scheduler-step callbacks.
+It is created before KVCM, reads optional ModelOpt K/V global scale metadata
+directly from the resolved checkpoint, and creates the native codec selected by
+``config.quant``. Codec ownership then moves into KVCM V2's C++
+``StorageManager`` before any cold Slots are allocated; C++ never calls back
+into Python from ``_batchedMigrate``. The provider is construction-only, so it
+is not registered in the per-iteration resource-manager cycle because its two
+hooks are native storage-boundary calls rather than scheduler-step callbacks.
 
 KVCM passes all authoritative GPU ``PoolGroupDesc`` objects to the codec once,
 reports the resulting compact cold Slot sizes, and later supplies only a
 GPU-accessible cold base pointer, possibly non-contiguous base-Page indices, and
 the migration CUDA stream. Page selection, Slot admission, staging, events,
 publication, rollback, and eviction remain KVCM responsibilities. No Attention
-object is retained after construction.
+or model object is involved in the scale path.
 """
 
+import json
 import math
+import os
+import re
 from dataclasses import dataclass
-from typing import Mapping, Optional, Sequence, Tuple
+from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping, Optional, Sequence, Tuple, Union
+
+from tensorrt_llm.quantization.modelopt_config import (
+    is_modelopt_quant_config,
+    read_modelopt_quant_config,
+)
 
 from ..pyexecutor.resource_manager import DataType
 
 ScalePair = Tuple[float, float]
+ModelSource = Optional[Union[str, os.PathLike]]
+
+_IDENTITY_NVFP4_SCALES = ((1.0, 1.0), (1.0, 1.0))
+_MODEL_OPT_KV_SCALE_KEY = re.compile(
+    r"(?:^|\.)layers\.(?P<layer_id>\d+)\.self_attn\."
+    r"(?P<kind>[kv])_proj\.(?P=kind)_scale$"
+)
 
 
-def _load_native_bindings():
-    """Load the compression-owned C++ codec and fused kernels lazily."""
+def _normalize_checkpoint_kv_cache_quant_algo(algorithm) -> Optional[str]:
+    """Normalize a checkpoint KV-cache algorithm string."""
 
-    from tensorrt_llm.bindings.internal import kv_cache_compression  # type: ignore
+    if algorithm is None:
+        return None
+    if not isinstance(algorithm, str):
+        raise ValueError(
+            f"ModelOpt kv_cache_quant_algo must be a string, got {type(algorithm).__name__}"
+        )
+    value = algorithm.upper()
+    if value not in {"NVFP4", "FP8", "INT8"}:
+        raise ValueError(f"Unsupported checkpoint KV-cache algorithm {value!r}")
+    return value
 
-    return kv_cache_compression
+
+def _checkpoint_metadata_directory(model_source: ModelSource) -> Optional[Path]:
+    """Return the directory that owns checkpoint quantization metadata."""
+
+    if model_source is None:
+        return None
+
+    source = Path(model_source)
+    if not source.exists():
+        raise FileNotFoundError(f"Model checkpoint source does not exist: {source}")
+    if source.is_dir():
+        return source
+    if source.is_file():
+        return source.parent
+    raise ValueError(f"Model checkpoint source is not a file or directory: {source}")
+
+
+def _read_json_object(path: Path) -> dict:
+    """Read one checkpoint JSON object with source-aware diagnostics."""
+
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Cannot read checkpoint metadata {path}: {error}") from error
+    if not isinstance(raw, dict):
+        raise ValueError(f"Checkpoint metadata {path} must contain a JSON object")
+    return raw
+
+
+def _resolve_checkpoint_kv_cache_quant_algo(model_source: ModelSource) -> Optional[str]:
+    """Resolve ModelOpt KV-cache provenance directly from the checkpoint.
+
+    ``hf_quant_config.json`` is authoritative when present. Otherwise a
+    ModelOpt-owned ``config.json.quantization_config`` is used as the inline
+    fallback. Ordinary model configs are intentionally ignored.
+    """
+
+    checkpoint_dir = _checkpoint_metadata_directory(model_source)
+    if checkpoint_dir is None:
+        return None
+
+    modelopt_path = checkpoint_dir / "hf_quant_config.json"
+    if modelopt_path.exists():
+        if not modelopt_path.is_file():
+            raise ValueError(f"Checkpoint metadata is not a file: {modelopt_path}")
+        normalized = read_modelopt_quant_config(_read_json_object(modelopt_path))
+        return _normalize_checkpoint_kv_cache_quant_algo(normalized.get("kv_cache_quant_algo"))
+
+    config_path = checkpoint_dir / "config.json"
+    if not config_path.exists():
+        return None
+    if not config_path.is_file():
+        raise ValueError(f"Checkpoint metadata is not a file: {config_path}")
+
+    inline = _read_json_object(config_path).get("quantization_config")
+    if inline is None or not is_modelopt_quant_config(inline):
+        return None
+    normalized = read_modelopt_quant_config(inline)
+    return _normalize_checkpoint_kv_cache_quant_algo(normalized.get("kv_cache_quant_algo"))
 
 
 @dataclass(frozen=True)
@@ -59,7 +143,8 @@ class Nvfp4ColdPageLayerConfig:
 def _create_nvfp4_codec(layer_configs: Sequence[Nvfp4ColdPageLayerConfig]):
     """Lower manager-owned layer metadata into the native NVFP4 codec."""
 
-    native = _load_native_bindings()
+    from tensorrt_llm.bindings.internal import kv_cache_compression as native  # type: ignore
+
     runtime_types = {
         "float16": native.Nvfp4BoundaryRuntimeType.FLOAT16,
         "bfloat16": native.Nvfp4BoundaryRuntimeType.BFLOAT16,
@@ -89,49 +174,170 @@ def _create_nvfp4_codec(layer_configs: Sequence[Nvfp4ColdPageLayerConfig]):
     return native.create_nvfp4_cold_page_codec(native_configs)
 
 
-def _model_nvfp4_scales(
-    attention_layers: Mapping[str, object], global_layer_id: int
-) -> tuple[ScalePair, ScalePair]:
-    """Read native ``[Q,K,V]`` scales from one loaded Attention layer.
+def _checkpoint_safetensor_inputs(
+    model_source: ModelSource,
+) -> tuple[tuple[Path, Optional[tuple[str, ...]]], ...]:
+    """Resolve safetensors inputs like the default Hugging Face weight loader.
 
-    Cold-page Attention initialization guarantees this existing native scale
-    pair even for ordinary QKV methods. The pair remains identity when no
-    calibrated K/V values are present. The conversion kernel still derives one
-    dynamic E4M3 block scale from every 16 values; identity here only disables
-    additional global normalization.
+    A direct safetensors path is accepted. For a directory, ordinary shards
+    win over files whose basename contains ``consolidated``; if only
+    consolidated files exist, they are used.
+
+    ``model.safetensors.index.json`` is authoritative when present. Only shards
+    referenced by matching scale entries are opened, and each tuple carries
+    the exact indexed tensor names to read. A valid checkpoint with no matching
+    metadata simply contributes identity global scales.
     """
 
-    layer_ref = attention_layers.get(str(global_layer_id))
-    if layer_ref is None:
-        raise RuntimeError(f"Loaded model has no registered Attention layer {global_layer_id}")
-    layer = layer_ref()
-    if layer is None:
-        raise RuntimeError(f"Registered Attention layer {global_layer_id} is no longer alive")
-    qkv_proj = getattr(layer, "qkv_proj", None)
-    if qkv_proj is None:
-        raise RuntimeError(f"Attention layer {global_layer_id} has no fused QKV scale owner")
+    if model_source is None:
+        return ()
 
-    quant_orig_tensor = getattr(qkv_proj, "kv_scales", None)
-    orig_quant_tensor = getattr(qkv_proj, "inv_kv_scales", None)
-    if quant_orig_tensor is None or orig_quant_tensor is None:
-        raise RuntimeError(
-            f"Attention layer {global_layer_id} must own both kv_scales and inv_kv_scales"
-        )
+    source = Path(model_source)
+    if not source.exists():
+        raise FileNotFoundError(f"Model checkpoint source does not exist: {source}")
+    if source.is_file():
+        return ((source, None),) if source.suffix == ".safetensors" else ()
+    if not source.is_dir():
+        raise ValueError(f"Model checkpoint source is not a file or directory: {source}")
 
-    def read_pair(tensor, name: str) -> ScalePair:
-        if tensor.numel() != 3:
-            raise RuntimeError(f"Attention layer {global_layer_id} {name} must contain [Q, K, V]")
-        pair = tuple(float(value) for value in tensor.detach().reshape(-1)[1:3].tolist())
-        if any(not math.isfinite(value) or value <= 0.0 for value in pair):
-            raise RuntimeError(
-                f"Attention layer {global_layer_id} {name} K/V values must be finite and positive"
+    index_path = source / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            index = json.loads(index_path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Cannot read safetensors index {index_path}: {error}") from error
+        if not isinstance(index, dict) or not isinstance(index.get("weight_map"), dict):
+            raise ValueError(
+                f"Safetensors index {index_path} must contain an object-valued weight_map"
             )
-        return pair
 
-    return (
-        read_pair(orig_quant_tensor, "inv_kv_scales"),
-        read_pair(quant_orig_tensor, "kv_scales"),
-    )
+        shard_tensors: dict[str, list[str]] = {}
+        for tensor_name, shard_name in index["weight_map"].items():
+            if _MODEL_OPT_KV_SCALE_KEY.search(tensor_name) is None:
+                continue
+            if not isinstance(shard_name, str) or not shard_name:
+                raise ValueError(
+                    f"Safetensors index {index_path} has an invalid shard for {tensor_name}"
+                )
+            shard_tensors.setdefault(shard_name, []).append(tensor_name)
+
+        result = []
+        for shard_name in sorted(shard_tensors):
+            relative_shard = Path(shard_name)
+            if relative_shard.is_absolute() or ".." in relative_shard.parts:
+                raise ValueError(
+                    f"Safetensors index {index_path} has an unsafe scale shard path {shard_name!r}"
+                )
+            shard_path = source / relative_shard
+            if not shard_path.is_file():
+                raise FileNotFoundError(
+                    f"Safetensors index {index_path} references missing scale shard {shard_path}"
+                )
+            if shard_path.suffix != ".safetensors":
+                raise ValueError(
+                    f"Safetensors index {index_path} maps KV scale metadata to "
+                    f"non-safetensors shard {shard_path}"
+                )
+            result.append((shard_path, tuple(sorted(shard_tensors[shard_name]))))
+        return tuple(result)
+
+    weight_files = tuple(sorted(source.glob("*.safetensors")))
+    ordinary_files = tuple(path for path in weight_files if "consolidated" not in path.name)
+    return tuple((path, None) for path in (ordinary_files or weight_files))
+
+
+def _load_checkpoint_nvfp4_scales(
+    model_source: ModelSource,
+    checkpoint_kv_cache_quant_algo: Optional[str],
+) -> Mapping[int, tuple[ScalePair, ScalePair]]:
+    """Read ModelOpt K/V global scales once into immutable Python values.
+
+    ModelOpt exports each dequantization multiplier as scalar
+    ``...layers.N.self_attn.{k,v}_proj.{k,v}_scale`` metadata. The checkpoint
+    value is quant-to-original; the codec's original-to-quant multiplier is its
+    reciprocal. Missing metadata uses identity. A malformed or ambiguous pair
+    fails closed before KVCM construction.
+
+    ``TRTLLM_LOAD_KV_SCALES`` deliberately matches the native fused-QKV loader:
+    it defaults to ``"1"`` and any other value disables metadata loading.
+    """
+
+    if os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") != "1":
+        return MappingProxyType({})
+
+    if checkpoint_kv_cache_quant_algo in {"FP8", "INT8"}:
+        # These checkpoints use the same tensor names for algorithm-specific
+        # source scales. They are not valid NVFP4 global scales. Hot FP8/INT8
+        # can still use identity global normalization when encoded to cold
+        # NVFP4 by the boundary codec.
+        return MappingProxyType({})
+
+    from safetensors import safe_open
+
+    found: dict[tuple[int, str], tuple[float, str, Path]] = {}
+    for file_path, indexed_names in _checkpoint_safetensor_inputs(model_source):
+        with safe_open(str(file_path), framework="pt", device="cpu") as checkpoint:
+            checkpoint_names = tuple(checkpoint.keys())
+            available_names = set(checkpoint_names)
+            tensor_names = indexed_names if indexed_names is not None else checkpoint_names
+            for tensor_name in tensor_names:
+                if tensor_name not in available_names:
+                    raise ValueError(
+                        f"Safetensors index references {file_path}:{tensor_name}, "
+                        "but that tensor is absent from the shard"
+                    )
+                match = _MODEL_OPT_KV_SCALE_KEY.search(tensor_name)
+                if match is None:
+                    continue
+                if checkpoint_kv_cache_quant_algo is None:
+                    raise ValueError(
+                        f"Ambiguous ModelOpt KV scale metadata {file_path}:{tensor_name}: "
+                        "checkpoint_kv_cache_quant_algo was not resolved as NVFP4"
+                    )
+
+                layer_id = int(match.group("layer_id"))
+                kind = match.group("kind")
+                identity = (layer_id, kind)
+                if identity in found:
+                    previous_name = found[identity][1]
+                    previous_path = found[identity][2]
+                    raise ValueError(
+                        f"Duplicate ModelOpt {kind.upper()} scale metadata for layer "
+                        f"{layer_id}: {previous_path}:{previous_name} and "
+                        f"{file_path}:{tensor_name}"
+                    )
+
+                tensor = checkpoint.get_tensor(tensor_name)
+                if tensor.numel() != 1:
+                    raise ValueError(
+                        f"ModelOpt KV scale metadata {file_path}:{tensor_name} must "
+                        f"contain exactly one value, got {tensor.numel()}"
+                    )
+                value = float(tensor.reshape(-1)[0].item())
+                if not math.isfinite(value) or value <= 0.0:
+                    raise ValueError(
+                        f"ModelOpt KV scale metadata {file_path}:{tensor_name} must "
+                        f"be finite and positive, got {value}"
+                    )
+                found[identity] = (value, tensor_name, file_path)
+
+    result: dict[int, tuple[ScalePair, ScalePair]] = {}
+    for layer_id in sorted({identity[0] for identity in found}):
+        k_entry = found.get((layer_id, "k"))
+        v_entry = found.get((layer_id, "v"))
+        if k_entry is None or v_entry is None:
+            missing = "K" if k_entry is None else "V"
+            present = v_entry if k_entry is None else k_entry
+            assert present is not None
+            raise ValueError(
+                f"ModelOpt KV scale metadata for layer {layer_id} is partial: "
+                f"{present[2]}:{present[1]} has no matching {missing} scale"
+            )
+        quant_orig = (k_entry[0], v_entry[0])
+        orig_quant = (1.0 / quant_orig[0], 1.0 / quant_orig[1])
+        result[layer_id] = (orig_quant, quant_orig)
+
+    return MappingProxyType(result)
 
 
 def _attention_layer_ids(cache_config) -> tuple[int, ...]:
@@ -162,13 +368,13 @@ def _attention_layer_ids(cache_config) -> tuple[int, ...]:
 def _build_nvfp4_layer_configs(
     cache_config,
     *,
-    attention_layers: Mapping[str, object],
+    model_nvfp4_scales: Mapping[int, tuple[ScalePair, ScalePair]],
     runtime_dtype,
     pp_layers: Sequence[int],
     num_kv_heads_per_layer: Sequence[int],
     head_dim_per_layer: Sequence[int],
 ) -> tuple[Nvfp4ColdPageLayerConfig, ...]:
-    """Combine KVCM's pre-construction layout with model-owned scales."""
+    """Combine KVCM's local layout with checkpoint-owned global scales."""
 
     attention_layer_ids = _attention_layer_ids(cache_config)
     if not attention_layer_ids:
@@ -191,7 +397,8 @@ def _build_nvfp4_layer_configs(
     layer_configs = []
     for layer_id in attention_layer_ids:
         global_layer_id = int(pp_layers[layer_id])
-        orig_quant, quant_orig = _model_nvfp4_scales(attention_layers, global_layer_id)
+        scales = model_nvfp4_scales.get(global_layer_id, _IDENTITY_NVFP4_SCALES)
+        orig_quant, quant_orig = scales
 
         layer_configs.append(
             Nvfp4ColdPageLayerConfig(
@@ -203,8 +410,8 @@ def _build_nvfp4_layer_configs(
                 nvfp4_scale_orig_quant=orig_quant,
                 nvfp4_scale_quant_orig=quant_orig,
                 # TRT-LLM's current PyTorch FP8 KV representation uses a unit
-                # *source* global scale. This is independent of the model-owned
-                # NVFP4 destination K/V multipliers above.
+                # *source* global scale. This is independent of the
+                # checkpoint-owned NVFP4 destination K/V multipliers above.
                 fp8_scale_orig_quant=((1.0, 1.0) if runtime_dtype_name == "fp8_e4m3" else None),
                 fp8_scale_quant_orig=((1.0, 1.0) if runtime_dtype_name == "fp8_e4m3" else None),
             )
@@ -215,23 +422,56 @@ def _build_nvfp4_layer_configs(
 class ColdPageQuantizationCompression:
     """Control-plane owner for cold-page quantization.
 
-    This manager owns the quantization choice, loaded-model scale adapter,
-    layer configuration, and native-codec construction. KVCM V2 invokes the
-    transferred codec's native ``encode`` for hot-to-cold offload and ``decode``
-    for cold-to-hot onboard. Keeping the data hooks native avoids a
-    C++-to-Python callback in ``_batchedMigrate`` while leaving algorithm policy
-    in this manager.
+    This manager owns the quantization choice, optional checkpoint auxiliary
+    K/V scale metadata, layer configuration, and native-codec construction.
+    Scale metadata is read once during construction and retained as immutable
+    Python floats; the loaded model and Attention modules remain unaware that
+    cold Pages use NVFP4. KVCM V2 invokes the transferred codec's native
+    ``encode`` for hot-to-cold offload and ``decode`` for cold-to-hot onboard.
+    Keeping the data hooks native avoids a C++-to-Python callback in
+    ``_batchedMigrate`` while leaving algorithm policy in this manager.
 
     Page selection, destination admission, ready events, publication, rollback,
     and eviction remain KVCM responsibilities. The manager therefore exposes
     no second Python forwarding API or late codec-registration lifetime.
     """
 
-    def __init__(self, config, attention_layers: Mapping[str, object]) -> None:
+    def __init__(
+        self,
+        config,
+        model_source: ModelSource = None,
+    ) -> None:
+        """Snapshot optional ModelOpt scale metadata from ``model_source``.
+
+        ``model_source`` is the resolved local checkpoint directory (or a
+        direct safetensors path). This manager independently resolves ModelOpt
+        provenance from the checkpoint: ``hf_quant_config.json`` is
+        authoritative, with ModelOpt ``config.json.quantization_config`` as
+        the fallback. Only NVFP4 provenance admits the auxiliary scalars.
+        Known FP8/INT8 provenance and missing metadata use identity global
+        scales. Metadata without provenance fails as ambiguous.
+
+        ``TRTLLM_LOAD_KV_SCALES=0`` disables this auxiliary metadata ingress
+        exactly as it does for the native QKV checkpoint loader.
+        """
+
         # KVCM does not exist yet: the codec must be available to its native
         # constructor so StorageManager can size cold Slots from the codec.
         self.config = config
-        self._attention_layers = attention_layers
+        self.checkpoint_kv_cache_quant_algo = _resolve_checkpoint_kv_cache_quant_algo(model_source)
+        self._model_nvfp4_scales = _load_checkpoint_nvfp4_scales(
+            model_source,
+            self.checkpoint_kv_cache_quant_algo,
+        )
+
+    def validate_runtime_support(self) -> None:
+        """Fail before KVCM performs any setup on an unsupported device."""
+        from tensorrt_llm._utils import is_sm_100f
+
+        if not is_sm_100f():
+            raise RuntimeError(
+                "NVFP4 cold-page compression requires an SM100-family device (SM100 or SM103)."
+            )
 
     def create_cold_page_codec(
         self,
@@ -257,17 +497,10 @@ class ColdPageQuantizationCompression:
                 f"Unsupported quantization compression format {self.config.quant!r}"
             )
 
-        from tensorrt_llm._utils import is_sm_100f
-
-        if not is_sm_100f():
-            raise RuntimeError(
-                "NVFP4 cold-page compression requires an SM100-family device (SM100 or SM103)."
-            )
-
         return _create_nvfp4_codec(
             _build_nvfp4_layer_configs(
                 cache_config,
-                attention_layers=self._attention_layers,
+                model_nvfp4_scales=self._model_nvfp4_scales,
                 runtime_dtype=runtime_dtype,
                 pp_layers=pp_layers,
                 num_kv_heads_per_layer=num_kv_heads_per_layer,

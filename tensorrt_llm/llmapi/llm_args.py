@@ -3678,6 +3678,9 @@ class KvCacheCompressionConfig(StrictBaseModel):
         return False
 
 
+# Telemetry flattens discriminated-union arms onto one path and retains one
+# representative annotation. The shared allowlist keeps either discriminator
+# value capturable regardless of which arm supplies that annotation.
 _KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY = TelemetryField.categorical(
     "quantization_for_cold_page", "triattention")
 
@@ -3690,9 +3693,10 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     NVFP4 is the first supported format, not part of the manager contract. The
     active GPU level keeps the runtime-selected KV dtype; every lower Host or
     Disk level uses KVCM's common cold-page representation. Page addresses come
-    from KVCM. Per-layer global scale multipliers come from the already-loaded
-    runtime model; the conversion kernel always computes dynamic per-block
-    scales from each group of 16 values.
+    from KVCM. Per-layer global scale multipliers come from optional
+    ModelOpt-compatible checkpoint metadata owned by this compression method;
+    the conversion kernel always computes dynamic per-block scales from each
+    group of 16 values.
     """
 
     # The discriminator names this cold-page lifecycle family; `quant`

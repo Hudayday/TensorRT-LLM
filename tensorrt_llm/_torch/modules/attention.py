@@ -549,12 +549,6 @@ class Attention(nn.Module):
              self.kv_size),
         }
 
-        compression_config = config.kv_cache_compression_config
-        uses_nvfp4_cold_pages = (compression_config is not None
-                                 and compression_config.algorithm
-                                 == "quantization_for_cold_page"
-                                 and compression_config.quant == "nvfp4")
-
         self.qkv_proj = Linear(
             self.hidden_size,
             tp_size * self.q_size * (2 if self.attn_output_gate else 1) +
@@ -573,24 +567,6 @@ class Attention(nn.Module):
             use_custom_cublas_mm=use_custom_cublas_mm,
             fused_weight_shard_indices_mapping=qkv_shard_indices_mapping,
             use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
-
-        # Reuse the native fused-QKV scale loader even though cold-page NVFP4
-        # leaves the hot cache in FP16/BF16/FP8. Quantized QKV methods may
-        # already own this existing [Q,K,V] pair; ordinary QKV needs identity
-        # parameters so checkpoint k_scale/v_scale can overwrite them.
-        if uses_nvfp4_cold_pages:
-            has_scales = hasattr(self.qkv_proj, "kv_scales")
-            has_inverse_scales = hasattr(self.qkv_proj, "inv_kv_scales")
-            if has_scales != has_inverse_scales:
-                raise RuntimeError(
-                    "Fused QKV must own both kv_scales and inv_kv_scales")
-            if not has_scales:
-                self.qkv_proj.kv_scales = nn.Parameter(torch.ones(
-                    3, dtype=torch.float32),
-                                                       requires_grad=False)
-                self.qkv_proj.inv_kv_scales = nn.Parameter(torch.ones(
-                    3, dtype=torch.float32),
-                                                           requires_grad=False)
 
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])

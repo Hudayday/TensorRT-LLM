@@ -795,8 +795,8 @@ def _create_kv_cache_manager_v2_impl(
     )
 
 
-def _validate_cold_page_codec_backend(cold_page_codec_provider) -> None:
-    """Reject a native cold-page codec on the pure-Python backend."""
+def _validate_cold_page_codec_provider(cold_page_codec_provider) -> None:
+    """Validate a cold-page provider before KVCM performs any setup."""
 
     if cold_page_codec_provider is None:
         return
@@ -804,6 +804,7 @@ def _validate_cold_page_codec_backend(cold_page_codec_provider) -> None:
 
     if _BACKEND == "python":
         raise ValueError("Cold-page quantization requires the C++ KVCacheManagerV2 backend")
+    cold_page_codec_provider.validate_runtime_support()
 
 
 class KVCacheManagerV2(BaseResourceManager):
@@ -842,6 +843,8 @@ class KVCacheManagerV2(BaseResourceManager):
         cold_page_codec_provider=None,
         **kwargs,
     ) -> None:
+        _validate_cold_page_codec_provider(cold_page_codec_provider)
+
         self.mapping = mapping
         self.dtype = dtype
         self.is_disagg = is_disagg
@@ -1118,8 +1121,6 @@ class KVCacheManagerV2(BaseResourceManager):
             logger.info(
                 f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
             )
-
-        _validate_cold_page_codec_backend(cold_page_codec_provider)
 
         self.vocab_size = vocab_size
 

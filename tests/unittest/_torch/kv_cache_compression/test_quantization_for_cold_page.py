@@ -2,16 +2,16 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Control-plane tests for cold-page quantization's native codec ownership."""
 
-import weakref
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page import (
     ColdPageQuantizationCompression,
-    _model_nvfp4_scales,
 )
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor import kv_cache_manager_v2 as v2_mod
@@ -28,27 +28,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BufferConfig,
     SsmLayerConfig,
 )
-
-_MISSING = object()
-
-
-class _AttentionLayer:
-    def __init__(self, kv_scales=_MISSING, inv_kv_scales=_MISSING):
-        self.qkv_proj = SimpleNamespace()
-        if kv_scales is not _MISSING:
-            self.qkv_proj.kv_scales = kv_scales
-        if inv_kv_scales is not _MISSING:
-            self.qkv_proj.inv_kv_scales = inv_kv_scales
-
-
-def _attention_registry(scales_by_layer):
-    owners = {}
-    registry = {}
-    for layer_id, (kv_scales, inv_kv_scales) in scales_by_layer.items():
-        layer = _AttentionLayer(kv_scales, inv_kv_scales)
-        owners[layer_id] = layer
-        registry[str(layer_id)] = weakref.ref(layer)
-    return registry, owners
 
 
 def _config(**kwargs):
@@ -86,36 +65,94 @@ def _native():
     return module, codec
 
 
-def _manager(attention_layers=None, **kwargs):
+def _manager(model_source=None, **kwargs):
     return ColdPageQuantizationCompression(
         _config(**kwargs),
-        {} if attention_layers is None else attention_layers,
+        model_source,
     )
 
 
-def test_factory_maps_pp_local_layers_to_model_owned_scales():
-    native, codec = _native()
-    attention_layers, owners = _attention_registry(
-        {
-            10: (
-                torch.tensor([1.0, 0.5, 0.25]),
-                torch.tensor([1.0, 2.0, 4.0]),
-            ),
-            4: (
-                torch.tensor([1.0, 0.125, 0.0625]),
-                torch.tensor([1.0, 8.0, 16.0]),
-            ),
+def _scale_tensor_names(layer_id, prefix="model"):
+    base = f"{prefix}.layers.{layer_id}.self_attn"
+    return (
+        f"{base}.k_proj.k_scale",
+        f"{base}.v_proj.v_scale",
+    )
+
+
+def _write_scales(
+    directory,
+    scales_by_layer,
+    *,
+    filename="model.safetensors",
+    prefix="model",
+):
+    tensors = {}
+    for layer_id, (k_scale, v_scale) in scales_by_layer.items():
+        k_name, v_name = _scale_tensor_names(layer_id, prefix)
+        tensors[k_name] = torch.as_tensor(k_scale, dtype=torch.float32)
+        tensors[v_name] = torch.as_tensor(v_scale, dtype=torch.float32)
+    path = directory / filename
+    save_file(tensors, str(path))
+    return path
+
+
+def _write_safetensors_index(directory, weight_map):
+    index_path = directory / "model.safetensors.index.json"
+    index_path.write_text(json.dumps({"weight_map": weight_map}))
+    return index_path
+
+
+def _write_modelopt_kv_config(directory, algorithm, *, inline=False):
+    """Write a real KV-only ModelOpt config in either supported location."""
+
+    value = getattr(algorithm, "value", algorithm)
+    if inline:
+        payload = {
+            "quantization_config": {
+                "producer": {"name": "modelopt"},
+                "quant_method": "modelopt",
+                "quant_algo": None,
+                "kv_cache_scheme": value,
+                "config_groups": {},
+            }
         }
+        path = directory / "config.json"
+    else:
+        payload = {
+            "producer": {"name": "modelopt"},
+            "quantization": {
+                "quant_algo": None,
+                "kv_cache_quant_algo": value,
+                "quantized_layers": {},
+            },
+        }
+        path = directory / "hf_quant_config.json"
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def test_factory_maps_pp_local_layers_to_checkpoint_scales(tmp_path):
+    native, codec = _native()
+    _write_modelopt_kv_config(tmp_path, "NVFP4")
+    _write_scales(
+        tmp_path,
+        {10: (0.5, 0.25)},
+        filename="model-00001-of-00002.safetensors",
+    )
+    _write_scales(
+        tmp_path,
+        {4: (0.125, 0.0625)},
+        filename="model-00002-of-00002.safetensors",
+        prefix="model.language_model",
     )
     with (
-        patch("tensorrt_llm._utils.is_sm_100f", return_value=True),
         patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
-            "_load_native_bindings",
-            return_value=native,
+            "tensorrt_llm.bindings.internal.kv_cache_compression",
+            new=native,
         ),
     ):
-        manager = _manager(attention_layers)
+        manager = _manager(tmp_path)
         codec_owner = manager.create_cold_page_codec(
             _cache_config((0, ("key", "value")), (1, ("key", "value"))),
             runtime_dtype=DataType.BF16,
@@ -143,30 +180,56 @@ def test_factory_maps_pp_local_layers_to_model_owned_scales():
     # native KVCM owns those values and calls codec.configure() after ownership
     # transfer in its constructor.
     assert not hasattr(native_configs[0], "layer_group_id")
-    assert set(owners) == {4, 10}
+
+
+def test_manager_snapshots_checkpoint_scales_and_uses_identity_for_missing_pp_layer(
+    tmp_path,
+):
+    native, _ = _native()
+    _write_modelopt_kv_config(tmp_path, "NVFP4")
+    checkpoint = _write_scales(tmp_path, {10: (0.5, 0.25)})
+    manager = _manager(tmp_path)
+
+    # Construction copies immutable Python scalars. Codec creation does no
+    # checkpoint I/O and chooses them by PP-global layer ID.
+    checkpoint.unlink()
+    assert set(manager._model_nvfp4_scales) == {10}
+    assert all(
+        isinstance(value, float) for pair in manager._model_nvfp4_scales[10] for value in pair
+    )
+    with pytest.raises(TypeError):
+        manager._model_nvfp4_scales[10] = ((4.0, 8.0), (0.25, 0.125))
+
+    with patch(
+        "tensorrt_llm.bindings.internal.kv_cache_compression",
+        new=native,
+    ):
+        manager.create_cold_page_codec(
+            _cache_config((0, ("key", "value")), (1, ("key", "value"))),
+            runtime_dtype=DataType.BF16,
+            pp_layers=(10, 4),
+            num_kv_heads_per_layer=(8, 8),
+            head_dim_per_layer=(128, 128),
+        )
+
+    native_configs = native.create_nvfp4_cold_page_codec.call_args.args[0]
+    assert native_configs[0].nvfp4_scale_quant_orig == (0.5, 0.25)
+    assert native_configs[0].nvfp4_scale_orig_quant == (2.0, 4.0)
+    assert native_configs[1].nvfp4_scale_quant_orig == (1.0, 1.0)
+    assert native_configs[1].nvfp4_scale_orig_quant == (1.0, 1.0)
 
 
 def test_factory_keeps_tp_local_geometry_in_native_codec():
     native, _ = _native()
     cache_config = _cache_config((0, ("key", "value")))
     cache_config.tokens_per_block = 5
-    attention_layers, owners = _attention_registry(
-        {
-            10: (
-                torch.tensor([1.0, 0.5, 0.25]),
-                torch.tensor([1.0, 2.0, 4.0]),
-            )
-        }
-    )
     with (
-        patch("tensorrt_llm._utils.is_sm_100f", return_value=True),
         patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
-            "_load_native_bindings",
-            return_value=native,
+            "tensorrt_llm.bindings.internal.kv_cache_compression",
+            new=native,
         ),
     ):
-        _manager(attention_layers).create_cold_page_codec(
+        _manager().create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.BF16,
             pp_layers=(10,),
@@ -178,164 +241,309 @@ def test_factory_keeps_tp_local_geometry_in_native_codec():
     assert native_config.num_kv_heads == 4
     assert native_config.tokens_per_page == 5
     assert native_config.head_dim == 128
-    assert owners[10].qkv_proj.kv_scales.tolist() == [1.0, 0.5, 0.25]
 
 
-def test_reads_calibrated_model_owned_kv_scales():
-    attention_layers, owners = _attention_registry(
-        {
-            7: (
-                torch.tensor([1.0, 0.5, 0.25]),
-                torch.tensor([1.0, 2.0, 4.0]),
-            )
-        }
+@pytest.mark.parametrize(
+    ("algorithm", "inline"),
+    [("nvfp4", False), ("NVFP4", True)],
+)
+def test_nvfp4_scale_provenance_uses_modelopt_file_or_inline_config(
+    tmp_path,
+    algorithm,
+    inline,
+):
+    _write_modelopt_kv_config(tmp_path, algorithm, inline=inline)
+    k_name, v_name = _scale_tensor_names(7)
+    save_file(
+        {k_name: torch.tensor(0.5), v_name: torch.tensor(0.25)},
+        str(tmp_path / "model.safetensors"),
     )
 
-    assert _model_nvfp4_scales(attention_layers, 7) == (
+    manager = _manager(tmp_path)
+    assert manager.checkpoint_kv_cache_quant_algo == "NVFP4"
+    assert manager._model_nvfp4_scales[7] == (
         (2.0, 4.0),
         (0.5, 0.25),
     )
-    assert owners[7].qkv_proj.kv_scales[0] == 1.0
 
 
-@pytest.mark.parametrize("skip_create_weights_in_init", [False, True])
-def test_attention_requests_native_qkv_scale_loading_for_cold_pages(
-    skip_create_weights_in_init,
-):
-    from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.modules.attention import Attention
-
-    model_config = ModelConfig(
-        kv_cache_compression_config=_config(),
-        skip_create_weights_in_init=skip_create_weights_in_init,
-    )
-    attention = Attention(
-        hidden_size=32,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        max_position_embeddings=128,
-        bias=False,
-        layer_idx=0,
-        dtype=torch.bfloat16,
-        config=model_config,
+@pytest.mark.parametrize("algorithm", ["FP8", "INT8"])
+def test_non_nvfp4_modelopt_scales_are_ignored(tmp_path, algorithm):
+    _write_modelopt_kv_config(tmp_path, algorithm)
+    k_name, v_name = _scale_tensor_names(7)
+    save_file(
+        {k_name: torch.tensor(0.5), v_name: torch.tensor(0.25)},
+        str(tmp_path / "model.safetensors"),
     )
 
-    assert attention.qkv_proj.quant_config.kv_cache_quant_algo is None
-    assert attention.qkv_proj.kv_scales.tolist() == [1.0, 1.0, 1.0]
-    assert attention.qkv_proj.inv_kv_scales.tolist() == [1.0, 1.0, 1.0]
-    assert _model_nvfp4_scales(model_config.extra_attrs["attn_layers"], 0) == (
-        (1.0, 1.0),
-        (1.0, 1.0),
+    manager = _manager(tmp_path)
+    assert manager.checkpoint_kv_cache_quant_algo == algorithm
+    assert manager._model_nvfp4_scales == {}
+
+
+def test_hf_quant_config_is_authoritative_over_inline_modelopt_config(tmp_path):
+    _write_modelopt_kv_config(tmp_path, "FP8")
+    _write_modelopt_kv_config(tmp_path, "NVFP4", inline=True)
+    _write_scales(tmp_path, {7: (0.5, 0.25)})
+
+    manager = _manager(tmp_path)
+
+    assert manager.checkpoint_kv_cache_quant_algo == "FP8"
+    assert manager._model_nvfp4_scales == {}
+
+
+def test_non_modelopt_inline_config_is_not_nvfp4_provenance(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "quantization_config": {
+                    "quant_method": "bitsandbytes",
+                    "kv_cache_scheme": "NVFP4",
+                }
+            }
+        )
     )
-    if skip_create_weights_in_init:
-        attention.qkv_proj.create_weights()
-    weights = [
-        {},
-        {"k_scale": torch.tensor(0.5)},
-        {"v_scale": torch.tensor(0.25)},
-    ]
-    shards = tuple(
-        torch.zeros(size, attention.qkv_proj.in_features)
-        for _, size in attention.qkv_proj.fused_weight_shard_indices_mapping.values()
+    _write_scales(tmp_path, {7: (0.5, 0.25)})
+
+    with pytest.raises(ValueError, match="Ambiguous ModelOpt KV scale metadata"):
+        _manager(tmp_path)
+
+
+@pytest.mark.parametrize("contents", ["{", "[]"])
+def test_rejects_malformed_authoritative_modelopt_config(tmp_path, contents):
+    (tmp_path / "hf_quant_config.json").write_text(contents)
+
+    with pytest.raises(ValueError, match="[Cc]heckpoint metadata"):
+        _manager(tmp_path)
+
+
+def test_scale_metadata_without_algorithm_provenance_is_rejected(tmp_path):
+    k_name, v_name = _scale_tensor_names(7)
+    save_file(
+        {k_name: torch.tensor(0.5), v_name: torch.tensor(0.25)},
+        str(tmp_path / "model.safetensors"),
     )
+
+    with pytest.raises(ValueError, match="Ambiguous ModelOpt KV scale metadata"):
+        _manager(tmp_path)
+
+
+def test_checkpoint_without_scale_metadata_or_provenance_uses_identity(tmp_path):
+    save_file(
+        {"model.embed_tokens.weight": torch.ones(1)},
+        str(tmp_path / "model.safetensors"),
+    )
+
+    assert _manager(tmp_path)._model_nvfp4_scales == {}
+
+
+def test_nvfp4_checkpoint_without_scale_metadata_uses_identity(tmp_path):
+    _write_modelopt_kv_config(tmp_path, "NVFP4")
+    save_file(
+        {"model.embed_tokens.weight": torch.ones(1)},
+        str(tmp_path / "model.safetensors"),
+    )
+
+    manager = _manager(tmp_path)
+
+    assert manager.checkpoint_kv_cache_quant_algo == "NVFP4"
+    assert manager._model_nvfp4_scales == {}
+
+
+def test_reads_one_scale_pair_across_normal_safetensors_shards(tmp_path):
+    _write_modelopt_kv_config(tmp_path, "NVFP4")
+    k_name, v_name = _scale_tensor_names(7)
+    save_file(
+        {k_name: torch.tensor(0.5)},
+        str(tmp_path / "model-00001-of-00002.safetensors"),
+    )
+    save_file(
+        {v_name: torch.tensor(0.25)},
+        str(tmp_path / "model-00002-of-00002.safetensors"),
+    )
+
+    manager = _manager(tmp_path)
+
+    assert manager._model_nvfp4_scales[7] == ((2.0, 4.0), (0.5, 0.25))
+
+
+def test_safetensors_index_selects_only_scale_metadata_shards(tmp_path):
+    _write_modelopt_kv_config(tmp_path, "NVFP4")
+    k_name, v_name = _scale_tensor_names(7)
+    save_file(
+        {k_name: torch.tensor(0.5)},
+        str(tmp_path / "model-00001-of-00003.safetensors"),
+    )
+    save_file(
+        {v_name: torch.tensor(0.25)},
+        str(tmp_path / "model-00002-of-00003.safetensors"),
+    )
+    # This unreferenced ordinary shard contains conflicting matching metadata;
+    # an index-backed load must not scan or open it.
+    _write_scales(
+        tmp_path,
+        {7: (0.125, 0.0625)},
+        filename="model-00003-of-00003.safetensors",
+        prefix="model.language_model",
+    )
+    _write_safetensors_index(
+        tmp_path,
+        {
+            k_name: "model-00001-of-00003.safetensors",
+            v_name: "model-00002-of-00003.safetensors",
+            "model.layers.7.self_attn.k_proj.weight": ("model-00003-of-00003.safetensors"),
+        },
+    )
+
+    assert _manager(tmp_path)._model_nvfp4_scales[7] == (
+        (2.0, 4.0),
+        (0.5, 0.25),
+    )
+
+
+def test_safetensors_index_rejects_missing_scale_shard(tmp_path):
+    _write_modelopt_kv_config(tmp_path, "NVFP4")
+    k_name, v_name = _scale_tensor_names(7)
+    _write_safetensors_index(
+        tmp_path,
+        {
+            k_name: "missing-00001-of-00002.safetensors",
+            v_name: "missing-00002-of-00002.safetensors",
+        },
+    )
+
+    with pytest.raises(FileNotFoundError, match="references missing scale shard"):
+        _manager(tmp_path)
+
+
+def test_safetensors_index_rejects_missing_indexed_tensor(tmp_path):
+    _write_modelopt_kv_config(tmp_path, "NVFP4")
+    k_name, v_name = _scale_tensor_names(7)
+    shard_name = "model-00001-of-00001.safetensors"
+    save_file(
+        {k_name: torch.tensor(0.5)},
+        str(tmp_path / shard_name),
+    )
+    _write_safetensors_index(
+        tmp_path,
+        {k_name: shard_name, v_name: shard_name},
+    )
+
+    with pytest.raises(ValueError, match="tensor is absent from the shard"):
+        _manager(tmp_path)
+
+
+@pytest.mark.parametrize("contents", ["{", "[]", '{"metadata": {}}'])
+def test_safetensors_index_rejects_malformed_index(tmp_path, contents):
+    _write_modelopt_kv_config(tmp_path, "NVFP4")
+    (tmp_path / "model.safetensors.index.json").write_text(contents)
+
+    with pytest.raises(ValueError, match="[Ss]afetensors index"):
+        _manager(tmp_path)
+
+
+def test_hf_loader_consolidated_filtering(tmp_path):
+    _write_modelopt_kv_config(tmp_path, "NVFP4")
+    _write_scales(tmp_path, {7: (0.5, 0.25)}, filename="model.safetensors")
+    # A normal shard exists, so the default HF-loader policy ignores this
+    # otherwise conflicting consolidated copy.
+    _write_scales(
+        tmp_path,
+        {7: (0.125, 0.0625)},
+        filename="consolidated.00.safetensors",
+    )
+    assert _manager(tmp_path)._model_nvfp4_scales[7] == (
+        (2.0, 4.0),
+        (0.5, 0.25),
+    )
+
+    consolidated_only = tmp_path / "consolidated_only"
+    consolidated_only.mkdir()
+    _write_modelopt_kv_config(consolidated_only, "NVFP4")
+    checkpoint = _write_scales(
+        consolidated_only,
+        {9: (0.125, 0.0625)},
+        filename="consolidated.00.safetensors",
+    )
+    # Direct paths and directories containing only consolidated files are both
+    # valid checkpoint sources.
+    expected = ((8.0, 16.0), (0.125, 0.0625))
+    assert _manager(consolidated_only)._model_nvfp4_scales[9] == expected
+    assert _manager(checkpoint)._model_nvfp4_scales[9] == expected
+
+
+def test_trtllm_load_kv_scales_zero_skips_checkpoint_ingress(tmp_path, monkeypatch):
+    _write_modelopt_kv_config(tmp_path, "NVFP4")
+    k_name, _ = _scale_tensor_names(7)
+    save_file({k_name: torch.tensor(0.5)}, str(tmp_path / "model.safetensors"))
+    monkeypatch.setenv("TRTLLM_LOAD_KV_SCALES", "0")
 
     with patch(
-        "tensorrt_llm._torch.modules.linear.load_weights_fused_qkv_helper",
-        return_value=shards,
-    ):
-        attention.qkv_proj.load_weights(weights)
+        "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
+        "_checkpoint_safetensor_inputs"
+    ) as checkpoint_files:
+        manager = _manager(tmp_path)
 
-    assert attention.qkv_proj.kv_scales.tolist() == [1.0, 0.5, 0.25]
-    assert attention.qkv_proj.inv_kv_scales.tolist() == [1.0, 2.0, 4.0]
-    assert _model_nvfp4_scales(model_config.extra_attrs["attn_layers"], 0) == (
-        (2.0, 4.0),
-        (0.5, 0.25),
-    )
-
-
-def test_attention_does_not_allocate_nvfp4_scales_without_cold_page_config():
-    from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.modules.attention import Attention
-
-    attention = Attention(
-        hidden_size=32,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        max_position_embeddings=128,
-        bias=False,
-        layer_idx=0,
-        dtype=torch.bfloat16,
-        config=ModelConfig(),
-    )
-
-    assert not hasattr(attention.qkv_proj, "kv_scales")
-    assert not hasattr(attention.qkv_proj, "inv_kv_scales")
-
-
-def test_rejects_missing_model_kv_scale_tensors():
-    attention_layers, owners = _attention_registry({7: (_MISSING, _MISSING)})
-
-    with pytest.raises(RuntimeError, match="must own both kv_scales and inv_kv_scales"):
-        _model_nvfp4_scales(attention_layers, 7)
-    assert owners[7].qkv_proj is not None
+    checkpoint_files.assert_not_called()
+    assert manager._model_nvfp4_scales == {}
 
 
 @pytest.mark.parametrize(
-    ("kv_scales", "inv_kv_scales"),
+    ("k_scale", "v_scale", "match"),
     [
-        (torch.tensor([1.0, 0.5, 0.25]), _MISSING),
-        (_MISSING, torch.tensor([1.0, 2.0, 4.0])),
+        (torch.tensor([0.5, 0.25]), torch.tensor(0.25), "exactly one value"),
+        (torch.tensor(float("nan")), torch.tensor(0.25), "finite and positive"),
+        (torch.tensor(float("inf")), torch.tensor(0.25), "finite and positive"),
+        (torch.tensor(0.0), torch.tensor(0.25), "finite and positive"),
+        (torch.tensor(0.5), torch.tensor(-0.25), "finite and positive"),
     ],
 )
-def test_rejects_partial_model_kv_scale_ownership(kv_scales, inv_kv_scales):
-    attention_layers, owners = _attention_registry({7: (kv_scales, inv_kv_scales)})
-
-    with pytest.raises(RuntimeError, match="must own both kv_scales and inv_kv_scales"):
-        _model_nvfp4_scales(attention_layers, 7)
-    assert owners[7].qkv_proj is not None
-
-
-@pytest.mark.parametrize(
-    ("kv_scales", "inv_kv_scales", "match"),
-    [
-        (
-            torch.tensor([1.0, 0.5]),
-            torch.tensor([1.0, 2.0, 4.0]),
-            r"kv_scales must contain \[Q, K, V\]",
-        ),
-        (
-            torch.tensor([1.0, 0.5, 0.25]),
-            torch.tensor([1.0, 2.0]),
-            r"inv_kv_scales must contain \[Q, K, V\]",
-        ),
-        (
-            torch.tensor([1.0, 0.0, 0.25]),
-            torch.tensor([1.0, 2.0, 4.0]),
-            "kv_scales K/V values must be finite and positive",
-        ),
-        (
-            torch.tensor([1.0, 0.5, 0.25]),
-            torch.tensor([1.0, float("inf"), 4.0]),
-            "inv_kv_scales K/V values must be finite and positive",
-        ),
-    ],
-)
-def test_rejects_malformed_model_kv_scale_tensors(
-    kv_scales,
-    inv_kv_scales,
+def test_rejects_malformed_checkpoint_scale_metadata(
+    tmp_path,
+    k_scale,
+    v_scale,
     match,
 ):
-    attention_layers, owners = _attention_registry({7: (kv_scales, inv_kv_scales)})
-    with pytest.raises(RuntimeError, match=match):
-        _model_nvfp4_scales(attention_layers, 7)
-    assert owners[7].qkv_proj is not None
+    _write_modelopt_kv_config(tmp_path, "NVFP4")
+    _write_scales(tmp_path, {7: (k_scale, v_scale)})
+
+    with pytest.raises(ValueError, match=match):
+        _manager(tmp_path)
+
+
+@pytest.mark.parametrize("present_kind", ["k", "v"])
+def test_rejects_partial_checkpoint_scale_metadata(tmp_path, present_kind):
+    _write_modelopt_kv_config(tmp_path, "NVFP4")
+    k_name, v_name = _scale_tensor_names(7)
+    name = k_name if present_kind == "k" else v_name
+    save_file({name: torch.tensor(0.5)}, str(tmp_path / "model.safetensors"))
+
+    with pytest.raises(ValueError, match=r"layer 7 is partial.*matching [KV] scale"):
+        _manager(tmp_path)
+
+
+def test_rejects_duplicate_checkpoint_scale_metadata(tmp_path):
+    _write_modelopt_kv_config(tmp_path, "NVFP4")
+    first_k, first_v = _scale_tensor_names(7, "model")
+    second_k, second_v = _scale_tensor_names(7, "model.language_model")
+    save_file(
+        {first_k: torch.tensor(0.5), first_v: torch.tensor(0.25)},
+        str(tmp_path / "model-00001-of-00002.safetensors"),
+    )
+    save_file(
+        {second_k: torch.tensor(0.5), second_v: torch.tensor(0.25)},
+        str(tmp_path / "model-00002-of-00002.safetensors"),
+    )
+
+    with pytest.raises(ValueError, match="Duplicate ModelOpt K scale metadata"):
+        _manager(tmp_path)
 
 
 def test_control_plane_provider_is_construction_only():
-    attention_layers = {}
-    manager = _manager(attention_layers)
+    manager = _manager()
     assert manager.config.quant == "nvfp4"
-    assert manager._attention_layers is attention_layers
+    assert manager._model_nvfp4_scales == {}
+    assert not hasattr(manager, "_attention_layers")
     assert not hasattr(manager, "_native_codec")
     assert not hasattr(manager, "kv_cache_manager")
 
@@ -415,30 +623,44 @@ def test_resolved_v1_manager_cannot_drop_cold_page_quantization():
         )
 
 
-def test_cold_page_codec_requires_cpp_backend(monkeypatch):
+def test_cold_page_codec_provider_admission_fails_closed(monkeypatch):
     manager = _manager()
 
     # Backend selection occurs when the runtime module is imported. A later
     # environment change must not make admission disagree with the loaded API.
     monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "python")
     monkeypatch.setenv("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp")
-    with pytest.raises(ValueError, match=r"require.*C\+\+ KVCacheManagerV2"):
-        v2_mod._validate_cold_page_codec_backend(manager)
+    with (
+        patch.object(manager, "validate_runtime_support") as validate_runtime,
+        pytest.raises(ValueError, match=r"require.*C\+\+ KVCacheManagerV2"),
+    ):
+        v2_mod._validate_cold_page_codec_provider(manager)
+    validate_runtime.assert_not_called()
 
     monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
     monkeypatch.setenv("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "python")
-    v2_mod._validate_cold_page_codec_backend(manager)
+    with (
+        patch("tensorrt_llm._utils.is_sm_100f", return_value=False),
+        pytest.raises(RuntimeError, match="requires an SM100-family device"),
+    ):
+        v2_mod._validate_cold_page_codec_provider(manager)
+    with patch("tensorrt_llm._utils.is_sm_100f", return_value=True):
+        v2_mod._validate_cold_page_codec_provider(manager)
 
 
-def test_build_managers_scopes_cold_page_quantization_to_final_target():
-    attention_layers = {}
+def test_build_managers_scopes_cold_page_quantization_to_final_target(tmp_path):
     compression_config = _config()
+    resolved_snapshot = tmp_path / "resolved-snapshot"
+    resolved_snapshot.mkdir()
     target_engine = SimpleNamespace(
         model=SimpleNamespace(
             model_config=SimpleNamespace(
                 is_generation=True,
-                pretrained_config=SimpleNamespace(num_hidden_layers=2),
-                extra_attrs={"attn_layers": attention_layers},
+                pretrained_config=SimpleNamespace(
+                    num_hidden_layers=2,
+                    _name_or_path=str(resolved_snapshot),
+                ),
+                quant_config=SimpleNamespace(kv_cache_quant_algo=None),
             )
         ),
         kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
@@ -473,6 +695,7 @@ def test_build_managers_scopes_cold_page_quantization_to_final_target():
                 max_batch_size=2,
                 kv_cache_config=KvCacheConfig(),
                 llm_args=SimpleNamespace(
+                    model="org/model-from-hub",
                     kv_cache_compression_config=compression_config,
                     cache_transceiver_config=None,
                 ),
@@ -523,12 +746,20 @@ def test_build_managers_scopes_cold_page_quantization_to_final_target():
     assert final_calls[0]["cold_page_codec_provider"] is cold_page_manager
     assert final_calls[1]["cold_page_codec_provider"] is None
     assert final_calls[2].get("cold_page_codec_provider") is None
-    final_constructor.assert_called_once_with(compression_config, attention_layers)
+    final_constructor.assert_called_once_with(
+        compression_config,
+        str(resolved_snapshot),
+    )
 
     estimation_calls, estimation_constructor = run_build(estimating=True)
     assert len(estimation_calls) == 3
     assert all(call.get("cold_page_codec_provider") is None for call in estimation_calls)
     estimation_constructor.assert_not_called()
+
+    target_engine.model.model_config.quant_config.kv_cache_quant_algo = "NVFP4"
+    active_nvfp4_calls, active_nvfp4_constructor = run_build(estimating=False)
+    assert active_nvfp4_calls[0]["cold_page_codec_provider"] is None
+    active_nvfp4_constructor.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -641,6 +872,7 @@ def test_codec_enabled_construction_failure_is_not_retried_gpu_only(monkeypatch)
     monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
     monkeypatch.setattr(v2_mod, "KVCacheOutOfMemoryError", NativeConstructionError)
     with (
+        patch("tensorrt_llm._utils.is_sm_100f", return_value=True),
         patch.object(KVCacheManagerV2, "_build_base_config", return_value=object()),
         patch.object(KVCacheManagerV2, "_build_cache_config", return_value=object()),
         patch.object(
@@ -668,25 +900,17 @@ def test_codec_enabled_construction_failure_is_not_retried_gpu_only(monkeypatch)
     native_constructor.assert_called_once()
 
 
-def test_hybrid_manager_compresses_attention_and_skips_ssm_buffers():
+def test_hybrid_manager_compresses_attention_and_skips_ssm_buffers(tmp_path):
     native, _ = _native()
-    attention_layers, owners = _attention_registry(
-        {
-            4: (
-                torch.tensor([1.0, 0.5, 0.25]),
-                torch.tensor([1.0, 2.0, 4.0]),
-            )
-        }
-    )
+    _write_modelopt_kv_config(tmp_path, "NVFP4")
+    _write_scales(tmp_path, {4: (0.5, 0.25)})
     with (
-        patch("tensorrt_llm._utils.is_sm_100f", return_value=True),
         patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
-            "_load_native_bindings",
-            return_value=native,
+            "tensorrt_llm.bindings.internal.kv_cache_compression",
+            new=native,
         ),
     ):
-        _manager(attention_layers).create_cold_page_codec(
+        _manager(tmp_path).create_cold_page_codec(
             _cache_config((0, ("ssm_state", "conv_state"), "ssm"), (1, ("key", "value"))),
             runtime_dtype=DataType.BF16,
             pp_layers=(10, 4),
@@ -696,22 +920,16 @@ def test_hybrid_manager_compresses_attention_and_skips_ssm_buffers():
 
     native_config = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
     assert native_config.layer_id == 1
-    assert owners[4].qkv_proj.inv_kv_scales.tolist() == [1.0, 2.0, 4.0]
+    assert native_config.nvfp4_scale_orig_quant == (2.0, 4.0)
 
 
 def test_ssm_only_pipeline_rank_builds_lossless_native_codec():
     native, codec = _native()
     with (
-        patch("tensorrt_llm._utils.is_sm_100f", return_value=True),
         patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
-            "_load_native_bindings",
-            return_value=native,
+            "tensorrt_llm.bindings.internal.kv_cache_compression",
+            new=native,
         ),
-        patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
-            "_model_nvfp4_scales"
-        ) as model_scales,
     ):
         result = _manager().create_cold_page_codec(
             _cache_config((0, ("ssm_state", "conv_state"), "ssm")),
@@ -726,22 +944,15 @@ def test_ssm_only_pipeline_rank_builds_lossless_native_codec():
 
     assert result is codec
     native.create_nvfp4_cold_page_codec.assert_called_once_with([])
-    model_scales.assert_not_called()
 
 
 def test_rejects_missing_attention_buffer_roles_when_heads_are_present():
     native, _ = _native()
     with (
-        patch("tensorrt_llm._utils.is_sm_100f", return_value=True),
         patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
-            "_load_native_bindings",
-            return_value=native,
+            "tensorrt_llm.bindings.internal.kv_cache_compression",
+            new=native,
         ),
-        patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
-            "_model_nvfp4_scales"
-        ) as model_scales,
         pytest.raises(RuntimeError, match="must contain both key and value buffers"),
     ):
         _manager().create_cold_page_codec(
@@ -753,22 +964,15 @@ def test_rejects_missing_attention_buffer_roles_when_heads_are_present():
         )
 
     native.create_nvfp4_cold_page_codec.assert_not_called()
-    model_scales.assert_not_called()
 
 
 def test_rejects_one_malformed_attention_layer_in_a_hybrid_config():
     native, _ = _native()
     with (
-        patch("tensorrt_llm._utils.is_sm_100f", return_value=True),
         patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
-            "_load_native_bindings",
-            return_value=native,
+            "tensorrt_llm.bindings.internal.kv_cache_compression",
+            new=native,
         ),
-        patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
-            "_model_nvfp4_scales"
-        ) as model_scales,
         pytest.raises(RuntimeError, match="Attention layer 2 must contain both key and value"),
     ):
         _manager().create_cold_page_codec(
@@ -784,28 +988,19 @@ def test_rejects_one_malformed_attention_layer_in_a_hybrid_config():
         )
 
     native.create_nvfp4_cold_page_codec.assert_not_called()
-    model_scales.assert_not_called()
 
 
-def test_fp8_runtime_uses_trtllm_unit_source_scale_contract():
+def test_fp8_runtime_uses_trtllm_unit_source_scale_contract(tmp_path):
     native, _ = _native()
-    attention_layers, owners = _attention_registry(
-        {
-            10: (
-                torch.tensor([1.0, 0.5, 0.25]),
-                torch.tensor([1.0, 2.0, 4.0]),
-            )
-        }
-    )
+    _write_modelopt_kv_config(tmp_path, "NVFP4")
+    _write_scales(tmp_path, {10: (0.5, 0.25)})
     with (
-        patch("tensorrt_llm._utils.is_sm_100f", return_value=True),
         patch(
-            "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
-            "_load_native_bindings",
-            return_value=native,
+            "tensorrt_llm.bindings.internal.kv_cache_compression",
+            new=native,
         ),
     ):
-        _manager(attention_layers).create_cold_page_codec(
+        _manager(tmp_path).create_cold_page_codec(
             _cache_config((0, ("key", "value"))),
             runtime_dtype=DataType.FP8,
             pp_layers=(10,),
@@ -816,4 +1011,4 @@ def test_fp8_runtime_uses_trtllm_unit_source_scale_contract():
     native_config = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
     assert native_config.fp8_scale_orig_quant == (1.0, 1.0)
     assert native_config.fp8_scale_quant_orig == (1.0, 1.0)
-    assert owners[10].qkv_proj.kv_scales.tolist() == [1.0, 0.5, 0.25]
+    assert native_config.nvfp4_scale_quant_orig == (0.5, 0.25)

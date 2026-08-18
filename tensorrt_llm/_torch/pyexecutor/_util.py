@@ -1338,17 +1338,31 @@ class KvCacheCreator:
         cold_page_codec_provider = None
         if (compression_config is not None and compression_config.algorithm
                 == "quantization_for_cold_page"):
-            # The provider reuses scales already loaded into Attention QKV
-            # modules and constructs one native codec before KVCM allocates
-            # cold Slots; migration never calls back into Python.
-            from ..kv_cache_compression.quantization_for_cold_page import \
-                ColdPageQuantizationCompression
-
-            attention_layers = getattr(model_engine.model.model_config,
-                                       "extra_attrs",
-                                       {}).get("attn_layers", {})
-            cold_page_codec_provider = ColdPageQuantizationCompression(
-                compression_config, attention_layers)
+            hot_kv_quant_algo = getattr(
+                model_engine.model.model_config.quant_config,
+                "kv_cache_quant_algo", None)
+            hot_kv_quant_algo = getattr(hot_kv_quant_algo, "value",
+                                        hot_kv_quant_algo)
+            if hot_kv_quant_algo == "NVFP4":
+                logger.info(
+                    "Skipping cold-page NVFP4 quantization because the active "
+                    "KV cache already uses NVFP4; KVCM will migrate its native "
+                    "data and block-scale buffers losslessly.")
+            else:
+                model_source = getattr(model_engine.model, "llm_checkpoint_dir",
+                                       None)
+                if not model_source:
+                    model_source = getattr(
+                        model_engine.model.model_config.pretrained_config,
+                        "_name_or_path", None)
+                if not model_source or not os.path.exists(
+                        os.fspath(model_source)):
+                    configured_model = self._llm_args.model
+                    model_source = (configured_model
+                                    if configured_model and os.path.exists(
+                                        os.fspath(configured_model)) else None)
+                cold_page_codec_provider = create_cold_page_codec_provider(
+                    compression_config, model_source)
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -2706,6 +2720,15 @@ def validate_kv_cache_compression_compatibility(
         raise ValueError(
             f"KV-cache compression does not support speculative decoding "
             f"mode {mode.name}; use one-model MTP or EAGLE3")
+
+
+def create_cold_page_codec_provider(config: KvCacheCompressionConfig,
+                                    checkpoint_dir: Optional[str]):
+    """Build a storage-boundary codec provider before KVCM construction."""
+    from ..kv_cache_compression.quantization_for_cold_page import \
+        ColdPageQuantizationCompression
+
+    return ColdPageQuantizationCompression(config, checkpoint_dir)
 
 
 def create_kv_cache_compression_manager(
