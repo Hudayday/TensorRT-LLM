@@ -3390,7 +3390,7 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
     }
     assert not cold_config.changes_physical_kv_length
     assert cold_config.supports_block_reuse()
-    assert not cold_config.supports_speculative_decoding()
+    assert cold_config.supports_speculative_decoding()
 
     cold_config_with_scales = TorchLlmArgs(
         model="/tmp/dummy_model",

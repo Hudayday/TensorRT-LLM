@@ -15,6 +15,7 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page import 
 )
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
 from tensorrt_llm.runtime import kv_cache_manager_v2 as runtime_v2_mod
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -143,6 +144,46 @@ def test_omitted_scale_checkpoint_uses_identity_and_keeps_kv_geometry():
     assert config.head_dim == 128
     assert config.nvfp4_scale_orig_quant == (1.0, 1.0)
     assert config.nvfp4_scale_quant_orig == (1.0, 1.0)
+
+
+def test_appended_draft_layer_does_not_reuse_target_scale(tmp_path):
+    native, _ = _native()
+    _write_scales(tmp_path, {0: (0.5, 0.25)})
+
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        _manager(tmp_path).create_cold_page_codec(
+            _cache_config((0, "attention")),
+            runtime_dtype=DataType.BF16,
+            pp_layers=(32,),
+            num_kv_heads_per_layer=(8,),
+            head_dim_per_layer=(128,),
+        )
+
+    config = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
+    assert config.nvfp4_scale_orig_quant == (1.0, 1.0)
+    assert config.nvfp4_scale_quant_orig == (1.0, 1.0)
+
+
+def test_provider_creates_one_native_codec_per_kv_cache_manager():
+    native, _ = _native()
+    codecs = (object(), object())
+    native.create_nvfp4_cold_page_codec.side_effect = codecs
+    provider = _manager()
+
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        results = tuple(
+            provider.create_cold_page_codec(
+                _cache_config((0, "attention")),
+                runtime_dtype=DataType.BF16,
+                pp_layers=(layer_id,),
+                num_kv_heads_per_layer=(8,),
+                head_dim_per_layer=(128,),
+            )
+            for layer_id in (0, 32)
+        )
+
+    assert results == codecs
+    assert native.create_nvfp4_cold_page_codec.call_count == 2
 
 
 def test_scale_loader_matches_hf_shard_and_consolidated_policy(tmp_path):
@@ -309,3 +350,85 @@ def test_runtime_admission_is_checked_in_utils_before_manager_creation(monkeypat
 
     monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
     util_mod.validate_kv_cache_compression_compatibility(config, kv_cache_config, None)
+
+
+def test_speculative_admission_accepts_only_one_model_eagle3(monkeypatch):
+    config = ColdPageQuantizationCompressionConfig()
+    kv_cache_config = SimpleNamespace(enable_block_reuse=False)
+    monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
+    monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
+
+    util_mod.validate_kv_cache_compression_compatibility(
+        config,
+        kv_cache_config,
+        SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL),
+    )
+    for mode in (
+        SpeculativeDecodingMode.MTP,
+        SpeculativeDecodingMode.EAGLE3,
+        SpeculativeDecodingMode.DFLASH,
+    ):
+        with pytest.raises(ValueError, match="only with one-model EAGLE3"):
+            util_mod.validate_kv_cache_compression_compatibility(
+                config,
+                kv_cache_config,
+                SimpleNamespace(spec_dec_mode=mode),
+            )
+
+
+def test_provider_is_disabled_for_estimation_and_active_nvfp4():
+    creator = object.__new__(util_mod.KvCacheCreator)
+    creator._skip_est = False
+    creator._llm_args = SimpleNamespace(
+        kv_cache_compression_config=ColdPageQuantizationCompressionConfig()
+    )
+    model_config = SimpleNamespace(quant_config=None)
+    creator._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=model_config))
+
+    assert isinstance(
+        creator._create_cold_page_codec_provider(False), ColdPageQuantizationCompression
+    )
+    assert creator._create_cold_page_codec_provider(True) is None
+
+    model_config.quant_config = SimpleNamespace(kv_cache_quant_algo="NVFP4")
+    assert creator._create_cold_page_codec_provider(False) is None
+
+
+def test_build_routes_one_provider_to_target_and_separate_draft():
+    creator = object.__new__(util_mod.KvCacheCreator)
+    creator._skip_est = False
+    creator._max_seq_len = 1024
+    creator._kv_cache_config = SimpleNamespace()
+    creator._model_engine = object()
+    creator._draft_model_engine = None
+    creator._kv_connector_manager = None
+    creator._is_kv_cache_manager_v2 = True
+    creator._fp8_ctx_mla_kv_len_cap = None
+    creator._is_encoder_decoder = MagicMock(return_value=False)
+    creator._should_create_separate_draft_kv_cache = MagicMock(return_value=True)
+    creator._needs_gpu_kv_cache_budget_split = MagicMock(return_value=False)
+
+    provider = object()
+    target_config = object()
+    draft_config = object()
+    target_manager = SimpleNamespace()
+    draft_manager = object()
+    creator._create_cold_page_codec_provider = MagicMock(return_value=provider)
+    creator._split_kv_cache_budget_for_draft = MagicMock(
+        side_effect=[(target_config, draft_config), (target_config, draft_config)]
+    )
+    creator._create_kv_cache_manager = MagicMock(return_value=target_manager)
+    creator._create_one_model_draft_kv_cache_manager = MagicMock(return_value=draft_manager)
+
+    resources = {}
+    creator.build_managers(resources)
+
+    assert creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"] is provider
+    assert (
+        creator._create_one_model_draft_kv_cache_manager.call_args.kwargs[
+            "cold_page_codec_provider"
+        ]
+        is provider
+    )
+    assert resources[util_mod.ResourceManagerType.KV_CACHE_MANAGER] is target_manager
+    assert resources[util_mod.ResourceManagerType.DRAFT_KV_CACHE_MANAGER] is draft_manager

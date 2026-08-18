@@ -1313,7 +1313,7 @@ class KvCacheCreator:
         model_engine: PyTorchModelEngine,
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
-        enable_cold_page_compression: bool = False,
+        cold_page_codec_provider: Optional[object] = None,
     ) -> KVCacheManager:
         mapping = self._mapping
         assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
@@ -1332,23 +1332,6 @@ class KvCacheCreator:
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
-        compression_config = (self._llm_args.kv_cache_compression_config
-                              if enable_cold_page_compression
-                              and not estimating_kv_cache else None)
-        cold_page_codec_provider = None
-        if (compression_config is not None and compression_config.algorithm
-                == "quantization_for_cold_page"):
-            if _uses_nvfp4_kv_cache(model_engine):
-                logger.info(
-                    "Skipping cold-page NVFP4 quantization because the active "
-                    "KV cache already uses NVFP4; KVCM will migrate its native "
-                    "data and block-scale buffers losslessly.")
-            else:
-                from ..kv_cache_compression.quantization_for_cold_page import \
-                    ColdPageQuantizationCompression
-
-                cold_page_codec_provider = ColdPageQuantizationCompression(
-                    compression_config)
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -1395,6 +1378,30 @@ class KvCacheCreator:
                 self._max_seq_len = kv_cache_manager.max_seq_len
 
         return kv_cache_manager
+
+    def _create_cold_page_codec_provider(
+        self,
+        estimating_kv_cache: bool,
+    ) -> Optional[object]:
+        """Create the immutable provider shared by final target/draft KVCMs."""
+
+        compression_config = self._llm_args.kv_cache_compression_config
+        if estimating_kv_cache and not self._skip_est:
+            return None
+        if (compression_config is None or compression_config.algorithm
+                != "quantization_for_cold_page"):
+            return None
+        if _uses_nvfp4_kv_cache(self._model_engine):
+            logger.info(
+                "Skipping cold-page NVFP4 quantization because the active "
+                "KV cache already uses NVFP4; KVCM will migrate its native "
+                "data and block-scale buffers losslessly.")
+            return None
+
+        from ..kv_cache_compression.quantization_for_cold_page import \
+            ColdPageQuantizationCompression
+
+        return ColdPageQuantizationCompression(compression_config)
 
     def _should_create_separate_draft_kv_cache(self) -> bool:
         """
@@ -1475,6 +1482,7 @@ class KvCacheCreator:
         max_seq_len: int,
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
+        cold_page_codec_provider: Optional[object] = None,
     ) -> Optional[KVCacheManager]:
         """
         Create a KV cache manager for draft model layers in one-model mode
@@ -1546,6 +1554,7 @@ class KvCacheCreator:
             layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
             is_disagg=self._is_disagg,
+            cold_page_codec_provider=cold_page_codec_provider,
         )
 
     def _get_target_and_draft_cache_costs(
@@ -1973,19 +1982,24 @@ class KvCacheCreator:
             v2_two_model = (self._is_kv_cache_manager_v2
                             and self._draft_model_engine is not None)
             if not v2_two_model:
-                # Each manager sizes its host pool from host_cache_size directly.
+                # Each manager sizes its cold pools from the configured quota.
                 self_kv_cache_config, draft_kv_cache_config = (
                     self._split_kv_cache_budget_for_draft(
                         "host_cache_size", self_kv_cache_config,
                         draft_kv_cache_config))
+                self_kv_cache_config, draft_kv_cache_config = (
+                    self._split_kv_cache_budget_for_draft(
+                        "disk_cache_size", self_kv_cache_config,
+                        draft_kv_cache_config))
+
+        cold_page_codec_provider = self._create_cold_page_codec_provider(
+            estimating_kv_cache)
 
         kv_cache_manager = self._create_kv_cache_manager(
             self._model_engine,
             estimating_kv_cache,
             kv_cache_config_override=self_kv_cache_config,
-            # Estimation, draft, and cross managers keep the lossless codec.
-            # Only the final target KVCM owns cold-page compression.
-            enable_cold_page_compression=True,
+            cold_page_codec_provider=cold_page_codec_provider,
         )
 
         # Carry the fp8 context-MLA workspace admission cap (computed in configure_kv_cache_capacity) onto
@@ -2020,7 +2034,8 @@ class KvCacheCreator:
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
                 original_max_seq_len,
                 estimating_kv_cache,
-                kv_cache_config_override=draft_build_kv_cache_config)
+                kv_cache_config_override=draft_build_kv_cache_config,
+                cold_page_codec_provider=cold_page_codec_provider)
 
         # Encoder-decoder cross-attention pool
         cross_kv_cache_manager = None
@@ -2714,6 +2729,12 @@ def validate_kv_cache_compression_compatibility(
             "support speculative decoding with its current configuration; "
             "TriAttention requires eviction_mode='union'")
     mode = spec_config.spec_dec_mode
+    if config.algorithm == "quantization_for_cold_page":
+        if not mode.is_eagle3_one_model():
+            raise ValueError(
+                "Cold-page quantization supports speculative decoding only "
+                f"with one-model EAGLE3, not {mode.name}")
+        return
     if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
         raise ValueError(
             f"KV-cache compression does not support speculative decoding "

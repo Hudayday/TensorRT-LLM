@@ -3710,6 +3710,10 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         # Compression changes representation and residency, not token identity.
         return True
 
+    def supports_speculative_decoding(self) -> bool:
+        # Each target or draft KVCM encodes its own pages at the storage boundary.
+        return True
+
 
 class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
     """TriAttention KV-cache compression: periodic decode-time eviction.
