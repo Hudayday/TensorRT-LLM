@@ -3657,9 +3657,9 @@ class KvCacheCompressionConfig(StrictBaseModel):
 
     Kept separate from SparseAttentionConfig by design -- compression changes
     which KV is stored, not the attention computation. Iteration-driven methods
-    use the resource-manager cycle; storage-boundary methods are retained and
-    invoked directly by KVCacheManagerV2. Concrete algorithms subclass this and
-    add their parameters.
+    use the resource-manager cycle; storage-boundary managers provide a native
+    codec that KVCacheManagerV2 retains and invokes. Concrete algorithms
+    subclass this and add their parameters.
     """
 
     changes_physical_kv_length: ClassVar[bool] = False

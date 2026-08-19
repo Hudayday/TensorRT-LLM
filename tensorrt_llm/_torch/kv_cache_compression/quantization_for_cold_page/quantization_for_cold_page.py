@@ -20,7 +20,7 @@ from tensorrt_llm.quantization.modelopt_config import (
     read_modelopt_quant_config,
 )
 
-from ..pyexecutor.resource_manager import DataType
+from ...pyexecutor.resource_manager import DataType, KVCacheCompressionManager
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
@@ -102,10 +102,14 @@ def _load_modelopt_nvfp4_scales(
     return result
 
 
-class ColdPageQuantizationCompression:
-    """Construction-time owner of the NVFP4 cold-page codec and its scales."""
+class ColdPageQuantizationCompression(KVCacheCompressionManager):
+    """NVFP4 cold-page manager and owner of its optional model scales."""
+
+    uses_iteration_lifecycle = False
+    provides_cold_page_codec = True
 
     def __init__(self, config: "ColdPageQuantizationCompressionConfig") -> None:
+        super().__init__(config)
         self._model_nvfp4_scales = _load_modelopt_nvfp4_scales(config.scale_checkpoint_path)
 
     def create_cold_page_codec(

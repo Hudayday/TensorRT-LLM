@@ -149,12 +149,10 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
     def __init__(
         self,
         config: "TriAttentionKvCacheCompressionConfig",
-        kv_cache_manager: KVCacheManagerV2,
-        draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
         *,
         pretrained_config: "PretrainedConfig",
     ) -> None:
-        super().__init__(config, kv_cache_manager, draft_kv_cache_manager)
+        super().__init__(config)
         self.budget = config.budget
         self.beta = config.beta
         self.eviction_mode = config.eviction_mode
@@ -167,6 +165,14 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         self._load_calibration()
 
         self._prepared_generation_batch: Optional["ScheduledRequests"] = None
+
+    def bind_kv_cache_managers(
+        self,
+        kv_cache_manager: KVCacheManagerV2,
+        draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+    ) -> None:
+        """Finalize state whose geometry is owned by the constructed KVCMs."""
+        super().bind_kv_cache_managers(kv_cache_manager, draft_kv_cache_manager)
         # Manager-lifetime constants.
         self._num_extra_kv_tokens = int(kv_cache_manager.num_extra_kv_tokens)
         self._protected_tail_capacity = (

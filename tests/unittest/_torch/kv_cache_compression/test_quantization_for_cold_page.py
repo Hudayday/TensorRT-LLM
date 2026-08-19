@@ -14,7 +14,7 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page import 
     ColdPageQuantizationCompression,
 )
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
-from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
+from tensorrt_llm._torch.pyexecutor.resource_manager import DataType, KVCacheCompressionManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
 from tensorrt_llm.runtime import kv_cache_manager_v2 as runtime_v2_mod
@@ -376,59 +376,21 @@ def test_speculative_admission_accepts_only_one_model_eagle3(monkeypatch):
             )
 
 
-def test_provider_is_disabled_for_estimation_and_active_nvfp4():
+def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4():
     creator = object.__new__(util_mod.KvCacheCreator)
     creator._skip_est = False
     creator._llm_args = SimpleNamespace(
         kv_cache_compression_config=ColdPageQuantizationCompressionConfig()
     )
-    model_config = SimpleNamespace(quant_config=None)
+    model_config = SimpleNamespace(quant_config=None, pretrained_config=object())
     creator._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=model_config))
 
-    assert isinstance(
-        creator._create_cold_page_codec_provider(False), ColdPageQuantizationCompression
-    )
-    assert creator._create_cold_page_codec_provider(True) is None
+    manager = creator._create_kv_cache_compression_manager(False)
+    assert isinstance(manager, ColdPageQuantizationCompression)
+    assert isinstance(manager, KVCacheCompressionManager)
+    assert manager.provides_cold_page_codec
+    assert not manager.uses_iteration_lifecycle
+    assert creator._create_kv_cache_compression_manager(True) is None
 
     model_config.quant_config = SimpleNamespace(kv_cache_quant_algo="NVFP4")
-    assert creator._create_cold_page_codec_provider(False) is None
-
-
-def test_build_routes_one_provider_to_target_and_separate_draft():
-    creator = object.__new__(util_mod.KvCacheCreator)
-    creator._skip_est = False
-    creator._max_seq_len = 1024
-    creator._kv_cache_config = SimpleNamespace()
-    creator._model_engine = object()
-    creator._draft_model_engine = None
-    creator._kv_connector_manager = None
-    creator._is_kv_cache_manager_v2 = True
-    creator._fp8_ctx_mla_kv_len_cap = None
-    creator._is_encoder_decoder = MagicMock(return_value=False)
-    creator._should_create_separate_draft_kv_cache = MagicMock(return_value=True)
-    creator._needs_gpu_kv_cache_budget_split = MagicMock(return_value=False)
-
-    provider = object()
-    target_config = object()
-    draft_config = object()
-    target_manager = SimpleNamespace()
-    draft_manager = object()
-    creator._create_cold_page_codec_provider = MagicMock(return_value=provider)
-    creator._split_kv_cache_budget_for_draft = MagicMock(
-        side_effect=[(target_config, draft_config), (target_config, draft_config)]
-    )
-    creator._create_kv_cache_manager = MagicMock(return_value=target_manager)
-    creator._create_one_model_draft_kv_cache_manager = MagicMock(return_value=draft_manager)
-
-    resources = {}
-    creator.build_managers(resources)
-
-    assert creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"] is provider
-    assert (
-        creator._create_one_model_draft_kv_cache_manager.call_args.kwargs[
-            "cold_page_codec_provider"
-        ]
-        is provider
-    )
-    assert resources[util_mod.ResourceManagerType.KV_CACHE_MANAGER] is target_manager
-    assert resources[util_mod.ResourceManagerType.DRAFT_KV_CACHE_MANAGER] is draft_manager
+    assert creator._create_kv_cache_compression_manager(False) is None
