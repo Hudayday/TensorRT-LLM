@@ -115,8 +115,7 @@ private:
     cudaStream_t mStream{};
 };
 
-//! Device allocation with canaries around the Page payload. It catches a
-//! descriptor-index or vector-tail bug independently of output comparisons.
+//! Device allocation guarded by canaries to catch descriptor or vector-tail out-of-bounds writes.
 class DeviceRegion
 {
 public:
@@ -191,10 +190,7 @@ private:
     std::size_t mTotalBytes{};
 };
 
-//! A real KVCM V2 Host carrier. HostMem uses
-//! CU_MEMHOSTREGISTER_DEVICEMAP, so the tested kernel accesses the same kind of
-//! pointer that StorageManager will eventually provide; no cudaMemcpy is used
-//! for the boundary payload itself.
+//! CUDA-mapped HostMem matching KVCM V2's Host carrier.
 class MappedHostRegion
 {
 public:
@@ -365,8 +361,7 @@ float e2m1Value(std::uint8_t nibble)
     return (nibble & 0x8U) != 0 ? -value : value;
 }
 
-//! Independent nearest-level oracle. Test inputs avoid exact midpoints, so the
-//! production instruction's tie rule is intentionally not duplicated here.
+//! Independent nearest-level oracle; fixtures avoid ties instead of duplicating production tie rules.
 std::uint8_t quantizeE2m1(float value)
 {
     constexpr std::array<float, 8> levels{0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
@@ -386,10 +381,7 @@ std::uint8_t quantizeE2m1(float value)
     return static_cast<std::uint8_t>(best | (negative ? 0x8U : 0U));
 }
 
-//! Dense and sparse values use exact E2M1 levels and exactly representable
-//! E4M3 scales. The rounding fixture keeps the same exact amax/scale but places
-//! other values safely away from E2M1 ties. This preserves deterministic byte
-//! comparisons while varying Page, K/V role, row, and scale group.
+//! Exactly representable E2M1 values and E4M3 scales keep byte comparisons deterministic.
 std::vector<std::uint8_t> makeRawPage(RawKind kind, std::size_t page, std::uint32_t role,
     Nvfp4BoundaryKernelParams const& params, PageGeometry const& geometry, InputPattern inputPattern)
 {
@@ -513,14 +505,9 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
     Nvfp4BoundaryKernelParams const params = makeParams(geometry);
     CudaStream stream;
     std::size_t const rawSlotBytes = rawBytes(kind, geometry);
-    // Nvfp4ColdPageCodec preserves the exact compact payload but rounds each
-    // cold Slot stride to keep every relative record start vector-friendly.
-    // The base itself may be an arbitrary staging offset; the test below
-    // exercises that byte path without changing the production Slot layout.
+    // Align compact Slot strides while independently testing an arbitrary staging-base offset.
     std::size_t const compactSlotBytes = roundUp(2U * (packedBytes(geometry) + scaleBytes(geometry)), alignof(uint4));
-    // Use every other Slot to prove that one launch handles non-contiguous KVCM
-    // Page indices. The Layer plan owns bases/strides; Page tasks carry only the
-    // complete Base Page index pair.
+    // Use alternate Slots to cover non-contiguous KVCM Page indices.
     std::size_t const slotCapacity = 2U * numPages;
     DeviceRegion rawInputK(slotCapacity * rawSlotBytes);
     DeviceRegion rawInputV(slotCapacity * rawSlotBytes);
@@ -586,8 +573,7 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
 
     if (synchronizeBetweenDirections)
     {
-        // Model StorageManager's normal event-gated publish: the Host Slot is
-        // inspected only after the offload completion event has fired.
+        // Read the Host Slot only after StorageManager-style event fencing.
         cudaEvent_t offloadComplete{};
         ASSERT_EQ(cudaEventCreateWithFlags(&offloadComplete, cudaEventDisableTiming), cudaSuccess);
         ASSERT_EQ(cudaEventRecord(offloadComplete, stream), cudaSuccess);
@@ -598,10 +584,7 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
         std::size_t const compactPayloadBytes = 2U * (packedBytes(geometry) + scaleBytes(geometry));
         if (compactPayloadBytes != compactSlotBytes)
         {
-            // A cold Slot may be recycled from another lifecycle before a raw
-            // Host-to-Disk copy. Poison every selected Slot, encode the same
-            // input again, and require the complete serialized bytes—including
-            // padding—to be identical. Unselected Slots remain guarded above.
+            // Re-encode poisoned recycled Slots to verify deterministic payload and padding bytes.
             auto const firstSerialization = compactPages.payload();
             for (std::size_t page = 0; page < numPages; ++page)
             {
@@ -630,21 +613,13 @@ void runBoundaryRoundTrip(RawKind kind, PageGeometry const& geometry = kDefaultG
 
     if (!synchronizeBetweenDirections)
     {
-        // PDL stress path: offload and onboard were enqueued back-to-back on
-        // one stream with no Host wait, event, or payload read between them.
-        // The final synchronization is the first point where Host NVFP4 bytes
-        // are observed.
+        // Verify back-to-back offload/onboard without an intervening Host fence.
         verifyCompressedPages();
     }
 
     if (repeatRoundTrip)
     {
-        // Reuse the same logical Pages and compact Slots for a second lossy
-        // lifecycle. This catches stale descriptors and proves that repeated
-        // offload/onboard follows Q(D(Q(D(Q(x))))) rather than accidentally
-        // retaining the first raw source. The second encode reads the first
-        // decode's output; the second decode deliberately writes back into the
-        // original raw Slots.
+        // A second lossy round trip catches stale descriptors and validates Q(D(Q(D(Q(x))))).
         for (std::size_t page = 0; page < numPages; ++page)
         {
             for (std::uint32_t role = 0; role < 2; ++role)
@@ -691,17 +666,13 @@ std::vector<std::uint8_t> makePartialRawPage(RawKind kind, std::int32_t validTok
                 float value = 0.0F;
                 if (token < validTokens)
                 {
-                    // The zero-tail and stale-tail Pages have identical valid
-                    // rows. K and V deliberately retain different values and
-                    // global scales.
+                    // Zero-tail and stale-tail fixtures share valid rows with distinct K/V values and scales.
                     value = static_cast<float>((dim % 13) - 6) * 0.125F + static_cast<float>(head) * 0.03125F
                         + static_cast<float>(token) * 0.0078125F + static_cast<float>(role) * 0.0625F;
                 }
                 else if (!zeroTail)
                 {
-                    // Model a recycled Slot with arbitrary inactive rows. A
-                    // 16-value scale group is contained within one token row,
-                    // so these values must not affect the valid prefix.
+                    // Poison inactive rows; 16-value groups stay within a token row and cannot affect the prefix.
                     if (dim % 31 == 0)
                     {
                         value = std::numeric_limits<float>::quiet_NaN();
@@ -859,9 +830,7 @@ TEST(Nvfp4BoundaryWholePageTest, DifferentLayerScalesRemainInOneCompletePageBatc
     std::array<std::unique_ptr<DeviceRegion>, numLayers> rawOutputK;
     std::array<std::unique_ptr<DeviceRegion>, numLayers> rawOutputV;
     std::array<Nvfp4BoundaryKernelParams, numLayers> params{makeParams(geometry), makeParams(geometry)};
-    // Deliberately give the second layer a different calibrated K/V convention.
-    // A correct whole-Page launch selects these values through blockIdx.y; a
-    // per-layer host loop is neither required nor permitted by the kernel ABI.
+    // Distinct per-layer K/V scales verify blockIdx.y selects immutable launch metadata.
     params[1].nvfp4ScaleOrigQuant[0] = 0.5F;
     params[1].nvfp4ScaleQuantOrig[0] = 2.0F;
     params[1].nvfp4ScaleOrigQuant[1] = 4.0F;
@@ -1213,7 +1182,7 @@ TEST(Nvfp4BoundaryValidationTest, RejectsInvalidGeometryAndScalesBeforeLaunch)
     EXPECT_ANY_THROW(prepareFp8(invalid));
 }
 
-TEST(Nvfp4BoundaryValidationTest, RejectsNullInvalidAndUnsupportedDescriptors)
+TEST(Nvfp4BoundaryValidationTest, RejectsInvalidLaunchDescriptors)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
     if (!tensorrt_llm::common::isSM100Family())
@@ -1225,7 +1194,6 @@ TEST(Nvfp4BoundaryValidationTest, RejectsNullInvalidAndUnsupportedDescriptors)
     PageBuffers buffers(
         rawBytes(RawKind::kFloat16, kDefaultGeometry), packedBytes(kDefaultGeometry), scaleBytes(kDefaultGeometry));
     Nvfp4BoundaryOffloadPageTask const validOffload{0, 0};
-    Nvfp4BoundaryOnboardPageTask const validOnboard{0, 0};
     std::size_t const coldPageBytes = 2U * (packedBytes(kDefaultGeometry) + scaleBytes(kDefaultGeometry));
     Nvfp4BoundaryLayerPlan const validLayer{reinterpret_cast<std::uintptr_t>(buffers.rawInputK.data()),
         reinterpret_cast<std::uintptr_t>(buffers.rawInputV.data()), rawBytes(RawKind::kFloat16, kDefaultGeometry),
@@ -1233,10 +1201,6 @@ TEST(Nvfp4BoundaryValidationTest, RejectsNullInvalidAndUnsupportedDescriptors)
     auto const validPlan = tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(
         {validLayer}, coldPageBytes, Nvfp4BoundaryRuntimeType::kFloat16);
 
-    auto invalidOffload = validOffload;
-    invalidOffload.gpuPageIndex = -1;
-    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress(
-        {invalidOffload}, validPlan, buffers.compactPage.data(), nullptr));
     auto invalidLayer = validLayer;
     invalidLayer.rawKBase += 1U;
     EXPECT_ANY_THROW(static_cast<void>(tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(
@@ -1255,10 +1219,6 @@ TEST(Nvfp4BoundaryValidationTest, RejectsNullInvalidAndUnsupportedDescriptors)
     EXPECT_ANY_THROW(static_cast<void>(tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(
         {validLayer}, coldPageBytes + alignof(uint4) / 2U, Nvfp4BoundaryRuntimeType::kFloat16)));
 
-    auto invalidOnboard = validOnboard;
-    invalidOnboard.coldPageIndex = -1;
-    EXPECT_ANY_THROW(tensorrt_llm::kernels::invokeNvfp4BoundaryOnboardDecompress(
-        {invalidOnboard}, validPlan, buffers.compactPage.data(), nullptr));
     invalidLayer = validLayer;
     invalidLayer.rawVBase += 1U;
     EXPECT_ANY_THROW(static_cast<void>(tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(

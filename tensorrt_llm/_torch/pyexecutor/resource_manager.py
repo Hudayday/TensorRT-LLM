@@ -2715,16 +2715,7 @@ class BlockManager:
 
 
 class KVCacheCompressionManager(BaseResourceManager):
-    """Framework-level base class for all KV-cache compression managers.
-
-    Managers are created before KVCM, then bound to the completed target and
-    optional draft KVCMs. Storage-boundary algorithms may provide a cold-page
-    codec during KVCM construction; iteration-driven algorithms opt into the
-    normal ``BaseResourceManager`` callbacks after binding.
-
-    Concrete compression methods subclass this directly and override only the
-    construction-time or iteration-time hooks they need.
-    """
+    """Base for iteration-driven and storage-boundary KV compression."""
 
     uses_iteration_lifecycle = True
     provides_cold_page_codec = False
@@ -2753,9 +2744,12 @@ class KVCacheCompressionManager(BaseResourceManager):
         kv_cache_manager.kv_compression_manages_history = (
             self.config.changes_physical_kv_length)
         if draft_kv_cache_manager is not None:
-            # Apply the same history-ownership contract to the admitted draft.
             draft_kv_cache_manager.kv_compression_manages_history = (
                 self.config.changes_physical_kv_length)
+
+    @property
+    def has_independent_draft_kv_cache(self) -> bool:
+        return self.draft_kv_cache_manager is not None
 
     def create_cold_page_codec(
         self,

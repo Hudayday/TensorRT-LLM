@@ -3679,21 +3679,8 @@ class KvCacheCompressionConfig(StrictBaseModel):
 
 
 class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
-    """Compress cold KV pages with the format selected by ``quant``.
+    """Quantize Host and Disk KV pages without changing the active GPU cache."""
 
-    This is the small initialization contract shared with KVCacheManagerV2.
-    The selected format determines the compressed layout and kernel dispatch;
-    NVFP4 is the first supported format, not part of the manager contract. The
-    active GPU level keeps the runtime-selected KV dtype; every lower Host or
-    Disk level uses KVCM's common cold-page representation. Page addresses come
-    from KVCM. Per-layer global scale multipliers optionally come from a
-    ModelOpt NVFP4 checkpoint owned by this compression method. Without one,
-    global K/V scales are one. The conversion kernel always computes dynamic
-    per-block scales from each group of 16 values.
-    """
-
-    # The discriminator names this cold-page lifecycle family; `quant`
-    # independently selects its format-specific layout and implementation.
     algorithm: Literal["quantization_for_cold_page"] = "quantization_for_cold_page"
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",

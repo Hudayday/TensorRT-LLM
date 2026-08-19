@@ -377,20 +377,41 @@ def test_speculative_admission_accepts_only_one_model_eagle3(monkeypatch):
 
 
 def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4():
-    creator = object.__new__(util_mod.KvCacheCreator)
-    creator._skip_est = False
-    creator._llm_args = SimpleNamespace(
-        kv_cache_compression_config=ColdPageQuantizationCompressionConfig()
-    )
-    model_config = SimpleNamespace(quant_config=None, pretrained_config=object())
-    creator._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=model_config))
+    def build(*, estimating=False, active_kv_quant=None):
+        creator = object.__new__(util_mod.KvCacheCreator)
+        creator._skip_est = False
+        creator._max_seq_len = 1024
+        creator._kv_cache_config = SimpleNamespace()
+        creator._llm_args = SimpleNamespace(
+            kv_cache_compression_config=ColdPageQuantizationCompressionConfig()
+        )
+        model_config = SimpleNamespace(
+            quant_config=active_kv_quant, pretrained_config=object()
+        )
+        creator._model_engine = SimpleNamespace(
+            model=SimpleNamespace(model_config=model_config)
+        )
+        creator._draft_model_engine = None
+        creator._kv_connector_manager = None
+        creator._fp8_ctx_mla_kv_len_cap = None
+        creator._is_encoder_decoder = MagicMock(return_value=False)
+        creator._should_create_separate_draft_kv_cache = MagicMock(return_value=False)
+        creator._create_kv_cache_manager = MagicMock(return_value=SimpleNamespace())
+        resources = {}
+        creator.build_managers(resources, estimating_kv_cache=estimating)
+        return resources
 
-    manager = creator._create_kv_cache_compression_manager(False)
+    resources = build()
+    manager = resources[util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER]
     assert isinstance(manager, ColdPageQuantizationCompression)
     assert isinstance(manager, KVCacheCompressionManager)
     assert manager.provides_cold_page_codec
     assert not manager.uses_iteration_lifecycle
-    assert creator._create_kv_cache_compression_manager(True) is None
-
-    model_config.quant_config = SimpleNamespace(kv_cache_quant_algo="NVFP4")
-    assert creator._create_kv_cache_compression_manager(False) is None
+    assert (
+        util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
+        not in build(estimating=True)
+    )
+    assert (
+        util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
+        not in build(active_kv_quant=SimpleNamespace(kv_cache_quant_algo="NVFP4"))
+    )

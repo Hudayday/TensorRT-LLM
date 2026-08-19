@@ -425,7 +425,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
                 # this request (pre-launch) instead of failing the batch.
                 continue
             draft_cache = None
-            if self.draft_kv_cache_manager is not None:
+            if self.has_independent_draft_kv_cache:
                 # A missing draft cache is a wiring bug: keep the precise KeyError.
                 draft_cache = self.draft_kv_cache_manager.kv_cache_map[request_id]
                 if not draft_cache.is_active:
@@ -605,7 +605,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         if self._swa_window is not None:
             swa_offsets = cumulative_offsets([self._swa_window + tail for tail in tails])
         draft_offsets = None
-        if self.draft_kv_cache_manager is not None:
+        if self.has_independent_draft_kv_cache:
             draft_offsets = cumulative_offsets(
                 [self.budget + self._draft_protected_tail_capacity] * len(eviction_requests)
             )
@@ -685,7 +685,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         """Create manager-lifetime state once."""
         target_layout = self._create_kv_layout()
         draft_layout = (
-            self._create_kv_layout(draft=True) if self.draft_kv_cache_manager is not None else None
+            self._create_kv_layout(draft=True) if self.has_independent_draft_kv_cache else None
         )
         self._target_layout = target_layout
         self._draft_layout = draft_layout

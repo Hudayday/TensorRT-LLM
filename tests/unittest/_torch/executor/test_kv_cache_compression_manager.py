@@ -145,6 +145,7 @@ class TestBaseABC:
 
         assert manager.kv_cache_manager is target
         assert manager.draft_kv_cache_manager is draft
+        assert manager.has_independent_draft_kv_cache
         assert target.kv_compression_manages_history is True
         assert draft.kv_compression_manages_history is True
 
@@ -319,26 +320,35 @@ class TestKvCacheCreatorLifecycle:
     def test_estimation_still_creates_triattention_manager(self):
         config = SimpleNamespace(algorithm="triattention")
         pretrained_config = object()
-        expected_manager = object()
+        expected_manager = SimpleNamespace(provides_cold_page_codec=False)
         creator = object.__new__(util_mod.KvCacheCreator)
         creator._skip_est = False
+        creator._max_seq_len = 1024
+        creator._kv_cache_config = SimpleNamespace()
         creator._llm_args = SimpleNamespace(kv_cache_compression_config=config)
         creator._model_engine = SimpleNamespace(
             model=SimpleNamespace(model_config=SimpleNamespace(pretrained_config=pretrained_config))
         )
+        creator._draft_model_engine = None
+        creator._is_encoder_decoder = MagicMock(return_value=False)
+        creator._should_create_separate_draft_kv_cache = MagicMock(return_value=False)
+        target_manager = object()
+        creator._create_kv_cache_manager = MagicMock(return_value=target_manager)
 
         with patch.object(
             util_mod,
             "create_kv_cache_compression_manager",
             return_value=expected_manager,
         ) as factory:
-            manager = creator._create_kv_cache_compression_manager(estimating_kv_cache=True)
+            resources = {}
+            creator.build_managers(resources, estimating_kv_cache=True)
 
-        assert manager is expected_manager
         factory.assert_called_once_with(
             config,
             pretrained_config=pretrained_config,
         )
+        assert resources[ResourceManagerType.KV_CACHE_MANAGER] is target_manager
+        assert resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] is expected_manager
 
     def test_teardown_pops_and_shuts_down_compression_manager(self):
         creator = object.__new__(util_mod.KvCacheCreator)
@@ -356,19 +366,21 @@ class TestKvCacheCreatorLifecycle:
 
 
 @pytest.mark.parametrize(
-    ("provides_cold_page_codec", "uses_iteration_lifecycle"),
-    ((True, False), (False, True)),
+    "provides_cold_page_codec",
+    (True, False),
     ids=("cold-codec", "iteration-manager"),
 )
-def test_build_routes_compression_manager_by_capabilities(
-    provides_cold_page_codec,
-    uses_iteration_lifecycle,
-):
+def test_build_routes_compression_manager_by_capabilities(provides_cold_page_codec):
     creator = object.__new__(util_mod.KvCacheCreator)
     creator._skip_est = False
     creator._max_seq_len = 1024
     creator._kv_cache_config = SimpleNamespace()
-    creator._model_engine = object()
+    compression_config = SimpleNamespace(algorithm="triattention")
+    pretrained_config = object()
+    creator._llm_args = SimpleNamespace(kv_cache_compression_config=compression_config)
+    creator._model_engine = SimpleNamespace(
+        model=SimpleNamespace(model_config=SimpleNamespace(pretrained_config=pretrained_config))
+    )
     creator._draft_model_engine = None
     creator._kv_connector_manager = None
     creator._is_kv_cache_manager_v2 = True
@@ -380,16 +392,11 @@ def test_build_routes_compression_manager_by_capabilities(
     build_order = []
     compression_manager = SimpleNamespace(
         provides_cold_page_codec=provides_cold_page_codec,
-        uses_iteration_lifecycle=uses_iteration_lifecycle,
-        bind_kv_cache_managers=MagicMock(side_effect=lambda *_: build_order.append("bind")),
     )
     target_config = object()
     draft_config = object()
     target_manager = SimpleNamespace()
     draft_manager = object()
-    creator._create_kv_cache_compression_manager = MagicMock(
-        side_effect=lambda *_: build_order.append("factory") or compression_manager
-    )
     creator._split_kv_cache_budget_for_draft = MagicMock(
         side_effect=[(target_config, draft_config), (target_config, draft_config)]
     )
@@ -401,9 +408,19 @@ def test_build_routes_compression_manager_by_capabilities(
     )
 
     resources = {}
-    creator.build_managers(resources)
+    with patch.object(
+        util_mod,
+        "create_kv_cache_compression_manager",
+        side_effect=lambda *_args, **_kwargs: build_order.append("factory")
+        or compression_manager,
+    ) as factory:
+        creator.build_managers(resources)
 
     expected_codec_provider = compression_manager if provides_cold_page_codec else None
+    factory.assert_called_once_with(
+        compression_config,
+        pretrained_config=pretrained_config,
+    )
     assert (
         creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"]
         is expected_codec_provider
@@ -417,19 +434,7 @@ def test_build_routes_compression_manager_by_capabilities(
     assert resources[ResourceManagerType.KV_CACHE_MANAGER] is target_manager
     assert resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER] is draft_manager
     assert resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] is compression_manager
-    compression_manager.bind_kv_cache_managers.assert_not_called()
     assert build_order == ["factory", "target", "draft"]
-
-    util_mod._bind_kv_cache_compression_manager(resources)
-
-    compression_manager.bind_kv_cache_managers.assert_called_once_with(
-        target_manager, draft_manager
-    )
-    assert build_order == ["factory", "target", "draft", "bind"]
-    if uses_iteration_lifecycle:
-        assert resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] is compression_manager
-    else:
-        assert ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in resources
 
 
 # ---------------------------------------------------------------------- #

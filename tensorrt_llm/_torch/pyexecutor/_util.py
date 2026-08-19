@@ -1379,30 +1379,6 @@ class KvCacheCreator:
 
         return kv_cache_manager
 
-    def _create_kv_cache_compression_manager(
-        self,
-        estimating_kv_cache: bool,
-    ) -> Optional[KVCacheCompressionManager]:
-        """Create the configured manager before constructing the final KVCMs."""
-
-        compression_config = self._llm_args.kv_cache_compression_config
-        if compression_config is None:
-            return None
-        if compression_config.algorithm == "quantization_for_cold_page":
-            if estimating_kv_cache and not self._skip_est:
-                return None
-            if _uses_nvfp4_kv_cache(self._model_engine):
-                logger.info(
-                    "Skipping cold-page NVFP4 quantization because the active "
-                    "KV cache already uses NVFP4; KVCM will migrate its native "
-                    "data and block-scale buffers losslessly.")
-                return None
-
-        model_config = self._model_engine.model.model_config
-        return create_kv_cache_compression_manager(
-            compression_config,
-            pretrained_config=model_config.pretrained_config)
-
     def _should_create_separate_draft_kv_cache(self) -> bool:
         """
         Check if we need a separate draft KV cache manager for one-model mode.
@@ -1992,8 +1968,24 @@ class KvCacheCreator:
                         "disk_cache_size", self_kv_cache_config,
                         draft_kv_cache_config))
 
-        compression_manager = self._create_kv_cache_compression_manager(
-            estimating_kv_cache)
+        compression_manager = None
+        compression_config = self._llm_args.kv_cache_compression_config
+        if compression_config is not None:
+            create_compression_manager = True
+            if compression_config.algorithm == "quantization_for_cold_page":
+                if estimating_kv_cache and not self._skip_est:
+                    create_compression_manager = False
+                elif _uses_nvfp4_kv_cache(self._model_engine):
+                    logger.info(
+                        "Skipping cold-page NVFP4 quantization because the active "
+                        "KV cache already uses NVFP4; KVCM will migrate its native "
+                        "data and block-scale buffers losslessly.")
+                    create_compression_manager = False
+            if create_compression_manager:
+                model_config = self._model_engine.model.model_config
+                compression_manager = create_kv_cache_compression_manager(
+                    compression_config,
+                    pretrained_config=model_config.pretrained_config)
         cold_page_codec_provider = (
             compression_manager if compression_manager is not None
             and compression_manager.provides_cold_page_codec else None)
@@ -2795,25 +2787,6 @@ def create_kv_cache_compression_manager(
     return None
 
 
-def _bind_kv_cache_compression_manager(resources: Dict) -> None:
-    """Bind after KVCM construction, in the extra-resource allocation scope.
-
-    Storage-only managers provide their codec during KVCM construction but do
-    not enter the per-iteration ``ResourceManager``.
-    """
-    key = ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
-    manager = resources.get(key)
-    if manager is None:
-        return
-
-    manager.bind_kv_cache_managers(
-        resources[ResourceManagerType.KV_CACHE_MANAGER],
-        resources.get(ResourceManagerType.DRAFT_KV_CACHE_MANAGER),
-    )
-    if not manager.uses_iteration_lifecycle:
-        resources.pop(key)
-
-
 def compute_max_num_sequences(mapping: Mapping,
                               max_batch_size: int,
                               disable_overlap_scheduler: bool,
@@ -3075,7 +3048,15 @@ def create_py_executor_instance(
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
-    _bind_kv_cache_compression_manager(resources)
+    compression_manager = resources.get(
+        ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER)
+    if compression_manager is not None:
+        compression_manager.bind_kv_cache_managers(
+            resources[ResourceManagerType.KV_CACHE_MANAGER],
+            resources.get(ResourceManagerType.DRAFT_KV_CACHE_MANAGER),
+        )
+        if not compression_manager.uses_iteration_lifecycle:
+            resources.pop(ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER)
     resource_manager = ResourceManager(resources)
 
     # KV cache manager runs last (others may depend on it), except the

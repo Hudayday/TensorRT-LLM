@@ -54,11 +54,7 @@ void initBindings(nb::module_& module)
         .def_rw("fp8_scale_orig_quant", &compression::Nvfp4ColdPageLayerConfig::fp8ScaleOrigQuant)
         .def_rw("fp8_scale_quant_orig", &compression::Nvfp4ColdPageLayerConfig::fp8ScaleQuantOrig);
 
-    // IKvCacheColdPageCodec is registered once by KVCM V2. The factory must
-    // allocate the codec in C++: an nb::init object is co-allocated inside its
-    // Python wrapper and cannot safely become a std::unique_ptr<Base> with the
-    // default deleter. Return the already-registered interface type, leaving
-    // no constructible or otherwise unused concrete Python type.
+    // Construct in C++ so ownership can transfer to KVCM as a unique_ptr codec.
     module.def(
         "create_nvfp4_cold_page_codec",
         [](std::vector<compression::Nvfp4ColdPageLayerConfig> layerConfigs)
