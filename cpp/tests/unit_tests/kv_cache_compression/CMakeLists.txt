@@ -19,5 +19,4 @@ add_gtest(nvfp4ColdPageCodecTest "${NVFP4_COLD_PAGE_CODEC_TEST_SRC}"
 target_link_libraries(nvfp4ColdPageCodecTest PRIVATE CUDA::cuda_driver CUDA::cudart)
 target_include_directories(
   nvfp4ColdPageCodecTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
-          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)

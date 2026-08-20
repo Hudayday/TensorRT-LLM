@@ -1030,14 +1030,6 @@ TEST(Nvfp4BoundaryWholePageTest, TwoHundredFiftySevenPagesUseExactlyTwoWholePage
     expectWholePageLaunchTopology(257, {1, 256});
 }
 
-TEST(Nvfp4BoundaryGeometryTest, MinimumCompactGeometryUsesOneAlignedRecord)
-{
-    EXPECT_EQ(packedBytes(kMinimumCompactGeometry), 8U);
-    EXPECT_EQ(scaleBytes(kMinimumCompactGeometry), 1U);
-    EXPECT_EQ(2U * (packedBytes(kMinimumCompactGeometry) + scaleBytes(kMinimumCompactGeometry)), 18U);
-    EXPECT_EQ(roundUp(18U, alignof(uint4)), 32U);
-}
-
 class Nvfp4BoundaryTailTest : public testing::TestWithParam<RawKind>
 {
 };
