@@ -13,6 +13,7 @@
 #include <array>
 #include <cstdint>
 #include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -60,16 +61,9 @@ std::vector<Nvfp4ColdPageLayerConfig> makeLayers(std::size_t count = kNumAttenti
     layers.reserve(count);
     for (std::size_t index = 0; index < count; ++index)
     {
-        Nvfp4ColdPageLayerConfig layer;
-        layer.layerId = firstLayer + static_cast<int>(index);
-        layer.runtimeType = kernels::Nvfp4BoundaryRuntimeType::kFloat16;
-        layer.numKvHeads = 1;
-        layer.tokensPerPage = 5;
-        layer.headDim = 32;
         auto const scale = static_cast<float>(index + 2U);
-        layer.nvfp4ScaleOrigQuant = {scale, scale + 0.5F};
-        layer.nvfp4ScaleQuantOrig = {1.0F / scale, 1.0F / (scale + 0.5F)};
-        layers.push_back(layer);
+        layers.push_back({firstLayer + static_cast<int>(index), kernels::Nvfp4BoundaryRuntimeType::kFloat16, 1, 5, 32,
+            {scale, scale + 0.5F}, {1.0F / scale, 1.0F / (scale + 0.5F)}});
     }
     return layers;
 }
@@ -78,10 +72,8 @@ kv::PoolGroupDesc makeAttentionDesc(kv::PoolGroupIndex poolGroupIndex = kv::Pool
     kv::LayerGroupId lifeCycle = kv::LayerGroupId{3}, std::size_t count = kNumAttentionLayers, int firstLayer = 0,
     std::uintptr_t keyBase = kGpuKBase, std::uintptr_t valueBase = kGpuVBase)
 {
-    kv::CoalescedBuffer keys;
-    keys.singleBufferSize = kLayerRawBytes;
-    kv::CoalescedBuffer values;
-    values.singleBufferSize = kLayerRawBytes;
+    kv::CoalescedBuffer keys{kLayerRawBytes, {}};
+    kv::CoalescedBuffer values{kLayerRawBytes, {}};
     for (std::size_t index = 0; index < count; ++index)
     {
         auto const layerId = firstLayer + static_cast<int>(index);
@@ -89,20 +81,12 @@ kv::PoolGroupDesc makeAttentionDesc(kv::PoolGroupIndex poolGroupIndex = kv::Pool
         values.bufferIds.push_back({layerId, "value"});
     }
 
-    kv::SlotDescVariant variant;
-    variant.lifeCycleId = lifeCycle;
-    variant.coalescedBuffers = kv::TypedVec<kv::PoolIndex, kv::CoalescedBuffer>{keys, values};
-
+    kv::SlotDescVariant variant{
+        lifeCycle, kv::TypedVec<kv::PoolIndex, kv::CoalescedBuffer>{std::move(keys), std::move(values)}};
     auto const slotBytes = count * kLayerRawBytes;
-    kv::PoolGroupDesc desc;
-    desc.poolGroupIndex = poolGroupIndex;
-    desc.numSlots = kv::SlotCount{512};
-    desc.slotDesc.variants = {variant};
-    desc.pools = kv::TypedVec<kv::PoolIndex, kv::PoolDesc>{
-        kv::PoolDesc{kv::PoolIndex{0}, keyBase, slotBytes},
-        kv::PoolDesc{kv::PoolIndex{1}, valueBase, slotBytes},
-    };
-    return desc;
+    return kv::PoolGroupDesc{poolGroupIndex, kv::SlotCount{512}, kv::SlotDesc{{std::move(variant)}},
+        kv::TypedVec<kv::PoolIndex, kv::PoolDesc>{
+            kv::PoolDesc{kv::PoolIndex{0}, keyBase, slotBytes}, kv::PoolDesc{kv::PoolIndex{1}, valueBase, slotBytes}}};
 }
 
 bool configureOne(Nvfp4ColdPageCodec& codec, kv::PoolGroupDesc const& desc)
@@ -110,19 +94,25 @@ bool configureOne(Nvfp4ColdPageCodec& codec, kv::PoolGroupDesc const& desc)
     return codec.configure(&desc, kv::PoolGroupIndex{1});
 }
 
+std::unique_ptr<Nvfp4ColdPageCodec> makeConfiguredAttentionCodec(
+    std::size_t count = kNumAttentionLayers, kv::LayerGroupId lifeCycle = kv::LayerGroupId{3})
+{
+    auto codec = std::make_unique<Nvfp4ColdPageCodec>(makeLayers(count));
+    EXPECT_TRUE(configureOne(*codec, makeAttentionDesc(kv::PoolGroupIndex{0}, lifeCycle, count)));
+    return codec;
+}
+
 TEST(Nvfp4ColdPageCodecTest, OneCompletePageTaskCoversAllLayersWithDistinctScales)
 {
     resetLaunch();
-    Nvfp4ColdPageCodec codec{makeLayers()};
-    auto const desc = makeAttentionDesc();
-    ASSERT_TRUE(configureOne(codec, desc));
-    EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{3}), kColdSlotBytes);
-    EXPECT_EQ(codec.queryPageIndexLocation(kv::LayerGroupId{3}), kv::PageIndexLocation::kHost);
+    auto codec = makeConfiguredAttentionCodec();
+    EXPECT_EQ(codec->queryColdPageBytes(kv::LayerGroupId{3}), kColdSlotBytes);
+    EXPECT_EQ(codec->queryPageIndexLocation(kv::LayerGroupId{3}), kv::PageIndexLocation::kHost);
 
     kv::PageIndexPair const indices[]{{2, 1}, {5, 3}};
     auto const stream = reinterpret_cast<cudaStream_t>(kStreamValue);
     ASSERT_TRUE(
-        codec.encode(kv::LayerGroupId{3}, reinterpret_cast<void*>(kColdBase), indices, std::size(indices), stream));
+        codec->encode(kv::LayerGroupId{3}, reinterpret_cast<void*>(kColdBase), indices, std::size(indices), stream));
 
     EXPECT_EQ(gLaunch.offloadCalls, 1);
     ASSERT_EQ(gLaunch.offloadPages.size(), 2U);
@@ -146,7 +136,7 @@ TEST(Nvfp4ColdPageCodecTest, OneCompletePageTaskCoversAllLayersWithDistinctScale
     EXPECT_EQ(gLaunch.plan.coldPageBytes, kColdSlotBytes);
     EXPECT_EQ(gLaunch.stream, stream);
 
-    ASSERT_TRUE(codec.decode(
+    ASSERT_TRUE(codec->decode(
         kv::LayerGroupId{3}, reinterpret_cast<void const*>(kColdBase), indices, std::size(indices), stream));
     EXPECT_EQ(gLaunch.onboardCalls, 1);
     ASSERT_EQ(gLaunch.onboardPages.size(), 2U);
@@ -157,16 +147,14 @@ TEST(Nvfp4ColdPageCodecTest, OneCompletePageTaskCoversAllLayersWithDistinctScale
 TEST(Nvfp4ColdPageCodecTest, PreservesOneCodecSubmissionAcrossThe256PageKernelBoundary)
 {
     resetLaunch();
-    Nvfp4ColdPageCodec codec{makeLayers()};
-    auto const desc = makeAttentionDesc();
-    ASSERT_TRUE(configureOne(codec, desc));
+    auto codec = makeConfiguredAttentionCodec();
 
     std::vector<kv::PageIndexPair> indices(257);
     for (std::size_t page = 0; page < indices.size(); ++page)
     {
         indices[page] = {static_cast<std::int32_t>(500U - page), static_cast<std::int32_t>(page * 2U)};
     }
-    ASSERT_TRUE(codec.encode(kv::LayerGroupId{3}, reinterpret_cast<void*>(kColdBase), indices.data(), indices.size(),
+    ASSERT_TRUE(codec->encode(kv::LayerGroupId{3}, reinterpret_cast<void*>(kColdBase), indices.data(), indices.size(),
         reinterpret_cast<cudaStream_t>(kStreamValue)));
     EXPECT_EQ(gLaunch.offloadCalls, 1);
     EXPECT_EQ(gLaunch.offloadPages.size(), 257U);
@@ -176,12 +164,10 @@ TEST(Nvfp4ColdPageCodecTest, PreservesOneCodecSubmissionAcrossThe256PageKernelBo
 TEST(Nvfp4ColdPageCodecTest, EmptyAttentionBatchIsValidAndDoesNotLaunch)
 {
     resetLaunch();
-    Nvfp4ColdPageCodec codec{makeLayers(1)};
-    auto const desc = makeAttentionDesc(kv::PoolGroupIndex{0}, kv::LayerGroupId{0}, 1);
-    ASSERT_TRUE(configureOne(codec, desc));
+    auto codec = makeConfiguredAttentionCodec(1, kv::LayerGroupId{0});
 
-    EXPECT_TRUE(codec.encode(kv::LayerGroupId{0}, nullptr, nullptr, 0U, nullptr));
-    EXPECT_TRUE(codec.decode(kv::LayerGroupId{0}, nullptr, nullptr, 0U, nullptr));
+    EXPECT_TRUE(codec->encode(kv::LayerGroupId{0}, nullptr, nullptr, 0U, nullptr));
+    EXPECT_TRUE(codec->decode(kv::LayerGroupId{0}, nullptr, nullptr, 0U, nullptr));
     EXPECT_EQ(gLaunch.offloadCalls, 0);
     EXPECT_EQ(gLaunch.onboardCalls, 0);
 }
@@ -189,26 +175,22 @@ TEST(Nvfp4ColdPageCodecTest, EmptyAttentionBatchIsValidAndDoesNotLaunch)
 TEST(Nvfp4ColdPageCodecTest, DefaultStreamIsAccepted)
 {
     resetLaunch();
-    Nvfp4ColdPageCodec codec{makeLayers(1)};
-    auto const desc = makeAttentionDesc(kv::PoolGroupIndex{0}, kv::LayerGroupId{0}, 1);
-    ASSERT_TRUE(configureOne(codec, desc));
+    auto codec = makeConfiguredAttentionCodec(1, kv::LayerGroupId{0});
 
     kv::PageIndexPair const indices[]{{0, 0}};
-    EXPECT_TRUE(codec.encode(kv::LayerGroupId{0}, reinterpret_cast<void*>(kColdBase), indices, 1U, nullptr));
-    EXPECT_TRUE(codec.decode(kv::LayerGroupId{0}, reinterpret_cast<void const*>(kColdBase), indices, 1U, nullptr));
+    EXPECT_TRUE(codec->encode(kv::LayerGroupId{0}, reinterpret_cast<void*>(kColdBase), indices, 1U, nullptr));
+    EXPECT_TRUE(codec->decode(kv::LayerGroupId{0}, reinterpret_cast<void const*>(kColdBase), indices, 1U, nullptr));
     EXPECT_EQ(gLaunch.offloadCalls, 1);
     EXPECT_EQ(gLaunch.onboardCalls, 1);
 }
 
 TEST(Nvfp4ColdPageCodecTest, NonEmptyAttentionBatchRequiresPageIndices)
 {
-    Nvfp4ColdPageCodec codec{makeLayers(1)};
-    auto const desc = makeAttentionDesc(kv::PoolGroupIndex{0}, kv::LayerGroupId{0}, 1);
-    ASSERT_TRUE(configureOne(codec, desc));
+    auto codec = makeConfiguredAttentionCodec(1, kv::LayerGroupId{0});
 
     auto const stream = reinterpret_cast<cudaStream_t>(kStreamValue);
-    EXPECT_FALSE(codec.encode(kv::LayerGroupId{0}, reinterpret_cast<void*>(kColdBase), nullptr, 1U, stream));
-    EXPECT_FALSE(codec.decode(kv::LayerGroupId{0}, reinterpret_cast<void const*>(kColdBase), nullptr, 1U, stream));
+    EXPECT_FALSE(codec->encode(kv::LayerGroupId{0}, reinterpret_cast<void*>(kColdBase), nullptr, 1U, stream));
+    EXPECT_FALSE(codec->decode(kv::LayerGroupId{0}, reinterpret_cast<void const*>(kColdBase), nullptr, 1U, stream));
 }
 
 TEST(Nvfp4ColdPageCodecTest, OnlyFp8RuntimeRequiresFp8Scales)
@@ -260,12 +242,10 @@ TEST(Nvfp4ColdPageCodecTest, RejectsAttentionAndUnknownSideBufferInOneLifecycle)
 
 TEST(Nvfp4ColdPageCodecTest, UnknownLifecycleUsesFailureSentinels)
 {
-    Nvfp4ColdPageCodec codec{makeLayers()};
-    auto const desc = makeAttentionDesc();
-    ASSERT_TRUE(configureOne(codec, desc));
-    EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{99}), 0U);
-    EXPECT_EQ(codec.getBatchingLayerGroupId(kv::LayerGroupId{99}), kv::LayerGroupId{-1});
-    EXPECT_EQ(codec.queryPageIndexLocation(kv::LayerGroupId{99}), kv::PageIndexLocation::kBadLocation);
+    auto codec = makeConfiguredAttentionCodec();
+    EXPECT_EQ(codec->queryColdPageBytes(kv::LayerGroupId{99}), 0U);
+    EXPECT_EQ(codec->getBatchingLayerGroupId(kv::LayerGroupId{99}), kv::LayerGroupId{-1});
+    EXPECT_EQ(codec->queryPageIndexLocation(kv::LayerGroupId{99}), kv::PageIndexLocation::kBadLocation);
 }
 
 TEST(Nvfp4ColdPageCodecTest, NonAttentionLifecycleUsesLosslessSingleBlob)

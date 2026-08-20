@@ -14,7 +14,7 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page import 
     ColdPageQuantizationCompression,
 )
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
-from tensorrt_llm._torch.pyexecutor.resource_manager import DataType, KVCacheCompressionManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
 from tensorrt_llm.runtime import kv_cache_manager_v2 as runtime_v2_mod
@@ -49,12 +49,11 @@ def _cache_config(*layers):
 
 
 def _native():
-    class NativeLayerConfig(SimpleNamespace):
-        def __init__(self):
-            super().__init__(
-                fp8_scale_orig_quant=(1.0, 1.0),
-                fp8_scale_quant_orig=(1.0, 1.0),
-            )
+    def layer_config():
+        return SimpleNamespace(
+            fp8_scale_orig_quant=(1.0, 1.0),
+            fp8_scale_quant_orig=(1.0, 1.0),
+        )
 
     codec = MagicMock()
     module = SimpleNamespace(
@@ -63,21 +62,22 @@ def _native():
             BFLOAT16="native-bf16",
             FP8_E4M3="native-fp8",
         ),
-        Nvfp4ColdPageLayerConfig=NativeLayerConfig,
+        Nvfp4ColdPageLayerConfig=layer_config,
         create_nvfp4_cold_page_codec=MagicMock(return_value=codec),
     )
     return module, codec
 
 
+def _write_quant_metadata(directory, algorithm="NVFP4"):
+    metadata = {
+        "producer": {"name": "modelopt"},
+        "quantization": {"kv_cache_quant_algo": algorithm},
+    }
+    (directory / "hf_quant_config.json").write_text(json.dumps(metadata))
+
+
 def _write_scales(directory, scales_by_layer, *, filename="model.safetensors", prefix="model"):
-    (directory / "hf_quant_config.json").write_text(
-        json.dumps(
-            {
-                "producer": {"name": "modelopt"},
-                "quantization": {"kv_cache_quant_algo": "NVFP4"},
-            }
-        )
-    )
+    _write_quant_metadata(directory)
     tensors = {}
     for layer_id, (k_scale, v_scale) in scales_by_layer.items():
         base = f"{prefix}.layers.{layer_id}.self_attn"
@@ -86,7 +86,16 @@ def _write_scales(directory, scales_by_layer, *, filename="model.safetensors", p
     save_file(tensors, str(directory / filename))
 
 
-def test_optional_modelopt_scales_map_pp_layers_into_native_codec(tmp_path):
+def _validate_compression(mode=None):
+    spec_config = None if mode is None else SimpleNamespace(spec_dec_mode=mode)
+    util_mod.validate_kv_cache_compression_compatibility(
+        ColdPageQuantizationCompressionConfig(),
+        SimpleNamespace(enable_block_reuse=False),
+        spec_config,
+    )
+
+
+def test_optional_modelopt_scales_map_pp_layers_and_ignore_local_draft_id(tmp_path):
     native, codec = _native()
     _write_scales(
         tmp_path,
@@ -95,31 +104,31 @@ def test_optional_modelopt_scales_map_pp_layers_into_native_codec(tmp_path):
     )
     _write_scales(
         tmp_path,
-        {4: (0.125, 0.0625)},
+        {4: (0.125, 0.0625), 2: (0.75, 0.5)},
         filename="model-00002-of-00002.safetensors",
         prefix="model.language_model",
     )
 
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
         result = _manager(tmp_path).create_cold_page_codec(
-            _cache_config((0, "attention"), (1, "attention")),
+            _cache_config((0, "attention"), (1, "attention"), (2, "attention")),
             runtime_dtype=DataType.BF16,
-            pp_layers=(10, 4),
-            num_kv_heads_per_layer=(8, 8),
-            head_dim_per_layer=(128, 128),
+            pp_layers=(10, 4, 32),
+            num_kv_heads_per_layer=(8, 8, 8),
+            head_dim_per_layer=(128, 128, 128),
         )
 
     assert result is codec
     configs = native.create_nvfp4_cold_page_codec.call_args.args[0]
-    assert [config.layer_id for config in configs] == [0, 1]
-    assert [config.runtime_type for config in configs] == ["native-bf16"] * 2
-    assert [config.nvfp4_scale_quant_orig for config in configs] == [
-        (0.5, 0.25),
-        (0.125, 0.0625),
-    ]
-    assert [config.nvfp4_scale_orig_quant for config in configs] == [
-        (2.0, 4.0),
-        (8.0, 16.0),
+    assert [config.layer_id for config in configs] == [0, 1, 2]
+    assert [config.runtime_type for config in configs] == ["native-bf16"] * 3
+    assert [
+        (config.nvfp4_scale_orig_quant, config.nvfp4_scale_quant_orig)
+        for config in configs
+    ] == [
+        ((2.0, 4.0), (0.5, 0.25)),
+        ((8.0, 16.0), (0.125, 0.0625)),
+        ((1.0, 1.0), (1.0, 1.0)),
     ]
 
 
@@ -142,26 +151,7 @@ def test_omitted_scale_checkpoint_uses_identity_and_keeps_kv_geometry():
     assert config.num_kv_heads == 4
     assert config.tokens_per_page == 5
     assert config.head_dim == 128
-    assert config.nvfp4_scale_orig_quant == (1.0, 1.0)
-    assert config.nvfp4_scale_quant_orig == (1.0, 1.0)
-
-
-def test_appended_draft_layer_does_not_reuse_target_scale(tmp_path):
-    native, _ = _native()
-    _write_scales(tmp_path, {0: (0.5, 0.25)})
-
-    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
-        _manager(tmp_path).create_cold_page_codec(
-            _cache_config((0, "attention")),
-            runtime_dtype=DataType.BF16,
-            pp_layers=(32,),
-            num_kv_heads_per_layer=(8,),
-            head_dim_per_layer=(128,),
-        )
-
-    config = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
-    assert config.nvfp4_scale_orig_quant == (1.0, 1.0)
-    assert config.nvfp4_scale_quant_orig == (1.0, 1.0)
+    assert config.nvfp4_scale_orig_quant == config.nvfp4_scale_quant_orig == (1.0, 1.0)
 
 
 def test_provider_creates_one_native_codec_per_kv_cache_manager():
@@ -233,14 +223,7 @@ def test_trtllm_load_kv_scales_zero_uses_identity(tmp_path, monkeypatch):
 
 def test_non_nvfp4_checkpoint_scales_are_not_reused(tmp_path):
     _write_scales(tmp_path, {7: (0.5, 0.25)})
-    (tmp_path / "hf_quant_config.json").write_text(
-        json.dumps(
-            {
-                "producer": {"name": "modelopt"},
-                "quantization": {"kv_cache_quant_algo": "FP8"},
-            }
-        )
-    )
+    _write_quant_metadata(tmp_path, "FP8")
     assert _manager(tmp_path)._model_nvfp4_scales == {}
 
 
@@ -330,50 +313,36 @@ def test_fp8_runtime_uses_native_unit_source_scale_default(tmp_path):
         )
 
     config = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
-    assert config.fp8_scale_orig_quant == (1.0, 1.0)
-    assert config.fp8_scale_quant_orig == (1.0, 1.0)
+    assert config.fp8_scale_orig_quant == config.fp8_scale_quant_orig == (1.0, 1.0)
     assert config.nvfp4_scale_quant_orig == (0.5, 0.25)
 
 
 def test_runtime_admission_is_checked_in_utils_before_manager_creation(monkeypatch):
-    config = ColdPageQuantizationCompressionConfig()
-    kv_cache_config = SimpleNamespace(enable_block_reuse=False)
-
     monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "python")
     with pytest.raises(ValueError, match=r"require.*C\+\+ KVCacheManagerV2"):
-        util_mod.validate_kv_cache_compression_compatibility(config, kv_cache_config, None)
+        _validate_compression()
 
     monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
     monkeypatch.setattr(util_mod, "is_sm_100f", lambda: False)
     with pytest.raises(RuntimeError, match="requires an SM100-family device"):
-        util_mod.validate_kv_cache_compression_compatibility(config, kv_cache_config, None)
+        _validate_compression()
 
     monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
-    util_mod.validate_kv_cache_compression_compatibility(config, kv_cache_config, None)
+    _validate_compression()
 
 
 def test_speculative_admission_accepts_only_one_model_eagle3(monkeypatch):
-    config = ColdPageQuantizationCompressionConfig()
-    kv_cache_config = SimpleNamespace(enable_block_reuse=False)
     monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
     monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
 
-    util_mod.validate_kv_cache_compression_compatibility(
-        config,
-        kv_cache_config,
-        SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL),
-    )
+    _validate_compression(SpeculativeDecodingMode.EAGLE3_ONE_MODEL)
     for mode in (
         SpeculativeDecodingMode.MTP,
         SpeculativeDecodingMode.EAGLE3,
         SpeculativeDecodingMode.DFLASH,
     ):
         with pytest.raises(ValueError, match="only with one-model EAGLE3"):
-            util_mod.validate_kv_cache_compression_compatibility(
-                config,
-                kv_cache_config,
-                SimpleNamespace(spec_dec_mode=mode),
-            )
+            _validate_compression(mode)
 
 
 def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4():
@@ -404,14 +373,12 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4():
     resources = build()
     manager = resources[util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER]
     assert isinstance(manager, ColdPageQuantizationCompression)
-    assert isinstance(manager, KVCacheCompressionManager)
     assert manager.provides_cold_page_codec
     assert not manager.uses_iteration_lifecycle
-    assert (
-        util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
-        not in build(estimating=True)
-    )
-    assert (
-        util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
-        not in build(active_kv_quant=SimpleNamespace(kv_cache_quant_algo="NVFP4"))
-    )
+    for kwargs in (
+        {"estimating": True},
+        {"active_kv_quant": SimpleNamespace(kv_cache_quant_algo="NVFP4")},
+    ):
+        assert util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in build(
+            **kwargs
+        )

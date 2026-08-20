@@ -33,6 +33,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace
@@ -231,30 +232,16 @@ private:
     std::size_t mPayloadBytes{};
 };
 
-struct PageBuffers
+struct LayerBuffers
 {
-    PageBuffers(std::size_t rawBytes, std::size_t packedBytes, std::size_t scaleBytes)
-        : rawInputK(rawBytes)
-        , rawInputV(rawBytes)
-        , rawOutputK(rawBytes)
-        , rawOutputV(rawBytes)
-        , compactPage(2 * (packedBytes + scaleBytes))
+    explicit LayerBuffers(std::size_t rawBytes)
+        : rawK(rawBytes)
+        , rawV(rawBytes)
     {
     }
 
-    std::vector<std::uint8_t> compactRegion(std::size_t offset, std::size_t bytes) const
-    {
-        auto const payload = compactPage.payload();
-        return {payload.begin() + static_cast<std::ptrdiff_t>(offset),
-            payload.begin() + static_cast<std::ptrdiff_t>(offset + bytes)};
-    }
-
-    DeviceRegion rawInputK;
-    DeviceRegion rawInputV;
-    DeviceRegion rawOutputK;
-    DeviceRegion rawOutputV;
-    MappedHostRegion compactPage;
-    std::array<std::vector<std::uint8_t>, 2> rawHost;
+    DeviceRegion rawK;
+    DeviceRegion rawV;
 };
 
 std::size_t numElements(PageGeometry const& geometry)
@@ -793,21 +780,76 @@ void runPartialPageTailIsolation(RawKind kind)
     compactPages.expectCanaries();
 }
 
-class Nvfp4Boundary16BitTest : public testing::TestWithParam<RawKind>
+struct RoundTripCase
+{
+    char const* name;
+    RawKind kind;
+    PageGeometry geometry{kDefaultGeometry};
+    std::size_t numPages{kDefaultNumPages};
+    InputPattern inputPattern{InputPattern::kDense};
+    bool synchronizeBetweenDirections{true};
+    bool repeatRoundTrip{false};
+    std::size_t coldBaseOffset{0};
+};
+
+RoundTripCase constexpr kRoundTripCases[]{
+    {"DefaultFloat16", RawKind::kFloat16},
+    {"DefaultBfloat16", RawKind::kBfloat16},
+    {"DefaultFp8IndependentScales", RawKind::kFp8},
+    {"SmallVectorFloat16", RawKind::kFloat16, kSmallVectorGeometry, 1},
+    {"MinimumFloat16", RawKind::kFloat16, kMinimumCompactGeometry, 1},
+    {"MinimumBfloat16", RawKind::kBfloat16, kMinimumCompactGeometry, 1},
+    {"MinimumFp8", RawKind::kFp8, kMinimumCompactGeometry, 1},
+    {"PackedScaleTailFloat16", RawKind::kFloat16, kPackedBodyAndTailGeometry, 1},
+    {"PackedScaleTailFp8", RawKind::kFp8, kPackedBodyAndTailGeometry, 1},
+    {"ByteAlignedColdBaseBfloat16", RawKind::kBfloat16, kPackedBodyAndTailGeometry, 1, InputPattern::kDense, true,
+        false, 1},
+    {"ByteAlignedColdBaseFp8", RawKind::kFp8, kPackedBodyAndTailGeometry, 1, InputPattern::kDense, true, false, 1},
+    {"OddTokenFloat16", RawKind::kFloat16, kLinearScaleTailGeometry, 1},
+    {"OddTokenBfloat16", RawKind::kBfloat16, kLinearScaleTailGeometry, 1},
+    {"OddTokenFp8", RawKind::kFp8, kLinearScaleTailGeometry, 1},
+    {"TiledTailsFloat16", RawKind::kFloat16, kTiledLinearScaleTailGeometry, 1},
+    {"TiledTailsFp8", RawKind::kFp8, kTiledLinearScaleTailGeometry, 1},
+    {"CrossRowTileBfloat16", RawKind::kBfloat16, kCrossRowTileGeometry, 1, InputPattern::kDense, true, false, 1},
+    {"LargeHeadDimFp8", RawKind::kFp8, kLargeHeadDimTailGeometry, 1},
+    {"ModelLikeBfloat16", RawKind::kBfloat16, kModelLikeGeometry, 1},
+    {"ModelLikeFp8", RawKind::kFp8, kModelLikeGeometry, 1},
+    {"ZeroGroupsFloat16", RawKind::kFloat16, kDefaultGeometry, 1, InputPattern::kAllZero},
+    {"ZeroGroupsBfloat16", RawKind::kBfloat16, kDefaultGeometry, 1, InputPattern::kAllZero},
+    {"ZeroGroupsFp8", RawKind::kFp8, kDefaultGeometry, 1, InputPattern::kAllZero},
+    {"WarpLaneAmaxFloat16", RawKind::kFloat16, kDefaultGeometry, 1, InputPattern::kSparseOutlier},
+    {"WarpLaneAmaxBfloat16", RawKind::kBfloat16, kDefaultGeometry, 1, InputPattern::kSparseOutlier},
+    {"WarpLaneAmaxFp8", RawKind::kFp8, kDefaultGeometry, 1, InputPattern::kSparseOutlier},
+    {"ReuseDefaultFloat16", RawKind::kFloat16, kDefaultGeometry, 3, InputPattern::kDense, true, true},
+    {"ReuseDefaultBfloat16", RawKind::kBfloat16, kDefaultGeometry, 3, InputPattern::kDense, true, true},
+    {"ReuseDefaultFp8", RawKind::kFp8, kDefaultGeometry, 3, InputPattern::kDense, true, true},
+    {"ReuseModelLikeFloat16", RawKind::kFloat16, kModelLikeGeometry, 2, InputPattern::kDense, true, true},
+    {"ReuseModelLikeBfloat16", RawKind::kBfloat16, kModelLikeGeometry, 2, InputPattern::kDense, true, true},
+    {"ReuseModelLikeFp8", RawKind::kFp8, kModelLikeGeometry, 2, InputPattern::kDense, true, true},
+    {"RoundingMarginsFloat16", RawKind::kFloat16, kDefaultGeometry, 1, InputPattern::kRoundingMargins},
+    {"CrossLaunchBfloat16", RawKind::kBfloat16, kSmallVectorGeometry, kCrossLaunchNumPages},
+    {"CrossLaunchFp8", RawKind::kFp8, kSmallVectorGeometry, kCrossLaunchNumPages},
+    {"PdlBfloat16", RawKind::kBfloat16, kSmallVectorGeometry, 65, InputPattern::kDense, false},
+    {"PdlFp8", RawKind::kFp8, kSmallVectorGeometry, 65, InputPattern::kDense, false},
+};
+
+class Nvfp4BoundaryRoundTripTest : public testing::TestWithParam<RoundTripCase>
 {
 };
 
-TEST_P(Nvfp4Boundary16BitTest, BatchesDisjointPagesAndMatchesLinearCompactLayout)
+TEST_P(Nvfp4BoundaryRoundTripTest, MatchesReference)
 {
-    runBoundaryRoundTrip(GetParam());
+    auto const& test = GetParam();
+    runBoundaryRoundTrip(test.kind, test.geometry, test.numPages, test.inputPattern, test.synchronizeBetweenDirections,
+        test.repeatRoundTrip, test.coldBaseOffset);
 }
 
-INSTANTIATE_TEST_SUITE_P(RuntimeType, Nvfp4Boundary16BitTest, testing::Values(RawKind::kFloat16, RawKind::kBfloat16));
-
-TEST(Nvfp4BoundaryFp8Test, BatchesDisjointPagesWithIndependentSourceAndTargetScales)
+std::string roundTripCaseName(testing::TestParamInfo<RoundTripCase> const& info)
 {
-    runBoundaryRoundTrip(RawKind::kFp8);
+    return info.param.name;
 }
+
+INSTANTIATE_TEST_SUITE_P(Scenarios, Nvfp4BoundaryRoundTripTest, testing::ValuesIn(kRoundTripCases), roundTripCaseName);
 
 TEST(Nvfp4BoundaryWholePageTest, DifferentLayerScalesRemainInOneCompletePageBatch)
 {
@@ -850,8 +892,7 @@ TEST(Nvfp4BoundaryWholePageTest, DifferentLayerScalesRemainInOneCompletePageBatc
         rawOutputV[layer] = std::make_unique<DeviceRegion>(rawSlotBytes);
         for (std::uint32_t role = 0; role < 2; ++role)
         {
-            rawHost[layer][role]
-                = makeRawPage(kind, layer, role, params[layer], geometry, InputPattern::kDense);
+            rawHost[layer][role] = makeRawPage(kind, layer, role, params[layer], geometry, InputPattern::kDense);
             references[layer][role] = compressReference(rawHost[layer][role], kind, role, params[layer], geometry);
         }
         rawInputK[layer]->copyFrom(rawHost[layer][0]);
@@ -989,123 +1030,25 @@ TEST(Nvfp4BoundaryWholePageTest, TwoHundredFiftySevenPagesUseExactlyTwoWholePage
     expectWholePageLaunchTopology(257, {1, 256});
 }
 
-TEST(Nvfp4BoundaryGeometryTest, SupportsSmallVectorGeometryAndWarpTail)
-{
-    runBoundaryRoundTrip(RawKind::kFloat16, kSmallVectorGeometry, 1);
-}
-
-TEST(Nvfp4BoundaryGeometryTest, SupportsMinimumTightCompactGeometry)
+TEST(Nvfp4BoundaryGeometryTest, MinimumCompactGeometryUsesOneAlignedRecord)
 {
     EXPECT_EQ(packedBytes(kMinimumCompactGeometry), 8U);
     EXPECT_EQ(scaleBytes(kMinimumCompactGeometry), 1U);
     EXPECT_EQ(2U * (packedBytes(kMinimumCompactGeometry) + scaleBytes(kMinimumCompactGeometry)), 18U);
     EXPECT_EQ(roundUp(18U, alignof(uint4)), 32U);
-    runBoundaryRoundTrip(RawKind::kFloat16, kMinimumCompactGeometry, 1);
-    runBoundaryRoundTrip(RawKind::kBfloat16, kMinimumCompactGeometry, 1);
-    runBoundaryRoundTrip(RawKind::kFp8, kMinimumCompactGeometry, 1);
 }
 
-TEST(Nvfp4BoundaryGeometryTest, SupportsPackedVectorBodyWithLeadingAndTrailingScaleGroups)
-{
-    runBoundaryRoundTrip(RawKind::kFloat16, kPackedBodyAndTailGeometry, 1);
-    runBoundaryRoundTrip(RawKind::kFp8, kPackedBodyAndTailGeometry, 1);
-}
-
-TEST(Nvfp4BoundaryGeometryTest, SupportsByteAlignedColdBase)
-{
-    runBoundaryRoundTrip(RawKind::kBfloat16, kPackedBodyAndTailGeometry, 1, InputPattern::kDense, true, false, 1);
-    runBoundaryRoundTrip(RawKind::kFp8, kPackedBodyAndTailGeometry, 1, InputPattern::kDense, true, false, 1);
-}
-
-TEST(Nvfp4BoundaryGeometryTest, SupportsOddTokenCountAndNonVectorScaleTail)
-{
-    runBoundaryRoundTrip(RawKind::kFloat16, kLinearScaleTailGeometry, 1);
-    runBoundaryRoundTrip(RawKind::kBfloat16, kLinearScaleTailGeometry, 1);
-    runBoundaryRoundTrip(RawKind::kFp8, kLinearScaleTailGeometry, 1);
-}
-
-TEST(Nvfp4BoundaryGeometryTest, SupportsTiledPackedAndScaleTails)
-{
-    runBoundaryRoundTrip(RawKind::kFloat16, kTiledLinearScaleTailGeometry, 1);
-    runBoundaryRoundTrip(RawKind::kFp8, kTiledLinearScaleTailGeometry, 1);
-}
-
-TEST(Nvfp4BoundaryGeometryTest, SupportsTileBoundaryInsideOneRowWithByteAlignedColdBase)
-{
-    runBoundaryRoundTrip(RawKind::kBfloat16, kCrossRowTileGeometry, 1, InputPattern::kDense, true, false, 1);
-}
-
-TEST(Nvfp4BoundaryGeometryTest, SupportsLargeHeadDimWithATwoHalfGroupTail)
-{
-    runBoundaryRoundTrip(RawKind::kFp8, kLargeHeadDimTailGeometry, 1);
-}
-
-TEST(Nvfp4BoundaryGeometryTest, SupportsModelLikeBfloat16Page)
-{
-    runBoundaryRoundTrip(RawKind::kBfloat16, kModelLikeGeometry, 1);
-}
-
-TEST(Nvfp4BoundaryGeometryTest, SupportsModelLikeFp8Page)
-{
-    runBoundaryRoundTrip(RawKind::kFp8, kModelLikeGeometry, 1);
-}
-
-class Nvfp4BoundaryInputPatternTest : public testing::TestWithParam<RawKind>
+class Nvfp4BoundaryTailTest : public testing::TestWithParam<RawKind>
 {
 };
 
-TEST_P(Nvfp4BoundaryInputPatternTest, InactiveTailRowsDoNotAffectTheValidPrefix)
+TEST_P(Nvfp4BoundaryTailTest, InactiveRowsDoNotAffectTheValidPrefix)
 {
     runPartialPageTailIsolation(GetParam());
 }
 
-TEST_P(Nvfp4BoundaryInputPatternTest, HandlesAllZeroScaleGroups)
-{
-    runBoundaryRoundTrip(GetParam(), kDefaultGeometry, 1, InputPattern::kAllZero);
-}
-
-TEST_P(Nvfp4BoundaryInputPatternTest, ReducesAmaxAcrossBothWarpLanes)
-{
-    runBoundaryRoundTrip(GetParam(), kDefaultGeometry, 1, InputPattern::kSparseOutlier);
-}
-
-TEST_P(Nvfp4BoundaryInputPatternTest, ReusesTheSamePagesAcrossTwoLossyColdRounds)
-{
-    runBoundaryRoundTrip(GetParam(), kDefaultGeometry, 3, InputPattern::kDense, true, true);
-}
-
-TEST_P(Nvfp4BoundaryInputPatternTest, ReusesModelLikeTiledPagesAcrossTwoLossyColdRounds)
-{
-    runBoundaryRoundTrip(GetParam(), kModelLikeGeometry, 2, InputPattern::kDense, true, true);
-}
-
-INSTANTIATE_TEST_SUITE_P(AllRuntimeTypes, Nvfp4BoundaryInputPatternTest,
-    testing::Values(RawKind::kFloat16, RawKind::kBfloat16, RawKind::kFp8));
-
-TEST(Nvfp4BoundaryRoundingTest, QuantizesValuesSafelyAwayFromE2m1Ties)
-{
-    runBoundaryRoundTrip(RawKind::kFloat16, kDefaultGeometry, 1, InputPattern::kRoundingMargins);
-}
-
-TEST(Nvfp4BoundaryBatchingTest, Bfloat16CrossesTheTwoHundredFiftySixPageChunkBoundary)
-{
-    runBoundaryRoundTrip(RawKind::kBfloat16, kSmallVectorGeometry, kCrossLaunchNumPages);
-}
-
-TEST(Nvfp4BoundaryBatchingTest, Fp8CrossesTheTwoHundredFiftySixPageChunkBoundary)
-{
-    runBoundaryRoundTrip(RawKind::kFp8, kSmallVectorGeometry, kCrossLaunchNumPages);
-}
-
-TEST(Nvfp4BoundaryPdlTest, ChainsBfloat16OffloadAndOnboardWithoutIntermediateHostSync)
-{
-    runBoundaryRoundTrip(RawKind::kBfloat16, kSmallVectorGeometry, 65, InputPattern::kDense, false);
-}
-
-TEST(Nvfp4BoundaryPdlTest, ChainsFp8OffloadAndOnboardWithoutIntermediateHostSync)
-{
-    runBoundaryRoundTrip(RawKind::kFp8, kSmallVectorGeometry, 65, InputPattern::kDense, false);
-}
+INSTANTIATE_TEST_SUITE_P(
+    AllRuntimeTypes, Nvfp4BoundaryTailTest, testing::Values(RawKind::kFloat16, RawKind::kBfloat16, RawKind::kFp8));
 
 TEST(Nvfp4BoundaryValidationTest, EmptyBatchIsAnAsyncNoOp)
 {
@@ -1121,65 +1064,49 @@ TEST(Nvfp4BoundaryValidationTest, RejectsInvalidGeometryAndScalesBeforeLaunch)
         GTEST_SKIP() << "NVFP4 boundary kernels require an SM100-family GPU";
     }
 
-    PageBuffers buffers(
-        rawBytes(RawKind::kFloat16, kDefaultGeometry), packedBytes(kDefaultGeometry), scaleBytes(kDefaultGeometry));
+    std::size_t const rawSlotBytes = rawBytes(RawKind::kFloat16, kDefaultGeometry);
+    LayerBuffers buffers(rawSlotBytes);
     std::size_t const coldPageBytes = 2U * (packedBytes(kDefaultGeometry) + scaleBytes(kDefaultGeometry));
-    auto const prepare16Bit = [&](Nvfp4BoundaryKernelParams const& params)
+    auto const prepare =
+        [&](Nvfp4BoundaryKernelParams const& params, Nvfp4BoundaryRuntimeType type = Nvfp4BoundaryRuntimeType::kFloat16)
     {
-        Nvfp4BoundaryLayerPlan const layer{reinterpret_cast<std::uintptr_t>(buffers.rawInputK.data()),
-            reinterpret_cast<std::uintptr_t>(buffers.rawInputV.data()), rawBytes(RawKind::kFloat16, kDefaultGeometry),
-            rawBytes(RawKind::kFloat16, kDefaultGeometry), 0U, params};
-        static_cast<void>(tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(
-            {layer}, coldPageBytes, Nvfp4BoundaryRuntimeType::kFloat16));
+        Nvfp4BoundaryLayerPlan const layer{reinterpret_cast<std::uintptr_t>(buffers.rawK.data()),
+            reinterpret_cast<std::uintptr_t>(buffers.rawV.data()), rawSlotBytes, rawSlotBytes, 0U, params};
+        static_cast<void>(tensorrt_llm::kernels::prepareNvfp4BoundaryPlan({layer}, coldPageBytes, type));
     };
-    auto const prepareFp8 = [&](Nvfp4BoundaryKernelParams const& params)
+    auto const expectInvalid
+        = [&](char const* name, auto const& mutate, Nvfp4BoundaryRuntimeType type = Nvfp4BoundaryRuntimeType::kFloat16)
     {
-        Nvfp4BoundaryLayerPlan const layer{reinterpret_cast<std::uintptr_t>(buffers.rawInputK.data()),
-            reinterpret_cast<std::uintptr_t>(buffers.rawInputV.data()), rawBytes(RawKind::kFloat16, kDefaultGeometry),
-            rawBytes(RawKind::kFloat16, kDefaultGeometry), 0U, params};
-        static_cast<void>(tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(
-            {layer}, coldPageBytes, Nvfp4BoundaryRuntimeType::kFp8E4m3));
+        SCOPED_TRACE(name);
+        auto params = makeParams();
+        mutate(params);
+        EXPECT_ANY_THROW(prepare(params, type));
     };
 
-    Nvfp4BoundaryKernelParams invalid = makeParams();
-    invalid.numKvHeads = 0;
-    EXPECT_ANY_THROW(prepare16Bit(invalid));
-    invalid = makeParams();
-    invalid.tokensPerPage = 0;
-    EXPECT_ANY_THROW(prepare16Bit(invalid));
-    invalid = makeParams();
-    invalid.tokensPerPage = 6;
-    EXPECT_NO_THROW(prepare16Bit(invalid));
-    invalid = makeParams(PageGeometry{1, 1, 16});
-    EXPECT_NO_THROW(prepare16Bit(invalid));
-    invalid = makeParams();
-    invalid.headDim = 0;
-    EXPECT_ANY_THROW(prepare16Bit(invalid));
-    invalid = makeParams();
-    invalid.headDim = 24;
-    EXPECT_ANY_THROW(prepare16Bit(invalid));
-    invalid = makeParams();
-    invalid.numKvHeads = std::numeric_limits<std::int32_t>::max();
-    EXPECT_ANY_THROW(prepare16Bit(invalid));
+    auto valid = makeParams();
+    valid.tokensPerPage = 6;
+    EXPECT_NO_THROW(prepare(valid));
+    EXPECT_NO_THROW(prepare(makeParams(PageGeometry{1, 1, 16})));
 
-    invalid = makeParams();
-    invalid.nvfp4ScaleOrigQuant[0] = 0.0F;
-    EXPECT_ANY_THROW(prepare16Bit(invalid));
-    invalid = makeParams();
-    invalid.nvfp4ScaleQuantOrig[1] = -1.0F;
-    EXPECT_ANY_THROW(prepare16Bit(invalid));
-    invalid = makeParams();
-    invalid.nvfp4ScaleOrigQuant[1] = std::numeric_limits<float>::quiet_NaN();
-    EXPECT_ANY_THROW(prepare16Bit(invalid));
-    invalid = makeParams();
-    invalid.nvfp4ScaleQuantOrig[0] = std::numeric_limits<float>::infinity();
-    EXPECT_ANY_THROW(prepare16Bit(invalid));
-    invalid = makeParams();
-    invalid.fp8ScaleOrigQuant[0] = 0.0F;
-    EXPECT_ANY_THROW(prepareFp8(invalid));
-    invalid = makeParams();
-    invalid.fp8ScaleQuantOrig[1] = std::numeric_limits<float>::infinity();
-    EXPECT_ANY_THROW(prepareFp8(invalid));
+    expectInvalid("zero heads", [](auto& params) { params.numKvHeads = 0; });
+    expectInvalid("zero tokens", [](auto& params) { params.tokensPerPage = 0; });
+    expectInvalid("zero head dimension", [](auto& params) { params.headDim = 0; });
+    expectInvalid("unaligned head dimension", [](auto& params) { params.headDim = 24; });
+    expectInvalid(
+        "element count overflow", [](auto& params) { params.numKvHeads = std::numeric_limits<std::int32_t>::max(); });
+    expectInvalid("zero NVFP4 quant scale", [](auto& params) { params.nvfp4ScaleOrigQuant[0] = 0.0F; });
+    expectInvalid("negative NVFP4 dequant scale", [](auto& params) { params.nvfp4ScaleQuantOrig[1] = -1.0F; });
+    expectInvalid("NaN NVFP4 quant scale",
+        [](auto& params) { params.nvfp4ScaleOrigQuant[1] = std::numeric_limits<float>::quiet_NaN(); });
+    expectInvalid("infinite NVFP4 dequant scale",
+        [](auto& params) { params.nvfp4ScaleQuantOrig[0] = std::numeric_limits<float>::infinity(); });
+    expectInvalid(
+        "zero FP8 quant scale", [](auto& params) { params.fp8ScaleOrigQuant[0] = 0.0F; },
+        Nvfp4BoundaryRuntimeType::kFp8E4m3);
+    expectInvalid(
+        "infinite FP8 dequant scale",
+        [](auto& params) { params.fp8ScaleQuantOrig[1] = std::numeric_limits<float>::infinity(); },
+        Nvfp4BoundaryRuntimeType::kFp8E4m3);
 }
 
 TEST(Nvfp4BoundaryValidationTest, RejectsInvalidLaunchDescriptors)
@@ -1190,43 +1117,36 @@ TEST(Nvfp4BoundaryValidationTest, RejectsInvalidLaunchDescriptors)
         GTEST_SKIP() << "NVFP4 boundary kernels require an SM100-family GPU";
     }
 
-    Nvfp4BoundaryKernelParams const params = makeParams();
-    PageBuffers buffers(
-        rawBytes(RawKind::kFloat16, kDefaultGeometry), packedBytes(kDefaultGeometry), scaleBytes(kDefaultGeometry));
+    std::size_t const rawSlotBytes = rawBytes(RawKind::kFloat16, kDefaultGeometry);
+    LayerBuffers buffers(rawSlotBytes);
     Nvfp4BoundaryOffloadPageTask const validOffload{0, 0};
     std::size_t const coldPageBytes = 2U * (packedBytes(kDefaultGeometry) + scaleBytes(kDefaultGeometry));
-    Nvfp4BoundaryLayerPlan const validLayer{reinterpret_cast<std::uintptr_t>(buffers.rawInputK.data()),
-        reinterpret_cast<std::uintptr_t>(buffers.rawInputV.data()), rawBytes(RawKind::kFloat16, kDefaultGeometry),
-        rawBytes(RawKind::kFloat16, kDefaultGeometry), 0U, params};
-    auto const validPlan = tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(
-        {validLayer}, coldPageBytes, Nvfp4BoundaryRuntimeType::kFloat16);
+    Nvfp4BoundaryLayerPlan const validLayer{reinterpret_cast<std::uintptr_t>(buffers.rawK.data()),
+        reinterpret_cast<std::uintptr_t>(buffers.rawV.data()), rawSlotBytes, rawSlotBytes, 0U, makeParams()};
+    auto const prepare = [&](Nvfp4BoundaryLayerPlan const& layer, std::size_t pageBytes,
+                             Nvfp4BoundaryRuntimeType type = Nvfp4BoundaryRuntimeType::kFloat16)
+    { return tensorrt_llm::kernels::prepareNvfp4BoundaryPlan({layer}, pageBytes, type); };
+    auto const expectInvalid
+        = [&](char const* name, auto const& mutate, Nvfp4BoundaryRuntimeType type = Nvfp4BoundaryRuntimeType::kFloat16)
+    {
+        SCOPED_TRACE(name);
+        auto layer = validLayer;
+        mutate(layer);
+        EXPECT_ANY_THROW(static_cast<void>(prepare(layer, coldPageBytes, type)));
+    };
+    auto const validPlan = prepare(validLayer, coldPageBytes);
 
-    auto invalidLayer = validLayer;
-    invalidLayer.rawKBase += 1U;
-    EXPECT_ANY_THROW(static_cast<void>(tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(
-        {invalidLayer}, coldPageBytes, Nvfp4BoundaryRuntimeType::kFloat16)));
+    expectInvalid("unaligned K base", [](auto& layer) { layer.rawKBase += 1U; });
     EXPECT_ANY_THROW(
         tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress({validOffload}, validPlan, nullptr, nullptr));
-
-    invalidLayer = validLayer;
-    invalidLayer.rawKSlotBytes += alignof(uint4) / 2U;
-    EXPECT_ANY_THROW(static_cast<void>(tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(
-        {invalidLayer}, coldPageBytes, Nvfp4BoundaryRuntimeType::kFloat16)));
-    invalidLayer = validLayer;
-    invalidLayer.rawVSlotBytes += alignof(uint4) / 2U;
-    EXPECT_ANY_THROW(static_cast<void>(tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(
-        {invalidLayer}, coldPageBytes, Nvfp4BoundaryRuntimeType::kFloat16)));
-    EXPECT_ANY_THROW(static_cast<void>(tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(
-        {validLayer}, coldPageBytes + alignof(uint4) / 2U, Nvfp4BoundaryRuntimeType::kFloat16)));
-
-    invalidLayer = validLayer;
-    invalidLayer.rawVBase += 1U;
-    EXPECT_ANY_THROW(static_cast<void>(tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(
-        {invalidLayer}, coldPageBytes, Nvfp4BoundaryRuntimeType::kFp8E4m3)));
+    expectInvalid("unaligned K stride", [](auto& layer) { layer.rawKSlotBytes += alignof(uint4) / 2U; });
+    expectInvalid("unaligned V stride", [](auto& layer) { layer.rawVSlotBytes += alignof(uint4) / 2U; });
+    EXPECT_ANY_THROW(static_cast<void>(prepare(validLayer, coldPageBytes + alignof(uint4) / 2U)));
+    expectInvalid(
+        "unaligned FP8 V base", [](auto& layer) { layer.rawVBase += 1U; }, Nvfp4BoundaryRuntimeType::kFp8E4m3);
 
     auto const unsupportedType = static_cast<Nvfp4BoundaryRuntimeType>(255);
-    EXPECT_ANY_THROW(static_cast<void>(
-        tensorrt_llm::kernels::prepareNvfp4BoundaryPlan({validLayer}, coldPageBytes, unsupportedType)));
+    EXPECT_ANY_THROW(static_cast<void>(prepare(validLayer, coldPageBytes, unsupportedType)));
 }
 
 } // namespace
