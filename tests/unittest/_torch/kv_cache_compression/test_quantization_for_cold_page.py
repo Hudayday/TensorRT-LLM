@@ -16,7 +16,11 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page import 
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
+from tensorrt_llm._torch.speculative.utils import update_spec_config_from_model_config
+from tensorrt_llm.llmapi.llm_args import (
+    ColdPageQuantizationCompressionConfig,
+    MTPDecodingConfig,
+)
 from tensorrt_llm.runtime import kv_cache_manager_v2 as runtime_v2_mod
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
@@ -331,18 +335,39 @@ def test_runtime_admission_is_checked_in_utils_before_manager_creation(monkeypat
     _validate_compression()
 
 
-def test_speculative_admission_accepts_only_one_model_eagle3(monkeypatch):
+def test_speculative_admission_accepts_verified_one_model_modes(monkeypatch):
     monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
     monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
 
     _validate_compression(SpeculativeDecodingMode.EAGLE3_ONE_MODEL)
+    _validate_compression(SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL)
     for mode in (
         SpeculativeDecodingMode.MTP,
+        SpeculativeDecodingMode.MTP_EAGLE,
         SpeculativeDecodingMode.EAGLE3,
         SpeculativeDecodingMode.DFLASH,
     ):
-        with pytest.raises(ValueError, match="only with one-model EAGLE3"):
+        with pytest.raises(ValueError, match="one-model MTP-EAGLE or EAGLE3"):
             _validate_compression(mode)
+
+
+def test_qwen35_mtp3_resolves_to_supported_one_model_mode(monkeypatch):
+    monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
+    monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
+
+    spec_config = MTPDecodingConfig(max_draft_len=3)
+    update_spec_config_from_model_config(
+        spec_config,
+        SimpleNamespace(mtp_num_hidden_layers=1),
+    )
+
+    assert spec_config.spec_dec_mode is SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
+    assert spec_config.max_draft_len == 3
+    util_mod.validate_kv_cache_compression_compatibility(
+        ColdPageQuantizationCompressionConfig(),
+        SimpleNamespace(enable_block_reuse=False),
+        spec_config,
+    )
 
 
 def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4():

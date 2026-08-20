@@ -2732,10 +2732,11 @@ def validate_kv_cache_compression_compatibility(
             "TriAttention requires eviction_mode='union'")
     mode = spec_config.spec_dec_mode
     if config.algorithm == "quantization_for_cold_page":
-        if not mode.is_eagle3_one_model():
+        if not (mode.is_eagle3_one_model()
+                or mode.is_mtp_eagle_one_model()):
             raise ValueError(
                 "Cold-page quantization supports speculative decoding only "
-                f"with one-model EAGLE3, not {mode.name}")
+                f"with one-model MTP-EAGLE or EAGLE3, not {mode.name}")
         return
     if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
         raise ValueError(
