@@ -48,6 +48,9 @@ constexpr std::size_t kLayerColdBytesAligned = 192;
 constexpr std::size_t kNumAttentionLayers = 8;
 constexpr std::size_t kGpuSlotBytes = kNumAttentionLayers * kLayerRawBytes;
 constexpr std::size_t kColdSlotBytes = kNumAttentionLayers * kLayerColdBytesAligned;
+constexpr std::size_t kMlaRawBytes = 64U * 576U * 2U;
+constexpr std::size_t kMlaColdBytes = 64U * 576U / 2U + 64U * 576U / 16U;
+constexpr std::size_t kDsaIndexKeyBytes = 64U * (128U + 4U);
 constexpr std::uintptr_t kStreamValue = 0x7000;
 
 void resetLaunch()
@@ -64,6 +67,18 @@ std::vector<Nvfp4ColdPageLayerConfig> makeLayers(std::size_t count = kNumAttenti
         auto const scale = static_cast<float>(index + 2U);
         layers.push_back({firstLayer + static_cast<int>(index), kernels::Nvfp4BoundaryRuntimeType::kFloat16, 1, 5, 32,
             {scale, scale + 0.5F}, {1.0F / scale, 1.0F / (scale + 0.5F)}});
+    }
+    return layers;
+}
+
+std::vector<Nvfp4ColdPageLayerConfig> makeMlaLayers(std::size_t count)
+{
+    std::vector<Nvfp4ColdPageLayerConfig> layers;
+    layers.reserve(count);
+    for (std::size_t layer = 0; layer < count; ++layer)
+    {
+        layers.push_back({static_cast<int>(layer), kernels::Nvfp4BoundaryRuntimeType::kFloat16, 1, 64, 576,
+            {1.0F, 1.0F}, {1.0F, 1.0F}});
     }
     return layers;
 }
@@ -87,6 +102,41 @@ kv::PoolGroupDesc makeAttentionDesc(kv::PoolGroupIndex poolGroupIndex = kv::Pool
     return kv::PoolGroupDesc{poolGroupIndex, kv::SlotCount{512}, kv::SlotDesc{{std::move(variant)}},
         kv::TypedVec<kv::PoolIndex, kv::PoolDesc>{
             kv::PoolDesc{kv::PoolIndex{0}, keyBase, slotBytes}, kv::PoolDesc{kv::PoolIndex{1}, valueBase, slotBytes}}};
+}
+
+kv::PoolGroupDesc makeMlaDesc(std::vector<bool> const& ownsIndexer, kv::LayerGroupId lifeCycle = kv::LayerGroupId{0},
+    int firstLayer = 0, std::size_t keyBytes = kLayerRawBytes, std::size_t indexBytes = 68U,
+    std::uintptr_t keyBase = kGpuKBase, std::uintptr_t indexBase = kGpuVBase)
+{
+    kv::CoalescedBuffer keys{keyBytes, {}};
+    kv::CoalescedBuffer indexes{indexBytes, {}};
+    for (std::size_t index = 0; index < ownsIndexer.size(); ++index)
+    {
+        auto const layerId = firstLayer + static_cast<int>(index);
+        keys.bufferIds.push_back({layerId, "key"});
+        if (ownsIndexer[index])
+        {
+            indexes.bufferIds.push_back({layerId, "index_key"});
+        }
+    }
+
+    kv::TypedVec<kv::PoolIndex, kv::CoalescedBuffer> buffers;
+    buffers.push_back(std::move(keys));
+    if (!indexes.bufferIds.empty())
+    {
+        buffers.push_back(std::move(indexes));
+    }
+    kv::SlotDescVariant variant{lifeCycle, std::move(buffers)};
+
+    kv::TypedVec<kv::PoolIndex, kv::PoolDesc> pools;
+    pools.push_back(kv::PoolDesc{kv::PoolIndex{0}, keyBase, ownsIndexer.size() * keyBytes});
+    auto const indexCount = static_cast<std::size_t>(std::count(ownsIndexer.begin(), ownsIndexer.end(), true));
+    if (indexCount != 0U)
+    {
+        pools.push_back(kv::PoolDesc{kv::PoolIndex{1}, indexBase, indexCount * indexBytes});
+    }
+    return kv::PoolGroupDesc{
+        kv::PoolGroupIndex{0}, kv::SlotCount{512}, kv::SlotDesc{{std::move(variant)}}, std::move(pools)};
 }
 
 bool configureOne(Nvfp4ColdPageCodec& codec, kv::PoolGroupDesc const& desc)
@@ -120,17 +170,30 @@ TEST(Nvfp4ColdPageCodecTest, OneCompletePageTaskCoversAllLayersWithDistinctScale
     EXPECT_EQ(gLaunch.offloadPages[0].coldPageIndex, 2);
     EXPECT_EQ(gLaunch.offloadPages[1].gpuPageIndex, 3);
     EXPECT_EQ(gLaunch.offloadPages[1].coldPageIndex, 5);
-    ASSERT_EQ(gLaunch.plan.numLayers, kNumAttentionLayers);
+    ASSERT_EQ(gLaunch.plan.numBuffers, 2U * kNumAttentionLayers);
     for (std::size_t layer = 0; layer < kNumAttentionLayers; ++layer)
     {
-        EXPECT_EQ(gLaunch.plan.layers[layer].rawKBase, kGpuKBase + layer * kLayerRawBytes);
-        EXPECT_EQ(gLaunch.plan.layers[layer].rawVBase, kGpuVBase + layer * kLayerRawBytes);
-        EXPECT_EQ(gLaunch.plan.layers[layer].rawKSlotBytes, kGpuSlotBytes);
-        EXPECT_EQ(gLaunch.plan.layers[layer].rawVSlotBytes, kGpuSlotBytes);
-        EXPECT_EQ(gLaunch.plan.layers[layer].coldOffset, layer * kLayerColdBytesAligned);
-        EXPECT_EQ(gLaunch.plan.layers[layer].params.tokensPerPage, 5);
-        EXPECT_EQ(gLaunch.plan.layers[layer].params.headDim, 32);
-        EXPECT_FLOAT_EQ(gLaunch.plan.layers[layer].params.nvfp4ScaleOrigQuant[0], static_cast<float>(layer + 2U));
+        auto const& key = gLaunch.plan.buffers[2U * layer];
+        auto const& value = gLaunch.plan.buffers[2U * layer + 1U];
+        auto const layerOffset = layer * kLayerColdBytesAligned;
+        EXPECT_EQ(key.rawBase, kGpuKBase + layer * kLayerRawBytes);
+        EXPECT_EQ(value.rawBase, kGpuVBase + layer * kLayerRawBytes);
+        EXPECT_EQ(key.rawSlotBytes, kGpuSlotBytes);
+        EXPECT_EQ(value.rawSlotBytes, kGpuSlotBytes);
+        EXPECT_EQ(key.rawBytes, kLayerRawBytes);
+        EXPECT_EQ(value.rawBytes, kLayerRawBytes);
+        EXPECT_EQ(key.coldDataOffset, layerOffset);
+        EXPECT_EQ(value.coldDataOffset, layerOffset + 80U);
+        EXPECT_EQ(key.coldScaleOffset, layerOffset + 160U);
+        EXPECT_EQ(value.coldScaleOffset, layerOffset + 170U);
+        EXPECT_EQ(value.coldPaddingOffset, layerOffset + 180U);
+        EXPECT_EQ(value.coldPaddingBytes, 12U);
+        EXPECT_EQ(key.transform, kernels::Nvfp4BoundaryTransform::kNvfp4);
+        EXPECT_EQ(value.transform, kernels::Nvfp4BoundaryTransform::kNvfp4);
+        EXPECT_EQ(key.params.tokensPerPage, 5);
+        EXPECT_EQ(key.params.headDim, 32);
+        EXPECT_FLOAT_EQ(key.params.nvfp4ScaleOrigQuant, static_cast<float>(layer + 2U));
+        EXPECT_FLOAT_EQ(value.params.nvfp4ScaleOrigQuant, static_cast<float>(layer + 2U) + 0.5F);
     }
     EXPECT_EQ(gLaunch.coldBase, reinterpret_cast<void*>(kColdBase));
     EXPECT_EQ(gLaunch.plan.coldPageBytes, kColdSlotBytes);
@@ -142,6 +205,110 @@ TEST(Nvfp4ColdPageCodecTest, OneCompletePageTaskCoversAllLayersWithDistinctScale
     ASSERT_EQ(gLaunch.onboardPages.size(), 2U);
     EXPECT_EQ(gLaunch.onboardPages[0].gpuPageIndex, 2);
     EXPECT_EQ(gLaunch.onboardPages[0].coldPageIndex, 1);
+}
+
+TEST(Nvfp4ColdPageCodecTest, KeyOnlyMlaUsesLatentPackedThenScaleLayout)
+{
+    resetLaunch();
+    Nvfp4ColdPageCodec codec{makeLayers(1)};
+    ASSERT_TRUE(configureOne(codec, makeMlaDesc({false})));
+    EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{0}), 96U);
+
+    kv::PageIndexPair const indices[]{{0, 0}};
+    ASSERT_TRUE(codec.encode(kv::LayerGroupId{0}, reinterpret_cast<void*>(kColdBase), indices, 1U, nullptr));
+    ASSERT_EQ(gLaunch.plan.numBuffers, 1U);
+    auto const& latent = gLaunch.plan.buffers[0];
+    EXPECT_EQ(latent.rawBase, kGpuKBase);
+    EXPECT_EQ(latent.rawSlotBytes, kLayerRawBytes);
+    EXPECT_EQ(latent.rawBytes, kLayerRawBytes);
+    EXPECT_EQ(latent.coldDataOffset, 0U);
+    EXPECT_EQ(latent.coldScaleOffset, 80U);
+    EXPECT_EQ(latent.coldPaddingOffset, 90U);
+    EXPECT_EQ(latent.coldPaddingBytes, 6U);
+    EXPECT_EQ(latent.transform, kernels::Nvfp4BoundaryTransform::kNvfp4);
+}
+
+TEST(Nvfp4ColdPageCodecTest, KeyAndIndexAppendsLosslessIndexWithinTheLayerRecord)
+{
+    resetLaunch();
+    Nvfp4ColdPageCodec codec{makeLayers(1)};
+    ASSERT_TRUE(configureOne(codec, makeMlaDesc({true})));
+    EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{0}), 160U);
+
+    kv::PageIndexPair const indices[]{{0, 0}};
+    ASSERT_TRUE(codec.encode(kv::LayerGroupId{0}, reinterpret_cast<void*>(kColdBase), indices, 1U, nullptr));
+    ASSERT_EQ(gLaunch.plan.numBuffers, 2U);
+    auto const& latent = gLaunch.plan.buffers[0];
+    auto const& index = gLaunch.plan.buffers[1];
+    EXPECT_EQ(latent.coldDataOffset, 0U);
+    EXPECT_EQ(latent.coldScaleOffset, 80U);
+    EXPECT_EQ(index.rawBase, kGpuVBase);
+    EXPECT_EQ(index.rawSlotBytes, 68U);
+    EXPECT_EQ(index.rawBytes, 68U);
+    EXPECT_EQ(index.coldDataOffset, 90U);
+    EXPECT_EQ(index.coldPaddingOffset, 158U);
+    EXPECT_EQ(index.coldPaddingBytes, 2U);
+    EXPECT_EQ(index.transform, kernels::Nvfp4BoundaryTransform::kLossless);
+}
+
+TEST(Nvfp4ColdPageCodecTest, FullAndSharedIndexerLayersHaveDistinctPerLayerRecords)
+{
+    resetLaunch();
+    Nvfp4ColdPageCodec codec{makeLayers(3)};
+    ASSERT_TRUE(configureOne(codec, makeMlaDesc({true, false, true})));
+    EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{0}), 416U);
+
+    kv::PageIndexPair const indices[]{{0, 0}};
+    ASSERT_TRUE(codec.encode(kv::LayerGroupId{0}, reinterpret_cast<void*>(kColdBase), indices, 1U, nullptr));
+    ASSERT_EQ(gLaunch.plan.numBuffers, 5U);
+    EXPECT_EQ(gLaunch.plan.buffers[0].rawBase, kGpuKBase);
+    EXPECT_EQ(gLaunch.plan.buffers[1].rawBase, kGpuVBase);
+    EXPECT_EQ(gLaunch.plan.buffers[2].rawBase, kGpuKBase + kLayerRawBytes);
+    EXPECT_EQ(gLaunch.plan.buffers[3].rawBase, kGpuKBase + 2U * kLayerRawBytes);
+    EXPECT_EQ(gLaunch.plan.buffers[4].rawBase, kGpuVBase + 68U);
+    EXPECT_EQ(gLaunch.plan.buffers[0].rawSlotBytes, 3U * kLayerRawBytes);
+    EXPECT_EQ(gLaunch.plan.buffers[1].rawSlotBytes, 2U * 68U);
+    EXPECT_EQ(gLaunch.plan.buffers[0].coldDataOffset, 0U);
+    EXPECT_EQ(gLaunch.plan.buffers[1].coldDataOffset, 90U);
+    EXPECT_EQ(gLaunch.plan.buffers[2].coldDataOffset, 160U);
+    EXPECT_EQ(gLaunch.plan.buffers[3].coldDataOffset, 256U);
+    EXPECT_EQ(gLaunch.plan.buffers[4].coldDataOffset, 346U);
+    EXPECT_EQ(gLaunch.plan.buffers[4].coldPaddingOffset, 414U);
+    EXPECT_EQ(gLaunch.plan.buffers[4].coldPaddingBytes, 2U);
+}
+
+TEST(Nvfp4ColdPageCodecTest, DeepSeekV32AllIndexerLayoutFitsOneColdPagePlan)
+{
+    resetLaunch();
+    std::vector<bool> const ownsIndexer(61, true);
+    Nvfp4ColdPageCodec codec{makeMlaLayers(ownsIndexer.size())};
+    ASSERT_TRUE(configureOne(codec, makeMlaDesc(ownsIndexer, kv::LayerGroupId{0}, 0, kMlaRawBytes, kDsaIndexKeyBytes)));
+    EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{0}), 61U * (kMlaColdBytes + kDsaIndexKeyBytes));
+
+    kv::PageIndexPair const indices[]{{0, 0}};
+    ASSERT_TRUE(codec.encode(kv::LayerGroupId{0}, reinterpret_cast<void*>(kColdBase), indices, 1U, nullptr));
+    EXPECT_EQ(gLaunch.plan.numBuffers, 122U);
+    EXPECT_EQ(gLaunch.plan.coldPageBytes, 1780224U);
+}
+
+TEST(Nvfp4ColdPageCodecTest, Glm52MixedIndexerLayoutFitsOneColdPagePlan)
+{
+    resetLaunch();
+    std::vector<bool> ownsIndexer(78, false);
+    for (std::size_t layer = 0; layer < ownsIndexer.size(); ++layer)
+    {
+        ownsIndexer[layer] = layer < 3U || (layer >= 6U && layer % 4U == 2U);
+    }
+    ASSERT_EQ(std::count(ownsIndexer.begin(), ownsIndexer.end(), true), 21);
+
+    Nvfp4ColdPageCodec codec{makeMlaLayers(ownsIndexer.size())};
+    ASSERT_TRUE(configureOne(codec, makeMlaDesc(ownsIndexer, kv::LayerGroupId{0}, 0, kMlaRawBytes, kDsaIndexKeyBytes)));
+    EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{0}), 78U * kMlaColdBytes + 21U * kDsaIndexKeyBytes);
+
+    kv::PageIndexPair const indices[]{{0, 0}};
+    ASSERT_TRUE(codec.encode(kv::LayerGroupId{0}, reinterpret_cast<void*>(kColdBase), indices, 1U, nullptr));
+    EXPECT_EQ(gLaunch.plan.numBuffers, 99U);
+    EXPECT_EQ(gLaunch.plan.coldPageBytes, 1794816U);
 }
 
 TEST(Nvfp4ColdPageCodecTest, PreservesOneCodecSubmissionAcrossThe256PageKernelBoundary)
@@ -158,7 +325,7 @@ TEST(Nvfp4ColdPageCodecTest, PreservesOneCodecSubmissionAcrossThe256PageKernelBo
         reinterpret_cast<cudaStream_t>(kStreamValue)));
     EXPECT_EQ(gLaunch.offloadCalls, 1);
     EXPECT_EQ(gLaunch.offloadPages.size(), 257U);
-    EXPECT_EQ(gLaunch.plan.numLayers, kNumAttentionLayers);
+    EXPECT_EQ(gLaunch.plan.numBuffers, 2U * kNumAttentionLayers);
 }
 
 TEST(Nvfp4ColdPageCodecTest, EmptyAttentionBatchIsValidAndDoesNotLaunch)
@@ -219,6 +386,12 @@ TEST(Nvfp4ColdPageCodecTest, DiscoversLifecycleMembershipAcrossPoolGroups)
     EXPECT_EQ(codec.getBatchingLayerGroupId(kv::LayerGroupId{1}), kv::LayerGroupId{1});
 }
 
+TEST(Nvfp4ColdPageCodecTest, RejectsConfiguredAttentionLayerAbsentFromAllGpuDescriptors)
+{
+    Nvfp4ColdPageCodec codec{makeLayers(2)};
+    EXPECT_FALSE(configureOne(codec, makeAttentionDesc(kv::PoolGroupIndex{0}, kv::LayerGroupId{0}, 1)));
+}
+
 TEST(Nvfp4ColdPageCodecTest, RejectsAttentionBufferWithMismatchedGeometry)
 {
     Nvfp4ColdPageCodec codec{makeLayers()};
@@ -229,15 +402,28 @@ TEST(Nvfp4ColdPageCodecTest, RejectsAttentionBufferWithMismatchedGeometry)
     EXPECT_FALSE(configureOne(codec, desc));
 }
 
-TEST(Nvfp4ColdPageCodecTest, RejectsAttentionAndUnknownSideBufferInOneLifecycle)
+TEST(Nvfp4ColdPageCodecTest, CoalescedAttentionSideBufferUsesItsOwnBaseOffsetAndSlotStride)
 {
+    resetLaunch();
     Nvfp4ColdPageCodec codec{makeLayers(1)};
     auto desc = makeAttentionDesc(kv::PoolGroupIndex{0}, kv::LayerGroupId{0}, 1);
     auto& keys = desc.slotDesc.variants.front().coalescedBuffers[kv::PoolIndex{0}];
     keys.bufferIds.push_back({0, "index_key"});
     desc.pools[kv::PoolIndex{0}].slotBytes += keys.singleBufferSize;
 
-    EXPECT_FALSE(configureOne(codec, desc));
+    ASSERT_TRUE(configureOne(codec, desc));
+    EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{0}), 512U);
+    kv::PageIndexPair const indices[]{{0, 0}};
+    ASSERT_TRUE(codec.encode(kv::LayerGroupId{0}, reinterpret_cast<void*>(kColdBase), indices, 1U, nullptr));
+    ASSERT_EQ(gLaunch.plan.numBuffers, 3U);
+    auto const& side = gLaunch.plan.buffers[2];
+    EXPECT_EQ(side.rawBase, kGpuKBase + kLayerRawBytes);
+    EXPECT_EQ(side.rawSlotBytes, 2U * kLayerRawBytes);
+    EXPECT_EQ(side.rawBytes, kLayerRawBytes);
+    EXPECT_EQ(side.coldDataOffset, 180U);
+    EXPECT_EQ(side.coldPaddingOffset, 500U);
+    EXPECT_EQ(side.coldPaddingBytes, 12U);
+    EXPECT_EQ(side.transform, kernels::Nvfp4BoundaryTransform::kLossless);
 }
 
 TEST(Nvfp4ColdPageCodecTest, UnknownLifecycleUsesFailureSentinels)
@@ -346,16 +532,16 @@ TEST(Nvfp4ColdPageCodecTest, AttentionAndSsmSharingOneHotPoolGroupUseDifferentTr
 namespace tensorrt_llm::kernels
 {
 
-Nvfp4BoundaryPreparedPlan prepareNvfp4BoundaryPlan(
-    std::vector<Nvfp4BoundaryLayerPlan> const& layers, std::size_t coldPageBytes, Nvfp4BoundaryRuntimeType runtimeType)
+Nvfp4BoundaryPreparedPlan prepareNvfp4BoundaryPlan(std::vector<Nvfp4BoundaryBufferPlan> const& buffers,
+    std::size_t coldPageBytes, Nvfp4BoundaryRuntimeType runtimeType)
 {
-    if (layers.empty() || layers.size() > kNvfp4BoundaryMaxLayersPerLaunch || coldPageBytes == 0U)
+    if (buffers.empty() || buffers.size() > kNvfp4BoundaryMaxBuffersPerLaunch || coldPageBytes == 0U)
     {
         throw std::invalid_argument("invalid test launch plan");
     }
     Nvfp4BoundaryPreparedPlan plan;
-    std::copy(layers.begin(), layers.end(), plan.layers.begin());
-    plan.numLayers = static_cast<std::uint32_t>(layers.size());
+    std::copy(buffers.begin(), buffers.end(), plan.buffers.begin());
+    plan.numBuffers = static_cast<std::uint32_t>(buffers.size());
     plan.coldPageBytes = coldPageBytes;
     plan.runtimeType = runtimeType;
     return plan;

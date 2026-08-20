@@ -53,45 +53,55 @@ struct Nvfp4BoundaryOnboardPageTask
     std::int32_t coldPageIndex;
 };
 
-//! Per-layer geometry and scales for [K | V | K scales | V scales] records in HND order.
-//! `headDim` is a multiple of 16; `*OrigQuant` encodes and `*QuantOrig` decodes K/V at indices 0/1.
+//! Per-buffer geometry and scales for one NVFP4 record in HND order.
+//! `headDim` is a multiple of 16; `*OrigQuant` encodes and `*QuantOrig` decodes this buffer.
 struct Nvfp4BoundaryKernelParams
 {
     std::int32_t numKvHeads;
     std::int32_t tokensPerPage;
     std::int32_t headDim;
-    float nvfp4ScaleOrigQuant[2];
-    float nvfp4ScaleQuantOrig[2];
-    float fp8ScaleOrigQuant[2];
-    float fp8ScaleQuantOrig[2];
+    float nvfp4ScaleOrigQuant;
+    float nvfp4ScaleQuantOrig;
+    float fp8ScaleOrigQuant;
+    float fp8ScaleQuantOrig;
 };
 
-//! Immutable transform plan for one Attention layer.
-struct Nvfp4BoundaryLayerPlan
+//! Transformation applied to one independently addressed hot buffer.
+enum class Nvfp4BoundaryTransform : std::uint8_t
 {
-    std::uintptr_t rawKBase;
-    std::uintptr_t rawVBase;
-    std::size_t rawKSlotBytes;
-    std::size_t rawVSlotBytes;
-    std::size_t coldOffset;
+    kNvfp4,
+    kLossless,
+};
+
+//! Immutable transform plan for one hot buffer and its fixed-offset cold record.
+struct Nvfp4BoundaryBufferPlan
+{
+    std::uintptr_t rawBase;
+    std::size_t rawSlotBytes;
+    std::size_t rawBytes;
+    std::size_t coldDataOffset;
+    std::size_t coldScaleOffset;
+    std::size_t coldPaddingOffset;
+    std::uint32_t coldPaddingBytes;
+    Nvfp4BoundaryTransform transform;
     Nvfp4BoundaryKernelParams params;
 };
 
-inline constexpr std::uint32_t kNvfp4BoundaryMaxLayersPerLaunch = 128;
+inline constexpr std::uint32_t kNvfp4BoundaryMaxBuffersPerLaunch = 256;
 
 //! Configure-time launch plan for one Attention lifecycle.
 struct Nvfp4BoundaryPreparedPlan
 {
-    std::array<Nvfp4BoundaryLayerPlan, kNvfp4BoundaryMaxLayersPerLaunch> layers{};
-    std::uint32_t numLayers = 0;
+    std::array<Nvfp4BoundaryBufferPlan, kNvfp4BoundaryMaxBuffersPerLaunch> buffers{};
+    std::uint32_t numBuffers = 0;
     std::uint32_t maxTileHalfGroups = 0;
     std::size_t coldPageBytes = 0;
     Nvfp4BoundaryRuntimeType runtimeType = Nvfp4BoundaryRuntimeType::kFloat16;
 };
 
 //! Validate and freeze one lifecycle's boundary-transform plan.
-[[nodiscard]] Nvfp4BoundaryPreparedPlan prepareNvfp4BoundaryPlan(
-    std::vector<Nvfp4BoundaryLayerPlan> const& layers, std::size_t coldPageBytes, Nvfp4BoundaryRuntimeType runtimeType);
+[[nodiscard]] Nvfp4BoundaryPreparedPlan prepareNvfp4BoundaryPlan(std::vector<Nvfp4BoundaryBufferPlan> const& buffers,
+    std::size_t coldPageBytes, Nvfp4BoundaryRuntimeType runtimeType);
 
 //! Compress GPU Pages into mapped-Host NVFP4 records.
 void invokeNvfp4BoundaryOffloadCompress(std::vector<Nvfp4BoundaryOffloadPageTask> const& pages,

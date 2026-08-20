@@ -130,11 +130,13 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
         for layer in cache_config.layers:
             if isinstance(layer, SsmLayerConfig):
                 continue
-            if not {"key", "value"}.issubset(buffer.role for buffer in layer.buffers):
+            roles = {buffer.role for buffer in layer.buffers}
+            if "key" not in roles:
                 raise NotImplementedError(
-                    "NVFP4 cold-page compression requires separate key and value buffers"
+                    "NVFP4 cold-page compression requires an Attention key buffer"
                 )
-            attention_layers.append(layer)
+            has_value = "value" in roles
+            attention_layers.append((layer, has_value))
         if not attention_layers:
             return native.create_nvfp4_cold_page_codec([])
 
@@ -150,11 +152,15 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
             )
 
         native_configs = []
-        for layer in attention_layers:
+        for layer, has_value in attention_layers:
             layer_id = int(layer.layer_id)
-            orig_quant, quant_orig = self._model_nvfp4_scales.get(
-                int(pp_layers[layer_id]), _IDENTITY_NVFP4_SCALES
-            )
+            if has_value:
+                orig_quant, quant_orig = self._model_nvfp4_scales.get(
+                    int(pp_layers[layer_id]), _IDENTITY_NVFP4_SCALES
+                )
+            else:
+                # ModelOpt K/V projection scales do not apply to MLA latent buffers.
+                orig_quant, quant_orig = _IDENTITY_NVFP4_SCALES
             native_config = native.Nvfp4ColdPageLayerConfig()
             native_config.layer_id = layer_id
             native_config.runtime_type = runtime_type

@@ -24,6 +24,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -81,30 +82,26 @@ std::size_t scalarCount(Nvfp4ColdPageLayerConfig const& config)
         headsTimesTokens, static_cast<std::size_t>(config.headDim), "NVFP4 Page geometry overflows size_t");
 }
 
-std::size_t compactLayerBytes(Nvfp4ColdPageLayerConfig const& config)
-{
-    auto const elements = scalarCount(config);
-    auto const packedBytes = elements / kPackedElementsPerByte;
-    auto const scaleBytes = elements / kElementsPerBlockScale;
-    return checkedAdd(checkedMul(packedBytes, 2U, "NVFP4 packed Page size overflows size_t"),
-        checkedMul(scaleBytes, 2U, "NVFP4 scale Page size overflows size_t"),
-        "NVFP4 compact Page size overflows size_t");
-}
-
-kernels::Nvfp4BoundaryKernelParams makeKernelParams(Nvfp4ColdPageLayerConfig const& config)
+kernels::Nvfp4BoundaryKernelParams makeKernelParams(Nvfp4ColdPageLayerConfig const& config, std::size_t role)
 {
     kernels::Nvfp4BoundaryKernelParams params{};
     params.numKvHeads = config.numKvHeads;
     params.tokensPerPage = config.tokensPerPage;
     params.headDim = config.headDim;
-    for (std::size_t role = 0; role < 2U; ++role)
-    {
-        params.nvfp4ScaleOrigQuant[role] = config.nvfp4ScaleOrigQuant[role];
-        params.nvfp4ScaleQuantOrig[role] = config.nvfp4ScaleQuantOrig[role];
-        params.fp8ScaleOrigQuant[role] = config.fp8ScaleOrigQuant[role];
-        params.fp8ScaleQuantOrig[role] = config.fp8ScaleQuantOrig[role];
-    }
+    params.nvfp4ScaleOrigQuant = config.nvfp4ScaleOrigQuant[role];
+    params.nvfp4ScaleQuantOrig = config.nvfp4ScaleQuantOrig[role];
+    params.fp8ScaleOrigQuant = config.fp8ScaleOrigQuant[role];
+    params.fp8ScaleQuantOrig = config.fp8ScaleQuantOrig[role];
     return params;
+}
+
+std::uintptr_t checkedAddress(std::uintptr_t base, std::size_t offset)
+{
+    if (offset > std::numeric_limits<std::uintptr_t>::max() - base)
+    {
+        throw std::overflow_error("GPU buffer address overflows uintptr_t");
+    }
+    return base + offset;
 }
 
 } // namespace
@@ -113,15 +110,14 @@ Nvfp4ColdPageCodec::Nvfp4ColdPageCodec(std::vector<Nvfp4ColdPageLayerConfig> lay
 {
     for (auto& config : layerConfigs)
     {
-        static_cast<void>(compactLayerBytes(config));
+        static_cast<void>(scalarCount(config));
         if (config.runtimeType != kernels::Nvfp4BoundaryRuntimeType::kFloat16
             && config.runtimeType != kernels::Nvfp4BoundaryRuntimeType::kBfloat16
             && config.runtimeType != kernels::Nvfp4BoundaryRuntimeType::kFp8E4m3)
         {
             throw std::invalid_argument("Nvfp4ColdPageCodec received an unsupported runtime type");
         }
-        auto const validScales = [](auto const& scales)
-        {
+        auto const validScales = [](auto const& scales) {
             return std::all_of(
                 scales.begin(), scales.end(), [](float value) { return std::isfinite(value) && value > 0; });
         };
@@ -129,8 +125,7 @@ Nvfp4ColdPageCodec::Nvfp4ColdPageCodec(std::vector<Nvfp4ColdPageLayerConfig> lay
             || (config.runtimeType == kernels::Nvfp4BoundaryRuntimeType::kFp8E4m3
                 && (!validScales(config.fp8ScaleOrigQuant) || !validScales(config.fp8ScaleQuantOrig))))
         {
-            throw std::invalid_argument(
-                "Nvfp4ColdPageCodec scales used by the runtime dtype must be finite and positive");
+            throw std::invalid_argument("NVFP4 runtime scales must be finite and positive");
         }
         auto const layerId = config.layerId;
         if (!mLayerConfigs.emplace(layerId, std::move(config)).second)
@@ -156,6 +151,7 @@ bool Nvfp4ColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolGr
         {
             BufferLocation key;
             BufferLocation value;
+            std::vector<BufferLocation> side;
         };
 
         // Use KVCM's default codec for non-Attention lifecycles.
@@ -166,13 +162,14 @@ bool Nvfp4ColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolGr
         }
 
         std::map<kv::LayerGroupId, LayerGroupState> pending;
+        std::set<kv::LayerId> configuredAttentionLayers;
         for (kv::PoolGroupIndex poolGroupIndex{0}; poolGroupIndex < numGpuDescs; ++poolGroupIndex)
         {
             auto const& gpuDesc = gpuDescs[kv::toSizeT(poolGroupIndex)];
             for (auto const& variant : gpuDesc.slotDesc.variants)
             {
                 std::map<kv::LayerId, AttentionBuffers> attentionBuffers;
-                bool hasSideBuffers = false;
+                bool hasUnconfiguredBuffer = false;
                 for (kv::PoolIndex poolIndex{0}; poolIndex < variant.coalescedBuffers.size(); ++poolIndex)
                 {
                     auto const& coalesced = variant.coalescedBuffers.at(poolIndex);
@@ -180,75 +177,112 @@ bool Nvfp4ColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolGr
                     for (auto const& bufferId : coalesced.bufferIds)
                     {
                         auto const config = mLayerConfigs.find(bufferId.layerId);
-                        if (config == mLayerConfigs.end()
-                            || (bufferId.role != kKeyRole && bufferId.role != kValueRole))
+                        if (config == mLayerConfigs.end())
                         {
-                            hasSideBuffers = true;
+                            hasUnconfiguredBuffer = true;
                         }
                         else
                         {
+                            configuredAttentionLayers.insert(bufferId.layerId);
                             auto& buffers = attentionBuffers[bufferId.layerId];
-                            auto& location = bufferId.role == kKeyRole ? buffers.key : buffers.value;
-                            if (location.found)
+                            if (bufferId.role == kKeyRole || bufferId.role == kValueRole)
                             {
-                                throw std::invalid_argument("GPU lifecycle contains a duplicate K/V buffer");
+                                auto& location = bufferId.role == kKeyRole ? buffers.key : buffers.value;
+                                if (location.found)
+                                {
+                                    throw std::invalid_argument("GPU lifecycle contains a duplicate K/V buffer");
+                                }
+                                location = BufferLocation{poolIndex, offset, coalesced.singleBufferSize, true};
                             }
-                            location = BufferLocation{poolIndex, offset, coalesced.singleBufferSize, true};
+                            else
+                            {
+                                buffers.side.push_back(
+                                    BufferLocation{poolIndex, offset, coalesced.singleBufferSize, true});
+                            }
                         }
-                        if (coalesced.singleBufferSize > std::numeric_limits<std::size_t>::max() - offset)
-                        {
-                            throw std::overflow_error("GPU Slot buffer offsets overflow size_t");
-                        }
-                        offset += coalesced.singleBufferSize;
+                        offset
+                            = checkedAdd(offset, coalesced.singleBufferSize, "GPU Slot buffer offsets overflow size_t");
                     }
                 }
 
                 LayerGroupState state;
                 if (!attentionBuffers.empty())
                 {
-                    if (hasSideBuffers)
+                    if (hasUnconfiguredBuffer)
                     {
-                        throw std::invalid_argument(
-                            "A lifecycle cannot mix configured Attention K/V with lossless side buffers");
+                        throw std::invalid_argument("Attention lifecycle mixes configured and unconfigured layers");
                     }
                     state.transform = Transform::kNvfp4Attention;
-                    std::vector<kernels::Nvfp4BoundaryLayerPlan> layers;
-                    layers.reserve(attentionBuffers.size());
+                    std::vector<kernels::Nvfp4BoundaryBufferPlan> plans;
                     auto const runtimeType = mLayerConfigs.at(attentionBuffers.begin()->first).runtimeType;
                     for (auto const& [layerId, buffers] : attentionBuffers)
                     {
-                        if (!buffers.key.found || !buffers.value.found)
+                        if (!buffers.key.found)
                         {
-                            throw std::invalid_argument("Configured Attention layer is missing K or V");
+                            throw std::invalid_argument("Configured Attention layer is missing key");
                         }
                         auto const& config = mLayerConfigs.at(layerId);
                         if (runtimeType != config.runtimeType)
                         {
-                            throw std::invalid_argument(
-                                "One Attention lifecycle must use one runtime dtype for whole-Page batching");
+                            throw std::invalid_argument("Attention lifecycle must use one runtime dtype");
                         }
 
+                        auto const elements = scalarCount(config);
                         auto const rawElementBytes
                             = config.runtimeType == kernels::Nvfp4BoundaryRuntimeType::kFp8E4m3 ? 1U : 2U;
                         auto const rawBytes
-                            = checkedMul(scalarCount(config), rawElementBytes, "Runtime KV Page size overflows size_t");
-                        if (buffers.key.bytes != rawBytes || buffers.value.bytes != rawBytes)
+                            = checkedMul(elements, rawElementBytes, "Runtime KV Page size overflows size_t");
+                        if (buffers.key.bytes != rawBytes || (buffers.value.found && buffers.value.bytes != rawBytes))
                         {
-                            throw std::invalid_argument(
-                                "GPU K/V buffer size does not match the configured Attention geometry");
+                            throw std::invalid_argument("GPU K/V buffer size does not match Attention geometry");
                         }
-                        auto const& keyPool = gpuDesc.pools.at(buffers.key.poolIndex);
-                        auto const& valuePool = gpuDesc.pools.at(buffers.value.poolIndex);
 
-                        auto const coldOffset = state.coldPageBytes;
-                        layers.push_back(kernels::Nvfp4BoundaryLayerPlan{keyPool.baseAddress + buffers.key.offset,
-                            valuePool.baseAddress + buffers.value.offset, keyPool.slotBytes, valuePool.slotBytes,
-                            coldOffset, makeKernelParams(config)});
-                        state.coldPageBytes = alignUp(
-                            checkedAdd(coldOffset, compactLayerBytes(config), "NVFP4 cold Page size overflows size_t"),
-                            kCompactAlignment);
+                        auto const layerOffset = state.coldPageBytes;
+                        auto const rolePackedBytes = elements / kPackedElementsPerByte;
+                        auto const roleScaleBytes = elements / kElementsPerBlockScale;
+                        auto const roleCount = buffers.value.found ? 2U : 1U;
+                        auto const scaleOffset = checkedAdd(layerOffset,
+                            checkedMul(rolePackedBytes, roleCount, "NVFP4 packed Page size overflows size_t"),
+                            "NVFP4 cold Page size overflows size_t");
+
+                        auto appendNvfp4 = [&](BufferLocation const& location, std::size_t role,
+                                               std::size_t coldDataOffset, std::size_t coldScaleOffset)
+                        {
+                            auto const& pool = gpuDesc.pools.at(location.poolIndex);
+                            plans.push_back(
+                                kernels::Nvfp4BoundaryBufferPlan{checkedAddress(pool.baseAddress, location.offset),
+                                    pool.slotBytes, location.bytes, coldDataOffset, coldScaleOffset, 0U, 0U,
+                                    kernels::Nvfp4BoundaryTransform::kNvfp4, makeKernelParams(config, role)});
+                        };
+
+                        appendNvfp4(buffers.key, 0U, layerOffset, scaleOffset);
+                        if (buffers.value.found)
+                        {
+                            appendNvfp4(buffers.value, 1U,
+                                checkedAdd(layerOffset, rolePackedBytes, "NVFP4 cold Page size overflows size_t"),
+                                checkedAdd(scaleOffset, roleScaleBytes, "NVFP4 cold Page size overflows size_t"));
+                        }
+
+                        auto coldOffset = checkedAdd(scaleOffset,
+                            checkedMul(roleScaleBytes, roleCount, "NVFP4 scale Page size overflows size_t"),
+                            "NVFP4 cold Page size overflows size_t");
+                        for (auto const& location : buffers.side)
+                        {
+                            auto const& pool = gpuDesc.pools.at(location.poolIndex);
+                            plans.push_back(kernels::Nvfp4BoundaryBufferPlan{
+                                checkedAddress(pool.baseAddress, location.offset), pool.slotBytes, location.bytes,
+                                coldOffset, 0U, 0U, 0U, kernels::Nvfp4BoundaryTransform::kLossless, {}});
+                            coldOffset = checkedAdd(
+                                coldOffset, location.bytes, "Lossless Attention side-buffer size overflows size_t");
+                        }
+
+                        auto const alignedEnd = alignUp(coldOffset, kCompactAlignment);
+                        auto const paddingBytes = alignedEnd - coldOffset;
+                        plans.back().coldPaddingOffset = coldOffset;
+                        plans.back().coldPaddingBytes = static_cast<std::uint32_t>(paddingBytes);
+                        state.coldPageBytes = alignedEnd;
                     }
-                    state.preparedPlan = kernels::prepareNvfp4BoundaryPlan(layers, state.coldPageBytes, runtimeType);
+                    state.preparedPlan = kernels::prepareNvfp4BoundaryPlan(plans, state.coldPageBytes, runtimeType);
                 }
                 else
                 {
@@ -256,6 +290,10 @@ bool Nvfp4ColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolGr
                 }
                 pending.emplace(variant.lifeCycleId, std::move(state));
             }
+        }
+        if (configuredAttentionLayers.size() != mLayerConfigs.size())
+        {
+            throw std::invalid_argument("A configured Attention layer is absent from all GPU descriptors");
         }
 
         mLayerGroups = std::move(pending);

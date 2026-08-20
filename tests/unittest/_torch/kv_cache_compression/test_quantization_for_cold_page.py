@@ -278,30 +278,38 @@ def test_hybrid_codec_skips_ssm_layers_and_ssm_only_rank_is_lossless(tmp_path):
     native.create_nvfp4_cold_page_codec.assert_called_with([])
 
 
-def test_mla_key_only_layout_is_rejected_before_native_codec_creation():
-    native, _ = _native()
+def test_mla_key_only_layout_with_index_key_uses_identity_scales(tmp_path):
+    native, codec = _native()
+    _write_scales(tmp_path, {10: (0.5, 0.25)})
     cache_config = SimpleNamespace(
         tokens_per_block=64,
         layers=(
             AttentionLayerConfig(
                 layer_id=0,
-                buffers=[BufferConfig(role="key", size=128)],
+                buffers=[
+                    BufferConfig(role="key", size=64 * 576 * 2),
+                    BufferConfig(role="index_key", size=64 * 132),
+                ],
             ),
         ),
     )
-    with (
-        patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
-        pytest.raises(NotImplementedError, match="separate key and value"),
-    ):
-        _manager().create_cold_page_codec(
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        result = _manager(tmp_path).create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.BF16,
-            pp_layers=(0,),
+            pp_layers=(10,),
             num_kv_heads_per_layer=(1,),
-            head_dim_per_layer=(128,),
+            head_dim_per_layer=(576,),
         )
 
-    native.create_nvfp4_cold_page_codec.assert_not_called()
+    assert result is codec
+    config = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
+    assert config.layer_id == 0
+    assert config.runtime_type == "native-bf16"
+    assert config.num_kv_heads == 1
+    assert config.tokens_per_page == 64
+    assert config.head_dim == 576
+    assert config.nvfp4_scale_orig_quant == config.nvfp4_scale_quant_orig == (1.0, 1.0)
 
 
 def test_fp8_runtime_uses_native_unit_source_scale_default(tmp_path):

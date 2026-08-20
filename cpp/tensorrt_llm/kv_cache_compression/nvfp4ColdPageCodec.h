@@ -46,7 +46,7 @@ struct Nvfp4ColdPageLayerConfig
     std::array<float, 2> fp8ScaleQuantOrig{1.0F, 1.0F};
 };
 
-//! NVFP4 codec for compact cold records laid out as [K | V | K scales | V scales].
+//! NVFP4 codec for compact Attention records with lossless side-buffer spans.
 class Nvfp4ColdPageCodec final : public kv::IKvCacheColdPageCodec
 {
 public:
