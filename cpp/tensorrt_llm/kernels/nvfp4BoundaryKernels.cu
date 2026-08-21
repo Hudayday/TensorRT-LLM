@@ -739,7 +739,6 @@ void validateBufferPlan(
     Nvfp4BoundaryBufferPlan const& buffer, std::size_t coldPageBytes, bool useFp8, std::vector<ColdInterval>& intervals)
 {
     TLLM_CHECK_WITH_INFO(buffer.rawBase != 0U, "rawBase must not be null");
-    TLLM_CHECK_WITH_INFO(buffer.rawSlotBytes > 0, "GPU raw Slot stride must be positive");
     TLLM_CHECK_WITH_INFO(buffer.rawBytes > 0 && buffer.rawBytes <= buffer.rawSlotBytes,
         "Raw buffer bytes must be positive and fit within the GPU Slot stride");
 
@@ -756,8 +755,7 @@ void validateBufferPlan(
             * static_cast<std::uint64_t>(buffer.params.tokensPerPage)
             * static_cast<std::uint64_t>(buffer.params.headDim);
         std::uint64_t const expectedRawBytes = elements * (useFp8 ? 1U : 2U);
-        TLLM_CHECK_WITH_INFO(expectedRawBytes <= std::numeric_limits<std::size_t>::max()
-                && buffer.rawBytes == static_cast<std::size_t>(expectedRawBytes),
+        TLLM_CHECK_WITH_INFO(buffer.rawBytes == static_cast<std::size_t>(expectedRawBytes),
             "Raw buffer size does not match NVFP4 geometry and runtime type");
         addColdInterval(intervals, buffer.coldDataOffset, static_cast<std::size_t>(elements / 2U), coldPageBytes,
             "NVFP4 packed-data interval");
@@ -931,7 +929,8 @@ Nvfp4BoundaryPreparedPlan prepareNvfp4BoundaryPlan(std::vector<Nvfp4BoundaryBuff
             plan.maxTileHalfGroups = std::max(plan.maxTileHalfGroups, compressedTransferHalfGroups(buffer.params));
         }
     }
-    std::sort(intervals.begin(), intervals.end(), [](ColdInterval const& lhs, ColdInterval const& rhs)
+    std::sort(intervals.begin(), intervals.end(),
+        [](ColdInterval const& lhs, ColdInterval const& rhs)
         { return lhs.begin < rhs.begin || (lhs.begin == rhs.begin && lhs.end < rhs.end); });
     for (std::size_t index = 1; index < intervals.size(); ++index)
     {
