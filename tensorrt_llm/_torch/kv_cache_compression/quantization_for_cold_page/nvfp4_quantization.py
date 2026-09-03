@@ -23,9 +23,10 @@ from .quantization_for_cold_page import ColdPageQuantizationCompression
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
 
-_LayerScales = tuple[tuple[float, float], tuple[float, float]]
+_ScalePair = tuple[float, float]
+_LayerScales = dict[str, _ScalePair]
 
-_IDENTITY_NVFP4_SCALES: _LayerScales = ((1.0, 1.0), (1.0, 1.0))
+_IDENTITY_NVFP4_SCALE: _ScalePair = (1.0, 1.0)
 _MODEL_OPT_LANGUAGE_KV_SCALE_KEY = re.compile(
     r"^model(?:\.language_model)?\.layers\.(?P<layer_id>\d+)\.self_attn\."
     r"(?P<kind>[kv])_proj\.(?P=kind)_scale$"
@@ -161,22 +162,21 @@ def _load_modelopt_nvfp4_scales(
 
     result: dict[int, _LayerScales] = {}
     for layer_id, layer_values in values.items():
-        k_values, v_values = layer_values["k"], layer_values["v"]
-        if not k_values or not v_values:
-            raise ValueError(f"ModelOpt KV scales for layer {layer_id} must contain both K and V")
-        quant_orig = (max(k_values), max(v_values))
-        orig_quant = (1.0 / quant_orig[0], 1.0 / quant_orig[1])
-        stored_scales = torch.tensor(
-            (*orig_quant, *quant_orig), dtype=torch.float32, device="cpu"
-        ).tolist()
-        if any(not math.isfinite(value) or value <= 0.0 for value in stored_scales):
-            raise ValueError(
-                f"ModelOpt KV scales for layer {layer_id} are not representable as float32"
-            )
-        result[layer_id] = (
-            (stored_scales[0], stored_scales[1]),
-            (stored_scales[2], stored_scales[3]),
-        )
+        stored: _LayerScales = {}
+        for role in ("k", "v"):
+            if not layer_values[role]:
+                continue
+            quant_orig = max(layer_values[role])
+            stored_scales = torch.tensor(
+                (1.0 / quant_orig, quant_orig), dtype=torch.float32, device="cpu"
+            ).tolist()
+            if any(not math.isfinite(value) or value <= 0.0 for value in stored_scales):
+                raise ValueError(
+                    f"ModelOpt {role.upper()} scale for layer {layer_id} "
+                    "is not representable as float32"
+                )
+            stored[role] = (stored_scales[0], stored_scales[1])
+        result[layer_id] = stored
     return result
 
 
@@ -230,6 +230,32 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         has_csa_cache = any(
             roles == _DEEPSEEK_V4_CSA_ROLES for roles in deepseek_v4_roles_by_layer.values()
         )
+        deepseek_v4_model_layers: dict[int, int] = {}
+        if has_csa_cache:
+            model_layer = None
+            num_model_layers = 0
+            for layer in attention_layers:
+                layer_id = int(layer.layer_id)
+                roles = deepseek_v4_roles_by_layer.get(layer_id)
+                if roles is None:
+                    continue
+                if _DEEPSEEK_V4_SWA in roles:
+                    if num_model_layers == len(pp_layers):
+                        raise ValueError(
+                            "DeepSeek-V4 KVCM layout has more model-layer anchors than pp_layers"
+                        )
+                    model_layer = int(pp_layers[num_model_layers])
+                    num_model_layers += 1
+                elif model_layer is None:
+                    raise ValueError(
+                        "DeepSeek-V4 KVCM layout must begin each model layer with an SWA Page"
+                    )
+                deepseek_v4_model_layers[layer_id] = model_layer
+            if num_model_layers != len(pp_layers):
+                raise ValueError(
+                    "DeepSeek-V4 KVCM layout and pp_layers have different model-layer counts"
+                )
+
         layer_layouts = []
         for layer in attention_layers:
             layer_id = int(layer.layer_id)
@@ -280,6 +306,17 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                         "ordinary runtime Page"
                     )
 
+                scale = _IDENTITY_NVFP4_SCALE
+                if not is_draft:
+                    model_scales = self._model_scales.get(deepseek_v4_model_layers[layer_id])
+                    if model_scales:
+                        if "k" not in model_scales:
+                            raise ValueError(
+                                "DeepSeek-V4 NVFP4 cold pages require a K scale when "
+                                "model-layer scale metadata is present"
+                            )
+                        scale = model_scales["k"]
+
                 layer_layouts.append(
                     _Nvfp4LayerLayout(
                         layer_id=layer_id,
@@ -291,7 +328,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                             _Nvfp4BufferLayout(
                                 role=str(buffer.role),
                                 scales=(
-                                    _Nvfp4Scales(1.0, 1.0)
+                                    _Nvfp4Scales(*scale)
                                     if str(buffer.role) == _DEEPSEEK_V4_COMPRESS
                                     else None
                                 ),
@@ -308,12 +345,15 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 )
 
             compressed_roles = ("key", "value") if "value" in buffer_roles else ("key",)
-            if len(compressed_roles) == 2 and not is_draft:
-                orig_quant, quant_orig = self._model_scales.get(
-                    int(pp_layers[layer_id]), _IDENTITY_NVFP4_SCALES
+            model_scales = None if is_draft else self._model_scales.get(int(pp_layers[layer_id]))
+            if model_scales and set(model_scales) != {"k", "v"}:
+                raise ValueError(
+                    f"ModelOpt KV scales for layer {pp_layers[layer_id]} must contain both K and V"
                 )
+            if len(compressed_roles) == 2 and model_scales:
+                scales = tuple(model_scales[role] for role in ("k", "v"))
             else:
-                orig_quant, quant_orig = _IDENTITY_NVFP4_SCALES
+                scales = (_IDENTITY_NVFP4_SCALE,) * len(compressed_roles)
 
             num_kv_heads = int(num_kv_heads_per_layer[layer_id])
             tokens_per_page = int(cache_config.tokens_per_block)
@@ -325,7 +365,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             buffer_layouts = [
                 _Nvfp4BufferLayout(
                     role=role,
-                    scales=_Nvfp4Scales(orig_quant[index], quant_orig[index]),
+                    scales=_Nvfp4Scales(*scales[index]),
                 )
                 for index, role in enumerate(compressed_roles)
             ]

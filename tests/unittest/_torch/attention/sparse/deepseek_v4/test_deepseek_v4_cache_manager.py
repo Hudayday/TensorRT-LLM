@@ -435,7 +435,8 @@ class TestDeepseekV4CacheManager:
     def test_nvfp4_cold_page_codec_migrates_real_csa_hca_through_host(
         self, dtype: DataType, cold_page_bytes: int
     ) -> None:
-        prompt_len = 4 * self.tokens_per_block
+        prompt_len = 64 * self.tokens_per_block
+        pressure_len = 65 * self.tokens_per_block
         compress_ratios = [4, 128]
         provider = Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompressionConfig())
         requests: list[LlmRequest] = []
@@ -460,7 +461,7 @@ class TestDeepseekV4CacheManager:
             cache_manager, sparse_attn_config = self._create_deepseek_v4_cache_manager(
                 tokens_per_block=self.tokens_per_block,
                 max_batch_size=1,
-                max_seq_len=prompt_len,
+                max_seq_len=pressure_len,
                 compress_ratios=compress_ratios,
                 dtype=dtype,
                 compressor_dtype=DataType.FLOAT,
@@ -496,7 +497,7 @@ class TestDeepseekV4CacheManager:
                 first_cache = cache_manager.kv_cache_map[first.py_request_id]
                 cache_manager.suspend_request(first)
 
-                pressure = self._create_request(request_id=1, prompt_len=prompt_len)
+                pressure = self._create_request(request_id=1, prompt_len=pressure_len)
                 requests.append(pressure)
                 assert cache_manager.prepare_context(pressure)
                 assert cache_manager.resize_context(pressure, pressure.context_chunk_size)

@@ -137,6 +137,48 @@ def _write_scales(directory, scales_by_layer, *, filename="model.safetensors", p
     save_file(tensors, str(directory / filename))
 
 
+def _write_role_scales(directory, scales_by_layer, *, prefix="model"):
+    _write_quant_metadata(directory)
+    tensors = {}
+    for layer_id, role_scales in scales_by_layer.items():
+        base = f"{prefix}.layers.{layer_id}.self_attn"
+        for role, scale in role_scales.items():
+            tensors[f"{base}.{role}_proj.{role}_scale"] = torch.as_tensor(
+                scale, dtype=torch.float32
+            )
+    save_file(tensors, str(directory / "model.safetensors"))
+
+
+def _deepseek_v4_csa_cache_config(*, num_model_layers=1, first_layer_id=0, element_bytes=2):
+    layers = []
+    for model_layer in range(num_model_layers):
+        swa_layer = first_layer_id + model_layer * 2
+        layers.extend(
+            [
+                AttentionLayerConfig(
+                    layer_id=swa_layer,
+                    buffers=[
+                        BufferConfig(
+                            role="deepseek_v4_swa",
+                            size=128 * 512 * element_bytes,
+                        )
+                    ],
+                ),
+                AttentionLayerConfig(
+                    layer_id=swa_layer + 1,
+                    buffers=[
+                        BufferConfig(
+                            role="deepseek_v4_compress",
+                            size=32 * 512 * element_bytes,
+                        ),
+                        BufferConfig(role="deepseek_v4_indexer_compress", size=32 * 68),
+                    ],
+                ),
+            ]
+        )
+    return SimpleNamespace(tokens_per_block=128, layers=tuple(layers))
+
+
 def _validate_compression(mode: object | None = None) -> None:
     spec_config = None if mode is None else SimpleNamespace(spec_dec_mode=mode)
     with patch.object(util_mod, "is_sm_100f", return_value=True):
@@ -491,10 +533,10 @@ def test_scale_loader_matches_hf_shard_and_consolidated_policy(tmp_path):
         {7: (0.125, 0.0625)},
         filename="consolidated.00.safetensors",
     )
-    assert _load_modelopt_nvfp4_scales(str(tmp_path))[7] == (
-        (2.0, 4.0),
-        (0.5, 0.25),
-    )
+    assert _load_modelopt_nvfp4_scales(str(tmp_path))[7] == {
+        "k": (2.0, 0.5),
+        "v": (4.0, 0.25),
+    }
 
     consolidated_only = tmp_path / "consolidated-only"
     consolidated_only.mkdir()
@@ -503,10 +545,10 @@ def test_scale_loader_matches_hf_shard_and_consolidated_policy(tmp_path):
         {9: (0.125, 0.0625)},
         filename="consolidated.00.safetensors",
     )
-    assert _load_modelopt_nvfp4_scales(str(consolidated_only))[9] == (
-        (8.0, 16.0),
-        (0.125, 0.0625),
-    )
+    assert _load_modelopt_nvfp4_scales(str(consolidated_only))[9] == {
+        "k": (8.0, 0.125),
+        "v": (16.0, 0.0625),
+    }
 
 
 def test_scale_loader_reduces_duplicate_shards_like_native_qkv_loader(tmp_path):
@@ -517,10 +559,10 @@ def test_scale_loader_reduces_duplicate_shards_like_native_qkv_loader(tmp_path):
         filename="model-00002.safetensors",
         prefix="model.language_model",
     )
-    assert _load_modelopt_nvfp4_scales(str(tmp_path))[7] == (
-        (2.0, 4.0),
-        (0.5, 0.25),
-    )
+    assert _load_modelopt_nvfp4_scales(str(tmp_path))[7] == {
+        "k": (2.0, 0.5),
+        "v": (4.0, 0.25),
+    }
 
 
 def test_scale_loader_ignores_multimodal_towers_with_the_same_layer_id(tmp_path):
@@ -535,10 +577,10 @@ def test_scale_loader_ignores_multimodal_towers_with_the_same_layer_id(tmp_path)
     }
     save_file(tensors, str(tmp_path / "model.safetensors"))
 
-    assert _load_modelopt_nvfp4_scales(str(tmp_path))[7] == (
-        (2.0, 4.0),
-        (0.5, 0.25),
-    )
+    assert _load_modelopt_nvfp4_scales(str(tmp_path))[7] == {
+        "k": (2.0, 0.5),
+        "v": (4.0, 0.25),
+    }
 
 
 def test_trtllm_load_kv_scales_zero_uses_identity(tmp_path, monkeypatch):
@@ -564,13 +606,50 @@ def test_explicit_scale_checkpoint_requires_safetensors(tmp_path):
 
 
 @pytest.mark.parametrize("present_kind", ["k", "v"])
-def test_scale_checkpoint_requires_kv_pair(tmp_path, present_kind):
-    _write_scales(tmp_path, {7: (0.5, 0.5)})
-    base = "model.layers.7.self_attn"
-    name = f"{base}.{present_kind}_proj.{present_kind}_scale"
-    save_file({name: torch.tensor(0.5)}, str(tmp_path / "model.safetensors"))
-    with pytest.raises(ValueError, match="both K and V"):
-        _load_modelopt_nvfp4_scales(str(tmp_path))
+def test_scale_loader_preserves_role_specific_metadata(tmp_path, present_kind):
+    _write_role_scales(tmp_path, {7: {present_kind: 0.5}})
+    assert _load_modelopt_nvfp4_scales(str(tmp_path)) == {7: {present_kind: (2.0, 0.5)}}
+
+
+def test_regular_kv_layout_requires_paired_modelopt_scales(tmp_path):
+    native, _ = _native()
+    _write_role_scales(tmp_path, {7: {"k": 0.5}})
+    with (
+        patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
+        pytest.raises(ValueError, match="must contain both K and V"),
+    ):
+        _manager(tmp_path).create_cold_page_codec(
+            _cache_config((0, "attention")),
+            runtime_dtype=DataType.BF16,
+            pp_layers=(7,),
+            num_kv_heads_per_layer=(8,),
+            head_dim_per_layer=(128,),
+        )
+
+
+def test_key_only_layout_rejects_partial_modelopt_scales(tmp_path):
+    native, _ = _native()
+    _write_role_scales(tmp_path, {7: {"k": 0.5}})
+    cache_config = SimpleNamespace(
+        tokens_per_block=64,
+        layers=(
+            AttentionLayerConfig(
+                layer_id=0,
+                buffers=[BufferConfig(role="key", size=64 * 576 * 2)],
+            ),
+        ),
+    )
+    with (
+        patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
+        pytest.raises(ValueError, match="must contain both K and V"),
+    ):
+        _manager(tmp_path).create_cold_page_codec(
+            cache_config,
+            runtime_dtype=DataType.BF16,
+            pp_layers=(7,),
+            num_kv_heads_per_layer=(1,),
+            head_dim_per_layer=(576,),
+        )
 
 
 def test_scale_checkpoint_requires_float32_reciprocals(tmp_path) -> None:
@@ -708,24 +787,13 @@ def test_deepseek_v4_csa_layout_quantizes_nope_and_preserves_other_bytes(
     indexer = "deepseek_v4_indexer_compress"
     compress_bytes = 32 * 512 * element_bytes
     indexer_bytes = 32 * (128 // 2 + 128 // 32)
-    cache_config = SimpleNamespace(
-        tokens_per_block=128,
-        layers=(
-            AttentionLayerConfig(
-                layer_id=8,
-                buffers=[
-                    BufferConfig(role=compress, size=compress_bytes),
-                    BufferConfig(role=indexer, size=indexer_bytes),
-                ],
-            ),
-        ),
-    )
+    cache_config = _deepseek_v4_csa_cache_config(first_layer_id=7, element_bytes=element_bytes)
 
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
         _manager().create_cold_page_codec(
             cache_config,
             runtime_dtype=runtime_dtype,
-            pp_layers=(),
+            pp_layers=(10,),
             num_kv_heads_per_layer=(),
             head_dim_per_layer=(),
         )
@@ -760,6 +828,108 @@ def test_deepseek_v4_csa_layout_quantizes_nope_and_preserves_other_bytes(
         (indexer_offset, cold_page_bytes),
     )
     assert all(left[1] <= right[0] for left, right in zip(sections, sections[1:]))
+
+
+def test_deepseek_v4_csa_uses_model_layer_k_scale(tmp_path) -> None:
+    native, _ = _native()
+    _write_role_scales(
+        tmp_path,
+        {
+            1: {"k": 0.875},
+            10: {"k": 0.5},
+            20: {"k": 0.25, "v": 0.125},
+        },
+    )
+    cache_config = _deepseek_v4_csa_cache_config(num_model_layers=2)
+
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        _manager(tmp_path).create_cold_page_codec(
+            cache_config,
+            runtime_dtype=DataType.BF16,
+            pp_layers=(10, 20),
+            num_kv_heads_per_layer=(),
+            head_dim_per_layer=(),
+        )
+
+    layouts = _codec_state(native).layer_layouts
+    assert layouts[1].buffers[0].scales.nvfp4_orig_quant == 2.0
+    assert layouts[1].buffers[0].scales.nvfp4_quant_orig == 0.5
+    assert layouts[3].buffers[0].scales.nvfp4_orig_quant == 4.0
+    assert layouts[3].buffers[0].scales.nvfp4_quant_orig == 0.25
+    metadata = _configure_lifecycle(
+        native,
+        {
+            1: {
+                "deepseek_v4_compress": 32 * 512 * 2,
+                "deepseek_v4_indexer_compress": 32 * 68,
+            },
+            3: {
+                "deepseek_v4_compress": 32 * 512 * 2,
+                "deepseek_v4_indexer_compress": 32 * 68,
+            },
+        },
+    )
+    assert metadata.scales[:4].tolist() == [
+        [2.0, 0.5, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0],
+        [4.0, 0.25, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0],
+    ]
+
+
+def test_deepseek_v4_csa_rejects_v_only_model_layer_scale(tmp_path) -> None:
+    native, _ = _native()
+    _write_role_scales(tmp_path, {10: {"v": 0.25}})
+    cache_config = _deepseek_v4_csa_cache_config()
+
+    with (
+        patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
+        pytest.raises(ValueError, match="require a K scale"),
+    ):
+        _manager(tmp_path).create_cold_page_codec(
+            cache_config,
+            runtime_dtype=DataType.BF16,
+            pp_layers=(10,),
+            num_kv_heads_per_layer=(),
+            head_dim_per_layer=(),
+        )
+
+
+def test_deepseek_v4_draft_csa_uses_identity_scale(tmp_path) -> None:
+    native, _ = _native()
+    _write_role_scales(tmp_path, {10: {"k": 0.5}})
+    cache_config = _deepseek_v4_csa_cache_config()
+
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        _manager(tmp_path).create_cold_page_codec(
+            cache_config,
+            runtime_dtype=DataType.BF16,
+            pp_layers=(10,),
+            num_kv_heads_per_layer=(),
+            head_dim_per_layer=(),
+            is_draft=True,
+        )
+
+    scales = _codec_state(native).layer_layouts[1].buffers[0].scales
+    assert scales.nvfp4_orig_quant == scales.nvfp4_quant_orig == 1.0
+
+
+@pytest.mark.parametrize("pp_layers", [(), (10, 20)])
+def test_deepseek_v4_layout_requires_one_swa_anchor_per_model_layer(pp_layers) -> None:
+    native, _ = _native()
+    cache_config = _deepseek_v4_csa_cache_config()
+
+    with (
+        patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
+        pytest.raises(ValueError, match="model-layer"),
+    ):
+        _manager().create_cold_page_codec(
+            cache_config,
+            runtime_dtype=DataType.BF16,
+            pp_layers=pp_layers,
+            num_kv_heads_per_layer=(),
+            head_dim_per_layer=(),
+        )
 
 
 def test_deepseek_v4_csa_and_colocated_hca_cache_are_provider_owned() -> None:
@@ -817,7 +987,7 @@ def test_deepseek_v4_csa_and_colocated_hca_cache_are_provider_owned() -> None:
         _manager().create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.BF16,
-            pp_layers=(),
+            pp_layers=(10, 11, 12),
             num_kv_heads_per_layer=(),
             head_dim_per_layer=(),
         )
@@ -871,6 +1041,10 @@ def test_deepseek_v4_fp8_footer_scale_layout_fails_before_codec_creation() -> No
         layers=(
             AttentionLayerConfig(
                 layer_id=0,
+                buffers=[BufferConfig(role="deepseek_v4_swa", size=128 * 512)],
+            ),
+            AttentionLayerConfig(
+                layer_id=1,
                 buffers=[
                     BufferConfig(role="deepseek_v4_compress", size=32 * 584),
                     BufferConfig(role="deepseek_v4_indexer_compress", size=32 * 68),
@@ -886,7 +1060,7 @@ def test_deepseek_v4_fp8_footer_scale_layout_fails_before_codec_creation() -> No
         _manager().create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.FP8,
-            pp_layers=(0,),
+            pp_layers=(10,),
             num_kv_heads_per_layer=(1,),
             head_dim_per_layer=(512,),
         )
