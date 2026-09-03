@@ -395,9 +395,9 @@ class TestDeepseekV4CacheManager:
             wraps=native_kvcc.create_python_cold_page_codec,
         ) as create_codec:
             cache_manager, _ = self._create_deepseek_v4_cache_manager(
-                tokens_per_block=self.tokens_per_block,
+                tokens_per_block=256,
                 max_batch_size=1,
-                max_seq_len=128,
+                max_seq_len=256,
                 compress_ratios=[4, 128],
                 dtype=DataType.BF16,
                 compressor_dtype=DataType.FLOAT,
@@ -424,7 +424,7 @@ class TestDeepseekV4CacheManager:
             metadata = codec_state.lifecycle_metadata[0]
             assert metadata.num_buffers == 3
             assert metadata.integers[:3, 1].tolist() == [0, 1, 1]
-            assert metadata.cold_page_bytes == 15360
+            assert metadata.cold_page_bytes == 30720
         finally:
             cache_manager.shutdown()
 
