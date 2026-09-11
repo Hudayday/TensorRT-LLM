@@ -30,6 +30,10 @@ roles in the same Attention lifecycle, such as a DSA index key, are appended to
 the blob losslessly. Non-Attention lifecycles, including GDN, SSM, and Conv
 state, use the default lossless cold-page codec and are not quantized.
 
+For DeepSeek-V4, cold-page compression encodes the NoPE prefix of the ratio-4
+CSA history as NVFP4. Its RoPE suffix and the remaining specialized cache state
+are preserved losslessly in the same cold Page.
+
 Disk migration uses pinned Host staging. TensorRT-LLM first produces the same
 compact cold Page used by the Host tier, writes that representation to Disk,
 and reads it back into staging before decode. Host and Disk therefore share one
@@ -61,7 +65,7 @@ Attention-visible GPU layout.
 | Key-only MLA Attention KV | Supported; the latent Attention key is encoded as NVFP4 |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly |
 | DSA and other auxiliary buffers | Skipped by quantization and preserved losslessly |
-| DeepSeek-V4 specialized sparse cache | Not supported |
+| DeepSeek-V4 specialized sparse cache | Supported; the CSA NoPE prefix is encoded as NVFP4 and the remaining state is preserved losslessly |
 
 The current implementation requires the PyTorch backend, native C++
 KVCacheManagerV2, and an SM100 or SM103 GPU. Hot Attention KV can use FP16,
@@ -88,6 +92,7 @@ families:
 * Qwen3.5 family
 * GLM family, including GLM-5.2
 * DeepSeek-R1 family
+* DeepSeek-V4 family
 
 This is a tested-model list, not an exhaustive support list. Other models that
 use the supported cache types above are expected to work, subject to their

@@ -251,7 +251,7 @@ structures. Both share the same general platform requirements.[^general-requirem
 | MLA Attention KV | Supported | Not supported |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Not supported |
 | DSA and other Attention side buffers | Preserved losslessly | Not supported |
-| DeepSeek-V4 specialized sparse cache | Not supported | Not supported |
+| DeepSeek-V4 specialized sparse cache | Supported; quantizes the CSA NoPE prefix and preserves the remaining cache state losslessly | Not supported |
 
 [^general-requirements]: Both methods currently require the PyTorch backend,
     KVCM V2, and an NVIDIA GPU with compute capability SM100 or SM103.
@@ -272,6 +272,7 @@ NVFP4 cold-page quantization has been tested with the following model families:
 - Qwen3.5 family
 - GLM family, including GLM-5.2
 - DeepSeek-R1 family
+- DeepSeek-V4 family
 
 TriAttention has been tested with the following model families:
 
