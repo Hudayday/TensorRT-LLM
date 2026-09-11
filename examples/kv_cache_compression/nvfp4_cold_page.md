@@ -67,6 +67,9 @@ Attention-visible GPU layout.
 | DSA and other auxiliary buffers | Skipped by quantization and preserved losslessly |
 | DeepSeek-V4 specialized sparse cache | Supported; the CSA NoPE prefix is encoded as NVFP4 and the remaining state is preserved losslessly |
 
+Kimi-K3 uses the generic MLA cache path and requires no model-specific
+cold-page handling.
+
 The current implementation requires the PyTorch backend, native C++
 KVCacheManagerV2, and an SM100 or SM103 GPU. Hot Attention KV can use FP16,
 BF16, or FP8. Host and Disk cold tiers share the same compact representation,

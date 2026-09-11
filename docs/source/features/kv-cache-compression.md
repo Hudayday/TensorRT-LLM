@@ -253,6 +253,9 @@ structures. Both share the same general platform requirements.[^general-requirem
 | DSA and other Attention side buffers | Preserved losslessly | Not supported |
 | DeepSeek-V4 specialized sparse cache | Supported; quantizes the CSA NoPE prefix and preserves the remaining cache state losslessly | Not supported |
 
+Kimi-K3 uses the supported generic MLA cache path and does not require
+model-specific cold-page handling.
+
 [^general-requirements]: Both methods currently require the PyTorch backend,
     KVCM V2, and an NVIDIA GPU with compute capability SM100 or SM103.
 [^cold-page-requirements]: NVFP4 cold-page quantization additionally requires
