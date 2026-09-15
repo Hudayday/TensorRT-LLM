@@ -44,10 +44,10 @@ A key challenge in deploying KV cache compression at scale is the diversity of e
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog28_kv_lifetime_stages.svg" width="1000">
+  <img src="../media/tech_blog28_kv_lifetime_stages.svg" width="900">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 1: The six moments in the life of a KV cache where compression can act. TensorRT LLM exposes hooks at these moments; the two shipped methods act while generating (S3) and after the KV leaves the GPU (S5).</em></sub></p>
+<p align="center"><sub><em>Figure 1: Six stages in the life of a KV cache where compression can run. The two methods in this blog act at stage 4 and stage 6.</em></sub></p>
 
 To demonstrate the framework's generality, we have integrated two methods that exercise the two contracts:
 

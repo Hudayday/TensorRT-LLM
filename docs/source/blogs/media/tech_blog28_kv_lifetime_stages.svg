@@ -1,44 +1,27 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 300" width="1180" height="300" font-family="system-ui,-apple-system,Segoe UI,sans-serif" style="background:#fff">
-<text x="590.0" y="34" font-size="17" font-weight="600" text-anchor="middle" fill="#1c2733">The six moments in the life of a KV cache where compression can act</text>
-<line x1="30" y1="220" x2="1155" y2="220" stroke="#6b7a8d" stroke-width="2" marker-end="url(#arrow)"/>
-<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#6b7a8d"/></marker></defs>
-<rect x="30" y="70" width="175" height="120" rx="10" fill="#f4c7a5" fill-opacity="0.35" stroke="#f4c7a5" stroke-width="2"/>
-<text x="44" y="100" font-size="20" font-weight="700" fill="#1c2733">S0</text>
-<text x="44" y="124" font-size="12.5" font-weight="600" fill="#1c2733">Before the input enters the model</text>
-<text x="44" y="146" font-size="11.5" fill="#3b4a5a">prompt text is shortened or</text>
-<text x="44" y="162" font-size="11.5" fill="#3b4a5a">rewritten before tokenization</text>
-<circle cx="117.5" cy="220" r="5" fill="#6b7a8d"/>
-<rect x="220" y="70" width="175" height="120" rx="10" fill="#f2b28a" fill-opacity="0.35" stroke="#f2b28a" stroke-width="2"/>
-<text x="234" y="100" font-size="20" font-weight="700" fill="#1c2733">S1</text>
-<text x="234" y="124" font-size="12.5" font-weight="600" fill="#1c2733">While the input is being read</text>
-<text x="234" y="146" font-size="11.5" fill="#3b4a5a">after each prefill chunk, or</text>
-<text x="234" y="162" font-size="11.5" fill="#3b4a5a">as KV is written</text>
-<circle cx="307.5" cy="220" r="5" fill="#6b7a8d"/>
-<rect x="410" y="70" width="175" height="120" rx="10" fill="#efa070" fill-opacity="0.35" stroke="#efa070" stroke-width="2"/>
-<text x="424" y="100" font-size="20" font-weight="700" fill="#1c2733">S2</text>
-<text x="424" y="124" font-size="12.5" font-weight="600" fill="#1c2733">Right after prefill</text>
-<text x="424" y="146" font-size="11.5" fill="#3b4a5a">one-shot compression of the</text>
-<text x="424" y="162" font-size="11.5" fill="#3b4a5a">full prompt KV</text>
-<circle cx="497.5" cy="220" r="5" fill="#6b7a8d"/>
-<rect x="600" y="70" width="175" height="120" rx="10" fill="#e98d5a" fill-opacity="0.35" stroke="#e98d5a" stroke-width="2"/>
-<text x="614" y="100" font-size="20" font-weight="700" fill="#1c2733">S3</text>
-<text x="614" y="124" font-size="12.5" font-weight="600" fill="#1c2733">While generating</text>
-<text x="614" y="146" font-size="11.5" fill="#3b4a5a">between decode steps,</text>
-<text x="614" y="162" font-size="11.5" fill="#3b4a5a">token by token</text>
-<circle cx="687.5" cy="220" r="5" fill="#6b7a8d"/>
-<rect x="790" y="70" width="175" height="120" rx="10" fill="#9fb8d6" fill-opacity="0.35" stroke="#9fb8d6" stroke-width="2"/>
-<text x="804" y="100" font-size="20" font-weight="700" fill="#1c2733">S4</text>
-<text x="804" y="124" font-size="12.5" font-weight="600" fill="#1c2733">Around a tool call</text>
-<text x="804" y="146" font-size="11.5" fill="#3b4a5a">when the call goes out and</text>
-<text x="804" y="162" font-size="11.5" fill="#3b4a5a">when its result returns</text>
-<circle cx="877.5" cy="220" r="5" fill="#6b7a8d"/>
-<rect x="980" y="70" width="175" height="120" rx="10" fill="#6f93c4" fill-opacity="0.35" stroke="#6f93c4" stroke-width="2"/>
-<text x="994" y="100" font-size="20" font-weight="700" fill="#1c2733">S5</text>
-<text x="994" y="124" font-size="12.5" font-weight="600" fill="#1c2733">After the KV leaves the GPU</text>
-<text x="994" y="146" font-size="11.5" fill="#3b4a5a">stored in host or disk tiers,</text>
-<text x="994" y="162" font-size="11.5" fill="#3b4a5a">moved, and fetched back</text>
-<circle cx="1067.5" cy="220" r="5" fill="#6b7a8d"/>
-<text x="30" y="252" font-size="12" fill="#6b7a8d">request lifetime</text>
-<text x="370" y="252" font-size="12" fill="#6b7a8d">hot: the KV is being read by attention</text>
-<text x="990" y="252" font-size="12" fill="#6b7a8d" text-anchor="end">cold: the KV is not being computed on</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1098 106" width="1098" height="106">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
+<rect x="0" y="0" width="1098" height="106" fill="#f5f5f5"/>
+<rect x="24" y="24" width="150" height="58" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="36" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399">STAGE 1</text>
+<text x="36" y="64" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">Before the input</text>
+<line x1="176" y1="53.0" x2="202" y2="53.0" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="204" y="24" width="150" height="58" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="216" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399">STAGE 2</text>
+<text x="216" y="64" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">After each prefill chunk</text>
+<line x1="356" y1="53.0" x2="382" y2="53.0" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="384" y="24" width="150" height="58" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="396" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399">STAGE 3</text>
+<text x="396" y="64" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">Right after prefill</text>
+<line x1="536" y1="53.0" x2="562" y2="53.0" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="564" y="24" width="150" height="58" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.25"/>
+<text x="576" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#eb6c36">STAGE 4</text>
+<text x="576" y="64" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">Between tokens</text>
+<line x1="716" y1="53.0" x2="742" y2="53.0" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="744" y="24" width="150" height="58" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="756" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399">STAGE 5</text>
+<text x="756" y="64" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">Around a tool call</text>
+<line x1="896" y1="53.0" x2="922" y2="53.0" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="924" y="24" width="150" height="58" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.25"/>
+<text x="936" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#eb6c36">STAGE 6</text>
+<text x="936" y="64" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">After the request</text>
 </svg>
