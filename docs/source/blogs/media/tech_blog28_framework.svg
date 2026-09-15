@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1092 316" width="1092" height="316">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M4,0.5 L11,4 L4,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
+<rect x="0" y="0" width="1092" height="316" fill="#f5f5f5"/>
+<path d="M106,54 L106,34 Q106,28 112,28 L760,28 Q766,28 766,34 L766,54" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="436" y="22" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">constructs the concrete manager; registers it as the last resource manager when uses_iteration_lifecycle</text>
+<path d="M106,134 L106,248 Q106,254 112,254 L238,254" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#ah)"/>
+<text x="178" y="247" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">cold_page_codec_provider</text>
+<path d="M414,94 L458,94" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="436" y="67" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">prepare /</text>
+<text x="436" y="77" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">update /</text>
+<text x="436" y="87" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">free</text>
+<path d="M634,94 L678,94" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="656" y="77" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">runs after</text>
+<text x="656" y="87" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">KVCM V2</text>
+<path d="M854,94 L898,94" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="876" y="77" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">lifecycle</text>
+<text x="876" y="87" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">hooks</text>
+<path d="M766,134 L766,214" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="774" y="172" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="start">create_cold_page_codec at KVCM V2 construction</text>
+<text x="774" y="182" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="start">returns the native codec (IKvCacheColdPageCodec)</text>
+<path d="M414,254 L458,254" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="436" y="227" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">codec to</text>
+<text x="436" y="237" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">C++ cache</text>
+<text x="436" y="247" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">manager</text>
+<path d="M634,254 L678,254" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="656" y="227" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">configure;</text>
+<text x="656" y="237" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">encode /</text>
+<text x="656" y="247" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">decode</text>
+<path d="M854,254 L898,254" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="876" y="227" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">one Python</text>
+<text x="876" y="237" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">callback</text>
+<text x="876" y="247" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">per batch</text>
+<rect x="20" y="56" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="28" y="72" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">HOST · CONFIG</text>
+<text x="28" y="89" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Configuration</text>
+<text x="28" y="104" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">and factory</text>
+<text x="28" y="122" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">KvCacheCompressionConfig</text>
+<rect x="240" y="56" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="248" y="72" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">HOST · EXECUTOR</text>
+<text x="248" y="89" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Executor</text>
+<text x="248" y="104" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">iteration loop</text>
+<text x="248" y="122" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">PyExecutor._executor_loop</text>
+<rect x="460" y="56" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="468" y="72" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">HOST · EXECUTOR</text>
+<text x="468" y="89" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Resource manager</text>
+<text x="468" y="104" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">fan-out</text>
+<text x="468" y="122" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">ResourceManager</text>
+<rect x="680" y="56" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="688" y="72" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">HOST · MANAGER BASE</text>
+<text x="688" y="89" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Compression</text>
+<text x="688" y="104" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">manager base</text>
+<text x="688" y="122" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">KVCacheCompressionManager</text>
+<rect x="900" y="56" width="172" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<text x="908" y="72" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">METHOD · HOOKS</text>
+<text x="908" y="89" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">TriAttention</text>
+<text x="908" y="104" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">evict and compact</text>
+<text x="908" y="122" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">on_generation_step_end</text>
+<rect x="240" y="216" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="248" y="232" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">HOST · CACHE MANAGER</text>
+<text x="248" y="249" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">KV cache manager</text>
+<text x="248" y="264" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">V2 (Python)</text>
+<text x="248" y="282" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">KVCacheManagerV2</text>
+<rect x="460" y="216" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="468" y="232" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STORAGE · C++</text>
+<text x="468" y="249" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Storage manager</text>
+<text x="468" y="264" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">page migration</text>
+<text x="468" y="282" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">StorageManager</text>
+<rect x="680" y="216" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="688" y="232" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STORAGE · C++ ADAPTER</text>
+<text x="688" y="249" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Native cold-page</text>
+<text x="688" y="264" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">codec adapter</text>
+<text x="688" y="282" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">NativeColdPageCodec</text>
+<rect x="900" y="216" width="172" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<text x="908" y="232" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">METHOD · CODEC</text>
+<text x="908" y="249" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">NVFP4 cold-page</text>
+<text x="908" y="264" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">quantization codec</text>
+<text x="908" y="282" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">encode_cold_pages</text>
+</svg>

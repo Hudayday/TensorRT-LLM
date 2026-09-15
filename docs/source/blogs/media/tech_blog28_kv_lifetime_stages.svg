@@ -15,7 +15,7 @@
 <line x1="536" y1="53.0" x2="562" y2="53.0" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
 <rect x="564" y="24" width="150" height="58" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.25"/>
 <text x="576" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#eb6c36">STAGE 4</text>
-<text x="576" y="64" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">Between tokens</text>
+<text x="576" y="64" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">Between decode steps</text>
 <line x1="716" y1="53.0" x2="742" y2="53.0" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
 <rect x="744" y="24" width="150" height="58" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
 <text x="756" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399">STAGE 5</text>
