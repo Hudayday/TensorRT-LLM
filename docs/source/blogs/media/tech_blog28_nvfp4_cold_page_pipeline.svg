@@ -1,78 +1,72 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1092 314" width="1092" height="314">
-<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M4,0.5 L11,4 L4,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
-<rect x="0" y="0" width="1092" height="314" fill="#f5f5f5"/>
-<path d="M414,62 L458,62" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="436" y="45" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">evicted</text>
-<text x="436" y="55" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">pages</text>
-<path d="M634,62 L678,62" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="656" y="35" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">encode(),</text>
-<text x="656" y="45" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">cold base,</text>
-<text x="656" y="55" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">stream</text>
-<path d="M854,62 L898,62" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="876" y="45" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">256-page</text>
-<text x="876" y="55" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">launches</text>
-<path d="M966,102 L966,142 Q966,148 960,148 L112,148 Q106,148 106,154 L106,182" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="536" y="141" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">one compressed blob per page; stores into device-mapped host memory are the transfer itself</text>
-<path d="M194,222 L238,222" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="216" y="195" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">cold page</text>
-<text x="216" y="205" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">needed</text>
-<text x="216" y="215" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">again</text>
-<path d="M414,222 L458,222" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="436" y="195" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">decode(),</text>
-<text x="436" y="205" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">cold base,</text>
-<text x="436" y="215" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">stream</text>
-<path d="M634,222 L678,222" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="656" y="195" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">page +</text>
-<text x="656" y="205" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">ready</text>
-<text x="656" y="215" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">event</text>
-<path d="M1006,182 L1006,102" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#ah)"/>
-<text x="1014" y="140" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="start">descriptor</text>
-<text x="1014" y="150" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="start">tables</text>
-<path d="M986,262 L986,284 Q986,290 980,290 L552,290 Q546,290 546,284 L546,262" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#ah)"/>
-<text x="766" y="283" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">addresses, geometry, global scales for both kernels</text>
-<rect x="240" y="24" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="248" y="40" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 1 · HOST</text>
-<text x="248" y="57" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Cache manager</text>
-<text x="248" y="72" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">evicts hot pages</text>
-<text x="248" y="90" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">_prepareFreeSlots</text>
-<rect x="460" y="24" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="468" y="40" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 2 · DATA</text>
-<text x="468" y="57" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Page-index records</text>
-<text x="468" y="72" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">{dst, src} per page</text>
-<text x="468" y="90" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">PageIndexPair</text>
-<rect x="680" y="24" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="688" y="40" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 3 · HOST</text>
-<text x="688" y="57" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Codec adapter</text>
-<text x="688" y="72" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">routes to provider</text>
-<text x="688" y="90" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">NativeColdPageCodec</text>
-<rect x="900" y="24" width="172" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
-<text x="908" y="40" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 4 · GPU KERNEL</text>
-<text x="908" y="57" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Fused encode kernel</text>
-<text x="908" y="72" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">hot page to blob</text>
-<text x="908" y="90" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">invokeNvfp4ColdPageEncode</text>
-<rect x="20" y="184" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1196 314" width="1196" height="314">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
+<rect x="0" y="0" width="1196" height="314" fill="#f5f5f5"/>
+<path d="M434,62 L514,62" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="474" y="45" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">evicted</text>
+<text x="474" y="55" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">pages</text>
+<path d="M682,62 L762,62" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="722" y="55" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">encode()</text>
+<path d="M930,62 L1010,62" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="970" y="45" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">256-page</text>
+<text x="970" y="55" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">launches</text>
+<path d="M1074,102 L1074,142 Q1074,148 1068,148 L108,148 Q102,148 102,154 L102,182" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="588" y="141" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">one compressed blob per page; stores into device-mapped host memory are the transfer itself</text>
+<path d="M186,222 L266,222" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="226" y="205" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">page needed</text>
+<text x="226" y="215" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">again</text>
+<path d="M434,222 L514,222" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="474" y="215" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">decode()</text>
+<path d="M682,222 L762,222" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="722" y="205" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">page + ready</text>
+<text x="722" y="215" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">event</text>
+<path d="M1114,182 L1114,102" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#ah)"/>
+<text x="1122" y="140" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="start">descriptor</text>
+<text x="1122" y="150" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="start">tables</text>
+<path d="M1094,262 L1094,284 Q1094,290 1088,290 L604,290 Q598,290 598,284 L598,262" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#ah)"/>
+<text x="846" y="283" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">addresses, geometry, global scales for both kernels</text>
+<rect x="268" y="24" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="276" y="40" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 1 · HOST</text>
+<text x="276" y="57" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Cache manager</text>
+<text x="276" y="72" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">evicts hot pages</text>
+<text x="276" y="90" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">_prepareFreeSlots</text>
+<rect x="516" y="24" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="524" y="40" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 2 · DATA</text>
+<text x="524" y="57" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Page-index records</text>
+<text x="524" y="72" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">{dst, src} per page</text>
+<text x="524" y="90" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">PageIndexPair</text>
+<rect x="764" y="24" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="772" y="40" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 3 · HOST</text>
+<text x="772" y="57" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Codec adapter</text>
+<text x="772" y="72" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">routes and chunks</text>
+<text x="772" y="90" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">NativeColdPageCodec</text>
+<rect x="1012" y="24" width="164" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<text x="1020" y="40" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 4 · GPU KERNEL</text>
+<text x="1020" y="57" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Fused encode kernel</text>
+<text x="1020" y="72" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">hot page to blob</text>
+<text x="1020" y="90" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">invokeNvfp4ColdPageEncode</text>
+<rect x="20" y="184" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
 <text x="28" y="200" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 5 · STORAGE</text>
 <text x="28" y="217" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Cold blob at rest</text>
 <text x="28" y="232" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">host tier or disk</text>
 <text x="28" y="250" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">HostMem / CopyEngine</text>
-<rect x="240" y="184" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="248" y="200" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 6 · HOST</text>
-<text x="248" y="217" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Request resumes:</text>
-<text x="248" y="232" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">lock pages to GPU</text>
-<text x="248" y="250" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">KvCache::resume</text>
-<rect x="460" y="184" width="172" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
-<text x="468" y="200" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 7 · GPU KERNEL</text>
-<text x="468" y="217" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Fused decode kernel</text>
-<text x="468" y="232" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">blob to hot page</text>
-<text x="468" y="250" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">invokeNvfp4ColdPageDecode</text>
-<rect x="680" y="184" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="688" y="200" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 8 · DATA</text>
-<text x="688" y="217" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Hot page ready for</text>
-<text x="688" y="232" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">attention kernel</text>
-<text x="688" y="250" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">readyEvent / get_buffers</text>
-<rect x="900" y="184" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="908" y="200" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">DATA · BUILT AT STARTUP</text>
-<text x="908" y="217" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Descriptor tables</text>
-<text x="908" y="232" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">from configure()</text>
-<text x="908" y="250" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">build_lifecycle_metadata</text>
+<rect x="268" y="184" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="276" y="200" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 6 · HOST</text>
+<text x="276" y="217" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Request resumes:</text>
+<text x="276" y="232" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">lock pages to GPU</text>
+<text x="276" y="250" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">KvCache::resume</text>
+<rect x="516" y="184" width="164" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<text x="524" y="200" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 7 · GPU KERNEL</text>
+<text x="524" y="217" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Fused decode kernel</text>
+<text x="524" y="232" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">blob to hot page</text>
+<text x="524" y="250" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">invokeNvfp4ColdPageDecode</text>
+<rect x="764" y="184" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="772" y="200" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 8 · DATA</text>
+<text x="772" y="217" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Hot page ready for</text>
+<text x="772" y="232" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">attention kernel</text>
+<text x="772" y="250" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">readyEvent / get_buffers</text>
+<rect x="1012" y="184" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="1020" y="200" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">DATA · BUILT AT STARTUP</text>
+<text x="1020" y="217" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Descriptor tables</text>
+<text x="1020" y="232" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">from configure()</text>
+<text x="1020" y="250" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">build_lifecycle_metadata</text>
 </svg>

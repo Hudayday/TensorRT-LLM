@@ -1,74 +1,69 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1092 316" width="1092" height="316">
-<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M4,0.5 L11,4 L4,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
-<rect x="0" y="0" width="1092" height="316" fill="#f5f5f5"/>
-<path d="M106,54 L106,34 Q106,28 112,28 L980,28 Q986,28 986,34 L986,54" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#ah)"/>
-<text x="546" y="22" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">per-head q_real / q_imag, MLR coefficient, mean-phase cos / sin table</text>
-<path d="M414,94 L458,94" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="436" y="67" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">after</text>
-<text x="436" y="77" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">KVCM V2</text>
-<text x="436" y="87" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">rewind</text>
-<path d="M634,94 L678,94" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="656" y="77" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">due</text>
-<text x="656" y="87" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">requests</text>
-<path d="M854,94 L898,94" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="876" y="67" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">snapshot,</text>
-<text x="876" y="77" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">lengths,</text>
-<text x="876" y="87" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">mean phase</text>
-<path d="M986,134 L986,174 Q986,180 980,180 L112,180 Q106,180 106,186 L106,214" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="546" y="173" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">fp32 score planes over the decode region (plus per-head partial stats in union mode)</text>
-<path d="M194,254 L238,254" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="216" y="237" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">selection</text>
-<text x="216" y="247" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">rows</text>
-<path d="M414,254 L458,254" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="436" y="227" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">kept</text>
-<text x="436" y="237" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">ordinals,</text>
-<text x="436" y="247" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">ascending</text>
-<path d="M634,254 L678,254" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="656" y="237" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">compaction</text>
-<text x="656" y="247" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">done event</text>
-<rect x="20" y="56" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1196 316" width="1196" height="316">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
+<rect x="0" y="0" width="1196" height="316" fill="#f5f5f5"/>
+<path d="M102,54 L102,34 Q102,28 108,28 L1088,28 Q1094,28 1094,34 L1094,54" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#ah)"/>
+<text x="598" y="22" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">per-head q_real / q_imag, MLR coefficient, mean-phase cos / sin table</text>
+<path d="M434,94 L514,94" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="474" y="77" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">after cache</text>
+<text x="474" y="87" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">manager step</text>
+<path d="M682,94 L762,94" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="722" y="87" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">due requests</text>
+<path d="M930,94 L1010,94" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="970" y="77" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">lengths and</text>
+<text x="970" y="87" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">mean phase</text>
+<path d="M1094,134 L1094,174 Q1094,180 1088,180 L108,180 Q102,180 102,186 L102,214" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="598" y="173" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">fp32 score planes over the decode region (plus per-head partial stats in union mode)</text>
+<path d="M186,254 L266,254" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="226" y="237" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">selection</text>
+<text x="226" y="247" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">rows</text>
+<path d="M434,254 L514,254" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="474" y="237" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">kept</text>
+<text x="474" y="247" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">ordinals</text>
+<path d="M682,254 L762,254" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="722" y="247" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">done event</text>
+<rect x="20" y="56" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
 <text x="28" y="72" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">DATA · LOADED ONCE</text>
 <text x="28" y="89" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Calibration stats</text>
 <text x="28" y="104" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">of pre-RoPE query</text>
 <text x="28" y="122" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">_load_calibration</text>
-<rect x="240" y="56" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="248" y="72" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 1 · HOST</text>
-<text x="248" y="89" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Decode step ends;</text>
-<text x="248" y="104" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">KVCM V2 updates</text>
-<text x="248" y="122" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">update_resources</text>
-<rect x="460" y="56" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="468" y="72" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 2 · HOOK</text>
-<text x="468" y="89" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Generation-end</text>
-<text x="468" y="104" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">hook: due requests</text>
-<text x="468" y="122" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">on_generation_step_end</text>
-<rect x="680" y="56" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="688" y="72" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 3 · HOST</text>
-<text x="688" y="89" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Stage lengths and</text>
-<text x="688" y="104" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">block offsets</text>
-<text x="688" y="122" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">_execute_eviction_round</text>
-<rect x="900" y="56" width="172" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
-<text x="908" y="72" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 4 · GPU KERNEL</text>
-<text x="908" y="89" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Fused scoring</text>
-<text x="908" y="104" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">kernel on K pages</text>
-<text x="908" y="122" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">_TriAttentionScoreKernel</text>
-<rect x="20" y="216" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<rect x="268" y="56" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="276" y="72" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 1 · HOST</text>
+<text x="276" y="89" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Decode step ends;</text>
+<text x="276" y="104" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">KVCM V2 updates</text>
+<text x="276" y="122" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">update_resources</text>
+<rect x="516" y="56" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="524" y="72" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 2 · HOOK</text>
+<text x="524" y="89" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Generation-end</text>
+<text x="524" y="104" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">hook: due requests</text>
+<text x="524" y="122" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">on_generation_step_end</text>
+<rect x="764" y="56" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="772" y="72" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 3 · HOST</text>
+<text x="772" y="89" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Stage lengths and</text>
+<text x="772" y="104" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">block offsets</text>
+<text x="772" y="122" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">_execute_eviction_round</text>
+<rect x="1012" y="56" width="164" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<text x="1020" y="72" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 4 · GPU KERNEL</text>
+<text x="1020" y="89" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Fused scoring</text>
+<text x="1020" y="104" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">kernel on K pages</text>
+<text x="1020" y="122" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">build_score_pipeline</text>
+<rect x="20" y="216" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
 <text x="28" y="232" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 5 · GPU KERNEL</text>
 <text x="28" y="249" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Reduce planes to</text>
 <text x="28" y="264" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">selection rows</text>
 <text x="28" y="282" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">eviction_mode</text>
-<rect x="240" y="216" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="248" y="232" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 6 · GPU KERNEL</text>
-<text x="248" y="249" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Radix top-k, then</text>
-<text x="248" y="264" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">settle ties</text>
-<text x="248" y="282" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">TopK, settle_ties</text>
-<rect x="460" y="216" width="172" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
-<text x="468" y="232" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 7 · GPU KERNEL</text>
-<text x="468" y="249" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Pack moves, then</text>
-<text x="468" y="264" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">compact K and V</text>
-<text x="468" y="282" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">compaction.compact</text>
-<rect x="680" y="216" width="172" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="688" y="232" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 8 · STORAGE</text>
-<text x="688" y="249" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Publish event and</text>
-<text x="688" y="264" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">count, then resize</text>
-<text x="688" y="282" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">py_num_compressed_tokens</text>
+<rect x="268" y="216" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="276" y="232" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 6 · GPU KERNEL</text>
+<text x="276" y="249" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Radix top-k, then</text>
+<text x="276" y="264" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">settle ties</text>
+<text x="276" y="282" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">TopK, settle_ties</text>
+<rect x="516" y="216" width="164" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<text x="524" y="232" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 7 · GPU KERNEL</text>
+<text x="524" y="249" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Pack moves, then</text>
+<text x="524" y="264" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">compact K and V</text>
+<text x="524" y="282" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">compaction.compact</text>
+<rect x="764" y="216" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
+<text x="772" y="232" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">STEP 8 · STORAGE</text>
+<text x="772" y="249" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Publish event and</text>
+<text x="772" y="264" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">count, then resize</text>
+<text x="772" y="282" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">py_num_compressed_tokens</text>
 </svg>
