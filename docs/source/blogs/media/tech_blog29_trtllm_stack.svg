@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="454" viewBox="0 0 1000 454" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif">
+<rect width="1000" height="454" fill="#f5f5f5"/>
+<text x="16" y="45.5" font-size="12.5" font-weight="600" fill="#2d3142">Serving &amp; APIs</text>
+<rect x="228.0" y="16" width="332.0" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="238.0" y="37" font-size="12.5" font-weight="600" fill="#2d3142">trtllm-serve</text>
+<text x="238.0" y="53" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">OpenAI-compatible server</text>
+<rect x="572.0" y="16" width="332.0" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="582.0" y="37" font-size="12.5" font-weight="600" fill="#2d3142">LLM API</text>
+<text x="582.0" y="53" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">Python, offline and online</text>
+<text x="16" y="107.5" font-size="12.5" font-weight="600" fill="#2d3142">Runtime &amp; Scheduling</text>
+<rect x="228.0" y="78" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="238.0" y="99" font-size="12.5" font-weight="600" fill="#2d3142">Executor &amp; scheduler</text>
+<text x="238.0" y="115" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">in-flight batching, KV budget</text>
+<rect x="457.3" y="78" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="467.3" y="99" font-size="12.5" font-weight="600" fill="#2d3142">Speculative decoding</text>
+<text x="467.3" y="115" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">MTP, EAGLE3</text>
+<rect x="686.7" y="78" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="696.7" y="99" font-size="12.5" font-weight="600" fill="#2d3142">Disaggregated serving</text>
+<text x="696.7" y="115" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">prefill and decode workers</text>
+<text x="16" y="169.5" font-size="12.5" font-weight="600" fill="#2d3142">KV Cache Management</text>
+<rect x="228.0" y="140" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="238.0" y="161" font-size="12.5" font-weight="600" fill="#2d3142">Paged KV cache manager</text>
+<text x="238.0" y="177" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">allocation, block reuse</text>
+<rect x="457.3" y="140" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="467.3" y="161" font-size="12.5" font-weight="600" fill="#2d3142">Host &amp; disk tiers</text>
+<text x="467.3" y="177" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">offload and onboard pages</text>
+<rect x="686.7" y="140" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="696.7" y="161" font-size="12.5" font-weight="600" fill="#2d3142">KV transfer</text>
+<text x="696.7" y="177" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">connectors, disaggregation</text>
+<text x="16" y="231.5" font-size="12.5" font-weight="600" fill="#2d3142">Compression</text>
+<rect x="228.0" y="202" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="238.0" y="223" font-size="12.5" font-weight="600" fill="#2d3142">Quantization</text>
+<text x="238.0" y="239" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">weights, activations, active KV</text>
+<rect x="457.3" y="202" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="467.3" y="223" font-size="12.5" font-weight="600" fill="#2d3142">Sparse Attention</text>
+<text x="467.3" y="239" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">attention reads part of the cache</text>
+<rect x="686.7" y="202" width="217.3" height="50" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.25"/>
+<text x="696.7" y="223" font-size="12.5" font-weight="600" fill="#2d3142">KV Cache Compression</text>
+<text x="696.7" y="239" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#eb6c36">this blog: hooks + page codec</text>
+<text x="16" y="293.5" font-size="12.5" font-weight="600" fill="#2d3142">Model Execution</text>
+<rect x="228.0" y="264" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="238.0" y="285" font-size="12.5" font-weight="600" fill="#2d3142">PyTorch model engine</text>
+<text x="238.0" y="301" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">model definitions</text>
+<rect x="457.3" y="264" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="467.3" y="285" font-size="12.5" font-weight="600" fill="#2d3142">Parallelism</text>
+<text x="467.3" y="301" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">TP, EP, PP, DP</text>
+<rect x="686.7" y="264" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="696.7" y="285" font-size="12.5" font-weight="600" fill="#2d3142">CUDA Graphs</text>
+<text x="696.7" y="301" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">overlap scheduling</text>
+<text x="16" y="355.5" font-size="12.5" font-weight="600" fill="#2d3142">Kernels &amp; Communication</text>
+<rect x="228.0" y="326" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="238.0" y="347" font-size="12.5" font-weight="600" fill="#2d3142">Attention kernels</text>
+<text x="238.0" y="363" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">TRT-LLM Gen, FlashInfer</text>
+<rect x="457.3" y="326" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="467.3" y="347" font-size="12.5" font-weight="600" fill="#2d3142">GEMM &amp; MoE kernels</text>
+<text x="467.3" y="363" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">CUTLASS, cuBLAS</text>
+<rect x="686.7" y="326" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="696.7" y="347" font-size="12.5" font-weight="600" fill="#2d3142">Collectives</text>
+<text x="696.7" y="363" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">NCCL, custom all-reduce</text>
+<text x="16" y="417.5" font-size="12.5" font-weight="600" fill="#2d3142">NVIDIA Platform</text>
+<rect x="228.0" y="388" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="238.0" y="417.5" font-size="12.5" font-weight="600" fill="#2d3142">CUDA</text>
+<rect x="457.3" y="388" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="467.3" y="417.5" font-size="12.5" font-weight="600" fill="#2d3142">NVLink &amp; NVSwitch</text>
+<rect x="686.7" y="388" width="217.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="696.7" y="417.5" font-size="12.5" font-weight="600" fill="#2d3142">Hopper &amp; Blackwell GPUs</text>
+<rect x="920" y="16" width="64" height="422" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="0" y="0" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="middle" transform="translate(944.0,227.0) rotate(-90)">Cross-layer tooling</text>
+<text x="0" y="0" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75" text-anchor="middle" transform="translate(962.0,227.0) rotate(-90)">NVIDIA Dynamo, trtllm-bench, /metrics</text>
+</svg>
