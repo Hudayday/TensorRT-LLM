@@ -21,18 +21,18 @@
 <text x="766" y="102" font-size="12.5" fill="#4f5d75">of KV state for one 100K-token</text>
 <text x="766" y="117" font-size="12.5" fill="#4f5d75">context</text>
 <rect x="139" y="156" width="230" height="124" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
-<text x="151" y="186" font-size="22" font-weight="600" fill="#2d3142">Reuse window</text>
+<text x="151" y="186" font-size="22" font-weight="600" fill="#2d3142">Keep for 15 min</text>
 <text x="151" y="220" font-size="30" font-weight="700" fill="#eb6c36">99%</text>
 <text x="151" y="242" font-size="12.5" fill="#4f5d75">of repeat requests arrive within</text>
-<text x="151" y="257" font-size="12.5" fill="#4f5d75">15 minutes</text>
+<text x="151" y="257" font-size="12.5" fill="#4f5d75">that window</text>
 <rect x="385" y="156" width="230" height="124" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
-<text x="397" y="186" font-size="22" font-weight="600" fill="#2d3142">Hot reuse</text>
+<text x="397" y="186" font-size="22" font-weight="600" fill="#2d3142">Next turn: 0.1 s</text>
 <text x="397" y="220" font-size="30" font-weight="700" fill="#eb6c36">50%</text>
-<text x="397" y="242" font-size="12.5" fill="#4f5d75">of repeat requests arrive within</text>
-<text x="397" y="257" font-size="12.5" fill="#4f5d75">0.1 seconds</text>
+<text x="397" y="242" font-size="12.5" fill="#4f5d75">of repeat requests return that</text>
+<text x="397" y="257" font-size="12.5" fill="#4f5d75">quickly</text>
 <rect x="631" y="156" width="230" height="124" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
-<text x="643" y="186" font-size="22" font-weight="600" fill="#2d3142">Reusable prefix</text>
+<text x="643" y="186" font-size="22" font-weight="600" fill="#2d3142">Prompt overlap</text>
 <text x="643" y="220" font-size="30" font-weight="700" fill="#eb6c36">96.5%</text>
-<text x="643" y="242" font-size="12.5" fill="#4f5d75">of the prompt tokens in agentic</text>
-<text x="643" y="257" font-size="12.5" fill="#4f5d75">coding jobs</text>
+<text x="643" y="242" font-size="12.5" fill="#4f5d75">of prompt tokens in agentic</text>
+<text x="643" y="257" font-size="12.5" fill="#4f5d75">coding jobs are reusable</text>
 </svg>
