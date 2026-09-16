@@ -11,10 +11,10 @@
   - [KV Cache Compression in Cross-Request KV Management](#kv-cache-compression-in-cross-request-kv-management)
   - [Covering the Other Stages](#covering-the-other-stages)
 - [Algorithm Implementations](#algorithm-implementations)
-  - [NVFP4 Cold-Page Quantization](#nvfp4-cold-page-quantization)
+  - [NVFP4 Cold-Page Compression](#nvfp4-cold-page-compression)
   - [TriAttention](#triattention)
 - [Evaluation](#evaluation)
-  - [NVFP4 Cold-Page Quantization](#nvfp4-cold-page-quantization-1)
+  - [NVFP4 Cold-Page Compression](#nvfp4-cold-page-compression-1)
   - [TriAttention](#triattention-1)
 - [Summary and Future Work](#summary-and-future-work)
   - [Current State](#current-state)
@@ -53,7 +53,7 @@ This is what makes the framework apply to any model, and it is also what lets fu
 
 On this framework, TensorRT LLM currently ships two methods:
 
-- **[NVFP4 cold-page quantization](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md#cold-page-quantization)**: keeps attention KV pages in NVFP4 only while they are cold, that is, while a page has left the GPU for host or disk memory. The conversion runs as part of the copy itself, and the page is restored to its original precision when it comes back to the GPU.
+- **[NVFP4 cold-page compression](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md#cold-page-quantization)**: keeps attention KV pages in NVFP4 only while they are cold, that is, while a page has left the GPU for host or disk memory. The conversion runs as part of the copy itself, and the page is restored to its original precision when it comes back to the GPU.
 - **[TriAttention](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md#triattention)**: a training-free method that periodically scores the tokens generated so far and evicts the least useful ones between decoding steps once a sequence exceeds its token budget.
 
 In the following sections, we first provide an overview of the KV cache compression capabilities in TensorRT LLM, then describe the framework design that makes them possible, walk through how each method is implemented on top of it, and finally present evaluation results.
@@ -88,9 +88,9 @@ We defined the stages this way so that the framework needs one small contract pe
 
 In both cases the cache manager keeps full ownership of pages. It allocates them, moves them between tiers, and reuses them. A compression method only changes their contents.
 
-We have built two methods on the framework, using two of the five stages. NVFP4 cold-page quantization works at the after-request stage (stage 5) and TriAttention at the decode stage (stage 3). The same framework lets us add methods at the other stages and support more complex algorithms in the future. The two methods are:
+We have built two methods on the framework, using two of the five stages. NVFP4 cold-page compression works at the after-request stage (stage 5) and TriAttention at the decode stage (stage 3). The same framework lets us add methods at the other stages and support more complex algorithms in the future. The two methods are:
 
-*   **NVFP4 cold-page quantization**: stores attention KV pages as NVFP4 while they sit in host or disk memory. A page is converted on the way out and restored on the way back. The GPU cache and the attention kernels keep the model's normal KV data type.
+*   **NVFP4 cold-page compression**: stores attention KV pages as NVFP4 while they sit in host or disk memory. A page is converted on the way out and restored on the way back. The GPU cache and the attention kernels keep the model's normal KV data type.
 *   **TriAttention**: runs between decoding steps. It scores the generated tokens with an importance measure calibrated offline for each attention head and keeps only a fixed budget of them. The prompt is never touched.
 
 The two tables below summarize the current coverage.
@@ -99,7 +99,7 @@ The two tables below summarize the current coverage.
 
 | Method | When It Runs | What It Changes | Supported Attention Types |
 | :--- | :--- | :--- | :--- |
-| **NVFP4 cold-page quantization** | After-request stage (stage 5): when a page moves between the GPU and host or disk memory | How attention KV is stored while off the GPU | MHA / MQA / GQA; MLA; hybrid models (attention KV only) |
+| **NVFP4 cold-page compression** | After-request stage (stage 5): when a page moves between the GPU and host or disk memory | How attention KV is stored while off the GPU | MHA / MQA / GQA; MLA; hybrid models (attention KV only) |
 | **TriAttention** | Decode stage (stage 3): periodically between decode steps | Which KV tokens are kept | MHA / MQA / GQA |
 
 <p align="center"><sub><em>Table 1. The two methods built on the framework: the stage each one runs at, what it changes, and the attention types it supports.</em></sub></p>
@@ -108,7 +108,7 @@ The two tables below summarize the current coverage.
 
 <div align="center">
 
-| Memory Tier | NVFP4 Cold-Page Quantization | TriAttention |
+| Memory Tier | NVFP4 Cold-Page Compression | TriAttention |
 | :--- | :--- | :--- |
 | **GPU (active KV)** | Unchanged (FP16 / BF16 / FP8) | Generated tokens evicted periodically; prompt kept |
 | **Host memory** | NVFP4 (4-bit values with FP8 block scales) | Not affected |
@@ -120,7 +120,7 @@ The two tables below summarize the current coverage.
 
 **Note**: Currently, this design targets and is validated on NVIDIA Blackwell GPUs (B200 and GB300).
 
-This blog covers the framework design shared by all methods, with NVFP4 cold-page quantization as the main worked example. The C++ interface between the cache manager and a page encoder is documented in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md). The APIs for adding a new method are in the [KV Cache Compression Development Guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md).
+This blog covers the framework design shared by all methods, with NVFP4 cold-page compression as the main worked example. The C++ interface between the cache manager and a page encoder is documented in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md). The APIs for adding a new method are in the [KV Cache Compression Development Guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md).
 
 ## KV Cache Compression Framework Design
 
@@ -143,7 +143,7 @@ A compression method is selected with one configuration block, `kv_cache_compres
 The framework has three well-defined parts that together form KV cache compression (KVCC) in TensorRT LLM.
 
 - **Compression config.** One configuration block collects everything the user asks for, validates it, and routes it to the concrete method. A factory then builds that method's manager before the model runs.
-- **Compression manager base.** This base class is the core of the framework: it defines where in the runtime compression is injected. For a method that works between decode steps, such as TriAttention, the base provides the ability to run after every decode step. For a method that works on pages leaving the GPU, such as cold-page quantization, the base hooks into the KV cache manager and adds compression to offloading and onboarding. A concrete method inherits the base and is injected at the matching points automatically.
+- **Compression manager base.** This base class is the core of the framework: it defines where in the runtime compression is injected. For a method that works between decode steps, such as TriAttention, the base provides the ability to run after every decode step. For a method that works on pages leaving the GPU, such as cold-page compression, the base hooks into the KV cache manager and adds compression to offloading and onboarding. A concrete method inherits the base and is injected at the matching points automatically.
 - **Method-specific kernels.** Each method brings its own kernels that compress and decompress the KV cache. The architecture lets a method define a new series of such kernels, optimize them, and fuse them with neighboring kernels, for example with the copy that moves a page off the GPU.
 
 The executor and the KV cache manager are existing components of TensorRT LLM. The framework does not replace them. It interacts with them at the insertion points and leaves scheduling and memory ownership where they are.
@@ -161,7 +161,7 @@ Some of these stages have a method today and some do not. The decode stage (stag
 
 ### Configuration and Integration with the Cache Manager
 
-Configuration is deliberately small. One block, `kv_cache_compression_config`, collects only the settings that belong to compression: which method to run and that method's own options. A factory validates the block, rejects unsupported combinations before anything is built, and hands the settings to the compression manager, which handles everything from there. Cold-page quantization is turned on with `algorithm: quantization_for_cold_page` and `quant: nvfp4`. TriAttention is turned on with `algorithm: triattention` plus its budget and calibration options. The same fields work in the Python API, in `trtllm-serve` YAML, and in `trtllm-bench`. The full option table is in the [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
+Configuration is deliberately small. One block, `kv_cache_compression_config`, collects only the settings that belong to compression: which method to run and that method's own options. A factory validates the block, rejects unsupported combinations before anything is built, and hands the settings to the compression manager, which handles everything from there. Cold-page compression is turned on with `algorithm: quantization_for_cold_page` and `quant: nvfp4`. TriAttention is turned on with `algorithm: triattention` plus its budget and calibration options. The same fields work in the Python API, in `trtllm-serve` YAML, and in `trtllm-bench`. The full option table is in the [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
 
 The cache manager and the attention backend are outside the framework. The compression manager is designed to adapt to any cache manager and any attention backend. It changes only the contents of KV pages, and it never owns pages, tiers, or the kernels that read them.
 
@@ -204,7 +204,7 @@ This path is the cross-request hook of the framework. It serves the stages outsi
 
 This whole period belongs to KVCacheManagerV2, introduced above. V2 decides which pages stay on the GPU, move to host or disk memory, are reused by a later request, or are transferred to another worker, and it does no compression itself. The framework therefore injects its compression management into V2 at the points where KV can be compressed: when pages are offloaded and onboarded, when they are transferred, and when a request ends. At each of these points a method's Python code and kernels can be plugged in, and V2 keeps working as before.
 
-Today we cover the offloading part of the after-request stage (stage 5) with **NVFP4 cold-page quantization**, enabled by `quantization_for_cold_page` with `quant: nvfp4`. It is a good example of how the framework interacts with V2. The storage path of V2 exposes two hook points, one when a page leaves the GPU and one when it returns. A codec plugged into these points encodes the page on the way out and decodes it on the way back, and the cache manager never sees the difference. How this works in detail, and how the NVFP4 codec is built, is described in the NVFP4 cold-page quantization section below and in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md).
+Today we cover the offloading part of the after-request stage (stage 5) with **NVFP4 cold-page compression**, enabled by `quantization_for_cold_page` with `quant: nvfp4`. It is a good example of how the framework interacts with V2. The storage path of V2 exposes two hook points, one when a page leaves the GPU and one when it returns. A codec plugged into these points encodes the page on the way out and decodes it on the way back, and the cache manager never sees the difference. How this works in detail, and how the NVFP4 codec is built, is described in the NVFP4 cold-page compression section below and in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md).
 
 The tool-call stage (stage 4) and the rest of the after-request stage (stage 5), such as KV transfer, will be reached by extending this path.
 
@@ -216,70 +216,82 @@ Together, the two paths cover the decode stage (stage 3) and one part of the aft
 
 In this section, we walk through the two KV cache compression methods currently implemented in TensorRT LLM, focusing on how each method works and how it integrates with the framework. For a quick-start guide and runnable configurations, please refer to the [KV cache compression examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/kv_cache_compression).
 
-### NVFP4 Cold-Page Quantization
+### NVFP4 Cold-Page Compression
 
 #### Introduction
 
-NVFP4 is a 4-bit floating-point format (E2M1) in which every group of 16 values shares one FP8 (E4M3) block scale, optionally combined with a per-tensor global scale. TensorRT LLM already uses it for NVFP4 weights and for the NVFP4 active KV cache, so its rounding behavior and conversion kernels are well established. Cold-page quantization applies the same format at a different point in the system: instead of keeping the *active* KV cache in NVFP4 and asking the attention kernel to read it, it keeps attention KV in NVFP4 **only while a page is in host or disk memory**. The GPU cache and the attention kernels keep the model's normal KV data type (FP16, BF16, or FP8).
+NVFP4 is NVIDIA's 4-bit floating-point format. Every value is stored in 4 bits (E2M1), and every group of 16 values shares one 8-bit (E4M3) scale, so a value costs 4.5 bits on average. TensorRT LLM already uses NVFP4 for model weights and for the active KV cache, so its numerics and conversion kernels are well established.
 
-Host and disk memory are the right place for this transform for three reasons. In a reuse-heavy deployment the quantities that bind are the bytes *stored* off the GPU and the bytes *moved* over PCIe and storage links, so a smaller page buys more retained pages per gigabyte and fewer bytes per transfer. Because the active KV is never quantized, no error accumulates step after step, and a page that never leaves the GPU is never touched. And the transform is invisible to everything above it: page identity, token identity, block reuse, scheduling, and the GPU layout that attention sees are unchanged.
+Cold-page compression applies this format at a different point in the system. Attention KV pages keep their normal data type, FP16, BF16, or FP8, while they are on the GPU. Only when a page leaves the GPU for host or disk memory is it converted to NVFP4, and it is converted back when it returns. The attention kernels never see the compressed form.
 
-The arithmetic is simple. Packed E2M1 data plus one E4M3 scale per 16 values costs 0.5625 bytes per value, against 2 bytes for FP16 or BF16 and 1 byte for FP8. After the alignment the layout imposes, the measured page sizes are:
+Host and disk offloading is a good place for compression for four reasons.
 
-- **Models with FP8 active KV**: 43.75% fewer bytes per attention page off the GPU (Qwen3.5-397B-A17B 1,048,576 -> 589,824 B; Qwen3-8B with FP8 KV 2,359,296 -> 1,327,104 B), that is 1.78x more pages per byte of host or disk memory.
-- **MLA latent pages (GLM-5.2)**: 41.1% fewer bytes (3,098,112 -> 1,824,000 B), or 1.70x; the ratio is lower because the index buffer in the same page is kept lossless.
-- **Models with BF16 active KV**: 71.9% fewer bytes (Qwen3-8B with BF16 KV 4,718,592 -> 1,327,104 B), or 3.56x.
+- **Compress only under pressure.** A page is compressed once, when it goes cold, and only if it goes cold. The active cache is never touched, so no error accumulates step after step, and the accuracy impact stays smaller than compressing the cache every step.
+- **Fused with the transfer.** The page has to be copied anyway. The encode happens inside that copy, so compression adds no separate pass over the data.
+- **Less to move.** A smaller page means fewer bytes over PCIe and the storage link, so offloading and onboarding get faster as well as more capacity.
+- **One payload per page.** The compressed page is a single fixed-size block with one base address per tier, instead of separate data and scale buffers. Storage tiers address it like any other page.
 
-These figures are for attention KV. The recurrent-state buffers of hybrid models (Gated DeltaNet, state-space, and convolution state) are stored as they are and do not shrink.
+Figure 6 compares the three layouts of one KV page.
+
+<div align="center">
+<figure>
+  <img src="../media/tech_blog29_page_layouts.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 6: One KV page of one layer, holding K and V for 32 tokens, in three layouts. The hot page on the GPU stores 16 bits per value in one pool. The NVFP4 active KV cache stores 4-bit data and 8-bit block scales in two pools that attention reads together. The NVFP4 cold page packs data, scales, and any lossless buffers into one fixed-size block with one base address.</em></sub></p>
 
 #### How It Works in TensorRT LLM
 
-Within TensorRT LLM, NVFP4 cold-page quantization is a compression manager that plugs into the cross-request KV management path of the framework. Below we highlight the key design choices in layout, kernels, scales, and verification.
+Within TensorRT LLM, NVFP4 cold-page compression is a compression manager on the cross-request KV management path. It is enabled with `algorithm: quantization_for_cold_page` and `quant: nvfp4`. The flow has three parts: set-up, the page round trip, and verification.
 
-**Interaction with the cache manager.** Figure 6 follows one page out of the GPU and back. A page goes cold when its request pauses or finishes, or when the cache manager evicts it under memory pressure. The cache manager selects such pages for offload and hands a batch of them to the encode kernel, which writes compressed pages into the host or disk tier. When an active request needs a page again, the cache manager onboards it and the decode kernel restores the original data type before attention reads it. The contract between the cache manager and the codec is small and keeps four properties: each layer group has one fixed compressed page size, so every tier can address pages with a plain slot allocator; the cache manager hands the codec whole batches of page indices with a stream, not one page at a time; encode and decode only enqueue GPU work on that stream, so the codec inherits the same ordering and failure handling as an ordinary copy; and compressed pages stay compressed between host and disk, so only the GPU boundary runs the codec.
+**Set-up.** The factory builds `ColdPageQuantizationCompression`, a subclass of `KVCacheCompressionManager`, before the cache manager, because the cache manager needs the compressed page size to lay out its host and disk tiers. When the cache manager is constructed, it asks the manager for a codec through `create_cold_page_codec`. The manager's `configure` step then receives the description of every GPU page buffer once and builds one layout table per layer group. K and V buffers become NVFP4 data plus block scales, the latent buffer of an MLA page is encoded the same way, and buffers that should not be quantized, such as the recurrent state of hybrid models or the index buffer of a sparse-attention model, are marked lossless and copied as they are. By default the global scales are identity, so a regular FP16, BF16, or FP8 checkpoint needs no calibration. A ModelOpt NVFP4 checkpoint can optionally supply per-layer K and V scales.
+
+**The page round trip.** Figure 7 follows one page out and back. When the cache manager offloads pages, it hands the codec a batch of page indices and a stream. The codec launches `invokeNvfp4ColdPageEncode`, which reads the GPU pages, quantizes them, and writes the packed pages straight into the host slots. Moves between host and disk copy the bytes as they are. When a request needs a page again, the cache manager onboards it and the codec launches `invokeNvfp4ColdPageDecode`, which restores the page in its original data type into the GPU pool before attention reads it. One launcher covers every layout, MHA, GQA, MQA, MLA, and DeepSeek-V4, because the layout table drives the kernel. Adding DeepSeek-V4 needed a new layout policy and no change to the kernel path or the cache manager. Target and draft caches are both covered, so speculative decoding works with the codec enabled.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_nvfp4_cold_page_pipeline.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 6: One page leaving and returning to the GPU inside the KV cache manager. A page goes cold when its request pauses or ends, or under memory pressure. The encode kernel compresses it on the way to the host and disk tiers, and the decode kernel restores it when an active request reuses it.</em></sub></p>
+<p align="center"><sub><em>Figure 7: One page leaving and returning to the GPU inside the KV cache manager. A page goes cold when its request pauses or ends, or under memory pressure. The encode kernel turns the 16-bit hot page into one 4.5-bit cold block on the way to the host and disk tiers, and the decode kernel restores it when an active request reuses it.</em></sub></p>
 
+**Verifying that it is active.** A parsed configuration does not prove that any page was compressed, because a short request may never leave the GPU. Two counters on the `/metrics` endpoint, `trtllm_kv_cache_offload_bytes_total` and `trtllm_kv_cache_onboard_bytes_total`, become nonzero only when pages cross a tier boundary, and an Nsight Systems trace shows the encode and decode kernels on the timeline. All results in this blog were gated on this check.
 
-**Layout policy.** Enabling `quantization_for_cold_page` with `quant: nvfp4` selects the manager, which is built before the cache manager because the cache manager needs the compressed page size to lay out its host and disk tiers. At start-up the manager receives the description of every GPU page buffer once and builds a layout table per layer group: for MHA, MQA, and GQA pages the K and V buffers become NVFP4 data plus block scales; for MLA pages the latent attention key is encoded; side buffers in the same page, such as the index buffer of a sparse-attention model, are appended as they are; and the recurrent-state buffers of hybrid models are routed to the default lossless path. For DeepSeek-V4, the part of the attention history without positional encoding is encoded as NVFP4 while the positional part and the remaining specialized state are kept losslessly in the same page. A GPU page may span several buffers in the normal KV type; the compressed page is one fixed-size block: the packed NVFP4 spans, then their E4M3 block scales, then the lossless spans, each 16-byte aligned.
-
-**Fused encode and decode kernels.** Encoding and transfer are one operation. The offload kernel reads the GPU page, quantizes it, and writes the packed page straight into the mapped host slot; the onboard kernel reads the compressed page from host memory, dequantizes it, and writes the full-precision page into the GPU pool. Each launch takes the layout table, a batch of page indices, the destination base address, and the stream the cache manager supplies, with no per-page host work. There is **no model-specific kernel**: the same launcher covers MHA, GQA, MQA, MLA, and the DeepSeek-V4 layout, driven entirely by the layout table; adding DeepSeek-V4 support meant a new layout policy and its CUDA operator, with no change to the cache manager or to the shared codec path. Host and disk share the encoded bytes, so moving a page to disk never re-quantizes it.
-
-**Scales and calibration.** By default the codec uses identity global scales, so a regular FP16, BF16, or FP8 checkpoint needs no calibration step; the block scale for each group of 16 values is computed during encode and stored with the page. A compatible NVIDIA ModelOpt NVFP4 checkpoint can optionally supply per-layer K and V global scales through `scale_checkpoint_path`; this applies to the K/V layout, while MLA pages and draft-model pages use identity scales. Weight quantization and KV compression are independent: a checkpoint with NVFP4 weights and FP8 active KV uses this feature as usual, and a model whose active KV is already NVFP4 is moved losslessly. Target and draft caches are both covered, so one-model MTP-EAGLE and EAGLE3 speculative decoding work with the codec enabled.
-
-**Verifying that it is active.** A parsed configuration does not prove that any page was compressed, because a short request may never leave the GPU. The feature therefore exposes two counters on the `/metrics` endpoint, `trtllm_kv_cache_offload_bytes_total` and `trtllm_kv_cache_onboard_bytes_total`, which become nonzero only when pages cross a tier boundary. Because the counters count every migration, including lossless ones, a profiler trace is the definitive check: with the codec enabled, Nsight Systems shows the fused offload and onboard kernels on the timeline, and every page read back from host memory has a matching encode and decode. All accuracy and serving results in this blog were gated on this check. Functional coverage includes Qwen3 MHA and GQA models on the host and disk paths, Qwen3.5 with one-model MTP (target and draft caches), one-model EAGLE3 on host and disk, and an MLA model with FP8 active KV under pipeline parallelism.
-
-The concrete implementation can be found in `tensorrt_llm/_torch/kv_cache_compression/` (the manager and layout policy), `cpp/tensorrt_llm/batch_manager/kv_cache_compression/` (the native codec path), `cpp/tensorrt_llm/kernels/nvfp4ColdPageKernels.cu` (the fused encode and decode kernels), and `cpp/tensorrt_llm/nanobind/kvCacheCompression/bindings.cpp` (the Python-to-native bridge).
+The implementation lives in `tensorrt_llm/_torch/kv_cache_compression/quantization_for_cold_page/` (the manager and layout policy), `cpp/tensorrt_llm/batch_manager/kv_cache_compression/` (the native codec path), and `cpp/tensorrt_llm/kernels/nvfp4ColdPageKernels.cu` (the fused encode and decode kernels).
 
 ### TriAttention
 
 #### Introduction
 
-[TriAttention](https://arxiv.org/abs/2604.04921) (ICML 2026) is a training-free KV cache eviction method for long generations. During decoding it periodically scores the cached tokens with a trigonometric importance measure derived from per-head query statistics collected offline, keeps the most important `budget` tokens, and physically compacts the cache, so that more sequences fit on a GPU at once. The prompt is always preserved; only generated tokens are evicted. For technical details, please refer to the paper and to the official implementation at [github.com/WeianMao/triattention](https://github.com/WeianMao/triattention).
+[TriAttention](https://arxiv.org/abs/2604.04921) (ICML 2026) is a training-free KV cache eviction method for long generations. Its observation is that the importance of a cached token to future queries can be predicted from statistics of the queries themselves, collected once offline for each attention head. During decoding, TriAttention periodically scores the generated tokens with a trigonometric importance measure built from these statistics, keeps the most important `budget` tokens, and physically compacts the cache, so that more sequences fit on a GPU at once. The prompt is always preserved; only generated tokens are evicted. Figure 8 shows one eviction round. For technical details, please refer to the paper and to the official implementation at [github.com/WeianMao/triattention](https://github.com/WeianMao/triattention).
+
+<div align="center">
+<figure>
+  <img src="../media/tech_blog29_triattention_concept.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 8: TriAttention keeps the prompt intact and evicts generated tokens. Every β new tokens, the generated tokens are scored with the calibrated query statistics of each head. The `budget` highest-scoring tokens stay, the rest are evicted, and the cache is compacted, so decoding continues over a shorter cache.</em></sub></p>
 
 #### How It Works in TensorRT LLM
 
-TriAttention is a compression manager for compression in the executor iteration loop. It overrides the generation-end hook. Every `beta` confirmed generation tokens, once a sequence exceeds its budget, the manager scores the evictable generated tokens with CuTe DSL and Triton kernels, selects the `budget` tokens to keep according to `eviction_mode` (`union`, `per_head`, or `per_layer_perhead`), and compacts the paged KV cache in place with a native CUDA kernel. A speculative step may confirm several tokens at once; crossing more than one eviction period in one step is coalesced into one eviction. The calibration file (each head's mean and magnitude of the pre-RoPE query, produced by the official tool) is loaded and converted once when the manager is created. Figure 7 follows one eviction round from the hook to the compacted cache.
+TriAttention is a compression manager for compression in the executor iteration loop, and it overrides one hook, `on_generation_step_end`. It is enabled with `algorithm: triattention` plus `budget`, `beta`, `eviction_mode`, and `calibration_path`. Figure 9 follows one eviction round from the hook to the compacted cache.
+
+When the hook fires, the manager picks the requests that have generated `beta` new tokens since their last round and exceed their budget. For these requests, `_execute_eviction_round` collects the cache lengths and block offsets, and a fused scoring kernel computes the importance of every evictable token from the calibration statistics loaded at start-up. The scores are reduced according to `eviction_mode` (`union`, `per_head`, or `per_layer_perhead`), the `budget` tokens to keep are selected with a top-k, and a native compaction kernel moves K and V in place. The manager then reports the new cache length to the cache manager, which returns the freed pages. A speculative step that confirms several tokens at once triggers at most one round.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_triattention_pipeline.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 7: TriAttention between two decode steps: the generation-end hook picks the due requests, a fused CuTe DSL kernel scores the generated tokens from calibration statistics, the scores are reduced per eviction mode and selected with a radix top-k, and a native compaction kernel moves K and V in place before the manager reports the new cache length and returns the freed pages.</em></sub></p>
+<p align="center"><sub><em>Figure 9: One TriAttention eviction round in TensorRT LLM, from the generation-end hook to the compacted cache.</em></sub></p>
 
-The method changes the physical cache length but keeps block reuse valid, because it compacts only the generated suffix and preserves the prompt prefix that the cache manager reuses. There is no sparse-attention configuration and no custom attention backend; decoding runs the model's standard attention kernel over the compacted cache. For calibration, configuration parameters, and current requirements, please refer to the [TriAttention example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/triattention.md).
+The method changes the physical cache length but keeps block reuse valid, because it compacts only the generated suffix and preserves the prompt prefix that the cache manager reuses. Decoding runs the model's standard attention kernel over the compacted cache. For calibration, configuration parameters, and current requirements, please refer to the [TriAttention example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/triattention.md).
 
 ## Evaluation
 
 This section consolidates accuracy and performance results for the KV cache compression methods supported in TensorRT LLM. Every comparison is against TensorRT LLM's own uncompressed configuration on the same hardware, software build, and serving configuration; only the compression setting differs.
 
-### NVFP4 Cold-Page Quantization
+### NVFP4 Cold-Page Compression
 
 Unless otherwise specified, the experiments below use GB300 GPUs, the PyTorch backend, the paged KV cache manager, and block reuse enabled. Before any result was accepted we confirmed that pages were actually compressed during the measured window, using the counters and profiler trace described above.
 
@@ -299,29 +311,40 @@ We evaluate accuracy on AIME25 with 16 seeds per configuration, using each model
   <img src="../media/tech_blog29_accuracy_aime25.svg" width="900">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 8: AIME25 accuracy over 16 seeds for Qwen3-8B (left) and Qwen3.5-397B-A17B (right): uncompressed baseline, cold-page NVFP4 at medium and high pressure, and an every-step NVFP4 control that quantizes the active KV after each forward step. The band is the baseline mean plus or minus one standard deviation.</em></sub></p>
+<p align="center"><sub><em>Figure 10: AIME25 accuracy over 16 seeds for Qwen3-8B (left) and Qwen3.5-397B-A17B (right): uncompressed baseline, cold-page NVFP4 at medium and high pressure, and an every-step NVFP4 control that quantizes the active KV after each forward step. The band is the baseline mean plus or minus one standard deviation.</em></sub></p>
 
-Compared with the uncompressed baseline, no significant degradation is observed in the tested scope. The paired differences are +0.00 and +0.21 percentage points (medium and high) for Qwen3.5-397B-A17B, with standard errors of 0.68 and 0.57, and -0.83 and +0.21 for Qwen3-8B, with a standard error of 1.39; all four are within one standard error of zero. Figure 8 also includes a control that quantizes the *active* KV to NVFP4 after every forward step: it lands 2.08 points below the baseline for Qwen3-8B and 0.42 below for Qwen3.5-397B-A17B, inside the seed noise at 16 seeds but consistently under the cold-page results. Because no native FP4 KV decode kernel exists for these head sizes on the tested release, this control is a quantize-dequantize emulation in PyTorch rather than a native kernel result, and we report it as directional only.
+Compared with the uncompressed baseline, no significant degradation is observed in the tested scope. The paired differences are +0.00 and +0.21 percentage points (medium and high) for Qwen3.5-397B-A17B, with standard errors of 0.68 and 0.57, and -0.83 and +0.21 for Qwen3-8B, with a standard error of 1.39; all four are within one standard error of zero. Figure 10 also includes a control that quantizes the *active* KV to NVFP4 after every forward step: it lands 2.08 points below the baseline for Qwen3-8B and 0.42 below for Qwen3.5-397B-A17B, inside the seed noise at 16 seeds but consistently under the cold-page results. Because no native FP4 KV decode kernel exists for these head sizes on the tested release, this control is a quantize-dequantize emulation in PyTorch rather than a native kernel result, and we report it as directional only.
 
 #### Performance
 
-We benchmark the NVFP4 host cache against the uncompressed host cache on two models: GLM-5.2 (756B, MLA attention) and Qwen3.5-397B-A17B (hybrid attention plus Gated DeltaNet, NVFP4 weights). The workload is a 3,600-second replay of the InferenceX AgentX 256k agentic trace, which has heavy prefix reuse across turns; these runs use the public trace and the published InferenceX configurations but are not an official InferenceX submission. In the uncompressed configuration the host tier stores pages in FP8, the normal KV type of both models. We sweep the published configurations and a large set of derived ones (concurrency, prefill/decode split, and GPU count) so that both settings are measured on the same grid: 54 matched configurations and 218 accepted runs (two repeats each) for GLM-5.2 on 8 to 48 GB300, and 131 matched configurations and 330 accepted runs (mostly single repeat) for Qwen3.5-397B-A17B on 3 to 60 GB300. The host tier is 128 GiB per prefill rank in every run. We report **total token throughput per reserved GPU** against **P90 end-to-end normalized interactivity** (tokens per second per user, higher is better), the Pareto view in Figure 9.
+The compression ratio follows from the format. Packed NVFP4 data plus one 8-bit scale per 16 values costs 0.5625 bytes per value, against 2 bytes for FP16 or BF16 and 1 byte for FP8. Table 5 lists the measured size of one attention KV page off the GPU. The recurrent-state buffers of hybrid models are stored as they are and do not shrink.
+
+| Active KV type | Model | Uncompressed page | NVFP4 cold page | Reduction |
+| :--- | :--- | :--- | :--- | :--- |
+| FP8 | Qwen3.5-397B-A17B | 1,048,576 B | 589,824 B | 43.75% (1.78x more pages per byte) |
+| FP8 | Qwen3-8B | 2,359,296 B | 1,327,104 B | 43.75% (1.78x) |
+| FP8 MLA latent, index buffer kept lossless | GLM-5.2 | 3,098,112 B | 1,824,000 B | 41.1% (1.70x) |
+| BF16 | Qwen3-8B | 4,718,592 B | 1,327,104 B | 71.9% (3.56x) |
+
+<p align="center"><sub><em>Table 5. Measured size of one attention KV page off the GPU, uncompressed and as an NVFP4 cold page.</em></sub></p>
+
+We benchmark the NVFP4 host cache against the uncompressed host cache on two models: GLM-5.2 (756B, MLA attention) and Qwen3.5-397B-A17B (hybrid attention plus Gated DeltaNet, NVFP4 weights). The workload is a 3,600-second replay of the InferenceX AgentX 256k agentic trace, which has heavy prefix reuse across turns; these runs use the public trace and the published InferenceX configurations but are not an official InferenceX submission. In the uncompressed configuration the host tier stores pages in FP8, the normal KV type of both models. We sweep the published configurations and a large set of derived ones (concurrency, prefill/decode split, and GPU count) so that both settings are measured on the same grid: 54 matched configurations and 218 accepted runs (two repeats each) for GLM-5.2 on 8 to 48 GB300, and 131 matched configurations and 330 accepted runs (mostly single repeat) for Qwen3.5-397B-A17B on 3 to 60 GB300. The host tier is 128 GiB per prefill rank in every run. We report **total token throughput per reserved GPU** against **P90 end-to-end normalized interactivity** (tokens per second per user, higher is better), the Pareto view in Figure 11.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_pareto.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 9: Throughput per reserved GB300 versus P90 interactivity for the uncompressed (FP8) and NVFP4 host caches on GLM-5.2 (left) and Qwen3.5-397B-A17B (right). Each point is one configuration averaged over repeats; outlined points are the published InferenceX configurations; lines are the Pareto frontiers of the two settings.</em></sub></p>
+<p align="center"><sub><em>Figure 11: Throughput per reserved GB300 versus P90 interactivity for the uncompressed (FP8) and NVFP4 host caches on GLM-5.2 (left) and Qwen3.5-397B-A17B (right). Each point is one configuration averaged over repeats; outlined points are the published InferenceX configurations; lines are the Pareto frontiers of the two settings.</em></sub></p>
 
-Figure 9 shows the throughput-interactivity Pareto frontiers; curves further to the upper right deliver more throughput at the same interactivity. On GLM-5.2 the NVFP4 frontier lies on or above the uncompressed one: it gains in the 31 to 51 tokens/s/user band (median +12.1% across the frontier points in the overlapping range, at most +28.5% at 36 tokens/s/user) and coincides with it above roughly 51 tokens/s/user, where both frontiers are formed by the same low-concurrency configurations. Below 31 tokens/s/user only NVFP4 has points, at 55,000 to 59,500 tokens/s per GPU, and the uncompressed cache has no tested point above 46,461 tokens/s per GPU. On Qwen3.5-397B-A17B the two frontiers largely coincide, and NVFP4 pulls ahead only at the throughput-bound, low-interactivity end. We summarize the results with four metrics:
+Figure 11 shows the throughput-interactivity Pareto frontiers; curves further to the upper right deliver more throughput at the same interactivity. On GLM-5.2 the NVFP4 frontier lies on or above the uncompressed one: it gains in the 31 to 51 tokens/s/user band (median +12.1% across the frontier points in the overlapping range, at most +28.5% at 36 tokens/s/user) and coincides with it above roughly 51 tokens/s/user, where both frontiers are formed by the same low-concurrency configurations. Below 31 tokens/s/user only NVFP4 has points, at 55,000 to 59,500 tokens/s per GPU, and the uncompressed cache has no tested point above 46,461 tokens/s per GPU. On Qwen3.5-397B-A17B the two frontiers largely coincide, and NVFP4 pulls ahead only at the throughput-bound, low-interactivity end. We summarize the results with four metrics:
 
 | Model | Workload | Peak throughput/GPU gain | Median gain at the same configuration | Cache-read hit rate | TTFT p90 (median) |
 | ------------------------------- | -------------------------- | ------------------------ | ------------------------------------- | ------------------------ | ----------------- |
 | GLM-5.2 (MLA), 8-48 GB300 | AgentX 256k replay, 3600 s | +28.0% | +3.5% (54 configurations) | +1.7 pp median | -32.5% (50 configurations) |
 | Qwen3.5-397B-A17B, 3-60 GB300 | AgentX 256k replay, 3600 s | not reported (single-repeat points; see text) | +0.9% (131 configurations) | +0.3 pp median | -6.1% (131 configurations) |
 
-<p align="center"><sub><em>Table 5. Serving gains of the NVFP4 host cache over the uncompressed host cache on the AgentX 256k replay.</em></sub></p>
+<p align="center"><sub><em>Table 6. Serving gains of the NVFP4 host cache over the uncompressed host cache on the AgentX 256k replay.</em></sub></p>
 
 The +28.0% for GLM-5.2 compares the best NVFP4 point (24 GB300) with the best uncompressed point anywhere on the grid (also 24 GB300, at a different concurrency); the same +28.0% holds for the best throughput at a P90 interactivity of at least 5 or 10 tokens/s/user, and +25.8% at 25 tokens/s/user. Across the 54 matched GLM-5.2 configurations the medians at the same configuration are +3.5% in throughput per GPU and -32.5% in TTFT p90 (over the 50 configurations with TTFT p90 in both settings), and 25 of 54 configurations gain more than 10%. For Qwen3.5-397B-A17B, the peak comparison (+6.0%, single-repeat points on 36 versus 28 GB300) and the best throughput at 10 tokens/s/user (+5.4%) sit at the edge of single-repeat noise, so we report them as observations; the medians over 131 matched configurations (+0.9% throughput per GPU, -6.1% TTFT p90) are the representative figures.
 
@@ -340,10 +363,10 @@ For TriAttention configuration, calibration workflow, validated modes, and evalu
 TensorRT LLM now has one KV cache compression framework and two methods built on it:
 
 - **Framework**: one configuration block, `kv_cache_compression_config`, selects a method and is checked for compatibility before anything is built. A method implements one of two small contracts: hooks that run in the executor iteration loop, or a page encoder and decoder that run when pages move between the GPU and the host or disk tiers. Attention kernels never see a compressed page, and the cache manager keeps ownership of pages, tiers, migration, and reuse. Compression is independent of the active KV data type and of sparse attention.
-- **NVFP4 cold-page quantization**: attention pages are stored as NVFP4 while they are in host or disk memory and restored to the model's normal KV data type before attention reads them. Encoding and decoding are fused into the copy itself, host and disk share one encoded form, and the recurrent state of hybrid models and side buffers such as an MLA index pass through losslessly in the same page. It covers MHA, MQA, GQA, MLA, and DeepSeek-V4 cache layouts and has been tested with the Qwen3, Qwen3.5, GLM, DeepSeek-R1, and DeepSeek-V4 families.
+- **NVFP4 cold-page compression**: attention pages are stored as NVFP4 while they are in host or disk memory and restored to the model's normal KV data type before attention reads them. Encoding and decoding are fused into the copy itself, host and disk share one encoded form, and the recurrent state of hybrid models and side buffers such as an MLA index pass through losslessly in the same page. It covers MHA, MQA, GQA, MLA, and DeepSeek-V4 cache layouts and has been tested with the Qwen3, Qwen3.5, GLM, DeepSeek-R1, and DeepSeek-V4 families.
 - **TriAttention**: demonstrates compression in the executor iteration loop by evicting generated tokens during decoding, with the model's standard attention kernel running over the compacted cache. It has been tested with the Qwen3, GPT-OSS, and Llama 3 families.
 
-The framework and both methods are upstream in [PR #16957](https://github.com/NVIDIA/TensorRT-LLM/pull/16957) (TriAttention), [PR #17512](https://github.com/NVIDIA/TensorRT-LLM/pull/17512) (page encoder and decoder support in the cache manager), and [PR #18091](https://github.com/NVIDIA/TensorRT-LLM/pull/18091) (NVFP4 cold-page quantization). A new method needs one contract and its kernel, and no change to the attention kernels, the cache manager, or the serving loop.
+The framework and both methods are upstream in [PR #16957](https://github.com/NVIDIA/TensorRT-LLM/pull/16957) (TriAttention), [PR #17512](https://github.com/NVIDIA/TensorRT-LLM/pull/17512) (page encoder and decoder support in the cache manager), and [PR #18091](https://github.com/NVIDIA/TensorRT-LLM/pull/18091) (NVFP4 cold-page compression). A new method needs one contract and its kernel, and no change to the attention kernels, the cache manager, or the serving loop.
 
 ### Future Work
 

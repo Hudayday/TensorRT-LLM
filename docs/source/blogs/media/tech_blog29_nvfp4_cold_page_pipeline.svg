@@ -16,12 +16,23 @@
 <rect x="262" y="66" width="200" height="208" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
 <text x="274" y="84" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">GPU</text>
 <text x="274" y="108" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">GPU cache</text>
-<text x="274" y="262" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">hot pages read by attention</text>
+<text x="274" y="262" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">hot page: 16-bit K and V</text>
 <rect x="722" y="66" width="236" height="208" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
 <text x="734" y="84" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">STORAGE</text>
 <text x="734" y="108" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Host and disk tiers</text>
-<text x="734" y="247" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">compressed pages at rest,</text>
-<text x="734" y="262" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">host to disk copied as is</text>
+<text x="734" y="262" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">cold page: one 4.5-bit block</text>
+<rect x="274.0" y="156.0" width="88.0" height="28" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<rect x="362.0" y="156.0" width="88.0" height="28" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="318" y="174.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#2d3142" text-anchor="middle">K · FP16</text>
+<text x="406" y="174.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#2d3142" text-anchor="middle">V · FP16</text>
+<rect x="734.0" y="156.0" width="58.0" height="28" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="792.0" y="156.0" width="58.0" height="28" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="850.0" y="156.0" width="40.0" height="28" fill="#e4e5e7" stroke="#bfc0c0" stroke-width="1"/>
+<rect x="890.0" y="156.0" width="56.0" height="28" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="763" y="174.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#2d3142" text-anchor="middle">K</text>
+<text x="821" y="174.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#2d3142" text-anchor="middle">V</text>
+<text x="870" y="174.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#2d3142" text-anchor="middle">sc</text>
+<text x="918" y="174.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#2d3142" text-anchor="middle">lossless</text>
 <rect x="492" y="66" width="200" height="84" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.25"/>
 <text x="504" y="84" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#eb6c36" text-anchor="start">KVCC · KERNEL</text>
 <text x="504" y="108" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Encode kernel</text>
