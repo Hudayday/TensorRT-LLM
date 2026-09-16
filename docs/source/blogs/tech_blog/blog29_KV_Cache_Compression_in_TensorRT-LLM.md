@@ -276,9 +276,13 @@ The implementation lives in `tensorrt_llm/_torch/kv_cache_compression/quantizati
 
 #### How It Works in TensorRT LLM
 
-TriAttention is a compression manager for compression in the executor iteration loop, and it overrides one hook, `on_generation_step_end`. It is enabled with `algorithm: triattention` plus `budget`, `beta`, `eviction_mode`, and `calibration_path`. Figure 9 follows one eviction round from the hook to the compacted cache.
+**The algorithm.** TriAttention scores a cached token by how much attention future queries are expected to pay to it, without waiting for those queries. With rotary position embedding, the attention logit between a query and a key is a sum over frequency bands. Each band contributes the product of the query and key magnitudes in that band times the cosine of the rotation angle between them, and that angle grows with the distance between the two positions. Averaging the query over a calibration corpus replaces the unknown future query by each head's mean pre-RoPE query and its magnitude, the `E_q` and `E_q_norm` entries of the calibration file, together with the RoPE frequencies `omega`. The expected logit of a key then depends only on the key itself and on its position, and it can be evaluated from the K cache alone. This trigonometric expected logit is the importance score.
 
-When the hook fires, the manager picks the requests that have generated `beta` new tokens since their last round and exceed their budget. For these requests, `_execute_eviction_round` collects the cache lengths and block offsets, and a fused scoring kernel computes the importance of every evictable token from the calibration statistics loaded at start-up. The scores are reduced according to `eviction_mode` (`union`, `per_head`, or `per_layer_perhead`), the `budget` tokens to keep are selected with a top-k, and a native compaction kernel moves K and V in place. The manager then reports the new cache length to the cache manager, which returns the freed pages. A speculative step that confirms several tokens at once triggers at most one round.
+Every `beta` generated tokens, once a sequence is over its budget, TriAttention gathers the K cache of the generated tokens, computes this score for every token and head, normalizes the scores per head over the decode window, and keeps the `budget` tokens with the highest scores. In the default `union` mode each KV head nominates its top tokens and the union is re-ranked by each token's best score; `per_head` and `per_layer_perhead` keep separate sets per head. The prompt is never scored or evicted, and the kept tokens are compacted so that the cache physically shrinks.
+
+**Kernel optimizations.** Doing this in plain PyTorch would gather K, apply the rotation, and multiply for every head and token, several times per second per request. TensorRT LLM performs a series of kernel optimizations instead. A fused CuTe DSL kernel on Blackwell reads the K pages directly from the paged cache, applies the calibrated cosine and sine coefficients from a precomputed mean-phase table, and produces the per-head scores together with the statistics needed for normalization in one pass. Triton kernels reduce the scores per eviction mode, normalize them, and settle top-k ties deterministically. A native CUDA compaction kernel then moves the kept K and V in place. No K or V leaves the paged cache for scoring.
+
+**Injection into decoding.** TriAttention is a compression manager for compression in the executor iteration loop, and it overrides one hook, `on_generation_step_end`, so an eviction round runs right after the KV cache manager has updated the cache and before the next decode step reads it. It is enabled with `algorithm: triattention` plus `budget`, `beta`, `eviction_mode`, and `calibration_path`. Figure 9 follows one round from the hook to the compacted cache. When the hook fires, the manager picks the requests that have generated `beta` new tokens since their last round and exceed their budget. For these requests, `_execute_eviction_round` collects the cache lengths and block offsets, launches the scoring kernel, reduces and selects the tokens to keep, and runs the compaction. The manager then reports the new cache length to the cache manager, which returns the freed pages. A speculative step that confirms several tokens at once triggers at most one round.
 
 <div align="center">
 <figure>
@@ -295,31 +299,28 @@ This section consolidates accuracy and performance results for the KV cache comp
 
 ### NVFP4 Cold-Page Compression
 
-Unless otherwise specified, the experiments below use GB300 GPUs, the PyTorch backend, the paged KV cache manager, and block reuse enabled. Before any result was accepted we confirmed that pages were actually compressed during the measured window, using the counters and profiler trace described above.
+Unless otherwise specified, the experiments below use GB300 GPUs, the PyTorch backend, the paged KV cache manager, and block reuse enabled. Before any result was accepted we confirmed that pages were actually compressed during the measured window, using the offload and onboard byte counters on the `/metrics` endpoint and an Nsight Systems trace.
 
 #### Accuracy
 
-We evaluate accuracy on AIME25 with 16 seeds per configuration, using each model's official sampling settings (Qwen3.5-397B-A17B: 64,000 output tokens, temperature 0.6, top-p 0.95, top-k 20; Qwen3-8B: 38,912 output tokens). The protocol pushes a controlled share of the reused prompt KV through the codec before scoring: the prompts are served once to populate the cache, part of the GPU cache is flushed so that those pages are moved to host memory and compressed, and the scoring pass serves the prompts again, reading the compressed pages back. Generated tokens are never compressed. "Medium" and "high" pressure mean that roughly 30% and 60% of the reused prompt KV pages had been NVFP4-compressed (measured: 28% and 61% for Qwen3.5-397B-A17B). Qwen3.5-397B-A17B runs NVFP4 weights with FP8 KV on four GB300 (tensor parallel 4); Qwen3-8B runs BF16 KV on one GB300. The baseline is the same model with all KV on the GPU in its normal KV type and no host tier.
+Cold-page compression is lossy, so the first question is how much accuracy it can cost. Two facts bound the answer.
 
-| Model | Dataset | Uncompressed baseline | Cold-page NVFP4, medium pressure | Cold-page NVFP4, high pressure |
-| ------------------ | ------------------ | --------------------- | -------------------------------- | ------------------------------ |
-| Qwen3.5-397B-A17B | AIME25 (16 seeds) | 90.0 | 90.0 | 90.2 |
-| Qwen3-8B | AIME25 (16 seeds) | 68.5 | 67.7 | 68.8 |
+First, a page is quantized only when it leaves the GPU, and at most once per offload. The worst case is a deployment where every page is re-quantized on every turn. Even then a page never carries more than one NVFP4 rounding at a time, so the accuracy of cold-page compression is bounded below by that of a fully NVFP4 KV cache, a configuration TensorRT LLM already ships and whose loss is small and well characterized. In practice most pages are offloaded once or not at all, so the typical case sits far from this bound.
 
-<p align="center"><sub><em>Table 4. AIME25 accuracy (%) of the uncompressed baseline and of cold-page NVFP4 at medium and high pressure, mean over 16 seeds.</em></sub></p>
+Second, repeated quantize-and-dequantize round trips do not compound. Quantization is a projection onto a finite set of values, not a fresh random error each time. For NVFP4 with 8-bit block scales we showed analytically that after the first round trip the encoded state can change at most once more, and on real KV values it does not change at all. Figure 10 shows the measurement on Qwen3-8B with a BF16 KV cache on AIME24 and AIME25, 30 questions with 8 seeds each, using the NVFP4 quantizer from Transformer Engine in a standalone harness on B200 and applying the round trips to every page. The first round trip changes 98.5% of the 13 billion compared KV values, which is the expected rounding. The second round trip changes none of them, and neither do the fourth or the eighth. End to end, one round trip moves accuracy by 2.08 and 1.67 points on the two sets, within the noise of this setup where most generations hit the 32K output cap. The second round trip reproduces all 480 outputs of the first exactly, so accuracy after two round trips is identical to accuracy after one.
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog29_accuracy_aime25.svg" width="900">
+  <img src="../media/tech_blog29_nvfp4_roundtrip.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 10: AIME25 accuracy over 16 seeds for Qwen3-8B (left) and Qwen3.5-397B-A17B (right): uncompressed baseline, cold-page NVFP4 at medium and high pressure, and an every-step NVFP4 control that quantizes the active KV after each forward step. The band is the baseline mean plus or minus one standard deviation.</em></sub></p>
+<p align="center"><sub><em>Figure 10: Repeated NVFP4 round trips on Qwen3-8B with a BF16 KV cache. Left: share of KV values changed by one more quantize-and-dequantize round trip; the first changes the expected 98.5%, the second, fourth, and eighth change none. Right: AIME24 and AIME25 accuracy after 0, 1, and 2 round trips; the first and second round trips produce identical outputs on all 480 samples.</em></sub></p>
 
-Compared with the uncompressed baseline, no significant degradation is observed in the tested scope. The paired differences are +0.00 and +0.21 percentage points (medium and high) for Qwen3.5-397B-A17B, with standard errors of 0.68 and 0.57, and -0.83 and +0.21 for Qwen3-8B, with a standard error of 1.39; all four are within one standard error of zero. Figure 10 also includes a control that quantizes the *active* KV to NVFP4 after every forward step: it lands 2.08 points below the baseline for Qwen3-8B and 0.42 below for Qwen3.5-397B-A17B, inside the seed noise at 16 seeds but consistently under the cold-page results. Because no native FP4 KV decode kernel exists for these head sizes on the tested release, this control is a quantize-dequantize emulation in PyTorch rather than a native kernel result, and we report it as directional only.
+Together, these two facts mean that cold-page compression cannot drift with repeated offloading. Its accuracy cost is at most one NVFP4 rounding of the pages that actually leave the GPU, and it does not grow with the number of times a page is offloaded and brought back.
 
 #### Performance
 
-The compression ratio follows from the format. Packed NVFP4 data plus one 8-bit scale per 16 values costs 0.5625 bytes per value, against 2 bytes for FP16 or BF16 and 1 byte for FP8. Table 5 lists the measured size of one attention KV page off the GPU. The recurrent-state buffers of hybrid models are stored as they are and do not shrink.
+The compression ratio follows from the format. Packed NVFP4 data plus one 8-bit scale per 16 values costs 0.5625 bytes per value, against 2 bytes for FP16 or BF16 and 1 byte for FP8. Table 4 lists the measured size of one attention KV page off the GPU. The recurrent-state buffers of hybrid models are stored as they are and do not shrink.
 
 | Active KV type | Model | Uncompressed page | NVFP4 cold page | Reduction |
 | :--- | :--- | :--- | :--- | :--- |
@@ -328,7 +329,7 @@ The compression ratio follows from the format. Packed NVFP4 data plus one 8-bit 
 | FP8 MLA latent, index buffer kept lossless | GLM-5.2 | 3,098,112 B | 1,824,000 B | 41.1% (1.70x) |
 | BF16 | Qwen3-8B | 4,718,592 B | 1,327,104 B | 71.9% (3.56x) |
 
-<p align="center"><sub><em>Table 5. Measured size of one attention KV page off the GPU, uncompressed and as an NVFP4 cold page.</em></sub></p>
+<p align="center"><sub><em>Table 4. Measured size of one attention KV page off the GPU, uncompressed and as an NVFP4 cold page.</em></sub></p>
 
 We benchmark the NVFP4 host cache against the uncompressed host cache on two models: GLM-5.2 (756B, MLA attention) and Qwen3.5-397B-A17B (hybrid attention plus Gated DeltaNet, NVFP4 weights). The workload is a 3,600-second replay of the InferenceX AgentX 256k agentic trace, which has heavy prefix reuse across turns; these runs use the public trace and the published InferenceX configurations but are not an official InferenceX submission. In the uncompressed configuration the host tier stores pages in FP8, the normal KV type of both models. We sweep the published configurations and a large set of derived ones (concurrency, prefill/decode split, and GPU count) so that both settings are measured on the same grid: 54 matched configurations and 218 accepted runs (two repeats each) for GLM-5.2 on 8 to 48 GB300, and 131 matched configurations and 330 accepted runs (mostly single repeat) for Qwen3.5-397B-A17B on 3 to 60 GB300. The host tier is 128 GiB per prefill rank in every run. We report **total token throughput per reserved GPU** against **P90 end-to-end normalized interactivity** (tokens per second per user, higher is better), the Pareto view in Figure 11.
 
@@ -346,7 +347,7 @@ Figure 11 shows the throughput-interactivity Pareto frontiers; curves further to
 | GLM-5.2 (MLA), 8-48 GB300 | AgentX 256k replay, 3600 s | +28.0% | +3.5% (54 configurations) | +1.7 pp median | -32.5% (50 configurations) |
 | Qwen3.5-397B-A17B, 3-60 GB300 | AgentX 256k replay, 3600 s | not reported (single-repeat points; see text) | +0.9% (131 configurations) | +0.3 pp median | -6.1% (131 configurations) |
 
-<p align="center"><sub><em>Table 6. Serving gains of the NVFP4 host cache over the uncompressed host cache on the AgentX 256k replay.</em></sub></p>
+<p align="center"><sub><em>Table 5. Serving gains of the NVFP4 host cache over the uncompressed host cache on the AgentX 256k replay.</em></sub></p>
 
 The +28.0% for GLM-5.2 compares the best NVFP4 point (24 GB300) with the best uncompressed point anywhere on the grid (also 24 GB300, at a different concurrency); the same +28.0% holds for the best throughput at a P90 interactivity of at least 5 or 10 tokens/s/user, and +25.8% at 25 tokens/s/user. Across the 54 matched GLM-5.2 configurations the medians at the same configuration are +3.5% in throughput per GPU and -32.5% in TTFT p90 (over the 50 configurations with TTFT p90 in both settings), and 25 of 54 configurations gain more than 10%. For Qwen3.5-397B-A17B, the peak comparison (+6.0%, single-repeat points on 36 versus 28 GB300) and the best throughput at 10 tokens/s/user (+5.4%) sit at the edge of single-repeat noise, so we report them as observations; the medians over 131 matched configurations (+0.9% throughput per GPU, -6.1% TTFT p90) are the representative figures.
 
@@ -373,7 +374,7 @@ The framework and both methods are upstream in [PR #16957](https://github.com/NV
 ### Future Work
 
 - **Smaller cold-page formats.** The page contract fixes only the compressed page size, so 2-bit formats, entropy coding, or low-rank projection can be added as new codecs without changes to the cache manager.
-- **Native low-precision decode kernels.** No attention kernel today reads a 4-bit KV cache for the head sizes of the tested models, which is why the every-step NVFP4 setting in the Evaluation section is emulated. Native kernels would let an NVFP4 active cache and NVFP4 cold pages work together.
+- **Native low-precision decode kernels.** No attention kernel today reads a 4-bit KV cache for the head sizes of the tested models. Native kernels would let an NVFP4 active cache and NVFP4 cold pages work together.
 - **Sizing guidance for the host tier.** The serving results above used one host tier size. A sweep over host tier sizes at the published InferenceX configurations, with the offload and onboard counters recorded, would show how much host memory a compressed cache actually needs.
 - **Disaggregated serving.** Cold-page compression covers the GPU-to-host and host-to-disk boundaries inside one worker today. Carrying the encoded page across the transfer from the prefill worker to the decode worker, and into the decode worker's host tier, is the natural next step.
 - **More methods in the executor iteration loop and hybrid-model state.** The hooks are not tied to TriAttention, and we expect further eviction and context-compression methods to use them. We are also exploring compression for the recurrent state of hybrid models, which today passes through losslessly.
