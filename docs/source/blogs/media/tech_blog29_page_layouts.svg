@@ -14,19 +14,17 @@
 <text x="370.0" y="150.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#2d3142" text-anchor="middle">K · NVFP4</text>
 <rect x="410.0" y="132" width="80.0" height="30" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
 <text x="450.0" y="150.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#2d3142" text-anchor="middle">V · NVFP4</text>
-<rect x="514.0" y="132" width="24.0" height="30" fill="#e4e5e7" stroke="#bfc0c0" stroke-width="1"/>
-<rect x="538.0" y="132" width="24.0" height="30" fill="#e4e5e7" stroke="#bfc0c0" stroke-width="1"/>
+<rect x="514.0" y="132" width="10.0" height="30" fill="#e4e5e7" stroke="#bfc0c0" stroke-width="1"/>
+<rect x="524.0" y="132" width="10.0" height="30" fill="#e4e5e7" stroke="#bfc0c0" stroke-width="1"/>
 <text x="514.0" y="176.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">block scales</text>
-<text x="330.0" y="192.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">2 pools, data and block scales · attention reads both</text>
+<text x="330.0" y="192.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">same bytes as below, but 2 pools, data and block scales · attention reads both</text>
 <text x="20.0" y="254.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">NVFP4 cold page off the GPU (ours)</text>
 <text x="20.0" y="274.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">4.5 bits per value · one fixed-size block</text>
 <rect x="330.0" y="240" width="80.0" height="30" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
 <text x="370.0" y="258.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#2d3142" text-anchor="middle">K · NVFP4</text>
 <rect x="410.0" y="240" width="80.0" height="30" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
 <text x="450.0" y="258.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#2d3142" text-anchor="middle">V · NVFP4</text>
-<rect x="490.0" y="240" width="48.0" height="30" fill="#e4e5e7" stroke="#bfc0c0" stroke-width="1"/>
-<text x="514.0" y="258.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#2d3142" text-anchor="middle">scales</text>
-<rect x="538.0" y="240" width="60.0" height="30" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="3,3"/>
-<text x="568.0" y="258.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#2d3142" text-anchor="middle">lossless</text>
-<text x="330.0" y="290.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">1 block, 1 base address per tier · about 3.5x smaller than FP16</text>
+<rect x="490.0" y="240" width="10.0" height="30" fill="#e4e5e7" stroke="#bfc0c0" stroke-width="1"/>
+<rect x="500.0" y="240" width="10.0" height="30" fill="#e4e5e7" stroke="#bfc0c0" stroke-width="1"/>
+<text x="330.0" y="290.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">same bytes as above, in 1 block with 1 base address per tier · 3.56x smaller than FP16</text>
 </svg>

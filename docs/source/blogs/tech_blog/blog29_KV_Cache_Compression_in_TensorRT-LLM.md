@@ -238,7 +238,7 @@ Figure 6 compares the three layouts of one KV page.
   <img src="../media/tech_blog29_page_layouts.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 6: One KV page of one layer, holding K and V for 32 tokens, in three layouts. The hot page on the GPU stores 16 bits per value in one pool. The NVFP4 active KV cache stores 4-bit data and 8-bit block scales in two pools that attention reads together. The NVFP4 cold page packs data, scales, and any lossless buffers into one fixed-size block with one base address.</em></sub></p>
+<p align="center"><sub><em>Figure 6: One KV page of one layer, holding K and V for 32 tokens, in three layouts. The hot page on the GPU stores 16 bits per value in one pool. The NVFP4 active KV cache and the NVFP4 cold page hold the same bytes, 4-bit data plus one 8-bit block scale per 16 values. The active cache keeps them in two pools that attention reads together; the cold page packs them into one fixed-size block with one base address.</em></sub></p>
 
 #### How It Works in TensorRT LLM
 
