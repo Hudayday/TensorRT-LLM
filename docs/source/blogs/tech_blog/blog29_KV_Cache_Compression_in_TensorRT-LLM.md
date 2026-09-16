@@ -333,29 +333,37 @@ The compression ratio follows from the format. Packed NVFP4 data plus one 8-bit 
 
 <p align="center"><sub><em>Table 4. Measured size of one attention KV page off the GPU, uncompressed and as an NVFP4 cold page.</em></sub></p>
 
-We benchmark the NVFP4 host cache against the uncompressed host cache on two models: GLM-5.2 (756B, MLA attention) and Qwen3.5-397B-A17B (hybrid attention plus Gated DeltaNet, NVFP4 weights). The workload is a 3,600-second replay of the InferenceX AgentX 256k agentic trace, which has heavy prefix reuse across turns; these runs use the public trace and the published InferenceX configurations but are not an official InferenceX submission. In the uncompressed configuration the host tier stores pages in FP8, the normal KV type of both models. We sweep the published configurations and a large set of derived ones (concurrency, prefill/decode split, and GPU count) so that both settings are measured on the same grid: 54 matched configurations and 218 accepted runs (two repeats each) for GLM-5.2 on 8 to 48 GB300, and 131 matched configurations and 330 accepted runs (mostly single repeat) for Qwen3.5-397B-A17B on 3 to 60 GB300. The host tier is 128 GiB per prefill rank in every run. We report **total token throughput per reserved GPU** against **P90 end-to-end normalized interactivity** (tokens per second per user, higher is better), the Pareto view in Figure 11.
+The serving effect of a smaller cold page is more capacity in the host and disk tiers, and therefore a higher prefix-cache hit rate when the working set does not fit. We show it in two settings.
+
+**A growing disk tier.** Figure 11 replays 393 AgentX agentic-coding traces at concurrency 192 for 1,800 seconds on Qwen3.5-397B-A17B, served disaggregated on three GB300 nodes: two prefill GPUs and eight generation GPUs. The host tier is fixed at 128 GiB per prefill rank and the disk tier grows from 0 to 1,024 GiB per rank. Both arms run the same configuration; only the cold-page format differs. At every disk size the NVFP4 tier holds more pages, so the cache-read hit rate is higher, fewer prefixes are recomputed, more requests complete in the window, and the average time to first token drops. The gain is largest where the uncompressed tier is under the most pressure: with 512 GiB of disk the NVFP4 arm completes 64% more requests and answers 48% sooner. With 1,024 GiB both arms approach the hit rate the trace allows and the curves flatten. Each cell is one closed-loop run, so small differences between neighboring cells are within run-to-run variation.
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog29_pareto.svg" width="1000">
+  <img src="../media/tech_blog29_disk_sweep.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 11: Throughput per reserved GB300 versus P90 interactivity for the uncompressed (FP8) and NVFP4 host caches on GLM-5.2 (left) and Qwen3.5-397B-A17B (right). Each point is one configuration averaged over repeats; outlined points are the published InferenceX configurations; lines are the Pareto frontiers of the two settings.</em></sub></p>
+<p align="center"><sub><em>Figure 11: Qwen3.5-397B-A17B on GB300, AgentX replay, with a host tier of 128 GiB per prefill rank and a growing disk tier. Left: requests completed per second. Middle: cache-read hit rate, with the hit rate the trace allows as the dashed line. Right: average time to first token. White bars are uncompressed FP8 cold pages, orange bars are NVFP4 cold pages.</em></sub></p>
 
-Figure 11 shows the throughput-interactivity Pareto frontiers; curves further to the upper right deliver more throughput at the same interactivity. On GLM-5.2 the NVFP4 frontier lies on or above the uncompressed one: it gains in the 31 to 51 tokens/s/user band (median +12.1% across the frontier points in the overlapping range, at most +28.5% at 36 tokens/s/user) and coincides with it above roughly 51 tokens/s/user, where both frontiers are formed by the same low-concurrency configurations. Below 31 tokens/s/user only NVFP4 has points, at 55,000 to 59,500 tokens/s per GPU, and the uncompressed cache has no tested point above 46,461 tokens/s per GPU. On Qwen3.5-397B-A17B the two frontiers largely coincide, and NVFP4 pulls ahead only at the throughput-bound, low-interactivity end. We summarize the results with four metrics:
+| Disk tier per rank | Requests/s, uncompressed | Requests/s, NVFP4 | Cache-read hit, uncompressed | Cache-read hit, NVFP4 | Average TTFT, uncompressed | Average TTFT, NVFP4 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 0 GiB | 1.75 | 1.89 (+7.8%) | 57.2% | 61.4% | 132.1 s | 119.4 s (-9.6%) |
+| 128 GiB | 1.99 | 2.68 (+34.2%) | 64.6% | 75.2% | 114.2 s | 82.2 s (-28.0%) |
+| 256 GiB | 2.27 | 3.39 (+49.7%) | 73.8% | 82.6% | 99.1 s | 59.2 s (-40.2%) |
+| 512 GiB | 2.66 | 4.37 (+64.4%) | 82.4% | 86.9% | 81.7 s | 42.3 s (-48.2%) |
+| 1,024 GiB | 2.76 | 4.35 (+57.7%) | 86.2% | 87.3% | 77.7 s | 42.7 s (-45.0%) |
 
-| Model | Workload | Peak throughput/GPU gain | Median gain at the same configuration | Cache-read hit rate | TTFT p90 (median) |
-| ------------------------------- | -------------------------- | ------------------------ | ------------------------------------- | ------------------------ | ----------------- |
-| GLM-5.2 (MLA), 8-48 GB300 | AgentX 256k replay, 3600 s | +28.0% | +3.5% (54 configurations) | +1.7 pp median | -32.5% (50 configurations) |
-| Qwen3.5-397B-A17B, 3-60 GB300 | AgentX 256k replay, 3600 s | not reported (single-repeat points; see text) | +0.9% (131 configurations) | +0.3 pp median | -6.1% (131 configurations) |
+<p align="center"><sub><em>Table 5. The disk-tier sweep of Figure 11 in numbers: one closed-loop run per cell, 1,800 seconds each.</em></sub></p>
 
-<p align="center"><sub><em>Table 5. Serving gains of the NVFP4 host cache over the uncompressed host cache on the AgentX 256k replay.</em></sub></p>
+**A published configuration.** The second setting is GLM-5.2, an MLA model, served at one of the published InferenceX configurations on 32 GB300s, again on the AgentX replay. Table 6 compares the uncompressed and NVFP4 host caches at this point, averaged over two repeats. Throughput per GPU is unchanged within repeat noise, because the uncompressed host tier already reaches 96.2% of the 97.2% hit rate the trace allows and has little left to gain. What NVFP4 buys here is latency: with more pages resident, the P90 interactivity rises and the P90 time to first token falls. This is the expected behavior of cold-page compression when the host tier is well provisioned. It costs nothing, and it helps as soon as the tier comes under pressure, as the disk sweep above shows.
 
-The +28.0% for GLM-5.2 compares the best NVFP4 point (24 GB300) with the best uncompressed point anywhere on the grid (also 24 GB300, at a different concurrency); the same +28.0% holds for the best throughput at a P90 interactivity of at least 5 or 10 tokens/s/user, and +25.8% at 25 tokens/s/user. Across the 54 matched GLM-5.2 configurations the medians at the same configuration are +3.5% in throughput per GPU and -32.5% in TTFT p90 (over the 50 configurations with TTFT p90 in both settings), and 25 of 54 configurations gain more than 10%. For Qwen3.5-397B-A17B, the peak comparison (+6.0%, single-repeat points on 36 versus 28 GB300) and the best throughput at 10 tokens/s/user (+5.4%) sit at the edge of single-repeat noise, so we report them as observations; the medians over 131 matched configurations (+0.9% throughput per GPU, -6.1% TTFT p90) are the representative figures.
+| Metric | Uncompressed | NVFP4 cold pages | Change |
+| :--- | :--- | :--- | :--- |
+| Throughput per GPU (tok/s) | 36,998 | 37,307 | +0.8% |
+| P90 interactivity (tok/s/user) | 40.9 | 42.7 | +4.5% |
+| TTFT p90 (ms) | 2,872 | 2,686 | -6.5% |
+| Cache-read hit rate | 96.2% | 96.4% | +0.2 pp |
 
-To understand where the benefit comes from, look at the cache-read hit rate, the share of KV that attention reads from the cache instead of recomputing. The gain tracks how far the uncompressed host cache falls below the maximum hit rate the trace allows: where the uncompressed host tier already holds the working set, both settings reach hit rates of 93.6% to 97.9%, within about 3 points of that maximum (95.5% to 98.0%), and NVFP4 has nothing to recover; where the uncompressed tier thrashes, NVFP4 keeps more of the reusable prefix resident and throughput follows. On GLM-5.2 the correlation between the hit-rate difference and the throughput gain over the 54 configurations is 0.959. The largest hit-rate difference, +34.2 points (52.6% to 86.7%), comes from an 8-GPU configuration too small for the uncompressed cache, which collapsed there; it is one of 9 of the 54 configurations where the uncompressed setting falls below half of the NVFP4 throughput, which we treat as robustness under pressure rather than as a gain to quote. At all 7 published InferenceX configurations for GLM-5.2 and all 6 for Qwen3.5-397B-A17B, NVFP4 is **neutral** (GLM-5.2 -0.27% to +0.84%, Qwen3.5-397B-A17B -0.48% to +1.13% throughput per GPU, within repeat noise), because those configurations are tuned so that the uncompressed host tier already holds the working set. Qwen3.5-397B-A17B stores its recurrent state losslessly and its host tier is rarely the bottleneck in these configurations, which is why its medians are near zero.
-
-Two qualifiers apply to every number above. The host tier is fixed at 128 GiB per prefill rank in all runs, so these measurements show what NVFP4 buys at a *given* host budget and make no claim about host memory saved at equal hit rate. And GPU counts differ across configurations, so peak comparisons mix compression and topology effects; the same-configuration medians do not.
+<p align="center"><sub><em>Table 6. GLM-5.2 at a published InferenceX configuration on 32 GB300s, AgentX replay, mean of two repeats per arm.</em></sub></p>
 
 ### TriAttention
 
@@ -377,6 +385,6 @@ The framework and both methods are upstream in [PR #16957](https://github.com/NV
 
 - **Smaller cold-page formats.** The page contract fixes only the compressed page size, so 2-bit formats, entropy coding, or low-rank projection can be added as new codecs without changes to the cache manager.
 - **Native low-precision decode kernels.** No attention kernel today reads a 4-bit KV cache for the head sizes of the tested models. Native kernels would let an NVFP4 active cache and NVFP4 cold pages work together.
-- **Sizing guidance for the host tier.** The serving results above used one host tier size. A sweep over host tier sizes at the published InferenceX configurations, with the offload and onboard counters recorded, would show how much host memory a compressed cache actually needs.
+- **Sizing guidance for the host tier.** The disk sweep above varied one tier at one host size. A sweep over host tier sizes at the published InferenceX configurations, with the offload and onboard counters recorded, would show how much host memory a compressed cache actually needs.
 - **Disaggregated serving.** Cold-page compression covers the GPU-to-host and host-to-disk boundaries inside one worker today. Carrying the encoded page across the transfer from the prefill worker to the decode worker, and into the decode worker's host tier, is the natural next step.
 - **More methods in the executor iteration loop and hybrid-model state.** The hooks are not tied to TriAttention, and we expect further eviction and context-compression methods to use them. We are also exploring compression for the recurrent state of hybrid models, which today passes through losslessly.
