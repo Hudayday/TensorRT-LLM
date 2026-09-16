@@ -316,7 +316,7 @@ The compression ratio follows from the format. Packed NVFP4 data plus one 8-bit 
 
 The serving effect of a smaller cold page is more capacity in the host and disk tiers, and therefore a higher prefix-cache hit rate when the working set does not fit. We show it in two settings.
 
-**A growing disk tier.** Figure 11 replays 393 AgentX agentic-coding traces at concurrency 192 for 1,800 seconds on Qwen3.5-397B-A17B, served disaggregated on three GB300 nodes: two prefill GPUs and eight generation GPUs. The host tier is fixed at 128 GiB per prefill rank and the disk tier grows from 0 to 1,024 GiB per rank. Both arms run the same configuration; only the cold-page format differs. At every disk size the NVFP4 tier holds more pages, so the cache-read hit rate is higher, fewer prefixes are recomputed, more requests complete in the window, and the average time to first token drops. The gain is largest where the uncompressed tier is under the most pressure: with 512 GiB of disk the NVFP4 arm completes 64% more requests and answers 48% sooner. With 1,024 GiB both arms approach the hit rate the trace allows and the curves flatten. Each cell is one closed-loop run, so small differences between neighboring cells are within run-to-run variation.
+**A growing disk tier.** Figure 11 replays 393 AgentX agentic-coding traces at concurrency 192 for 1,800 seconds on Qwen3.5-397B-A17B, served disaggregated on three GB300 nodes: two prefill GPUs and eight generation GPUs. The host tier is fixed at 128 GiB per prefill rank and the disk tier grows from 0 to 1,024 GiB per rank. Both settings run the same configuration; only the cold-page format differs. At every disk size the NVFP4 tier holds more pages, so the cache-read hit rate is higher, fewer prefixes are recomputed, more requests complete in the window, and the average time to first token drops. The gain is largest where the uncompressed tier is under the most pressure: with 512 GiB of disk the NVFP4 setting completes 64% more requests and answers 48% sooner. With 1,024 GiB both settings approach the hit rate the trace allows and the curves flatten. Each point is one closed-loop run, so small differences between neighboring points are within run-to-run variation.
 
 <div align="center">
 <figure>
@@ -333,7 +333,7 @@ The serving effect of a smaller cold page is more capacity in the host and disk 
   <img src="../media/tech_blog29_glm_point.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 12: GLM-5.2 at a published InferenceX configuration on 32 GB300s, AgentX replay, mean of two repeats per arm. Throughput per GPU is unchanged within noise; P90 interactivity and P90 time to first token improve.</em></sub></p>
+<p align="center"><sub><em>Figure 12: GLM-5.2 at a published InferenceX configuration on 32 GB300s, AgentX replay, mean of two repeats per setting. Throughput per GPU is unchanged within noise; P90 interactivity and P90 time to first token improve.</em></sub></p>
 
 #### Accuracy
 
@@ -369,7 +369,7 @@ At matched batch sizes the compacted cache decodes faster: at batch size 32, bud
 
 #### Accuracy
 
-Eviction is lossy by design, and the budget sets the trade. Figure 15 shows AIME25 accuracy against the decode KV budget for Qwen3-8B and GPT-OSS-120B in `union` mode, with the dense result as the dashed line. Each cell is 30 problems with 4 samples, so single cells carry about 4 to 5 points of noise. With aggressive budgets of 1,000 or 2,000 tokens for outputs that run to 32,000 tokens, accuracy drops sharply. At 4,096 tokens, the budget used for the throughput results above, the drop is about 5 points on both models while the decode KV shrinks 7.9 times on Qwen3-8B. From 8,192 tokens on, accuracy is within noise of dense on both models while the decode KV still shrinks 2 to 4 times. The friendly region is therefore wide, and the budget can be chosen per deployment to trade a known amount of accuracy for capacity.
+Eviction is lossy by design, and the budget sets the trade. Figure 15 shows AIME25 accuracy against the decode KV budget for Qwen3-8B and GPT-OSS-120B in `union` mode, with the dense result as the dashed line. Each point is 30 problems with 4 samples, so single points carry about 4 to 5 points of noise. With aggressive budgets of 1,000 or 2,000 tokens for outputs that run to 32,000 tokens, accuracy drops sharply. At 4,096 tokens, the budget used for the throughput results above, the drop is about 5 points on both models while the decode KV shrinks 7.9 times on Qwen3-8B. From 8,192 tokens on, accuracy is within noise of dense on both models while the decode KV still shrinks 2 to 4 times. The friendly region is therefore wide, and the budget can be chosen per deployment to trade a known amount of accuracy for capacity.
 
 <div align="center">
 <figure>
