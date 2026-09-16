@@ -70,20 +70,24 @@ Figure 2 shows where this sits in TensorRT LLM. It is one of three ways to cut m
 </div>
 <p align="center"><sub><em>Figure 2: The TensorRT LLM stack. KV cache compression sits in the compression layer next to quantization and sparse attention. It changes what is stored in the KV cache and touches neither the kernels below nor the serving layers above.</em></sub></p>
 
-KV cache compression methods differ in three ways. Some run between forward steps, others run when a page moves between memory tiers. Some drop tokens, others store the kept values in fewer bytes. And each one supports its own set of cache layouts, from standard attention pages to MLA and hybrid models.
+KV cache compression in TensorRT LLM covers the whole life of a KV cache, not only the gap between two forward steps. It can run during inference, after prefill and between decode steps. It can also run when the system moves KV around, for example when pages are offloaded or transferred, and after a request ends and its KV is kept for reuse. The result is one optimization for the whole serving system rather than for one kernel.
 
-TensorRT LLM handles this diversity with one framework instead of special cases. The framework has one configuration entry, one common base that every method builds on, and two plug-in points. Hooks run between forward steps. A page encoder and decoder run when a page moves between the GPU and host or disk memory.
-
-The cache manager keeps full ownership of pages. It allocates them, moves them between tiers, and reuses them. A compression method only changes their contents.
+In detail, we define five stages in the life of a KV cache, shown in Figure 3. Each stage is a moment when nothing is reading the cache, so compression can run there safely. Together the five stages cover every KV cache in the system, and they apply to any large language model.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_kv_lifetime_stages.svg" width="900">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 3: Six stages in the life of a KV cache where compression can run. TriAttention acts at stage 4 and cold-page compression at stage 6.</em></sub></p>
+<p align="center"><sub><em>Figure 3: Five stages in the life of a KV cache where compression can run. TriAttention acts at stage 3 and cold-page compression at stage 5.</em></sub></p>
 
-We have built two methods on the framework, one for each plug-in point:
+Working in stages has two benefits. A method picks only the stages it needs, and a stage works the same way for every model.
+
+We defined the stages this way so that the framework needs one small contract per kind of stage and nothing more. Stages inside a request are reached through hooks between forward steps. Stages where pages move between memory tiers are reached through a page encoder and decoder.
+
+In both cases the cache manager keeps full ownership of pages. It allocates them, moves them between tiers, and reuses them. A compression method only changes their contents.
+
+We have built two methods on the framework, using two of the five stages. NVFP4 cold-page quantization works at stage 5 and TriAttention at stage 3. The same framework lets us add methods at the other stages and support more complex algorithms in the future. The two methods are:
 
 *   **NVFP4 cold-page quantization**: stores attention KV pages as NVFP4 while they sit in host or disk memory. A page is converted on the way out and restored on the way back. The GPU cache and the attention kernels keep the model's normal KV data type.
 *   **TriAttention**: runs between decoding steps. It scores the generated tokens with an importance measure calibrated offline for each attention head and keeps only a fixed budget of them. The prompt is never touched.
