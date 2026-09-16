@@ -40,9 +40,9 @@ The most direct one is failing to serve: requests cannot be admitted until memor
 
 To serve these workloads well, a system has to keep more KV cache and keep it for longer, without adding memory. These characteristics create three opportunities that KV cache compression addresses directly:
 
-- **The KV cache volume keeps growing.** Long prompts, dozens of requests per job, and many concurrent jobs produce far more KV than any GPU can hold, and the same prefix pages are requested again and again. Compressing the stored KV itself is the most direct way to keep more of it.
-- **Serving already relies on host and disk tiers.** Prefixes that do not fit on the GPU are kept in host memory or on disk and moved back on the next turn. Compression lets those tiers hold more pages for the same capacity and moves fewer bytes across the GPU, host, and disk boundaries.
-- **Every model runs agentic workloads.** Dense, MoE, MLA, and hybrid models all face the same pressure, so a method tied to one attention layout or one KV data type helps only one deployment. Compression applied at the level of KV cache pages, independent of the model's kernels, covers them all.
+- **The KV cache keeps growing.** Agent jobs produce far more KV than a GPU can hold, and the same prefix pages are needed again and again. Compressing the stored KV is the most direct way to keep more of it.
+- **Serving already relies on host and disk tiers.** Prefixes that do not fit on the GPU are kept in host memory or on disk and brought back on the next turn. Compression lets those tiers hold more pages and moves fewer bytes between them.
+- **All models face this pressure.** A method tied to one attention type or one KV data type helps only one deployment. Compression at the level of KV cache pages works for every model.
 
 A wide range of KV cache compression methods have been proposed, from prompt compression and token eviction to low-precision storage, and TensorRT LLM already applies some of them inside the model: the active KV cache can be quantized, and the [sparse attention framework](blog17_Sparse_Attention_in_TensorRT-LLM.md) lets the attention kernel read only part of the cache. This blog is about the other places where compression can act: between prefill chunks, between decoding steps, around tool calls, and after the KV has left the GPU for host or disk memory.
 
