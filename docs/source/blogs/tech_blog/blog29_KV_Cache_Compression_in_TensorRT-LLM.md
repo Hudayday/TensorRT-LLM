@@ -83,7 +83,7 @@ In detail, we define five stages in the life of a KV cache, shown in Figure 3. E
 
 Working in stages has two benefits. A method picks only the stages it needs, and a stage works the same way for every model.
 
-We defined the stages this way so that the framework needs one small contract per kind of stage and nothing more. Stages inside a request are reached by compression between forward steps. Stages where pages move between memory tiers are reached by compression when offloading and onboarding.
+We defined the stages this way so that the framework needs one small contract per kind of stage and nothing more. Stages inside a request are reached by compression between forward steps. Stages beyond a single request, where the KV cache is kept and managed across requests, are reached through the KV cache manager, for example when pages are offloaded and onboarded.
 
 In both cases the cache manager keeps full ownership of pages. It allocates them, moves them between tiers, and reuses them. A compression method only changes their contents.
 
@@ -154,7 +154,9 @@ The executor and the KV cache manager are existing components of TensorRT LLM. T
 </div>
 <p align="center"><sub><em>Figure 4: The KV cache compression framework and its execution order. The config builds the manager (1). The manager base inserts a hook into the executor and one into the KV cache manager (2). The concrete method inherits the base and runs inside those hooks (3), launching its own kernels (4). Highlighted boxes are the KVCC parts; white boxes are existing system components, with the stages each one hosts today and in the future.</em></sub></p>
 
-Figure 4 introduces the whole framework and how it follows the lifetime of a KV cache. The framework is meant to support every stage of that lifetime through different hook designs. The executor iteration loop and its hooks are responsible for stages 1, 2, and 3, the stages inside a request. The hooks injected into the KV cache manager are responsible for stages 4 and 5, the stages where pages move between memory tiers. Today, stage 3 is implemented for TriAttention and stage 5 for cold-page compression. The rest of this section walks through the framework in detail: how each path works, how the other stages will be covered, and how a user configures it.
+Figure 4 introduces the whole framework and how it follows the lifetime of a KV cache. The framework interacts with different parts of the TensorRT LLM runtime so that compression can be injected at the five stages defined above. The executor iteration loop hosts the stages inside a request: after each prefill chunk, right after prefill, and between decode steps. The KV cache manager hosts the stages beyond a single request: around a tool call and after the request, when the KV cache is kept and managed across requests.
+
+Some of these stages have a method today and some do not. Stage 3 is implemented by TriAttention. Stage 5 is implemented in part by cold-page compression, which handles the pages that leave the GPU for host or disk memory. The rest of this section walks through the framework in detail: how each path works, how the other stages will be covered, and how a user configures it.
 
 ### KV Cache Compression Between Forward Steps
 
