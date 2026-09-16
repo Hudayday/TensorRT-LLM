@@ -139,7 +139,7 @@ A compression method is selected with one configuration block, `kv_cache_compres
 
 ### Architecture Overview
 
-The framework has three parts, shown in Figure 4.
+The framework has three well-defined parts that together form KV cache compression (KVCC) in TensorRT LLM.
 
 - **Compression config.** One configuration block collects everything the user asks for, validates it, and routes it to the concrete method. A factory then builds that method's manager before the model runs.
 - **Compression manager base.** This base class is the core of the framework: it defines where in the runtime compression is injected. For a method that works between decode steps, such as TriAttention, the base provides the ability to run after every decode step. For a method that works on pages leaving the GPU, such as cold-page quantization, the base hooks into the KV cache manager and adds compression to offloading and onboarding. A concrete method inherits the base and is injected at the matching points automatically.
@@ -152,7 +152,7 @@ The executor and the KV cache manager are existing components of TensorRT LLM. T
   <img src="../media/tech_blog29_framework.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 4: The KV cache compression framework and its execution order. The config builds the manager (1). The manager base inserts a hook into the executor and one into the KV cache manager (2). The concrete method inherits the base and runs inside those hooks (3), launching its own kernels (4). Highlighted boxes are ours; white boxes are existing system components.</em></sub></p>
+<p align="center"><sub><em>Figure 4: The KV cache compression framework and its execution order. The config builds the manager (1). The manager base inserts a hook into the executor and one into the KV cache manager (2). The concrete method inherits the base and runs inside those hooks (3), launching its own kernels (4). Highlighted boxes are the KVCC parts; white boxes are existing system components, with the stages each one hosts today and in the future.</em></sub></p>
 
 In Figure 4, compression between forward steps runs after the cache manager has updated its state at each step. Compression when offloading and onboarding is set up before the cache manager is built, because the cache manager needs the compressed page size to lay out its host and disk tiers. A method may use either path or both, but the two stay separate.
 
