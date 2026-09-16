@@ -169,7 +169,7 @@ The way in is simple. The executor already keeps a list of resource managers and
   <img src="../media/tech_blog29_hooks_flow.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 5: How the hooks reach the executor iteration loop. The executor calls its resource managers before the forward pass, after it, and when a request ends. The compression manager base is one of those resource managers, registered last, and turns the three callbacks into the five hooks. A method overrides the hooks it needs.</em></sub></p>
+<p align="center"><sub><em>Figure 5: How the hooks reach the executor iteration loop. Every BaseResourceManager receives three callbacks per iteration: before the forward pass, after it, and when a request ends. KVCacheCompressionManager inherits BaseResourceManager and turns the three callbacks into the five hooks. A method overrides the hooks it needs.</em></sub></p>
 
 <div align="center">
 
