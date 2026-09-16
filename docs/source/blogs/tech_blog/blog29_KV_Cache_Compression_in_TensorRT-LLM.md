@@ -38,7 +38,7 @@ This pressure grows while the space for the KV cache does not: GPU memory is fix
 
 The most direct one is failing to serve: requests cannot be admitted until memory frees up. The next is slow serving, as the system spends its time evicting and refilling cache instead of computing. In agentic workloads especially, a shortage of storage means missing the opportunity to reuse KV: a prefix computed a moment ago is gone when the next turn arrives, so it is computed again, and that extra computation is paid on almost every turn of the job.
 
-Serving such workloads well therefore means keeping as much of that KV as possible for as long as it is useful, at a cost the deployment can afford. These characteristics create three opportunities that KV cache compression addresses directly:
+To serve these workloads well, a system has to keep more KV cache and keep it for longer, without adding memory. These characteristics create three opportunities that KV cache compression addresses directly:
 
 - **The KV cache volume keeps growing.** Long prompts, dozens of requests per job, and many concurrent jobs produce far more KV than any GPU can hold, and the same prefix pages are requested again and again. Compressing the stored KV itself is the most direct way to keep more of it.
 - **Serving already relies on host and disk tiers.** Prefixes that do not fit on the GPU are kept in host memory or on disk and moved back on the next turn. Compression lets those tiers hold more pages for the same capacity and moves fewer bytes across the GPU, host, and disk boundaries.
