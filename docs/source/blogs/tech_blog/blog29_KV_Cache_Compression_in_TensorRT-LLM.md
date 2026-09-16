@@ -8,7 +8,7 @@
   - [Architecture Overview](#architecture-overview)
   - [KV Cache Compression in the Executor Iteration Loop](#kv-cache-compression-in-the-executor-iteration-loop)
   - [KV Cache Compression in Cross-Request KV Management](#kv-cache-compression-in-cross-request-kv-management)
-  - [Configuration and Ownership](#configuration-and-ownership)
+  - [Configuration and Integration with the Cache Manager](#configuration-and-integration-with-the-cache-manager)
 - [Algorithm Implementations](#algorithm-implementations)
   - [NVFP4 Cold-Page Quantization](#nvfp4-cold-page-quantization)
   - [TriAttention](#triattention)
@@ -193,38 +193,23 @@ The hooks ride on the executor's existing request cycle, and the framework wires
 
 This path is the cross-request hook of the framework. It serves the stages outside a single request: the tool-call stage (stage 4), when a request pauses and its KV waits for the tool to return, and the after-request stage (stage 5), when a request has finished and its KV is kept for reuse, transferred to another worker, or offloaded to host or disk memory.
 
-Today we cover the offloading part of the after-request stage (stage 5) with **NVFP4 cold-page quantization**, enabled by `quantization_for_cold_page` with `quant: nvfp4`. A page is encoded as it is copied from the GPU to host or disk memory, and decoded into the normal GPU representation when it comes back, before anything reads it. Figure 6 follows one page out and back. The cache manager steps are the same for any codec.
+In TensorRT LLM this whole period is managed by the KV cache manager. It decides which pages stay on the GPU, which move to host or disk memory, which are reused by a later request, and which are transferred to another worker. The cache manager itself does no compression. To compress KV in this period, the framework injects its compression management into the cache manager at the points where KV can be compressed: when pages are offloaded and onboarded, when they are transferred, and when a request ends. At each of these points a method's Python code and kernels can be plugged in, and the cache manager keeps working as before.
 
-<div align="center">
-<figure>
-  <img src="../media/tech_blog29_nvfp4_cold_page_pipeline.svg" width="1000">
-</figure>
-</div>
-<p align="center"><sub><em>Figure 6: One page leaving and returning to the GPU. When a request ends, the cache manager evicts its pages and hands them to the encode kernel, which writes compressed pages into host or disk memory. When the request resumes, the decode kernel restores the pages in their original data type before attention reads them.</em></sub></p>
+Today we cover the offloading part of the after-request stage (stage 5) with **NVFP4 cold-page quantization**, enabled by `quantization_for_cold_page` with `quant: nvfp4`. It is a good example of how the framework interacts with the cache manager. The cache manager's storage path exposes two hook points, one when a page leaves the GPU and one when it returns. A codec plugged into these points encodes the page on the way out and decodes it on the way back, and the cache manager never sees the difference. How this works in detail, and how the NVFP4 codec is built, is described in the NVFP4 cold-page quantization section below and in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md).
 
-Under the hood, the contract between the cache manager and a codec is small. A GPU page may consist of several buffers: K and V, an MLA latent buffer plus an index buffer, or the mixed buffers of a hybrid model. A compressed page is one fixed-size block of bytes. The codec converts between the two, and four properties keep it simple:
-
-- **Fixed compressed size.** Each layer group has one compressed page size. Every tier can then address pages with a plain slot allocator.
-- **Batched calls.** The cache manager hands the codec a whole batch of page indices and a stream, not one page at a time.
-- **Asynchronous by design.** Encode and decode only enqueue GPU work on that stream. The cache manager tracks completion and owns the events, so the codec inherits the same ordering and failure handling as an ordinary copy.
-- **Compressed pages stay compressed between tiers.** Moves between host and disk copy the bytes as they are. Only the GPU boundary runs the codec.
-
-Compression is optional at this layer. The default codec simply packs the page buffers into the block at full size. A compressing codec produces a smaller block through the same path. It can also mark some buffers as lossless, so the recurrent state of hybrid models or side buffers such as an MLA index pass through unchanged inside the same page. Adding a new format means adding a kernel and its layout description. Tier routing, staging, batching, and ordering are shared. The C++ interface and the Python API are documented in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md). The tool-call stage (stage 4) and the rest of the after-request stage (stage 5), such as KV transfer, will be reached by extending this path.
+The tool-call stage (stage 4) and the rest of the after-request stage (stage 5), such as KV transfer, will be reached by extending this path.
 
 ### Covering the Other Stages
 
 Together, the two paths cover the decode stage (stage 3) and one part of the after-request stage (stage 5), which is what the two shipped methods need. The base class keeps the ability to define more hooks, so every stage that offers a compression opportunity can be reached the same way. How those hooks look is future work, and we will extend the framework as new methods need them.
 
-### Configuration and Ownership
+### Configuration and Integration with the Cache Manager
 
-The framework spans the executor, the cache manager, and native kernels. Its most important decision is who owns what:
+Configuration is deliberately small. One block, `kv_cache_compression_config`, collects only the settings that belong to compression: which method to run and that method's own options. A factory validates the block, rejects unsupported combinations before anything is built, and hands the settings to the compression manager, which handles everything from there. Cold-page quantization is turned on with `algorithm: quantization_for_cold_page` and `quant: nvfp4`. TriAttention is turned on with `algorithm: triattention` plus its budget and calibration options. The same fields work in the Python API, in `trtllm-serve` YAML, and in `trtllm-bench`. The full option table is in the [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
 
-- The **configuration and factory** own method selection and compatibility checks. An unsupported combination is rejected before anything is built. Nothing falls back silently at run time.
-- The **compression manager** owns the method's cadence, its per-request state, its format metadata, and its kernel launches.
-- The **cache manager** owns pages, tiers, migration, reuse, and the ordering of copies.
-- The **attention backend** owns the active GPU representation it reads, and nothing else.
+The cache manager and the attention backend are outside the framework. The compression manager is designed to adapt to any cache manager and any attention backend. It changes only the contents of KV pages, and it never owns pages, tiers, or the kernels that read them.
 
-Configuration is opt-in and small. Cold-page quantization is turned on with `algorithm: quantization_for_cold_page` and `quant: nvfp4` under `kv_cache_compression_config`. It also needs a host tier under `kv_cache_config`, set with `host_cache_size` and optionally `disk_cache_size` and `disk_cache_path`. The active cache keeps its normal data type. TriAttention is turned on with `algorithm: triattention` plus `budget`, `beta`, `eviction_mode`, and `calibration_path`. The same fields work in the Python API, in `trtllm-serve` YAML, and in `trtllm-bench`. Calibration files are validated at start-up, and the runtime fails fast if they are missing or incompatible. The full option table is in the [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
+Today the framework integrates with KVCacheManagerV2, the KV cache manager built around a flexible, hierarchical storage model. V2 can give different layers pools of different types and sizes, groups layers by their lifecycle, and coalesces buffers of the same size within each group, which keeps fragmentation low even for models that mix full-attention, sliding-window, and recurrent layers. It also manages the host and disk tiers and the migration of pages between them, and it exposes a clean Python API for per-layer buffer configuration. These properties are what make cross-request compression possible. The compression manager binds to V2 once V2 is built, and the cold-page codec plugs into V2's page migration path, so V2 keeps ownership of pools, mappings, and migration while the codec decides how a page is stored off the GPU.
 
 ## Algorithm Implementations
 
@@ -249,6 +234,16 @@ These figures are for attention KV. The recurrent-state buffers of hybrid models
 #### How It Works in TensorRT LLM
 
 Within TensorRT LLM, NVFP4 cold-page quantization is a compression manager that plugs into the cross-request KV management path of the framework. Below we highlight the key design choices in layout, kernels, scales, and verification.
+
+**Interaction with the cache manager.** Figure 6 follows one page out of the GPU and back. A page goes cold when its request pauses or finishes, or when the cache manager evicts it under memory pressure. The cache manager selects such pages for offload and hands a batch of them to the encode kernel, which writes compressed pages into the host or disk tier. When an active request needs a page again, the cache manager onboards it and the decode kernel restores the original data type before attention reads it. The contract between the cache manager and the codec is small and keeps four properties: each layer group has one fixed compressed page size, so every tier can address pages with a plain slot allocator; the cache manager hands the codec whole batches of page indices with a stream, not one page at a time; encode and decode only enqueue GPU work on that stream, so the codec inherits the same ordering and failure handling as an ordinary copy; and compressed pages stay compressed between host and disk, so only the GPU boundary runs the codec.
+
+<div align="center">
+<figure>
+  <img src="../media/tech_blog29_nvfp4_cold_page_pipeline.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 6: One page leaving and returning to the GPU inside the KV cache manager. A page goes cold when its request pauses or ends, or under memory pressure. The encode kernel compresses it on the way to the host and disk tiers, and the decode kernel restores it when an active request reuses it.</em></sub></p>
+
 
 **Layout policy.** Enabling `quantization_for_cold_page` with `quant: nvfp4` selects the manager, which is built before the cache manager because the cache manager needs the compressed page size to lay out its host and disk tiers. At start-up the manager receives the description of every GPU page buffer once and builds a layout table per layer group: for MHA, MQA, and GQA pages the K and V buffers become NVFP4 data plus block scales; for MLA pages the latent attention key is encoded; side buffers in the same page, such as the index buffer of a sparse-attention model, are appended as they are; and the recurrent-state buffers of hybrid models are routed to the default lossless path. For DeepSeek-V4, the part of the attention history without positional encoding is encoded as NVFP4 while the positional part and the remaining specialized state are kept losslessly in the same page. A GPU page may span several buffers in the normal KV type; the compressed page is one fixed-size block: the packed NVFP4 spans, then their E4M3 block scales, then the lossless spans, each 16-byte aligned.
 
