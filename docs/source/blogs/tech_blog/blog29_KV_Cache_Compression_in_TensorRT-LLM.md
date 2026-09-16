@@ -113,7 +113,7 @@ The two tables below summarize the current coverage.
 
 </div>
 
-**Note**: Both methods require the PyTorch backend, the KV cache manager selected by `use_kv_cache_manager_v2: true`, and an NVIDIA Blackwell GPU (SM100 or SM103, such as B200 or GB300). All results in this blog were measured on GB300. The cold-page feature was also validated functionally on B200.
+**Note**: Currently, this design targets and is validated on NVIDIA Blackwell GPUs (B200 and GB300).
 
 This blog covers the framework design shared by all methods, with NVFP4 cold-page quantization as the main worked example. The C++ interface between the cache manager and a page encoder is documented in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md). The APIs for adding a new method are in the [KV Cache Compression Development Guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md).
 
