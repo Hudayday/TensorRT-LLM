@@ -16,9 +16,7 @@
 <rect x="262" y="66" width="200" height="208" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
 <text x="274" y="84" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">GPU</text>
 <text x="274" y="108" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">GPU cache</text>
-<text x="274" y="232" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">pages selected for offload</text>
-<text x="274" y="247" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">leave from here; restored</text>
-<text x="274" y="262" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">pages return here</text>
+<text x="274" y="262" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">hot pages read by attention</text>
 <rect x="722" y="66" width="236" height="208" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
 <text x="734" y="84" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">STORAGE</text>
 <text x="734" y="108" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Host and disk tiers</text>
