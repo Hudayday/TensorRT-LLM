@@ -162,7 +162,7 @@ Some of these stages have a method today and some do not. Stage 3 is implemented
 
 This path serves stage 3 of the KV cache compression opportunities today, and it is designed to reach every stage inside a request. While a prefill or decode step runs, attention reads a fixed view of the KV cache. Between two steps that view can change, and that is where the hooks fire. A method overrides only the hooks it needs, and all of them do nothing by default.
 
-The way in is simple. The executor already keeps a list of resource managers and calls every one of them at fixed points of each iteration: before the forward pass, after it, and when a request ends. The compression manager base inherits the same resource manager class and is registered as the last one in that list, so it runs after the KV cache manager has updated its state. Inside those three callbacks it fires the five hooks, as Figure 5 shows. A method inherits the base and overrides only the hooks it needs; TriAttention overrides the one after each decode step.
+The way in is simple. The executor already keeps a list of resource managers and calls every one of them at fixed points of each iteration: before the forward pass, after it, and when a request ends. The compression manager base inherits the same resource manager class and is registered as the last one in that list, so it runs after the KV cache manager has updated its state. Inside those three callbacks it fires the five hooks, as Figure 5 shows. A method inherits the base and overrides only the hooks it needs; **TriAttention** overrides the one after each decode step.
 
 <div align="center">
 <figure>
@@ -178,14 +178,14 @@ The way in is simple. The executor already keeps a list of resource managers and
 | `on_request_init` | Before a request's first prefill chunk | Stage 1, set-up before the first chunk |
 | `on_context_step_end` | After a request's last prefill chunk | Stage 2, right after prefill |
 | `on_generation_step_begin` | Before each decode step | Stage 3, between decode steps |
-| `on_generation_step_end` | After each decode step, once the cache has been updated | Stage 3, between decode steps (used by TriAttention) |
+| `on_generation_step_end` | After each decode step, once the cache has been updated | Stage 3, between decode steps (used by **TriAttention**) |
 | `on_request_finish` | When a request completes or is aborted | Stages 4 and 5, when a request pauses for a tool call or ends |
 
 <p align="center"><sub><em>Table 3. The five hooks in the executor iteration loop, when each one fires, and the stage it serves.</em></sub></p>
 
 </div>
 
-We currently define these five hooks. TriAttention uses the generation-end hook, so stage 3 is the stage exercised by a shipped method. The other hooks are already in place for stages 1 and 2 and for the request-level events of stages 4 and 5, and a new method can use them without changes to the framework.
+We currently define these five hooks. **TriAttention** uses the generation-end hook, so stage 3 is the stage exercised by a shipped method. The other hooks are already in place for stages 1 and 2 and for the request-level events of stages 4 and 5, and a new method can use them without changes to the framework.
 
 The hooks ride on the executor's existing request cycle, and the framework wires them up. Methods on this path change which tokens are kept or how they are arranged in the paged cache. Two obligations come with it. The policy that chooses tokens stays separate from the shared compaction kernel. And a method must finish its GPU work before it shrinks or frees any cache pages.
 
