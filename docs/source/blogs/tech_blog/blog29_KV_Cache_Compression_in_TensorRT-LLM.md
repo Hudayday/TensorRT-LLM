@@ -187,7 +187,7 @@ The way in is simple. The executor already keeps a list of resource managers and
 
 We currently define these five hooks. TriAttention uses the generation-end hook, so stage 3 is the stage exercised by a shipped method. The other hooks are already in place for stages 1 and 2 and for the request-level events of stages 4 and 5, and a new method can use them without changes to the framework.
 
-The hooks ride on the executor's existing request cycle, and the framework wires them up. Methods on this path change which tokens are kept or how they are arranged in the paged cache. Two obligations come with it. The policy that chooses tokens stays separate from the shared compaction kernel. And a method must finish its GPU work before it shrinks or frees any cache pages. TriAttention, described below, leaves scheduling, prefix reuse, and the attention kernel unchanged.
+The hooks ride on the executor's existing request cycle, and the framework wires them up. Methods on this path change which tokens are kept or how they are arranged in the paged cache. Two obligations come with it. The policy that chooses tokens stays separate from the shared compaction kernel. And a method must finish its GPU work before it shrinks or frees any cache pages.
 
 ### KV Cache Compression in Cross-Request KV Management
 
