@@ -127,7 +127,7 @@ TensorRT LLM provides a general framework for KV cache compression, built around
 
 ### Design Philosophy
 
-The design starts from one observation. Compression does not need to live inside the model or the attention kernel. It only needs to run at the right moment, on the KV that is already there. So the runtime pauses at a well-defined point, hands the KV cache to the compression method, and continues once the method returns. Compression is extra work inserted at the right points of the runtime, and the whole serving system benefits from the smaller cache.
+The design starts from one observation: compression does not need to live inside the model or the attention kernel. It only needs to run at the right moment, on the KV that is already there. So the runtime pauses at a well-defined point, hands the KV cache to the compression method, and continues once the method returns. Compression is extra work inserted at the right points of the runtime, and the whole serving system benefits from the smaller cache.
 
 Three principles follow from this.
 
