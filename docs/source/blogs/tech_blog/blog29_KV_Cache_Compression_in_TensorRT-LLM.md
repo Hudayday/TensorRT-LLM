@@ -46,7 +46,7 @@ A key challenge in deploying KV cache compression at scale is the diversity of e
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog28_kv_lifetime_stages.svg" width="900">
+  <img src="../media/tech_blog29_kv_lifetime_stages.svg" width="900">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: Six stages in the life of a KV cache where compression can run. The two methods in this blog act at stage 4 and stage 6.</em></sub></p>
@@ -109,7 +109,7 @@ From the user's side all of this is driven by `kv_cache_compression_config`. Whe
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog28_framework.svg" width="1000">
+  <img src="../media/tech_blog29_framework.svg" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: The KV cache compression framework: one configuration and factory, one manager base, and two entry points, the executor's iteration cycle for hook-based methods such as TriAttention (top row) and the cache manager's page migration for page codecs such as NVFP4 quantization (bottom row).</em></sub></p>
@@ -140,7 +140,7 @@ The second contract runs when the cache manager moves pages between tiers. On th
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog28_nvfp4_cold_page_pipeline.svg" width="1000">
+  <img src="../media/tech_blog29_nvfp4_cold_page_pipeline.svg" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3: One page leaving and returning to the GPU with the NVFP4 codec: the cache manager evicts pages and hands a batch of page indices to the codec, the fused encode kernel writes one compressed page into host memory, and when the request resumes the fused decode kernel restores the page in its original data type before attention reads it.</em></sub></p>
@@ -211,7 +211,7 @@ TriAttention is a compression manager on the hook path that overrides the genera
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog28_triattention_pipeline.svg" width="1000">
+  <img src="../media/tech_blog29_triattention_pipeline.svg" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4: TriAttention between two decode steps: the generation-end hook picks the due requests, a fused CuTe DSL kernel scores the generated tokens from calibration statistics, the scores are reduced per eviction mode and selected with a radix top-k, and a native compaction kernel moves K and V in place before the manager reports the new cache length and returns the freed pages.</em></sub></p>
@@ -237,7 +237,7 @@ We evaluate accuracy on AIME25 with 16 seeds per configuration, using each model
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog28_accuracy_aime25.svg" width="900">
+  <img src="../media/tech_blog29_accuracy_aime25.svg" width="900">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5: AIME25 accuracy over 16 seeds for Qwen3-8B (left) and Qwen3.5-397B-A17B (right): uncompressed baseline, cold-page NVFP4 at medium and high pressure, and an every-step NVFP4 control that quantizes the active KV after each forward step. The band is the baseline mean plus or minus one standard deviation.</em></sub></p>
@@ -250,7 +250,7 @@ We benchmark the NVFP4 host cache against the uncompressed host cache on two mod
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog28_pareto.svg" width="1000">
+  <img src="../media/tech_blog29_pareto.svg" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 6: Throughput per reserved GB300 versus P90 interactivity for the uncompressed (FP8) and NVFP4 host caches on GLM-5.2 (left) and Qwen3.5-397B-A17B (right). Each point is one configuration averaged over repeats; outlined points are the published InferenceX configurations; lines are the Pareto frontiers of the two settings.</em></sub></p>
