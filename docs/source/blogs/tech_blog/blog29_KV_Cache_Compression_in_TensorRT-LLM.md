@@ -98,7 +98,7 @@ The two tables below summarize the current coverage.
 
 | Method | When It Runs | What It Changes | Supported Attention Types |
 | :--- | :--- | :--- | :--- |
-| **NVFP4 cold-page quantization** | Stage 5: when a page moves between the GPU and host or disk memory | How attention KV is stored while off the GPU | MHA / MQA / GQA; MLA; hybrid models with recurrent layers such as Gated DeltaNet or state-space layers (only the attention KV is quantized) |
+| **NVFP4 cold-page quantization** | Stage 5: when a page moves between the GPU and host or disk memory | How attention KV is stored while off the GPU | MHA / MQA / GQA; MLA; hybrid models (attention KV only) |
 | **TriAttention** | Stage 3: periodically between decode steps | Which KV tokens are kept | MHA / MQA / GQA |
 
 </div>
