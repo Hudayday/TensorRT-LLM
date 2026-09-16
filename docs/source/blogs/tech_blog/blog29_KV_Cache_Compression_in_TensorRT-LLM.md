@@ -32,7 +32,7 @@ In the [InferenceX](https://inferencex.semianalysis.com/) AgentX coding traces, 
   <img src="../media/tech_blog29_workload_facts.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 1: LLM serving today, measured on a one-year production trace: requests are prompt-heavy, outputs are getting shorter, a single long context carries tens of gigabytes of KV, and almost all reuse arrives within minutes.</em></sub></p>
+<p align="center"><sub><em>Figure 1: LLM serving today. On a one-year production trace, requests are prompt-heavy, outputs are getting shorter, a single long context carries tens of gigabytes of KV, and almost all reuse arrives within minutes. In agentic coding traces, almost the entire prompt is reusable prefix.</em></sub></p>
 
 This pressure grows while the space for the KV cache does not: GPU memory is fixed, and the DRAM behind it is finite too. When the KV cache no longer fits, the consequences are severe.
 
