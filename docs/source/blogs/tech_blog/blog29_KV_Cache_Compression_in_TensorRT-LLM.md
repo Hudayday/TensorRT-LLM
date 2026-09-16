@@ -21,17 +21,34 @@
 
 ## Introduction and Motivation
 
-The tasks handed to Large Language Models (LLMs) keep getting more complex and more expensive to serve: models grow, the text they read and write grows with them, and nowhere is this more visible than in agentic workflows, where a model works through a task in many steps instead of one reply. An agent job is a chain of model calls separated by tool calls, and each tool result is appended to one growing conversation. Input length grows turn by turn, tool calls repeat dozens of times per job, and most of every prompt is text the system has already seen. For example, in the [InferenceX](https://inferencex.semianalysis.com/) AgentX coding traces the median input length per request is 14.4k tokens and over 96% of the prompt tokens are reusable prefix.
+The tasks handed to Large Language Models (LLMs) keep getting more complex and more expensive to serve. Models grow, the text they read and write grows with them, and nowhere is this more visible than in agentic workflows, where a model works through a task in many steps instead of one reply.
 
-This pressure grows while the space for the KV cache does not: GPU memory is fixed, and the DRAM behind it is finite too. When the KV cache no longer fits, the consequences are severe. The most direct one is failing to serve: requests cannot be admitted until memory frees up. The next is slow serving, as the system spends its time evicting and refilling cache instead of computing. And in agentic workloads especially, a shortage of storage means missing the opportunity to reuse KV: a prefix that was computed a moment ago is gone when the next turn arrives, so it is computed again, and that extra computation is paid on almost every turn of the job. Serving such workloads well therefore means keeping as much of that KV as possible for as long as it is useful, at a cost the deployment can afford.
+An agent job is a chain of model calls separated by tool calls, and each tool result is appended to one growing conversation. Input length grows turn by turn, tool calls repeat dozens of times per job, and most of every prompt is text the system has already seen.
 
-These characteristics create three opportunities that KV cache compression addresses directly:
+In the [InferenceX](https://inferencex.semianalysis.com/) AgentX coding traces, for example, the median input length per request is 14.4k tokens and over 96% of the prompt tokens are reusable prefix. Our earlier blog on [evaluating agentic serving with trace replay](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html) characterizes these workloads and the role of KV cache reuse in detail. Figure 1 shows that the same shift is visible at the scale of a whole serving platform.
+
+<div align="center">
+<figure>
+  <img src="../media/tech_blog29_workload_facts.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 1: LLM serving today, measured on a one-year production trace: requests are prompt-heavy, outputs are getting shorter, a single long context carries tens of gigabytes of KV, and almost all reuse arrives within minutes.</em></sub></p>
+
+This pressure grows while the space for the KV cache does not: GPU memory is fixed, and the DRAM behind it is finite too. When the KV cache no longer fits, the consequences are severe.
+
+The most direct one is failing to serve: requests cannot be admitted until memory frees up. The next is slow serving, as the system spends its time evicting and refilling cache instead of computing. In agentic workloads especially, a shortage of storage means missing the opportunity to reuse KV: a prefix computed a moment ago is gone when the next turn arrives, so it is computed again, and that extra computation is paid on almost every turn of the job.
+
+Serving such workloads well therefore means keeping as much of that KV as possible for as long as it is useful, at a cost the deployment can afford. These characteristics create three opportunities that KV cache compression addresses directly:
 
 - **The KV cache volume keeps growing.** Long prompts, dozens of requests per job, and many concurrent jobs produce far more KV than any GPU can hold, and the same prefix pages are requested again and again. Compressing the stored KV itself is the most direct way to keep more of it.
 - **Serving already relies on host and disk tiers.** Prefixes that do not fit on the GPU are kept in host memory or on disk and moved back on the next turn. Compression lets those tiers hold more pages for the same capacity and moves fewer bytes across the GPU, host, and disk boundaries.
 - **Every model runs agentic workloads.** Dense, MoE, MLA, and hybrid models all face the same pressure, so a method tied to one attention layout or one KV data type helps only one deployment. Compression applied at the level of KV cache pages, independent of the model's kernels, covers them all.
 
-A wide range of KV cache compression methods have been proposed, from prompt compression and token eviction to low-precision storage, and TensorRT LLM already applies some of them inside the model: the active KV cache can be quantized, and the [sparse attention framework](blog17_Sparse_Attention_in_TensorRT-LLM.md) lets the attention kernel read only part of the cache. This blog is about the other places where compression can act: between prefill chunks, between decoding steps, around tool calls, and after the KV has left the GPU for host or disk memory. Two things set our approach apart. First, we introduce concrete methods that compress the KV cache at these points successfully, with accuracy and serving results to back them. Second, and more importantly, the framework treats all of these points the same way: each moment in the life of a KV cache where compression can run is exposed as a well-defined attachment point, a method plugs into the points it needs, and the rest of the serving stack is untouched. This is what makes the framework apply to any model, and it is also what lets future methods be added by plugging into an existing point rather than by modifying the serving loop or the attention kernels.
+A wide range of KV cache compression methods have been proposed, from prompt compression and token eviction to low-precision storage, and TensorRT LLM already applies some of them inside the model: the active KV cache can be quantized, and the [sparse attention framework](blog17_Sparse_Attention_in_TensorRT-LLM.md) lets the attention kernel read only part of the cache. This blog is about the other places where compression can act: between prefill chunks, between decoding steps, around tool calls, and after the KV has left the GPU for host or disk memory.
+
+Two things set our approach apart. First, we introduce concrete methods that compress the KV cache at these points successfully, with accuracy and serving results to back them. Second, and more importantly, the framework treats all of these points the same way: each moment in the life of a KV cache where compression can run is exposed as a well-defined attachment point, a method plugs into the points it needs, and the rest of the serving stack is untouched.
+
+This is what makes the framework apply to any model, and it is also what lets future methods be added by plugging into an existing point rather than by modifying the serving loop or the attention kernels.
 
 On this framework, TensorRT LLM currently ships two methods:
 
@@ -49,7 +66,7 @@ A key challenge in deploying KV cache compression at scale is the diversity of e
   <img src="../media/tech_blog29_kv_lifetime_stages.svg" width="900">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 1: Six stages in the life of a KV cache where compression can run. The two methods in this blog act at stage 4 and stage 6.</em></sub></p>
+<p align="center"><sub><em>Figure 2: Six stages in the life of a KV cache where compression can run. The two methods in this blog act at stage 4 and stage 6.</em></sub></p>
 
 To demonstrate the framework's generality, we have integrated two methods, one for each plug-in point:
 
@@ -112,9 +129,9 @@ From the user's side all of this is driven by `kv_cache_compression_config`. Whe
   <img src="../media/tech_blog29_framework.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 2: The KV cache compression framework: one configuration and factory, one manager base, and two entry points, the executor's iteration cycle for hook-based methods such as TriAttention (top row) and the cache manager's page migration for page codecs such as NVFP4 quantization (bottom row).</em></sub></p>
+<p align="center"><sub><em>Figure 3: The KV cache compression framework: one configuration and factory, one manager base, and two entry points, the executor's iteration cycle for hook-based methods such as TriAttention (top row) and the cache manager's page migration for page codecs such as NVFP4 quantization (bottom row).</em></sub></p>
 
-Figure 2 follows the two entry points. A hook-based manager is registered with the executor and runs after the cache manager has updated its own state at each step. A page-codec manager is built before the cache manager, because the cache manager needs to know the compressed page size to lay out its host and disk tiers. A method may use either path or both, but the two stay separate: eviction policy does not belong in a migration, and a page codec never allocates or publishes pages.
+Figure 3 follows the two entry points. A hook-based manager is registered with the executor and runs after the cache manager has updated its own state at each step. A page-codec manager is built before the cache manager, because the cache manager needs to know the compressed page size to lay out its host and disk tiers. A method may use either path or both, but the two stay separate: eviction policy does not belong in a migration, and a page codec never allocates or publishes pages.
 
 ### Hooks Between Forward Steps
 
@@ -136,14 +153,14 @@ The hooks ride on the executor's existing request cycle; the framework wires the
 
 ### Encoding Pages That Leave the GPU
 
-The second contract runs when the cache manager moves pages between tiers. On the way out, a GPU page is encoded into its compressed form as it is copied to host or disk memory; on the way back, the compressed page is decoded into the normal GPU representation before anything reads it. Figure 3 follows one page out and back with the NVFP4 codec described later; the cache-manager steps are the same for any codec.
+The second contract runs when the cache manager moves pages between tiers. On the way out, a GPU page is encoded into its compressed form as it is copied to host or disk memory; on the way back, the compressed page is decoded into the normal GPU representation before anything reads it. Figure 4 follows one page out and back with the NVFP4 codec described later; the cache-manager steps are the same for any codec.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_nvfp4_cold_page_pipeline.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 3: One page leaving and returning to the GPU with the NVFP4 codec: the cache manager evicts pages and hands a batch of page indices to the codec, the fused encode kernel writes one compressed page into host memory, and when the request resumes the fused decode kernel restores the page in its original data type before attention reads it.</em></sub></p>
+<p align="center"><sub><em>Figure 4: One page leaving and returning to the GPU with the NVFP4 codec: the cache manager evicts pages and hands a batch of page indices to the codec, the fused encode kernel writes one compressed page into host memory, and when the request resumes the fused decode kernel restores the page in its original data type before attention reads it.</em></sub></p>
 
 A GPU page may consist of several buffers (K and V, or an MLA latent buffer plus an index buffer, or the mixed buffers of a hybrid model), while a compressed page is one fixed-size block of bytes. The codec converts between the two, and four properties keep it simple:
 
@@ -207,14 +224,14 @@ The concrete implementation can be found in `tensorrt_llm/_torch/kv_cache_compre
 
 #### How It Works in TensorRT LLM
 
-TriAttention is a compression manager on the hook path that overrides the generation-end hook. Every `beta` confirmed generation tokens, once a sequence exceeds its budget, the manager scores the evictable generated tokens with CuTe DSL and Triton kernels, selects the `budget` tokens to keep according to `eviction_mode` (`union`, `per_head`, or `per_layer_perhead`), and compacts the paged KV cache in place with a native CUDA kernel. A speculative step may confirm several tokens at once; crossing more than one eviction period in one step is coalesced into one eviction. The calibration file (each head's mean and magnitude of the pre-RoPE query, produced by the official tool) is loaded and converted once when the manager is created. Figure 4 follows one eviction round from the hook to the compacted cache.
+TriAttention is a compression manager on the hook path that overrides the generation-end hook. Every `beta` confirmed generation tokens, once a sequence exceeds its budget, the manager scores the evictable generated tokens with CuTe DSL and Triton kernels, selects the `budget` tokens to keep according to `eviction_mode` (`union`, `per_head`, or `per_layer_perhead`), and compacts the paged KV cache in place with a native CUDA kernel. A speculative step may confirm several tokens at once; crossing more than one eviction period in one step is coalesced into one eviction. The calibration file (each head's mean and magnitude of the pre-RoPE query, produced by the official tool) is loaded and converted once when the manager is created. Figure 5 follows one eviction round from the hook to the compacted cache.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_triattention_pipeline.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 4: TriAttention between two decode steps: the generation-end hook picks the due requests, a fused CuTe DSL kernel scores the generated tokens from calibration statistics, the scores are reduced per eviction mode and selected with a radix top-k, and a native compaction kernel moves K and V in place before the manager reports the new cache length and returns the freed pages.</em></sub></p>
+<p align="center"><sub><em>Figure 5: TriAttention between two decode steps: the generation-end hook picks the due requests, a fused CuTe DSL kernel scores the generated tokens from calibration statistics, the scores are reduced per eviction mode and selected with a radix top-k, and a native compaction kernel moves K and V in place before the manager reports the new cache length and returns the freed pages.</em></sub></p>
 
 The method changes the physical cache length but keeps block reuse valid, because it compacts only the generated suffix and preserves the prompt prefix that the cache manager reuses. There is no sparse-attention configuration and no custom attention backend; decoding runs the model's standard attention kernel over the compacted cache. For calibration, configuration parameters, and current requirements, please refer to the [TriAttention example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/triattention.md).
 
@@ -240,22 +257,22 @@ We evaluate accuracy on AIME25 with 16 seeds per configuration, using each model
   <img src="../media/tech_blog29_accuracy_aime25.svg" width="900">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 5: AIME25 accuracy over 16 seeds for Qwen3-8B (left) and Qwen3.5-397B-A17B (right): uncompressed baseline, cold-page NVFP4 at medium and high pressure, and an every-step NVFP4 control that quantizes the active KV after each forward step. The band is the baseline mean plus or minus one standard deviation.</em></sub></p>
+<p align="center"><sub><em>Figure 6: AIME25 accuracy over 16 seeds for Qwen3-8B (left) and Qwen3.5-397B-A17B (right): uncompressed baseline, cold-page NVFP4 at medium and high pressure, and an every-step NVFP4 control that quantizes the active KV after each forward step. The band is the baseline mean plus or minus one standard deviation.</em></sub></p>
 
-Compared with the uncompressed baseline, no significant degradation is observed in the tested scope. The paired differences are +0.00 and +0.21 percentage points (medium and high) for Qwen3.5-397B-A17B, with standard errors of 0.68 and 0.57, and -0.83 and +0.21 for Qwen3-8B, with a standard error of 1.39; all four are within one standard error of zero. Figure 5 also includes a control that quantizes the *active* KV to NVFP4 after every forward step: it lands 2.08 points below the baseline for Qwen3-8B and 0.42 below for Qwen3.5-397B-A17B, inside the seed noise at 16 seeds but consistently under the cold-page results. Because no native FP4 KV decode kernel exists for these head sizes on the tested release, this control is a quantize-dequantize emulation in PyTorch rather than a native kernel result, and we report it as directional only.
+Compared with the uncompressed baseline, no significant degradation is observed in the tested scope. The paired differences are +0.00 and +0.21 percentage points (medium and high) for Qwen3.5-397B-A17B, with standard errors of 0.68 and 0.57, and -0.83 and +0.21 for Qwen3-8B, with a standard error of 1.39; all four are within one standard error of zero. Figure 6 also includes a control that quantizes the *active* KV to NVFP4 after every forward step: it lands 2.08 points below the baseline for Qwen3-8B and 0.42 below for Qwen3.5-397B-A17B, inside the seed noise at 16 seeds but consistently under the cold-page results. Because no native FP4 KV decode kernel exists for these head sizes on the tested release, this control is a quantize-dequantize emulation in PyTorch rather than a native kernel result, and we report it as directional only.
 
 #### Performance
 
-We benchmark the NVFP4 host cache against the uncompressed host cache on two models: GLM-5.2 (756B, MLA attention) and Qwen3.5-397B-A17B (hybrid attention plus Gated DeltaNet, NVFP4 weights). The workload is a 3,600-second replay of the InferenceX AgentX 256k agentic trace, which has heavy prefix reuse across turns; these runs use the public trace and the published InferenceX configurations but are not an official InferenceX submission. In the uncompressed configuration the host tier stores pages in FP8, the normal KV type of both models. We sweep the published configurations and a large set of derived ones (concurrency, prefill/decode split, and GPU count) so that both settings are measured on the same grid: 54 matched configurations and 218 accepted runs (two repeats each) for GLM-5.2 on 8 to 48 GB300, and 131 matched configurations and 330 accepted runs (mostly single repeat) for Qwen3.5-397B-A17B on 3 to 60 GB300. The host tier is 128 GiB per prefill rank in every run. We report **total token throughput per reserved GPU** against **P90 end-to-end normalized interactivity** (tokens per second per user, higher is better), the Pareto view in Figure 6.
+We benchmark the NVFP4 host cache against the uncompressed host cache on two models: GLM-5.2 (756B, MLA attention) and Qwen3.5-397B-A17B (hybrid attention plus Gated DeltaNet, NVFP4 weights). The workload is a 3,600-second replay of the InferenceX AgentX 256k agentic trace, which has heavy prefix reuse across turns; these runs use the public trace and the published InferenceX configurations but are not an official InferenceX submission. In the uncompressed configuration the host tier stores pages in FP8, the normal KV type of both models. We sweep the published configurations and a large set of derived ones (concurrency, prefill/decode split, and GPU count) so that both settings are measured on the same grid: 54 matched configurations and 218 accepted runs (two repeats each) for GLM-5.2 on 8 to 48 GB300, and 131 matched configurations and 330 accepted runs (mostly single repeat) for Qwen3.5-397B-A17B on 3 to 60 GB300. The host tier is 128 GiB per prefill rank in every run. We report **total token throughput per reserved GPU** against **P90 end-to-end normalized interactivity** (tokens per second per user, higher is better), the Pareto view in Figure 7.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_pareto.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 6: Throughput per reserved GB300 versus P90 interactivity for the uncompressed (FP8) and NVFP4 host caches on GLM-5.2 (left) and Qwen3.5-397B-A17B (right). Each point is one configuration averaged over repeats; outlined points are the published InferenceX configurations; lines are the Pareto frontiers of the two settings.</em></sub></p>
+<p align="center"><sub><em>Figure 7: Throughput per reserved GB300 versus P90 interactivity for the uncompressed (FP8) and NVFP4 host caches on GLM-5.2 (left) and Qwen3.5-397B-A17B (right). Each point is one configuration averaged over repeats; outlined points are the published InferenceX configurations; lines are the Pareto frontiers of the two settings.</em></sub></p>
 
-Figure 6 shows the throughput-interactivity Pareto frontiers; curves further to the upper right deliver more throughput at the same interactivity. On GLM-5.2 the NVFP4 frontier lies on or above the uncompressed one: it gains in the 31 to 51 tokens/s/user band (median +12.1% across the frontier points in the overlapping range, at most +28.5% at 36 tokens/s/user) and coincides with it above roughly 51 tokens/s/user, where both frontiers are formed by the same low-concurrency configurations. Below 31 tokens/s/user only NVFP4 has points, at 55,000 to 59,500 tokens/s per GPU, and the uncompressed cache has no tested point above 46,461 tokens/s per GPU. On Qwen3.5-397B-A17B the two frontiers largely coincide, and NVFP4 pulls ahead only at the throughput-bound, low-interactivity end. We summarize the results with four metrics:
+Figure 7 shows the throughput-interactivity Pareto frontiers; curves further to the upper right deliver more throughput at the same interactivity. On GLM-5.2 the NVFP4 frontier lies on or above the uncompressed one: it gains in the 31 to 51 tokens/s/user band (median +12.1% across the frontier points in the overlapping range, at most +28.5% at 36 tokens/s/user) and coincides with it above roughly 51 tokens/s/user, where both frontiers are formed by the same low-concurrency configurations. Below 31 tokens/s/user only NVFP4 has points, at 55,000 to 59,500 tokens/s per GPU, and the uncompressed cache has no tested point above 46,461 tokens/s per GPU. On Qwen3.5-397B-A17B the two frontiers largely coincide, and NVFP4 pulls ahead only at the throughput-bound, low-interactivity end. We summarize the results with four metrics:
 
 | Model | Workload | Peak throughput/GPU gain | Median gain at the same configuration | Cache-read hit rate | TTFT p90 (median) |
 | ------------------------------- | -------------------------- | ------------------------ | ------------------------------------- | ------------------------ | ----------------- |
