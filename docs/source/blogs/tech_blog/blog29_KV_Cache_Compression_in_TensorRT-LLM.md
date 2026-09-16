@@ -139,26 +139,26 @@ A compression method is selected with one configuration block, `kv_cache_compres
 
 ### Architecture Overview
 
-At a system level the framework has three parts:
+The framework has three parts, shown in Figure 4.
 
-- A **compression manager** that receives the executor's hooks or the cache manager's migration requests and turns them into method-specific actions.
-- A **transform kernel** launched on the stream the framework supplies. Methods that drop tokens use a selection-and-compaction kernel. Methods that re-encode pages use an encode and decode kernel.
-- The **cache manager**, which keeps ownership of pages and migration. Compressed and uncompressed pages flow through the same paths.
+- **Compression config.** One configuration block collects everything the user asks for, validates it, and routes it to the concrete method. A factory then builds that method's manager before the model runs.
+- **Compression manager base.** This base class is the core of the framework: it defines where in the runtime compression is injected. For a method that works between decode steps, such as TriAttention, the base provides the ability to run after every decode step. For a method that works on pages leaving the GPU, such as cold-page quantization, the base hooks into the KV cache manager and adds compression to offloading and onboarding. A concrete method inherits the base and is injected at the matching points automatically.
+- **Method-specific kernels.** Each method brings its own kernels that compress and decompress the KV cache. The architecture lets a method define a new series of such kernels, optimize them, and fuse them with neighboring kernels, for example with the copy that moves a page off the GPU.
 
-From the user's side, all of this is driven by `kv_cache_compression_config`. When it is present, a factory validates the requested combination and builds the manager before the model runs or any page moves.
+The executor and the KV cache manager are existing components of TensorRT LLM. The framework does not replace them. It interacts with them at the insertion points and leaves scheduling and memory ownership where they are.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_framework.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 4: The KV cache compression framework. One configuration and factory, one manager base, and two entry points: the executor's step cycle for hook-based methods such as TriAttention (top row), and the cache manager's page migration for page codecs such as NVFP4 quantization (bottom row).</em></sub></p>
+<p align="center"><sub><em>Figure 4: The KV cache compression framework. The highlighted parts are ours: the compression config and factory, the compression manager base that defines the insertion points, the concrete method that inherits it, and the method's own kernels. The executor and the KV cache manager are existing system components that the base hooks into.</em></sub></p>
 
-Figure 4 follows the two entry points. A hook-based manager is registered with the executor. It runs after the cache manager has updated its own state at each step. A page-codec manager is built before the cache manager, because the cache manager needs the compressed page size to lay out its host and disk tiers. A method may use either path or both, but the two stay separate. Eviction policy does not belong in a migration, and a page codec never allocates pages.
+In Figure 4, the executor path runs after the cache manager has updated its state at each step. The page path is set up before the cache manager is built, because the cache manager needs the compressed page size to lay out its host and disk tiers. A method may use either path or both, but the two stay separate.
 
 ### Hooks Between Forward Steps
 
-While a prefill or decode step runs, attention reads a fixed view of the KV cache. Between two steps that view can change, and that is where the hooks fire. A method overrides only the hooks it needs. All of them do nothing by default.
+This path serves stage 3 of Figure 3, between decode steps. While a prefill or decode step runs, attention reads a fixed view of the KV cache. Between two steps that view can change, and that is where the hooks fire. A method overrides only the hooks it needs. All of them do nothing by default.
 
 <div align="center">
 
@@ -178,7 +178,7 @@ The hooks ride on the executor's existing request cycle, and the framework wires
 
 ### Encoding Pages That Leave the GPU
 
-The second contract runs when the cache manager moves pages between tiers. On the way out, a GPU page is encoded as it is copied to host or disk memory. On the way back, the compressed page is decoded into the normal GPU representation before anything reads it. Figure 5 follows one page out and back with the NVFP4 codec described later. The cache manager steps are the same for any codec.
+This path serves stage 5 of Figure 3. It runs when the cache manager moves pages between tiers. On the way out, a GPU page is encoded as it is copied to host or disk memory. On the way back, the compressed page is decoded into the normal GPU representation before anything reads it. Figure 5 follows one page out and back with the NVFP4 codec described later. The cache manager steps are the same for any codec.
 
 <div align="center">
 <figure>
@@ -195,6 +195,10 @@ A GPU page may consist of several buffers: K and V, an MLA latent buffer plus an
 - **Compressed pages stay compressed between tiers.** Moves between host and disk copy the bytes as they are. Only the GPU boundary runs the codec.
 
 Compression is optional at this layer. The default codec simply packs the page buffers into the block at full size. A compressing codec produces a smaller block through the same path. It can also mark some buffers as lossless, so the recurrent state of hybrid models or side buffers such as an MLA index pass through unchanged inside the same page. Adding a new format means adding a kernel and its layout description. Tier routing, staging, batching, and ordering are shared. The C++ interface and the Python API are documented in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md).
+
+### Covering the Other Stages
+
+The two paths above cover stage 3 and stage 5, the stages the two shipped methods need. The base class keeps the ability to define more hooks, so every stage in Figure 3 that offers a compression opportunity can be reached the same way. How those hooks look is future work, and we will extend the framework as new methods need them.
 
 ### Configuration and Ownership
 
