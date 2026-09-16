@@ -305,48 +305,35 @@ Unless otherwise specified, the experiments below use GB300 GPUs, the PyTorch ba
 
 #### Performance
 
-The compression ratio follows from the format. Packed NVFP4 data plus one 8-bit scale per 16 values costs 0.5625 bytes per value, against 2 bytes for FP16 or BF16 and 1 byte for FP8. Table 4 lists the measured size of one attention KV page off the GPU. The recurrent-state buffers of hybrid models are stored as they are and do not shrink.
+The compression ratio follows from the format. Packed NVFP4 data plus one 8-bit scale per 16 values costs 0.5625 bytes per value, against 2 bytes for FP16 or BF16 and 1 byte for FP8. Figure 10 shows the measured size of one attention KV page off the GPU for four models. The recurrent-state buffers of hybrid models are stored as they are and do not shrink.
 
-| Active KV type | Model | Uncompressed page | NVFP4 cold page | Reduction |
-| :--- | :--- | :--- | :--- | :--- |
-| FP8 | Qwen3.5-397B-A17B | 1,048,576 B | 589,824 B | 43.75% (1.78x more pages per byte) |
-| FP8 | Qwen3-8B | 2,359,296 B | 1,327,104 B | 43.75% (1.78x) |
-| FP8 MLA latent, index buffer kept lossless | GLM-5.2 | 3,098,112 B | 1,824,000 B | 41.1% (1.70x) |
-| BF16 | Qwen3-8B | 4,718,592 B | 1,327,104 B | 71.9% (3.56x) |
-
-<p align="center"><sub><em>Table 4. Measured size of one attention KV page off the GPU, uncompressed and as an NVFP4 cold page.</em></sub></p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog29_page_sizes.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 10: Measured size of one attention KV page off the GPU, uncompressed and as an NVFP4 cold page. FP8 pages shrink by 43.75%, BF16 pages by 71.9%; the GLM-5.2 MLA page shrinks a little less because its index buffer stays lossless.</em></sub></p>
 
 The serving effect of a smaller cold page is more capacity in the host and disk tiers, and therefore a higher prefix-cache hit rate when the working set does not fit. We show it in two settings.
 
-**A growing disk tier.** Figure 10 replays 393 AgentX agentic-coding traces at concurrency 192 for 1,800 seconds on Qwen3.5-397B-A17B, served disaggregated on three GB300 nodes: two prefill GPUs and eight generation GPUs. The host tier is fixed at 128 GiB per prefill rank and the disk tier grows from 0 to 1,024 GiB per rank. Both arms run the same configuration; only the cold-page format differs. At every disk size the NVFP4 tier holds more pages, so the cache-read hit rate is higher, fewer prefixes are recomputed, more requests complete in the window, and the average time to first token drops. The gain is largest where the uncompressed tier is under the most pressure: with 512 GiB of disk the NVFP4 arm completes 64% more requests and answers 48% sooner. With 1,024 GiB both arms approach the hit rate the trace allows and the curves flatten. Each cell is one closed-loop run, so small differences between neighboring cells are within run-to-run variation.
+**A growing disk tier.** Figure 11 replays 393 AgentX agentic-coding traces at concurrency 192 for 1,800 seconds on Qwen3.5-397B-A17B, served disaggregated on three GB300 nodes: two prefill GPUs and eight generation GPUs. The host tier is fixed at 128 GiB per prefill rank and the disk tier grows from 0 to 1,024 GiB per rank. Both arms run the same configuration; only the cold-page format differs. At every disk size the NVFP4 tier holds more pages, so the cache-read hit rate is higher, fewer prefixes are recomputed, more requests complete in the window, and the average time to first token drops. The gain is largest where the uncompressed tier is under the most pressure: with 512 GiB of disk the NVFP4 arm completes 64% more requests and answers 48% sooner. With 1,024 GiB both arms approach the hit rate the trace allows and the curves flatten. Each cell is one closed-loop run, so small differences between neighboring cells are within run-to-run variation.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_disk_sweep.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 10: Qwen3.5-397B-A17B on GB300, AgentX replay, with a host tier of 128 GiB per prefill rank and a growing disk tier. Left: requests completed per second. Middle: cache-read hit rate, with the hit rate the trace allows as the dashed line. Right: average time to first token. White bars are uncompressed FP8 cold pages, orange bars are NVFP4 cold pages.</em></sub></p>
+<p align="center"><sub><em>Figure 11: Qwen3.5-397B-A17B on GB300, AgentX replay, with a host tier of 128 GiB per prefill rank and a growing disk tier. Left: requests completed per second. Middle: cache-read hit rate, with the hit rate the trace allows as the dashed line. Right: average time to first token. White bars are uncompressed FP8 cold pages, orange bars are NVFP4 cold pages.</em></sub></p>
 
-| Disk tier per rank | Requests/s, uncompressed | Requests/s, NVFP4 | Cache-read hit, uncompressed | Cache-read hit, NVFP4 | Average TTFT, uncompressed | Average TTFT, NVFP4 |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| 0 GiB | 1.75 | 1.89 (+7.8%) | 57.2% | 61.4% | 132.1 s | 119.4 s (-9.6%) |
-| 128 GiB | 1.99 | 2.68 (+34.2%) | 64.6% | 75.2% | 114.2 s | 82.2 s (-28.0%) |
-| 256 GiB | 2.27 | 3.39 (+49.7%) | 73.8% | 82.6% | 99.1 s | 59.2 s (-40.2%) |
-| 512 GiB | 2.66 | 4.37 (+64.4%) | 82.4% | 86.9% | 81.7 s | 42.3 s (-48.2%) |
-| 1,024 GiB | 2.76 | 4.35 (+57.7%) | 86.2% | 87.3% | 77.7 s | 42.7 s (-45.0%) |
 
-<p align="center"><sub><em>Table 5. The disk-tier sweep of Figure 10 in numbers: one closed-loop run per cell, 1,800 seconds each.</em></sub></p>
+**A published configuration.** The second setting is GLM-5.2, an MLA model, served at one of the published InferenceX configurations on 32 GB300s, again on the AgentX replay. Figure 12 compares the uncompressed and NVFP4 host caches at this point, averaged over two repeats. Throughput per GPU is unchanged within repeat noise, because the uncompressed host tier already reaches 96.2% of the 97.2% hit rate the trace allows and has little left to gain. What NVFP4 buys here is latency: with more pages resident, the P90 interactivity rises and the P90 time to first token falls. This is the expected behavior of cold-page compression when the host tier is well provisioned. It costs nothing, and it helps as soon as the tier comes under pressure, as the disk sweep above shows.
 
-**A published configuration.** The second setting is GLM-5.2, an MLA model, served at one of the published InferenceX configurations on 32 GB300s, again on the AgentX replay. Table 6 compares the uncompressed and NVFP4 host caches at this point, averaged over two repeats. Throughput per GPU is unchanged within repeat noise, because the uncompressed host tier already reaches 96.2% of the 97.2% hit rate the trace allows and has little left to gain. What NVFP4 buys here is latency: with more pages resident, the P90 interactivity rises and the P90 time to first token falls. This is the expected behavior of cold-page compression when the host tier is well provisioned. It costs nothing, and it helps as soon as the tier comes under pressure, as the disk sweep above shows.
-
-| Metric | Uncompressed | NVFP4 cold pages | Change |
-| :--- | :--- | :--- | :--- |
-| Throughput per GPU (tok/s) | 36,998 | 37,307 | +0.8% |
-| P90 interactivity (tok/s/user) | 40.9 | 42.7 | +4.5% |
-| TTFT p90 (ms) | 2,872 | 2,686 | -6.5% |
-| Cache-read hit rate | 96.2% | 96.4% | +0.2 pp |
-
-<p align="center"><sub><em>Table 6. GLM-5.2 at a published InferenceX configuration on 32 GB300s, AgentX replay, mean of two repeats per arm.</em></sub></p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog29_glm_point.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 12: GLM-5.2 at a published InferenceX configuration on 32 GB300s, AgentX replay, mean of two repeats per arm. Throughput per GPU is unchanged within noise; P90 interactivity and P90 time to first token improve.</em></sub></p>
 
 #### Accuracy
 
@@ -354,14 +341,14 @@ Cold-page compression is lossy, so the remaining question is how much accuracy i
 
 First, a page is quantized only when it leaves the GPU, and at most once per offload. The worst case is a deployment where every page is re-quantized on every turn. Even then a page never carries more than one NVFP4 rounding at a time, so the accuracy of cold-page compression is bounded below by that of a fully NVFP4 KV cache, a configuration TensorRT LLM already ships and whose loss is small and well characterized. In practice most pages are offloaded once or not at all, so the typical case sits far from this bound.
 
-Second, repeated quantize-and-dequantize round trips do not compound. Quantization is a projection onto a finite set of values, not a fresh random error each time. For NVFP4 with 8-bit block scales we showed analytically that after the first round trip the encoded state can change at most once more, and on real KV values it does not change at all. Figure 11 shows the measurement on Qwen3-8B with a BF16 KV cache on AIME24 and AIME25, 30 questions with 8 seeds each, using the NVFP4 quantizer from Transformer Engine in a standalone harness on B200 and applying the round trips to every page. The first round trip changes 98.5% of the 13 billion compared KV values, which is the expected rounding. The second round trip changes none of them, and neither do the fourth or the eighth. End to end, one round trip moves accuracy by 2.08 and 1.67 points on the two sets, within the noise of this setup where most generations hit the 32K output cap. The second round trip reproduces all 480 outputs of the first exactly, so accuracy after two round trips is identical to accuracy after one.
+Second, repeated quantize-and-dequantize round trips do not compound. Quantization is a projection onto a finite set of values, not a fresh random error each time. For NVFP4 with 8-bit block scales we showed analytically that after the first round trip the encoded state can change at most once more, and on real KV values it does not change at all. Figure 13 shows the measurement on Qwen3-8B with a BF16 KV cache on AIME24 and AIME25, 30 questions with 8 seeds each, using the NVFP4 quantizer from Transformer Engine in a standalone harness on B200 and applying the round trips to every page. The first round trip changes 98.5% of the 13 billion compared KV values, which is the expected rounding. The second round trip changes none of them, and neither do the fourth or the eighth. End to end, one round trip moves accuracy by 2.08 and 1.67 points on the two sets, within the noise of this setup where most generations hit the 32K output cap. The second round trip reproduces all 480 outputs of the first exactly, so accuracy after two round trips is identical to accuracy after one.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_nvfp4_roundtrip.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 11: Repeated NVFP4 round trips on Qwen3-8B with a BF16 KV cache. Left: share of KV values changed by one more quantize-and-dequantize round trip; the first changes the expected 98.5%, the second, fourth, and eighth change none. Right: AIME24 and AIME25 accuracy after 0, 1, and 2 round trips; the first and second round trips produce identical outputs on all 480 samples.</em></sub></p>
+<p align="center"><sub><em>Figure 13: Repeated NVFP4 round trips on Qwen3-8B with a BF16 KV cache. Left: share of KV values changed by one more quantize-and-dequantize round trip; the first changes the expected 98.5%, the second, fourth, and eighth change none. Right: AIME24 and AIME25 accuracy after 0, 1, and 2 round trips; the first and second round trips produce identical outputs on all 480 samples.</em></sub></p>
 
 Together, these two facts mean that cold-page compression cannot drift with repeated offloading. Its accuracy cost is at most one NVFP4 rounding of the pages that actually leave the GPU, and it does not grow with the number of times a page is offloaded and brought back.
 
