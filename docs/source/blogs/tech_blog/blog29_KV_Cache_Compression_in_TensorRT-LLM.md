@@ -59,7 +59,7 @@ In the following sections, we first provide an overview of the KV cache compress
 
 ## Overview of KV Cache Compression in TensorRT LLM
 
-Figure 2 shows where KV cache compression sits in TensorRT LLM. It is one of three ways to cut memory and compute, next to quantization and sparse attention, and it works on the KV pages that the cache manager owns.
+Figure 2 shows where KV cache compression sits in TensorRT LLM. It is one of three ways to cut memory and compute, next to quantization and sparse attention. It works on the KV pages that the cache manager owns.
 
 <div align="center">
 <figure>
@@ -68,7 +68,11 @@ Figure 2 shows where KV cache compression sits in TensorRT LLM. It is one of thr
 </div>
 <p align="center"><sub><em>Figure 2: The TensorRT LLM stack. KV cache compression is a compression-layer feature alongside quantization and sparse attention. It changes what is stored in the KV cache and touches neither the kernels below nor the serving layers above.</em></sub></p>
 
-A key challenge in deploying KV cache compression at scale is the diversity of existing methods: they differ in **when they run** (between forward steps vs. when a page moves between memory tiers), in **what they change** (which tokens are kept vs. how the kept values are stored), and in the **cache layouts** they can handle (conventional MHA/GQA pages, MLA latent KV, and hybrid models that mix attention layers with recurrent state). To handle this diversity without special cases in the scheduler or the cache manager, TensorRT LLM introduces a **unified, extensible KV cache compression framework**. It has one configuration entry, one common foundation that every method builds on, and two plug-in points. Hooks run between forward steps; an encoder/decoder pair runs whenever a page moves between the GPU and host or disk memory. The cache manager keeps full ownership of pages, allocating them, moving them between tiers, and reusing them; a compression method only transforms their contents.
+KV cache compression methods differ in three ways. Some run between forward steps, others run when a page moves between memory tiers. Some drop tokens, others store the kept values in fewer bytes. And each one supports its own set of cache layouts, from standard attention pages to MLA and hybrid models.
+
+TensorRT LLM handles this diversity with one framework instead of special cases. The framework has one configuration entry, one common base that every method builds on, and two plug-in points. Hooks run between forward steps. A page encoder and decoder run when a page moves between the GPU and host or disk memory.
+
+The cache manager keeps full ownership of pages. It allocates them, moves them between tiers, and reuses them. A compression method only changes their contents.
 
 <div align="center">
 <figure>
@@ -77,18 +81,18 @@ A key challenge in deploying KV cache compression at scale is the diversity of e
 </div>
 <p align="center"><sub><em>Figure 3: Six stages in the life of a KV cache where compression can run. TriAttention acts at stage 4 and cold-page compression at stage 6.</em></sub></p>
 
-To demonstrate the framework's generality, we have integrated two methods, one for each plug-in point:
+We have built two methods on the framework, one for each plug-in point:
 
-*   **NVFP4 cold-page quantization**: converts attention KV pages to NVFP4 as they are written to host or disk memory and converts them back on the way to the GPU; the GPU cache and the attention kernels keep the model's normal KV data type (FP16, BF16, or FP8).
-*   **TriAttention**: runs between decoding steps, scores the generated tokens with an importance measure calibrated offline for each attention head, and compacts the cache down to a fixed token budget while leaving the prompt intact.
+*   **NVFP4 cold-page quantization**: stores attention KV pages as NVFP4 while they sit in host or disk memory. A page is converted on the way out and restored on the way back. The GPU cache and the attention kernels keep the model's normal KV data type.
+*   **TriAttention**: runs between decoding steps. It scores the generated tokens with an importance measure calibrated offline for each attention head and keeps only a fixed budget of them. The prompt is never touched.
 
-The following tables summarize the current coverage:
+The two tables below summarize the current coverage.
 
 <div align="center">
 
 | Method | When It Runs | What It Changes | Supported Attention Types |
 | :--- | :--- | :--- | :--- |
-| **NVFP4 cold-page quantization** | When a page moves between the GPU and host or disk memory | How attention KV is stored while off the GPU | MHA / MQA / GQA; MLA; hybrid models that mix attention with recurrent layers such as Gated DeltaNet (GDN) or state-space model (SSM) layers (only the attention KV is quantized) |
+| **NVFP4 cold-page quantization** | When a page moves between the GPU and host or disk memory | How attention KV is stored while off the GPU | MHA / MQA / GQA; MLA; hybrid models with recurrent layers such as Gated DeltaNet or state-space layers (only the attention KV is quantized) |
 | **TriAttention** | Periodically during generation | Which KV tokens are kept | MHA / MQA / GQA |
 
 </div>
@@ -103,9 +107,9 @@ The following tables summarize the current coverage:
 
 </div>
 
-**Note**: Today, both methods require the PyTorch backend, the KV cache manager selected by `use_kv_cache_manager_v2: true`, and an NVIDIA Blackwell GPU (SM100 or SM103, for example B200 or GB300). The results in this blog were measured on GB300 systems; the cold-page feature was also validated functionally on B200.
+**Note**: Both methods require the PyTorch backend, the KV cache manager selected by `use_kv_cache_manager_v2: true`, and an NVIDIA Blackwell GPU (SM100 or SM103, such as B200 or GB300). All results in this blog were measured on GB300. The cold-page feature was also validated functionally on B200.
 
-This blog focuses on the **framework-level** design that is common across methods and on the NVFP4 cold-page implementation as the main worked example. For the low-level C++ interface between the cache manager and a cold-page encoder, including how pages are staged and moved between tiers, please refer to the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md); for the APIs used to add a new method, please refer to the [KV Cache Compression Development Guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md).
+This blog covers the framework design shared by all methods, with NVFP4 cold-page quantization as the main worked example. The C++ interface between the cache manager and a page encoder is documented in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md). The APIs for adding a new method are in the [KV Cache Compression Development Guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md).
 
 ## KV Cache Compression Framework Design
 
