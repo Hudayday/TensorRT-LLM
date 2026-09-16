@@ -119,7 +119,7 @@ This blog covers the framework design shared by all methods, with NVFP4 cold-pag
 
 ## KV Cache Compression Framework Design
 
-The KV cache compression framework gives every method the same foundation and hides the details from users. A developer adds a method by implementing one of two small contracts. Hooks run between forward steps. A page encoder and decoder run when pages move between memory tiers. Neither contract touches the attention kernels, the cache manager, or the serving loop.
+TensorRT LLM provides a general framework for KV cache compression, built around two ideas. First, users turn on a compression method with one designated compression config and nothing else. Second, developers add a new compression method on top of the framework with plain Python and a just-in-time compiled kernel, without touching the runtime. The framework takes care of the rest: when a method runs, how it reaches the KV cache, and how the cache manager keeps control of memory. The sections below describe how this works.
 
 ### Design Philosophy
 
