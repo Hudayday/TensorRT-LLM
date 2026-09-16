@@ -113,11 +113,11 @@ This blog covers the framework design shared by all methods, with NVFP4 cold-pag
 
 ## KV Cache Compression Framework Design
 
-The KV cache compression framework in TensorRT LLM gives different methods a common runway while hiding the complexity from users. A developer adds a new method by implementing one of two small contracts, hooks that run between forward steps or an encoder/decoder pair that runs when pages move between memory tiers, without touching the attention kernels, the cache manager's allocation and migration logic, or the serving loop.
+The KV cache compression framework gives every method the same foundation and hides the details from users. A developer adds a method by implementing one of two small contracts. Hooks run between forward steps. A page encoder and decoder run when pages move between memory tiers. Neither contract touches the attention kernels, the cache manager, or the serving loop.
 
 ### Design Philosophy
 
-A compression method is selected with one configuration block, `kv_cache_compression_config`. It is deliberately separate from the KV cache configuration (capacity, memory tiers, block reuse, the data type of the active cache) and from the sparse attention configuration (how attention computes). One method can be active per LLM instance, and a method must either handle every cache layout it is given or pass the parts it does not understand through unchanged.
+A compression method is selected with one configuration block, `kv_cache_compression_config`. It is kept separate from the KV cache configuration, which sets capacity, memory tiers, block reuse, and the active KV data type. It is also separate from the sparse attention configuration, which controls how attention computes. One method can be active per LLM instance. A method must handle every cache layout it is given, or pass the parts it does not understand through unchanged.
 
 Every method in this framework follows the same three moves:
 
@@ -125,30 +125,30 @@ Every method in this framework follows the same three moves:
 - **Transform** it: drop tokens and compact the remaining ones, or re-encode a page into a smaller representation.
 - **Hand it back**: report the new cache length, or return the encoded bytes to the cache manager so that the next reader sees a valid page.
 
-The framework turns this pattern into two contracts. Methods that act between forward steps implement lifecycle hooks (listed below). Methods that act when pages leave or return to the GPU implement a page encoder and decoder. Two rules hold for both. First, compression stays outside the attention kernel: attention always reads the normal GPU representation and never sees the compressed form. Second, the cache manager remains in charge of pages: it allocates them, moves them between tiers, reuses them, and orders the copies. A method decides what to transform and how; it never decides where bytes live.
+The framework turns this pattern into two contracts. Methods that act between forward steps implement the hooks listed below. Methods that act when pages leave or return to the GPU implement a page encoder and decoder. Two rules hold for both. First, compression stays outside the attention kernel. Attention always reads the normal GPU representation and never sees the compressed form. Second, the cache manager stays in charge of pages. It allocates them, moves them between tiers, reuses them, and orders the copies. A method decides what to transform and how. It never decides where bytes live.
 
 ### Architecture Overview
 
 At a system level the framework has three parts:
 
 - A **compression manager** that receives the executor's hooks or the cache manager's migration requests and turns them into method-specific actions.
-- A **transform kernel**, either a selection-and-compaction kernel for methods that drop tokens, or an encode/decode kernel for methods that re-encode pages, launched on the stream the framework supplies.
-- The **cache manager**, which keeps ownership of pages and migration, so that compressed and uncompressed pages flow through the same paths.
+- A **transform kernel** launched on the stream the framework supplies. Methods that drop tokens use a selection-and-compaction kernel. Methods that re-encode pages use an encode and decode kernel.
+- The **cache manager**, which keeps ownership of pages and migration. Compressed and uncompressed pages flow through the same paths.
 
-From the user's side all of this is driven by `kv_cache_compression_config`. When it is present, a factory validates the requested combination and builds the concrete manager before the model runs or any page moves.
+From the user's side, all of this is driven by `kv_cache_compression_config`. When it is present, a factory validates the requested combination and builds the manager before the model runs or any page moves.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_framework.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 4: The KV cache compression framework: one configuration and factory, one manager base, and two entry points, the executor's iteration cycle for hook-based methods such as TriAttention (top row) and the cache manager's page migration for page codecs such as NVFP4 quantization (bottom row).</em></sub></p>
+<p align="center"><sub><em>Figure 4: The KV cache compression framework. One configuration and factory, one manager base, and two entry points: the executor's step cycle for hook-based methods such as TriAttention (top row), and the cache manager's page migration for page codecs such as NVFP4 quantization (bottom row).</em></sub></p>
 
-Figure 4 follows the two entry points. A hook-based manager is registered with the executor and runs after the cache manager has updated its own state at each step. A page-codec manager is built before the cache manager, because the cache manager needs to know the compressed page size to lay out its host and disk tiers. A method may use either path or both, but the two stay separate: eviction policy does not belong in a migration, and a page codec never allocates or publishes pages.
+Figure 4 follows the two entry points. A hook-based manager is registered with the executor. It runs after the cache manager has updated its own state at each step. A page-codec manager is built before the cache manager, because the cache manager needs the compressed page size to lay out its host and disk tiers. A method may use either path or both, but the two stay separate. Eviction policy does not belong in a migration, and a page codec never allocates pages.
 
 ### Hooks Between Forward Steps
 
-While a prefill or decode step runs, attention reads a fixed view of the KV cache. Between two steps that view can change, and that is where the hooks fire. A method overrides only the hooks it needs; all of them do nothing by default.
+While a prefill or decode step runs, attention reads a fixed view of the KV cache. Between two steps that view can change, and that is where the hooks fire. A method overrides only the hooks it needs. All of them do nothing by default.
 
 <div align="center">
 
@@ -162,38 +162,38 @@ While a prefill or decode step runs, attention reads a fixed view of the KV cach
 
 </div>
 
-The hooks ride on the executor's existing request cycle; the framework wires them up. Methods on this path change which tokens are kept or how they are arranged in the paged cache. Two obligations come with it: the policy that chooses tokens stays separate from the shared compaction kernel, and a method must finish its GPU work before it shrinks or frees any cache pages. TriAttention, described below, is the shipped example. It uses the generation-end hook and leaves scheduling, prompt-prefix reuse, and the attention kernel unchanged.
+The hooks ride on the executor's existing request cycle, and the framework wires them up. Methods on this path change which tokens are kept or how they are arranged in the paged cache. Two obligations come with it. The policy that chooses tokens stays separate from the shared compaction kernel. And a method must finish its GPU work before it shrinks or frees any cache pages. TriAttention, described below, is the shipped example. It uses the generation-end hook and leaves scheduling, prefix reuse, and the attention kernel unchanged.
 
 ### Encoding Pages That Leave the GPU
 
-The second contract runs when the cache manager moves pages between tiers. On the way out, a GPU page is encoded into its compressed form as it is copied to host or disk memory; on the way back, the compressed page is decoded into the normal GPU representation before anything reads it. Figure 5 follows one page out and back with the NVFP4 codec described later; the cache-manager steps are the same for any codec.
+The second contract runs when the cache manager moves pages between tiers. On the way out, a GPU page is encoded as it is copied to host or disk memory. On the way back, the compressed page is decoded into the normal GPU representation before anything reads it. Figure 5 follows one page out and back with the NVFP4 codec described later. The cache manager steps are the same for any codec.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_nvfp4_cold_page_pipeline.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 5: One page leaving and returning to the GPU with the NVFP4 codec: the cache manager evicts pages and hands a batch of page indices to the codec, the fused encode kernel writes one compressed page into host memory, and when the request resumes the fused decode kernel restores the page in its original data type before attention reads it.</em></sub></p>
+<p align="center"><sub><em>Figure 5: One page leaving and returning to the GPU with the NVFP4 codec. The cache manager evicts pages and hands a batch of page indices to the codec. The fused encode kernel writes one compressed page into host memory. When the request resumes, the fused decode kernel restores the page in its original data type before attention reads it.</em></sub></p>
 
-A GPU page may consist of several buffers (K and V, or an MLA latent buffer plus an index buffer, or the mixed buffers of a hybrid model), while a compressed page is one fixed-size block of bytes. The codec converts between the two, and four properties keep it simple:
+A GPU page may consist of several buffers: K and V, an MLA latent buffer plus an index buffer, or the mixed buffers of a hybrid model. A compressed page is one fixed-size block of bytes. The codec converts between the two, and four properties keep it simple:
 
-- **Fixed compressed size.** Each layer group has one compressed page size, so every tier can address pages as base plus slot times size with a plain allocator.
-- **Batched calls.** The cache manager hands the codec a whole batch of page indices (destination and source per page) with a stream, rather than one page at a time.
-- **Asynchronous by design.** Encode and decode only enqueue GPU work on that stream; the cache manager tracks completion and owns the events, so the codec inherits the same ordering and failure handling as an ordinary copy.
-- **Compressed pages stay compressed between tiers.** Host-to-disk and disk-to-host moves copy the bytes as they are; only the GPU boundary runs the codec.
+- **Fixed compressed size.** Each layer group has one compressed page size. Every tier can then address pages with a plain slot allocator.
+- **Batched calls.** The cache manager hands the codec a whole batch of page indices and a stream, not one page at a time.
+- **Asynchronous by design.** Encode and decode only enqueue GPU work on that stream. The cache manager tracks completion and owns the events, so the codec inherits the same ordering and failure handling as an ordinary copy.
+- **Compressed pages stay compressed between tiers.** Moves between host and disk copy the bytes as they are. Only the GPU boundary runs the codec.
 
-Compression is optional at this layer: the default codec simply packs the page buffers into the block at full size. A compressing codec produces a smaller block through the same path and can mark some buffers as lossless, so recurrent-state buffers of hybrid models or side buffers such as an MLA index pass through unchanged inside the same page. Adding a new format means adding a kernel and its layout description; tier routing, staging, batching, and ordering are shared. The C++ interface and the Python provider API are documented in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md).
+Compression is optional at this layer. The default codec simply packs the page buffers into the block at full size. A compressing codec produces a smaller block through the same path. It can also mark some buffers as lossless, so the recurrent state of hybrid models or side buffers such as an MLA index pass through unchanged inside the same page. Adding a new format means adding a kernel and its layout description. Tier routing, staging, batching, and ordering are shared. The C++ interface and the Python API are documented in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md).
 
 ### Configuration and Ownership
 
-Because the framework spans the executor, the cache manager, and native kernels, its most important decision is who owns what:
+The framework spans the executor, the cache manager, and native kernels. Its most important decision is who owns what:
 
-- The **configuration and factory** own method selection and compatibility checks. An unsupported combination is rejected before anything is built; nothing falls back silently at run time.
+- The **configuration and factory** own method selection and compatibility checks. An unsupported combination is rejected before anything is built. Nothing falls back silently at run time.
 - The **compression manager** owns the method's cadence, its per-request state, its format metadata, and its kernel launches.
 - The **cache manager** owns pages, tiers, migration, reuse, and the ordering of copies.
 - The **attention backend** owns the active GPU representation it reads, and nothing else.
 
-Configuration is opt-in and small. Cold-page quantization is turned on with `algorithm: quantization_for_cold_page` and `quant: nvfp4` under `kv_cache_compression_config`, together with a host tier (`host_cache_size`, optionally `disk_cache_size` and `disk_cache_path`) under `kv_cache_config`; the active cache keeps its normal data type. TriAttention is turned on with `algorithm: triattention` plus `budget`, `beta`, `eviction_mode`, and `calibration_path`. The same fields work in the Python API, in `trtllm-serve` YAML, and in `trtllm-bench`. Calibration files and other offline artifacts are inputs, not work: the runtime validates them at start-up and fails fast if they are missing or incompatible. The full option table is in the [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
+Configuration is opt-in and small. Cold-page quantization is turned on with `algorithm: quantization_for_cold_page` and `quant: nvfp4` under `kv_cache_compression_config`. It also needs a host tier under `kv_cache_config`, set with `host_cache_size` and optionally `disk_cache_size` and `disk_cache_path`. The active cache keeps its normal data type. TriAttention is turned on with `algorithm: triattention` plus `budget`, `beta`, `eviction_mode`, and `calibration_path`. The same fields work in the Python API, in `trtllm-serve` YAML, and in `trtllm-bench`. Calibration files are validated at start-up, and the runtime fails fast if they are missing or incompatible. The full option table is in the [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
 
 ## Algorithm Implementations
 
