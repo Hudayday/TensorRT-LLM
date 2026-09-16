@@ -6,9 +6,10 @@
 - [KV Cache Compression Framework Design](#kv-cache-compression-framework-design)
   - [Design Philosophy](#design-philosophy)
   - [Architecture Overview](#architecture-overview)
+  - [Configuration and Integration with the Cache Manager](#configuration-and-integration-with-the-cache-manager)
   - [KV Cache Compression in the Executor Iteration Loop](#kv-cache-compression-in-the-executor-iteration-loop)
   - [KV Cache Compression in Cross-Request KV Management](#kv-cache-compression-in-cross-request-kv-management)
-  - [Configuration and Integration with the Cache Manager](#configuration-and-integration-with-the-cache-manager)
+  - [Covering the Other Stages](#covering-the-other-stages)
 - [Algorithm Implementations](#algorithm-implementations)
   - [NVFP4 Cold-Page Quantization](#nvfp4-cold-page-quantization)
   - [TriAttention](#triattention)
@@ -156,7 +157,15 @@ The executor and the KV cache manager are existing components of TensorRT LLM. T
 
 Figure 4 introduces the whole framework and how it follows the lifetime of a KV cache. The framework interacts with different parts of the TensorRT LLM runtime so that compression can be injected at the five stages defined above. The executor iteration loop hosts the stages inside a request: the prefill-chunk, after-prefill, and decode stages (stages 1 to 3). The KV cache manager hosts the stages beyond a single request: the tool-call and after-request stages (stages 4 and 5), when the KV cache is kept and managed across requests.
 
-Some of these stages have a method today and some do not. The decode stage (stage 3) is implemented by TriAttention. The after-request stage (stage 5) is implemented in part by cold-page compression, which handles the pages that leave the GPU for host or disk memory. The rest of this section walks through the framework in detail: how each path works, how the other stages will be covered, and how a user configures it.
+Some of these stages have a method today and some do not. The decode stage (stage 3) is implemented by TriAttention. The after-request stage (stage 5) is implemented in part by cold-page compression, which handles the pages that leave the GPU for host or disk memory. The rest of this section walks through the framework in detail: how a user configures it and which cache manager it works with, how each path works, and how the other stages will be covered.
+
+### Configuration and Integration with the Cache Manager
+
+Configuration is deliberately small. One block, `kv_cache_compression_config`, collects only the settings that belong to compression: which method to run and that method's own options. A factory validates the block, rejects unsupported combinations before anything is built, and hands the settings to the compression manager, which handles everything from there. Cold-page quantization is turned on with `algorithm: quantization_for_cold_page` and `quant: nvfp4`. TriAttention is turned on with `algorithm: triattention` plus its budget and calibration options. The same fields work in the Python API, in `trtllm-serve` YAML, and in `trtllm-bench`. The full option table is in the [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
+
+The cache manager and the attention backend are outside the framework. The compression manager is designed to adapt to any cache manager and any attention backend. It changes only the contents of KV pages, and it never owns pages, tiers, or the kernels that read them.
+
+Today the framework integrates with KVCacheManagerV2, the KV cache manager built around a flexible, hierarchical storage model. V2 can give different layers pools of different types and sizes, groups layers by their lifecycle, and coalesces buffers of the same size within each group, which keeps fragmentation low even for models that mix full-attention, sliding-window, and recurrent layers. It also manages the host and disk tiers and the migration of pages between them, and it exposes a clean Python API for per-layer buffer configuration. These properties are what make cross-request compression possible. The compression manager binds to V2 once V2 is built, and the cold-page codec plugs into V2's page migration path, so V2 keeps ownership of pools, mappings, and migration while the codec decides how a page is stored off the GPU.
 
 ### KV Cache Compression in the Executor Iteration Loop
 
@@ -193,23 +202,15 @@ The hooks ride on the executor's existing request cycle, and the framework wires
 
 This path is the cross-request hook of the framework. It serves the stages outside a single request: the tool-call stage (stage 4), when a request pauses and its KV waits for the tool to return, and the after-request stage (stage 5), when a request has finished and its KV is kept for reuse, transferred to another worker, or offloaded to host or disk memory.
 
-In TensorRT LLM this whole period is managed by the KV cache manager. It decides which pages stay on the GPU, which move to host or disk memory, which are reused by a later request, and which are transferred to another worker. The cache manager itself does no compression. To compress KV in this period, the framework injects its compression management into the cache manager at the points where KV can be compressed: when pages are offloaded and onboarded, when they are transferred, and when a request ends. At each of these points a method's Python code and kernels can be plugged in, and the cache manager keeps working as before.
+This whole period belongs to KVCacheManagerV2, introduced above. V2 decides which pages stay on the GPU, move to host or disk memory, are reused by a later request, or are transferred to another worker, and it does no compression itself. The framework therefore injects its compression management into V2 at the points where KV can be compressed: when pages are offloaded and onboarded, when they are transferred, and when a request ends. At each of these points a method's Python code and kernels can be plugged in, and V2 keeps working as before.
 
-Today we cover the offloading part of the after-request stage (stage 5) with **NVFP4 cold-page quantization**, enabled by `quantization_for_cold_page` with `quant: nvfp4`. It is a good example of how the framework interacts with the cache manager. The cache manager's storage path exposes two hook points, one when a page leaves the GPU and one when it returns. A codec plugged into these points encodes the page on the way out and decodes it on the way back, and the cache manager never sees the difference. How this works in detail, and how the NVFP4 codec is built, is described in the NVFP4 cold-page quantization section below and in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md).
+Today we cover the offloading part of the after-request stage (stage 5) with **NVFP4 cold-page quantization**, enabled by `quantization_for_cold_page` with `quant: nvfp4`. It is a good example of how the framework interacts with V2. The storage path of V2 exposes two hook points, one when a page leaves the GPU and one when it returns. A codec plugged into these points encodes the page on the way out and decodes it on the way back, and the cache manager never sees the difference. How this works in detail, and how the NVFP4 codec is built, is described in the NVFP4 cold-page quantization section below and in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md).
 
 The tool-call stage (stage 4) and the rest of the after-request stage (stage 5), such as KV transfer, will be reached by extending this path.
 
 ### Covering the Other Stages
 
 Together, the two paths cover the decode stage (stage 3) and one part of the after-request stage (stage 5), which is what the two shipped methods need. The base class keeps the ability to define more hooks, so every stage that offers a compression opportunity can be reached the same way. How those hooks look is future work, and we will extend the framework as new methods need them.
-
-### Configuration and Integration with the Cache Manager
-
-Configuration is deliberately small. One block, `kv_cache_compression_config`, collects only the settings that belong to compression: which method to run and that method's own options. A factory validates the block, rejects unsupported combinations before anything is built, and hands the settings to the compression manager, which handles everything from there. Cold-page quantization is turned on with `algorithm: quantization_for_cold_page` and `quant: nvfp4`. TriAttention is turned on with `algorithm: triattention` plus its budget and calibration options. The same fields work in the Python API, in `trtllm-serve` YAML, and in `trtllm-bench`. The full option table is in the [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
-
-The cache manager and the attention backend are outside the framework. The compression manager is designed to adapt to any cache manager and any attention backend. It changes only the contents of KV pages, and it never owns pages, tiers, or the kernels that read them.
-
-Today the framework integrates with KVCacheManagerV2, the KV cache manager built around a flexible, hierarchical storage model. V2 can give different layers pools of different types and sizes, groups layers by their lifecycle, and coalesces buffers of the same size within each group, which keeps fragmentation low even for models that mix full-attention, sliding-window, and recurrent layers. It also manages the host and disk tiers and the migration of pages between them, and it exposes a clean Python API for per-layer buffer configuration. These properties are what make cross-request compression possible. The compression manager binds to V2 once V2 is built, and the cold-page codec plugs into V2's page migration path, so V2 keeps ownership of pools, mappings, and migration while the codec decides how a page is stored off the GPU.
 
 ## Algorithm Implementations
 
