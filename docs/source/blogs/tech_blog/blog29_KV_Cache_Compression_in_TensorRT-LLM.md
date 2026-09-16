@@ -123,15 +123,15 @@ TensorRT LLM provides a general framework for KV cache compression, built around
 
 ### Design Philosophy
 
+The design starts from one observation. Compression does not need to live inside the model or the attention kernel. It only needs to run at the right moment, on the KV that is already there. So the runtime pauses at a well-defined point, hands the KV cache to the compression method, and continues once the method returns. Compression is extra work inserted at the right points of the runtime, and the whole serving system benefits from the smaller cache.
+
+Three principles follow from this.
+
+- **Attention stays untouched.** Sparse attention changes how the attention kernel reads the cache. KV cache compression never does. Attention always reads the normal GPU representation, and a compressed page is restored before anything reads it.
+- **Insertion is seamless.** A method plugs into the runtime without changes to the scheduler, the executor loop, or the model. It only changes the contents of KV pages. The cache manager keeps control of memory: it allocates pages, moves them between tiers, and reuses them.
+- **Insertion points are well defined.** They follow the life of a request and of the server, the five stages of Figure 3: after each prefill chunk, right after prefill, between decode steps, around a tool call, and after the request. We call these points hooks, but the idea is simply a place in the runtime where a compression algorithm can be inserted and run to completion.
+
 A compression method is selected with one configuration block, `kv_cache_compression_config`. It is kept separate from the KV cache configuration, which sets capacity, memory tiers, block reuse, and the active KV data type. It is also separate from the sparse attention configuration, which controls how attention computes. One method can be active per LLM instance. A method must handle every cache layout it is given, or pass the parts it does not understand through unchanged.
-
-Every method in this framework follows the same three moves:
-
-- **Observe** the KV cache at a moment when nothing is reading it: after a forward step, or when the cache manager is about to move a page to another tier.
-- **Transform** it: drop tokens and compact the remaining ones, or re-encode a page into a smaller representation.
-- **Hand it back**: report the new cache length, or return the encoded bytes to the cache manager so that the next reader sees a valid page.
-
-The framework turns this pattern into two contracts. Methods that act between forward steps implement the hooks listed below. Methods that act when pages leave or return to the GPU implement a page encoder and decoder. Two rules hold for both. First, compression stays outside the attention kernel. Attention always reads the normal GPU representation and never sees the compressed form. Second, the cache manager stays in charge of pages. It allocates them, moves them between tiers, reuses them, and orders the copies. A method decides what to transform and how. It never decides where bytes live.
 
 ### Architecture Overview
 
