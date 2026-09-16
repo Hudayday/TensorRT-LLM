@@ -44,22 +44,22 @@
 <text x="582.0" y="129.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="end">80</text>
 <line x1="590" y1="78.0" x2="950" y2="78.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
 <text x="582.0" y="81.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="end">90</text>
-<path d="M650.0,151.2 L770.0,161.1 L890.0,161.1" fill="none" stroke="#eb6c36" stroke-width="1.5"/>
-<circle cx="650.0" cy="151.2" r="4" fill="#ffffff" stroke="#eb6c36" stroke-width="1.5"/>
-<text x="650.0" y="141.2" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#eb6c36" text-anchor="middle">74.58</text>
-<circle cx="770.0" cy="161.1" r="4" fill="#ffffff" stroke="#eb6c36" stroke-width="1.5"/>
-<text x="770.0" y="151.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#eb6c36" text-anchor="middle">72.50</text>
-<circle cx="890.0" cy="161.1" r="4" fill="#ffffff" stroke="#eb6c36" stroke-width="1.5"/>
-<text x="890.0" y="151.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#eb6c36" text-anchor="middle">72.50</text>
-<text x="902.0" y="164.6" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#eb6c36" text-anchor="start">AIME24</text>
-<path d="M650.0,182.9 L770.0,190.8 L890.0,190.8" fill="none" stroke="#2d3142" stroke-width="1.5"/>
-<circle cx="650.0" cy="182.9" r="4" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
-<text x="650.0" y="200.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">67.92</text>
-<circle cx="770.0" cy="190.8" r="4" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
-<text x="770.0" y="208.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">66.25</text>
-<circle cx="890.0" cy="190.8" r="4" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
-<text x="890.0" y="208.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">66.25</text>
-<text x="902.0" y="194.3" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="start">AIME25</text>
+<rect x="613.0" y="151.2" width="34" height="116.8" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<text x="630.0" y="145.2" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">74.58</text>
+<rect x="653.0" y="182.9" width="34" height="85.1" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="670.0" y="176.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">67.92</text>
+<rect x="733.0" y="161.1" width="34" height="106.9" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<text x="750.0" y="155.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">72.50</text>
+<rect x="773.0" y="190.8" width="34" height="77.2" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="790.0" y="184.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">66.25</text>
+<rect x="853.0" y="161.1" width="34" height="106.9" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<text x="870.0" y="155.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">72.50</text>
+<rect x="893.0" y="190.8" width="34" height="77.2" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="910.0" y="184.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">66.25</text>
+<rect x="780" y="84" width="12" height="12" fill="rgba(235,108,54,0.08)" stroke="#eb6c36"/>
+<text x="798.0" y="94.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">AIME24</text>
+<rect x="860" y="84" width="12" height="12" fill="#ffffff" stroke="#2d3142"/>
+<text x="878.0" y="94.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">AIME25</text>
 <text x="650.0" y="286.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">r0</text>
 <text x="770.0" y="286.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">r1</text>
 <text x="890.0" y="286.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">r2</text>
