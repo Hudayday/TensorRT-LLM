@@ -1,47 +1,48 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 948 300" width="948" height="300">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 372" width="1000" height="372">
 <defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
-<rect x="0" y="0" width="948" height="300" fill="#f5f5f5"/>
-<path d="M186,70 L266,70" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="226" y="53" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">builds the</text>
-<text x="226" y="63" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">manager</text>
-<path d="M434,70 L514,70" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="474" y="53" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">inherited</text>
-<text x="474" y="63" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">by</text>
-<path d="M682,70 L762,70" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="722" y="63" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">launches</text>
-<path d="M380,110 L380,190" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="388" y="148" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="start">insertion point:</text>
-<text x="388" y="158" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="start">page offload and onboard</text>
-<path d="M320,110 L320,150 Q320,156 314,156 L108,156 Q102,156 102,162 L102,190" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<text x="211" y="149" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="400" fill="#4f5d75" text-anchor="middle">insertion point: after each decode step</text>
-<rect x="20" y="32" width="164" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
-<text x="28" y="48" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">OURS · CONFIG</text>
-<text x="28" y="65" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Compression config</text>
-<text x="28" y="80" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">and factory</text>
-<text x="28" y="98" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">one config block</text>
-<rect x="268" y="32" width="164" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
-<text x="276" y="48" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">OURS · BASE CLASS</text>
-<text x="276" y="65" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Compression</text>
-<text x="276" y="80" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">manager base</text>
-<text x="276" y="98" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">defines insertion points</text>
-<rect x="516" y="32" width="164" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
-<text x="524" y="48" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">OURS · METHOD</text>
-<text x="524" y="65" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Concrete method</text>
-<text x="524" y="80" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">manager</text>
-<text x="524" y="98" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">TriAttention, NVFP4</text>
-<rect x="764" y="32" width="164" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
-<text x="772" y="48" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">OURS · KERNELS</text>
-<text x="772" y="65" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Method-specific</text>
-<text x="772" y="80" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">kernels</text>
-<text x="772" y="98" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">compress, decompress</text>
-<rect x="20" y="192" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="28" y="208" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">SYSTEM · EXECUTOR</text>
-<text x="28" y="225" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Executor</text>
-<text x="28" y="240" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">iteration loop</text>
-<text x="28" y="258" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">prefill and decode steps</text>
-<rect x="268" y="192" width="164" height="76" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="276" y="208" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" fill="#7a8399" text-anchor="start" letter-spacing="1.4">SYSTEM · CACHE MANAGER</text>
-<text x="276" y="225" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">KV cache</text>
-<text x="276" y="240" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">manager</text>
-<text x="276" y="258" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="400" fill="#4f5d75" text-anchor="start">offload and onboard pages</text>
+<rect width="1000" height="372" fill="#f5f5f5"/>
+<rect x="150" y="16" width="200" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.25"/>
+<text x="162" y="32" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">1 · OURS · CONFIG</text>
+<text x="162" y="49" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Compression config</text>
+<text x="162" y="64" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">and factory</text>
+<text x="162" y="82" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">one config block</text>
+<rect x="400" y="16" width="200" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.25"/>
+<text x="412" y="32" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">2 · OURS · BASE CLASS</text>
+<text x="412" y="49" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Compression</text>
+<text x="412" y="64" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">manager base</text>
+<text x="412" y="82" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">defines insertion points</text>
+<rect x="100" y="148" width="300" height="76" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="112" y="164" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">SYSTEM · EXECUTOR</text>
+<text x="112" y="181" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Executor</text>
+<text x="112" y="196" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">iteration loop</text>
+<text x="112" y="214" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#eb6c36" text-anchor="start">compression between forward steps</text>
+<rect x="600" y="148" width="300" height="76" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="612" y="164" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">SYSTEM · CACHE MANAGER</text>
+<text x="612" y="181" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">KV cache</text>
+<text x="612" y="196" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">manager</text>
+<text x="612" y="214" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#eb6c36" text-anchor="start">compression when offloading and onboarding</text>
+<rect x="400" y="280" width="200" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.25"/>
+<text x="412" y="296" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">3 · OURS · METHOD</text>
+<text x="412" y="313" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Concrete method</text>
+<text x="412" y="328" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">manager</text>
+<text x="412" y="346" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">inherits the base</text>
+<rect x="680" y="280" width="200" height="76" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.25"/>
+<text x="692" y="296" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">4 · OURS · KERNELS</text>
+<text x="692" y="313" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Method-specific</text>
+<text x="692" y="328" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">kernels</text>
+<text x="692" y="346" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">compress, decompress</text>
+<path d="M352,54.0 L398,54.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="375" y="47.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" fill="#4f5d75" text-anchor="middle">builds</text>
+<path d="M470,94 L470,120 L230,120 L230,146" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="350.0" y="114" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" fill="#4f5d75" text-anchor="middle">2 · inserts the hook</text>
+<path d="M530,94 L530,120 L770,120 L770,146" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="650.0" y="114" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" fill="#4f5d75" text-anchor="middle">2 · inserts the hook</text>
+<path d="M500,94 L500,278" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#ah)"/>
+<text x="508" y="189.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" fill="#4f5d75" text-anchor="start">3 · inherits</text>
+<path d="M470,278 L470,252 L270,252 L270,226" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="370.0" y="264" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" fill="#4f5d75" text-anchor="middle">3 · TriAttention runs here</text>
+<path d="M530,278 L530,252 L730,252 L730,226" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="630.0" y="264" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" fill="#4f5d75" text-anchor="middle">3 · cold-page compression runs here</text>
+<path d="M602,318.0 L678,318.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="640" y="311.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" fill="#4f5d75" text-anchor="middle">4 · launches</text>
 </svg>

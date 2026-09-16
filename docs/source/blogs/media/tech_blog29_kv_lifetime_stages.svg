@@ -1,15 +1,17 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 968 132" width="968" height="132">
 <defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
 <rect x="0" y="0" width="968" height="132" fill="#f5f5f5"/>
-<rect x="24" y="24" width="160" height="84" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="36" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399">STAGE 1</text>
+<rect x="24" y="24" width="160" height="84" rx="6" fill="#f5f5f5" stroke="#eb6c36" stroke-width="1" stroke-dasharray="5,4"/>
+<text x="36" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#eb6c36">STAGE 1</text>
 <text x="36" y="62" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">After each</text>
 <text x="36" y="79" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">prefill chunk</text>
+<text x="36" y="97" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#eb6c36">TODO</text>
 <line x1="186" y1="66.0" x2="212" y2="66.0" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<rect x="214" y="24" width="160" height="84" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="226" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399">STAGE 2</text>
+<rect x="214" y="24" width="160" height="84" rx="6" fill="#f5f5f5" stroke="#eb6c36" stroke-width="1" stroke-dasharray="5,4"/>
+<text x="226" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#eb6c36">STAGE 2</text>
 <text x="226" y="62" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">Right after</text>
 <text x="226" y="79" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">prefill</text>
+<text x="226" y="97" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#eb6c36">TODO</text>
 <line x1="376" y1="66.0" x2="402" y2="66.0" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
 <rect x="404" y="24" width="160" height="84" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.25"/>
 <text x="416" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#eb6c36">STAGE 3</text>
@@ -17,10 +19,11 @@
 <text x="416" y="79" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">decode steps</text>
 <text x="416" y="97" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#eb6c36">TriAttention</text>
 <line x1="566" y1="66.0" x2="592" y2="66.0" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
-<rect x="594" y="24" width="160" height="84" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-width="1"/>
-<text x="606" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#7a8399">STAGE 4</text>
+<rect x="594" y="24" width="160" height="84" rx="6" fill="#f5f5f5" stroke="#eb6c36" stroke-width="1" stroke-dasharray="5,4"/>
+<text x="606" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#eb6c36">STAGE 4</text>
 <text x="606" y="62" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">Around</text>
 <text x="606" y="79" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">a tool call</text>
+<text x="606" y="97" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#eb6c36">TODO</text>
 <line x1="756" y1="66.0" x2="782" y2="66.0" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
 <rect x="784" y="24" width="160" height="84" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.25"/>
 <text x="796" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#eb6c36">STAGE 5</text>

@@ -6,8 +6,8 @@
 - [KV Cache Compression Framework Design](#kv-cache-compression-framework-design)
   - [Design Philosophy](#design-philosophy)
   - [Architecture Overview](#architecture-overview)
-  - [Hooks Between Forward Steps](#hooks-between-forward-steps)
-  - [Encoding Pages That Leave the GPU: The Cold-Page Codec Contract](#encoding-pages-that-leave-the-gpu-the-cold-page-codec-contract)
+  - [KV Cache Compression Between Forward Steps](#kv-cache-compression-between-forward-steps)
+  - [KV Cache Compression When Offloading and Onboarding](#kv-cache-compression-when-offloading-and-onboarding)
   - [Configuration and Ownership](#configuration-and-ownership)
 - [Algorithm Implementations](#algorithm-implementations)
   - [NVFP4 Cold-Page Quantization](#nvfp4-cold-page-quantization)
@@ -79,11 +79,11 @@ In detail, we define five stages in the life of a KV cache, shown in Figure 3. E
   <img src="../media/tech_blog29_kv_lifetime_stages.svg" width="900">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 3: Five stages in the life of a KV cache where compression can run. TriAttention acts at stage 3 and cold-page compression at stage 5.</em></sub></p>
+<p align="center"><sub><em>Figure 3: Five stages in the life of a KV cache where compression can run. TriAttention acts at stage 3 and cold-page compression at stage 5. The dashed stages are in scope and have no method yet.</em></sub></p>
 
 Working in stages has two benefits. A method picks only the stages it needs, and a stage works the same way for every model.
 
-We defined the stages this way so that the framework needs one small contract per kind of stage and nothing more. Stages inside a request are reached through hooks between forward steps. Stages where pages move between memory tiers are reached through a page encoder and decoder.
+We defined the stages this way so that the framework needs one small contract per kind of stage and nothing more. Stages inside a request are reached by compression between forward steps. Stages where pages move between memory tiers are reached by compression when offloading and onboarding.
 
 In both cases the cache manager keeps full ownership of pages. It allocates them, moves them between tiers, and reuses them. A compression method only changes their contents.
 
@@ -152,11 +152,11 @@ The executor and the KV cache manager are existing components of TensorRT LLM. T
   <img src="../media/tech_blog29_framework.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 4: The KV cache compression framework. The highlighted parts are ours: the compression config and factory, the compression manager base that defines the insertion points, the concrete method that inherits it, and the method's own kernels. The executor and the KV cache manager are existing system components that the base hooks into.</em></sub></p>
+<p align="center"><sub><em>Figure 4: The KV cache compression framework and its execution order. The config builds the manager (1). The manager base inserts a hook into the executor and one into the KV cache manager (2). The concrete method inherits the base and runs inside those hooks (3), launching its own kernels (4). Highlighted boxes are ours; white boxes are existing system components.</em></sub></p>
 
-In Figure 4, the executor path runs after the cache manager has updated its state at each step. The page path is set up before the cache manager is built, because the cache manager needs the compressed page size to lay out its host and disk tiers. A method may use either path or both, but the two stay separate.
+In Figure 4, compression between forward steps runs after the cache manager has updated its state at each step. Compression when offloading and onboarding is set up before the cache manager is built, because the cache manager needs the compressed page size to lay out its host and disk tiers. A method may use either path or both, but the two stay separate.
 
-### Hooks Between Forward Steps
+### KV Cache Compression Between Forward Steps
 
 This path serves stage 3 of Figure 3, between decode steps. While a prefill or decode step runs, attention reads a fixed view of the KV cache. Between two steps that view can change, and that is where the hooks fire. A method overrides only the hooks it needs. All of them do nothing by default.
 
@@ -176,7 +176,7 @@ This path serves stage 3 of Figure 3, between decode steps. While a prefill or d
 
 The hooks ride on the executor's existing request cycle, and the framework wires them up. Methods on this path change which tokens are kept or how they are arranged in the paged cache. Two obligations come with it. The policy that chooses tokens stays separate from the shared compaction kernel. And a method must finish its GPU work before it shrinks or frees any cache pages. TriAttention, described below, is the shipped example. It uses the generation-end hook and leaves scheduling, prefix reuse, and the attention kernel unchanged.
 
-### Encoding Pages That Leave the GPU
+### KV Cache Compression When Offloading and Onboarding
 
 This path serves stage 5 of Figure 3. It runs when the cache manager moves pages between tiers. On the way out, a GPU page is encoded as it is copied to host or disk memory. On the way back, the compressed page is decoded into the normal GPU representation before anything reads it. Figure 5 follows one page out and back with the NVFP4 codec described later. The cache manager steps are the same for any codec.
 
@@ -233,7 +233,7 @@ These figures are for attention KV. The recurrent-state buffers of hybrid models
 
 #### How It Works in TensorRT LLM
 
-Within TensorRT LLM, NVFP4 cold-page quantization is a compression manager that plugs into the page-codec path of the framework. Below we highlight the key design choices in layout, kernels, scales, and verification.
+Within TensorRT LLM, NVFP4 cold-page quantization is a compression manager that plugs into the offloading and onboarding path of the framework. Below we highlight the key design choices in layout, kernels, scales, and verification.
 
 **Layout policy.** Enabling `quantization_for_cold_page` with `quant: nvfp4` selects the manager, which is built before the cache manager because the cache manager needs the compressed page size to lay out its host and disk tiers. At start-up the manager receives the description of every GPU page buffer once and builds a layout table per layer group: for MHA, MQA, and GQA pages the K and V buffers become NVFP4 data plus block scales; for MLA pages the latent attention key is encoded; side buffers in the same page, such as the index buffer of a sparse-attention model, are appended as they are; and the recurrent-state buffers of hybrid models are routed to the default lossless path. For DeepSeek-V4, the part of the attention history without positional encoding is encoded as NVFP4 while the positional part and the remaining specialized state are kept losslessly in the same page. A GPU page may span several buffers in the normal KV type; the compressed page is one fixed-size block: the packed NVFP4 spans, then their E4M3 block scales, then the lossless spans, each 16-byte aligned.
 
@@ -253,7 +253,7 @@ The concrete implementation can be found in `tensorrt_llm/_torch/kv_cache_compre
 
 #### How It Works in TensorRT LLM
 
-TriAttention is a compression manager on the hook path that overrides the generation-end hook. Every `beta` confirmed generation tokens, once a sequence exceeds its budget, the manager scores the evictable generated tokens with CuTe DSL and Triton kernels, selects the `budget` tokens to keep according to `eviction_mode` (`union`, `per_head`, or `per_layer_perhead`), and compacts the paged KV cache in place with a native CUDA kernel. A speculative step may confirm several tokens at once; crossing more than one eviction period in one step is coalesced into one eviction. The calibration file (each head's mean and magnitude of the pre-RoPE query, produced by the official tool) is loaded and converted once when the manager is created. Figure 6 follows one eviction round from the hook to the compacted cache.
+TriAttention is a compression manager for compression between forward steps. It overrides the generation-end hook. Every `beta` confirmed generation tokens, once a sequence exceeds its budget, the manager scores the evictable generated tokens with CuTe DSL and Triton kernels, selects the `budget` tokens to keep according to `eviction_mode` (`union`, `per_head`, or `per_layer_perhead`), and compacts the paged KV cache in place with a native CUDA kernel. A speculative step may confirm several tokens at once; crossing more than one eviction period in one step is coalesced into one eviction. The calibration file (each head's mean and magnitude of the pre-RoPE query, produced by the official tool) is loaded and converted once when the manager is created. Figure 6 follows one eviction round from the hook to the compacted cache.
 
 <div align="center">
 <figure>
@@ -330,7 +330,7 @@ TensorRT LLM now has one KV cache compression framework and two methods built on
 
 - **Framework**: one configuration block, `kv_cache_compression_config`, selects a method and is checked for compatibility before anything is built. A method implements one of two small contracts: hooks that run between forward steps, or a page encoder and decoder that run when pages move between the GPU and the host or disk tiers. Attention kernels never see a compressed page, and the cache manager keeps ownership of pages, tiers, migration, and reuse. Compression is independent of the active KV data type and of sparse attention.
 - **NVFP4 cold-page quantization**: attention pages are stored as NVFP4 while they are in host or disk memory and restored to the model's normal KV data type before attention reads them. Encoding and decoding are fused into the copy itself, host and disk share one encoded form, and the recurrent state of hybrid models and side buffers such as an MLA index pass through losslessly in the same page. It covers MHA, MQA, GQA, MLA, and DeepSeek-V4 cache layouts and has been tested with the Qwen3, Qwen3.5, GLM, DeepSeek-R1, and DeepSeek-V4 families.
-- **TriAttention**: demonstrates the hook path by evicting generated tokens during decoding, with the model's standard attention kernel running over the compacted cache. It has been tested with the Qwen3, GPT-OSS, and Llama 3 families.
+- **TriAttention**: demonstrates compression between forward steps by evicting generated tokens during decoding, with the model's standard attention kernel running over the compacted cache. It has been tested with the Qwen3, GPT-OSS, and Llama 3 families.
 
 The framework and both methods are upstream in [PR #16957](https://github.com/NVIDIA/TensorRT-LLM/pull/16957) (TriAttention), [PR #17512](https://github.com/NVIDIA/TensorRT-LLM/pull/17512) (page encoder and decoder support in the cache manager), and [PR #18091](https://github.com/NVIDIA/TensorRT-LLM/pull/18091) (NVFP4 cold-page quantization). A new method needs one contract and its kernel, and no change to the attention kernels, the cache manager, or the serving loop.
 
@@ -340,4 +340,4 @@ The framework and both methods are upstream in [PR #16957](https://github.com/NV
 - **Native low-precision decode kernels.** No attention kernel today reads a 4-bit KV cache for the head sizes of the tested models, which is why the every-step NVFP4 setting in the Evaluation section is emulated. Native kernels would let an NVFP4 active cache and NVFP4 cold pages work together.
 - **Sizing guidance for the host tier.** The serving results above used one host tier size. A sweep over host tier sizes at the published InferenceX configurations, with the offload and onboard counters recorded, would show how much host memory a compressed cache actually needs.
 - **Disaggregated serving.** Cold-page compression covers the GPU-to-host and host-to-disk boundaries inside one worker today. Carrying the encoded page across the transfer from the prefill worker to the decode worker, and into the decode worker's host tier, is the natural next step.
-- **More hook-based methods and hybrid-model state.** The hooks are not tied to TriAttention, and we expect further eviction and context-compression methods to use them. We are also exploring compression for the recurrent state of hybrid models, which today passes through losslessly.
+- **More methods between forward steps and hybrid-model state.** The hooks are not tied to TriAttention, and we expect further eviction and context-compression methods to use them. We are also exploring compression for the recurrent state of hybrid models, which today passes through losslessly.
