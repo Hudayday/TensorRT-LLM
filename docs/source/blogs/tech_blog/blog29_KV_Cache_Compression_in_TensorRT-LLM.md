@@ -101,6 +101,8 @@ The two tables below summarize the current coverage.
 | **NVFP4 cold-page quantization** | Stage 5: when a page moves between the GPU and host or disk memory | How attention KV is stored while off the GPU | MHA / MQA / GQA; MLA; hybrid models (attention KV only) |
 | **TriAttention** | Stage 3: periodically between decode steps | Which KV tokens are kept | MHA / MQA / GQA |
 
+<p align="center"><sub><em>Table 1. The two methods built on the framework: the stage each one runs at, what it changes, and the attention types it supports.</em></sub></p>
+
 </div>
 
 <div align="center">
@@ -110,6 +112,8 @@ The two tables below summarize the current coverage.
 | **GPU (active KV)** | Unchanged (FP16 / BF16 / FP8) | Generated tokens evicted periodically; prompt kept |
 | **Host memory** | NVFP4 (4-bit values with FP8 block scales) | Not affected |
 | **Disk** | Same NVFP4 data as host memory, copied as is | Not affected |
+
+<p align="center"><sub><em>Table 2. What each method does to the KV cache in each memory tier.</em></sub></p>
 
 </div>
 
@@ -165,6 +169,8 @@ While a prefill or decode step runs, attention reads a fixed view of the KV cach
 | `on_generation_step_begin` | Before each decode step | Prepare a compression action for this step |
 | `on_generation_step_end` | After each decode step, once the cache has been updated | Compress the cache before the next step reads it |
 | `on_request_finish` | When a request completes or is aborted | Release per-request state |
+
+<p align="center"><sub><em>Table 3. The hooks between forward steps, when each one fires, and the work a method typically does there.</em></sub></p>
 
 </div>
 
@@ -271,6 +277,8 @@ We evaluate accuracy on AIME25 with 16 seeds per configuration, using each model
 | Qwen3.5-397B-A17B | AIME25 (16 seeds) | 90.0 | 90.0 | 90.2 |
 | Qwen3-8B | AIME25 (16 seeds) | 68.5 | 67.7 | 68.8 |
 
+<p align="center"><sub><em>Table 4. AIME25 accuracy (%) of the uncompressed baseline and of cold-page NVFP4 at medium and high pressure, mean over 16 seeds.</em></sub></p>
+
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_accuracy_aime25.svg" width="900">
@@ -297,6 +305,8 @@ Figure 8 shows the throughput-interactivity Pareto frontiers; curves further to 
 | ------------------------------- | -------------------------- | ------------------------ | ------------------------------------- | ------------------------ | ----------------- |
 | GLM-5.2 (MLA), 8-48 GB300 | AgentX 256k replay, 3600 s | +28.0% | +3.5% (54 configurations) | +1.7 pp median | -32.5% (50 configurations) |
 | Qwen3.5-397B-A17B, 3-60 GB300 | AgentX 256k replay, 3600 s | not reported (single-repeat points; see text) | +0.9% (131 configurations) | +0.3 pp median | -6.1% (131 configurations) |
+
+<p align="center"><sub><em>Table 5. Serving gains of the NVFP4 host cache over the uncompressed host cache on the AgentX 256k replay.</em></sub></p>
 
 The +28.0% for GLM-5.2 compares the best NVFP4 point (24 GB300) with the best uncompressed point anywhere on the grid (also 24 GB300, at a different concurrency); the same +28.0% holds for the best throughput at a P90 interactivity of at least 5 or 10 tokens/s/user, and +25.8% at 25 tokens/s/user. Across the 54 matched GLM-5.2 configurations the medians at the same configuration are +3.5% in throughput per GPU and -32.5% in TTFT p90 (over the 50 configurations with TTFT p90 in both settings), and 25 of 54 configurations gain more than 10%. For Qwen3.5-397B-A17B, the peak comparison (+6.0%, single-repeat points on 36 versus 28 GB300) and the best throughput at 10 tokens/s/user (+5.4%) sit at the edge of single-repeat noise, so we report them as observations; the medians over 131 matched configurations (+0.9% throughput per GPU, -6.1% TTFT p90) are the representative figures.
 
