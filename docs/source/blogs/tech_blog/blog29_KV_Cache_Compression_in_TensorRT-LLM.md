@@ -7,7 +7,7 @@
   - [Design Philosophy](#design-philosophy)
   - [Architecture Overview](#architecture-overview)
   - [KV Cache Compression in the Executor Iteration Loop](#kv-cache-compression-in-the-executor-iteration-loop)
-  - [KV Cache Compression When Offloading and Onboarding](#kv-cache-compression-when-offloading-and-onboarding)
+  - [KV Cache Compression in Cross-Request KV Management](#kv-cache-compression-in-cross-request-kv-management)
   - [Configuration and Ownership](#configuration-and-ownership)
 - [Algorithm Implementations](#algorithm-implementations)
   - [NVFP4 Cold-Page Quantization](#nvfp4-cold-page-quantization)
@@ -180,7 +180,7 @@ We currently define these five hooks. TriAttention uses the generation-end hook,
 
 The hooks ride on the executor's existing request cycle, and the framework wires them up. Methods on this path change which tokens are kept or how they are arranged in the paged cache. Two obligations come with it. The policy that chooses tokens stays separate from the shared compaction kernel. And a method must finish its GPU work before it shrinks or frees any cache pages. TriAttention, described below, leaves scheduling, prefix reuse, and the attention kernel unchanged.
 
-### KV Cache Compression When Offloading and Onboarding
+### KV Cache Compression in Cross-Request KV Management
 
 This path serves stage 5 of the KV cache compression opportunities. Today it covers one part of that stage: whole-page compression when a page leaves the GPU for host or disk memory, and decompression when it comes back. It runs when the cache manager moves pages between tiers. On the way out, a GPU page is encoded as it is copied to host or disk memory. On the way back, the compressed page is decoded into the normal GPU representation before anything reads it. Figure 5 follows one page out and back with the NVFP4 codec described later. The cache manager steps are the same for any codec.
 
@@ -237,7 +237,7 @@ These figures are for attention KV. The recurrent-state buffers of hybrid models
 
 #### How It Works in TensorRT LLM
 
-Within TensorRT LLM, NVFP4 cold-page quantization is a compression manager that plugs into the offloading and onboarding path of the framework. Below we highlight the key design choices in layout, kernels, scales, and verification.
+Within TensorRT LLM, NVFP4 cold-page quantization is a compression manager that plugs into the cross-request KV management path of the framework. Below we highlight the key design choices in layout, kernels, scales, and verification.
 
 **Layout policy.** Enabling `quantization_for_cold_page` with `quant: nvfp4` selects the manager, which is built before the cache manager because the cache manager needs the compressed page size to lay out its host and disk tiers. At start-up the manager receives the description of every GPU page buffer once and builds a layout table per layer group: for MHA, MQA, and GQA pages the K and V buffers become NVFP4 data plus block scales; for MLA pages the latent attention key is encoded; side buffers in the same page, such as the index buffer of a sparse-attention model, are appended as they are; and the recurrent-state buffers of hybrid models are routed to the default lossless path. For DeepSeek-V4, the part of the attention history without positional encoding is encoded as NVFP4 while the positional part and the remaining specialized state are kept losslessly in the same page. A GPU page may span several buffers in the normal KV type; the compressed page is one fixed-size block: the packed NVFP4 spans, then their E4M3 block scales, then the lossless spans, each 16-byte aligned.
 
