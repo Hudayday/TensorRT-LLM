@@ -59,14 +59,16 @@ In the following sections, we first provide an overview of the KV cache compress
 
 ## Overview of KV Cache Compression in TensorRT LLM
 
-Figure 2 shows where KV cache compression sits in TensorRT LLM. It is one of three ways to cut memory and compute, next to quantization and sparse attention. It works on the KV pages that the cache manager owns.
+KV cache compression, as used in this blog, means shrinking the KV cache at any point in a workflow, however complex the workflow is. The goal is to cut KV cache pressure while keeping the information in the cache accurate.
+
+Figure 2 shows where this sits in TensorRT LLM. It is one of three ways to cut memory and compute, next to quantization and sparse attention. It works on the KV pages that the cache manager owns.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_trtllm_stack.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 2: The TensorRT LLM stack. KV cache compression is a compression-layer feature alongside quantization and sparse attention. It changes what is stored in the KV cache and touches neither the kernels below nor the serving layers above.</em></sub></p>
+<p align="center"><sub><em>Figure 2: The TensorRT LLM stack. KV cache compression sits in the compression layer next to quantization and sparse attention. It changes what is stored in the KV cache and touches neither the kernels below nor the serving layers above.</em></sub></p>
 
 KV cache compression methods differ in three ways. Some run between forward steps, others run when a page moves between memory tiers. Some drop tokens, others store the kept values in fewer bytes. And each one supports its own set of cache layouts, from standard attention pages to MLA and hybrid models.
 
