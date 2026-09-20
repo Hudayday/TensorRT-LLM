@@ -10,9 +10,9 @@
 <text x="330.0" y="74.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">1 pool per layer group · read directly by attention</text>
 <text x="20.0" y="146.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">NVFP4 active KV cache on the GPU</text>
 <text x="20.0" y="166.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">4-bit data + 8-bit block scale per 16 values</text>
-<rect x="330.0" y="132" width="80.0" height="30" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="330.0" y="132" width="80.0" height="30" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="370.0" y="150.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#2d3142" text-anchor="middle">K · NVFP4</text>
-<rect x="410.0" y="132" width="80.0" height="30" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="410.0" y="132" width="80.0" height="30" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="450.0" y="150.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#2d3142" text-anchor="middle">V · NVFP4</text>
 <rect x="514.0" y="132" width="10.0" height="30" fill="#e4e5e7" stroke="#bfc0c0" stroke-width="1"/>
 <rect x="524.0" y="132" width="10.0" height="30" fill="#e4e5e7" stroke="#bfc0c0" stroke-width="1"/>
@@ -20,9 +20,9 @@
 <text x="330.0" y="192.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">same bytes as below, but 2 pools, data and block scales · attention reads both</text>
 <text x="20.0" y="254.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">NVFP4 cold page off the GPU (ours)</text>
 <text x="20.0" y="274.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">4.5 bits per value · one fixed-size block</text>
-<rect x="330.0" y="240" width="80.0" height="30" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="330.0" y="240" width="80.0" height="30" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="370.0" y="258.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#2d3142" text-anchor="middle">K · NVFP4</text>
-<rect x="410.0" y="240" width="80.0" height="30" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="410.0" y="240" width="80.0" height="30" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="450.0" y="258.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#2d3142" text-anchor="middle">V · NVFP4</text>
 <rect x="490.0" y="240" width="10.0" height="30" fill="#e4e5e7" stroke="#bfc0c0" stroke-width="1"/>
 <rect x="500.0" y="240" width="10.0" height="30" fill="#e4e5e7" stroke="#bfc0c0" stroke-width="1"/>

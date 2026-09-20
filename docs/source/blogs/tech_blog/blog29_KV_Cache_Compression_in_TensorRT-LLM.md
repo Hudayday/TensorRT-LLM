@@ -388,10 +388,9 @@ The KV cache compression framework, NVFP4 cold-page compression, and TriAttentio
 
 ### Future Work
 
-- **Lower-bit cold-page formats.** The page contract fixes only the compressed page size, so lower-bit formats and other codecs can be added as new cold-page codecs without changes to the cache manager.
-- **Cross-request compression.** Different requests often carry similar KV, for example the same system prompt or the same tool outputs. Keeping one copy of such KV for several requests is a natural next use of the cross-request hooks.
-- **Disaggregated serving.** Cold-page compression covers the GPU-to-host and host-to-disk boundaries inside one worker today. Carrying the encoded page from the prefill worker to the decode worker, and into its host tier, is the next step.
-- **More methods and hybrid-model state.** The hooks in the executor iteration loop are not tied to TriAttention, and the recurrent state of hybrid models, which today passes through losslessly, is the next target for compression.
+- **Compression fusion.** Further reduce compression and decompression overhead.
+- **Higher compression ratios.** Improve storage efficiency while preserving model quality.
+- **More compression opportunities.** Explore broader uses of KV cache compression.
 
 ## References
 

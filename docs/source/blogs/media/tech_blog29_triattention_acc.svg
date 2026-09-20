@@ -16,23 +16,23 @@
 <text x="52.0" y="77.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">100</text>
 <line x1="60" y1="135.0" x2="460" y2="135.0" stroke="#2d3142" stroke-width="1" stroke-dasharray="5,3"/>
 <text x="66.0" y="130.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" fill="#2d3142" text-anchor="start">dense 67.9</text>
-<rect x="78.0" y="213.3" width="44" height="50.7" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="78.0" y="213.3" width="44" height="50.7" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="100.0" y="208.3" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" fill="#2d3142" text-anchor="middle">26.7</text>
 <text x="100.0" y="279.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">1k</text>
 <text x="100.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">31.5x</text>
-<rect x="158.0" y="175.3" width="44" height="88.7" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="158.0" y="175.3" width="44" height="88.7" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="180.0" y="170.3" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" fill="#2d3142" text-anchor="middle">46.7</text>
 <text x="180.0" y="279.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">2k</text>
 <text x="180.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">15.8x</text>
-<rect x="238.0" y="145.2" width="44" height="118.8" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="238.0" y="145.2" width="44" height="118.8" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="260.0" y="140.2" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" fill="#2d3142" text-anchor="middle">62.5</text>
 <text x="260.0" y="279.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">4k</text>
 <text x="260.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">7.9x</text>
-<rect x="318.0" y="140.5" width="44" height="123.5" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="318.0" y="140.5" width="44" height="123.5" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="340.0" y="135.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" fill="#2d3142" text-anchor="middle">65.0</text>
 <text x="340.0" y="279.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">8k</text>
 <text x="340.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">3.9x</text>
-<rect x="398.0" y="134.2" width="44" height="129.8" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="398.0" y="134.2" width="44" height="129.8" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="420.0" y="129.2" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" fill="#2d3142" text-anchor="middle">68.3</text>
 <text x="420.0" y="279.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">16k</text>
 <text x="420.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">2.0x</text>
@@ -50,23 +50,23 @@
 <text x="532.0" y="77.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">100</text>
 <line x1="540" y1="110.5" x2="940" y2="110.5" stroke="#2d3142" stroke-width="1" stroke-dasharray="5,3"/>
 <text x="546.0" y="105.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" fill="#2d3142" text-anchor="start">dense 80.8</text>
-<rect x="558.0" y="181.7" width="44" height="82.3" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="558.0" y="181.7" width="44" height="82.3" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="580.0" y="176.7" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" fill="#2d3142" text-anchor="middle">43.3</text>
 <text x="580.0" y="279.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">1k</text>
 <text x="580.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">7.2x</text>
-<rect x="638.0" y="135.8" width="44" height="128.2" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="638.0" y="135.8" width="44" height="128.2" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="660.0" y="130.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" fill="#2d3142" text-anchor="middle">67.5</text>
 <text x="660.0" y="279.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">2k</text>
 <text x="660.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">3.6x</text>
-<rect x="718.0" y="120.0" width="44" height="144.0" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="718.0" y="120.0" width="44" height="144.0" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="740.0" y="115.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" fill="#2d3142" text-anchor="middle">75.8</text>
 <text x="740.0" y="279.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">4k</text>
 <text x="740.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">1.8x</text>
-<rect x="798.0" y="116.8" width="44" height="147.2" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="798.0" y="116.8" width="44" height="147.2" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="820.0" y="111.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" fill="#2d3142" text-anchor="middle">77.5</text>
 <text x="820.0" y="279.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">8k</text>
 <text x="820.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">0.9x</text>
-<rect x="878.0" y="110.5" width="44" height="153.5" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+<rect x="878.0" y="110.5" width="44" height="153.5" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="900.0" y="105.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" fill="#2d3142" text-anchor="middle">80.8</text>
 <text x="900.0" y="279.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">16k</text>
 <text x="900.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">0.4x</text>
