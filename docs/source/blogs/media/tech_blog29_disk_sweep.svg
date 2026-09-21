@@ -118,6 +118,5 @@
 <text x="68.0" y="59.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">uncompressed FP8 cold pages</text>
 <rect x="252" y="50" width="11" height="11" fill="rgba(118,185,0,0.08)" stroke="#76B900"/>
 <text x="268.0" y="59.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">NVFP4 cold pages</text>
-<text x="980.0" y="59.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">Qwen3.5-397B-A17B · GB300 · AgentX replay · host 128 GiB per rank · one run per cell</text>
-<text x="500.0" y="338.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">at every disk size the NVFP4 tier completes more requests, hits more often, and answers sooner</text>
+<text x="980.0" y="59.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">Qwen3.5-397B-A17B · 10 GB300 · C192</text>
 </svg>
