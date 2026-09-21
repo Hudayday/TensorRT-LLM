@@ -99,7 +99,7 @@ The two tables below summarize the current coverage.
 
 | Method | When It Runs | What It Changes | Supported Attention Types |
 | :--- | :--- | :--- | :--- |
-| **NVFP4 cold-page compression** | After-request stage (stage 5): when a page moves between the GPU and host or disk memory | How attention KV is stored while off the GPU | MHA / MQA / GQA; MLA; hybrid models (attention KV only) |
+| **NVFP4 cold-page compression** | After-request stage (stage 5): when a page moves between the GPU and host or disk memory | How attention KV is stored while off the GPU | multi-head, multi-query and grouped-query attention (MHA / MQA / GQA); multi-head latent attention (MLA); hybrid models (attention KV only) |
 | **TriAttention** | Decode stage (stage 3): periodically between decode steps | Which KV tokens are kept | MHA / MQA / GQA |
 
 <p align="center"><sub><em>Table 1. The two methods built on the framework: the stage each one runs at, what it changes, and the attention types it supports.</em></sub></p>
@@ -140,7 +140,7 @@ A compression method is selected with one configuration block, `kv_cache_compres
 
 ### Architecture Overview
 
-The framework has three well-defined parts that together form KV cache compression (KVCC) in TensorRT LLM.
+The framework has three well-defined parts that together form KV cache compression in TensorRT LLM.
 
 - **Compression config.** One configuration block collects everything the user asks for, validates it, and routes it to the concrete method. A factory then builds that method's manager before the model runs.
 - **Compression manager base.** This base class is the core of the framework: it defines where in the runtime compression is injected. For a method that works between decode steps, such as TriAttention, the base provides the ability to run after every decode step. For a method that works on pages leaving the GPU, such as cold-page compression, the base hooks into the KV cache manager and adds compression to offloading and onboarding. A concrete method inherits the base and is injected at the matching points automatically.
@@ -153,7 +153,7 @@ The executor and the KV cache manager are existing components of TensorRT LLM. T
   <img src="../media/tech_blog29_framework.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 4: The KV cache compression framework and its execution order. The config builds the manager (1). The manager base inserts a hook into the executor and one into the KV cache manager (2). The concrete method inherits the base and runs inside those hooks (3), launching its own kernels (4). Highlighted boxes are the KVCC parts; white boxes are existing system components, with the stages each one hosts today and in the future.</em></sub></p>
+<p align="center"><sub><em>Figure 4: The KV cache compression framework and its execution order. The config builds the manager (1). The manager base inserts a hook into the executor and one into the KV cache manager (2). The concrete method inherits the base and runs inside those hooks (3), launching its own kernels (4). Highlighted boxes are the framework parts; white boxes are existing system components, with the stages each one hosts today and in the future.</em></sub></p>
 
 Figure 4 introduces the whole framework and how it follows the lifetime of a KV cache. The framework interacts with different parts of the TensorRT LLM runtime so that compression can be injected at the five stages defined above. The executor iteration loop hosts the stages inside a request: the prefill-chunk, after-prefill, and decode stages (stages 1 to 3). The KV cache manager hosts the stages beyond a single request: the tool-call and after-request stages (stages 4 and 5), when the KV cache is kept and managed across requests.
 
@@ -252,7 +252,7 @@ The result is one cold page per hot page: a single fixed-size block that holds t
 
 **Decode, on the way back.** When a request needs a page again, the cache manager onboards it and the codec launches `invokeNvfp4ColdPageDecode`, the fused counterpart that dequantizes the page and writes it in its original data type into the GPU pool before attention reads it. One launcher covers every layout, because the layout table drives the kernel. Target and draft caches are both covered, so speculative decoding works with the codec enabled.
 
-**Kernel optimizations.** The point of fusing compression into the transfer is that the encode must not be slower than the plain copy it replaces. The kernels are therefore shaped like the cache manager's own mapped-host copy kernel, with the same CTA count and split policy, so compression rides the same bandwidth as a plain copy. Each CTA works on bounded tiles that always hold complete 16-value scale groups. It streams the GPU page in with a multi-stage 16-byte `cp.async` ring, four stages for GPU-resident input and eight for the slower mapped-host reads on the decode side, quantizes in shared memory with the packed values and scales staged together, and stores the result with 128-bit vector stores straight into the mapped host slot, so the store is the transfer. One launch covers up to 256 buffers and a whole batch of pages, and buffers marked lossless take a byte-exact vectorized copy in the same launch.
+**Kernel optimizations.** The point of fusing compression into the transfer is that the encode must not be slower than the plain copy it replaces. The kernels are therefore shaped like the cache manager's own mapped-host copy kernel, with the same thread-block (CTA) count and split policy, so compression rides the same bandwidth as a plain copy. Each CTA works on bounded tiles that always hold complete 16-value scale groups. It streams the GPU page in with a multi-stage 16-byte `cp.async` ring, four stages for GPU-resident input and eight for the slower mapped-host reads on the decode side, quantizes in shared memory with the packed values and scales staged together, and stores the result with 128-bit vector stores straight into the mapped host slot, so the store is the transfer. One launch covers up to 256 buffers and a whole batch of pages, and buffers marked lossless take a byte-exact vectorized copy in the same launch.
 
 <div align="center">
 <figure>
@@ -316,7 +316,7 @@ The compression ratio follows from the format. Packed NVFP4 data plus one 8-bit 
 
 The serving effect of a smaller cold page is more capacity in the host and disk tiers, and therefore a higher prefix-cache hit rate when the working set does not fit. We show it in three settings, from a well-provisioned published configuration to a deliberately GPU-limited one.
 
-**A published configuration.** Figure 11 shows GLM-5.2 at a published InferenceX configuration on 32 GB300s. The uncompressed host tier already hits 96.2% of the trace ceiling, so throughput is neutral. NVFP4 buys latency: P90 interactivity rises and TTFT falls.
+**A published configuration.** Figure 11 shows GLM-5.2 at a published InferenceX configuration on 32 GB300s. The uncompressed host tier already reads 96.2% of the prefixes, close to the 97.2% the trace allows, so throughput is neutral. NVFP4 buys latency: P90 interactivity (output tokens per second per user) rises and the P90 time to first token (TTFT) falls.
 
 <div align="center">
 <figure>
@@ -334,7 +334,7 @@ The serving effect of a smaller cold page is more capacity in the host and disk 
 </div>
 <p align="center"><sub><em>Figure 12: GLM-5.2 · 24 GB300s · concurrency 288 · AgentX replay. NVFP4 lifts the cache-read hit rate from 90.2% to 95.5% and improves every serving metric.</em></sub></p>
 
-**A GPU-limited deployment.** The third setting is a resource-constrained configuration: Qwen3.5-397B-A17B served on ten GB300s (one prefill worker at TP2/EP2, one generation worker at TP8/EP8) at concurrency 192. With the host tier alone the uncompressed setting reads only 57% of prefixes. Figure 13 grows the disk tier from 0 to 1,024 GiB. NVFP4 hits more, completes more, and answers sooner at every disk size. The gain peaks at 512 GiB: 64% more requests completed and 48% sooner.
+**A GPU-limited deployment.** The third setting is a resource-constrained configuration: Qwen3.5-397B-A17B served on ten GB300s (prefill on 2 GPUs, generation on 8 GPUs) at concurrency 192. With the host tier alone the uncompressed setting reads only 57% of prefixes. Figure 13 grows the disk tier from 0 to 1,024 GiB. NVFP4 hits more, completes more, and answers sooner at every disk size. The gain peaks at 512 GiB: 64% more requests completed and 48% sooner.
 
 <div align="center">
 <figure>

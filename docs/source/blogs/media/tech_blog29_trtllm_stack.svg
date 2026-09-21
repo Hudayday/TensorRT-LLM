@@ -36,8 +36,8 @@
 <text x="230.0" y="275" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">FP8, NVFP4, INT4</text>
 <rect x="457.3" y="238" width="223.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
 <text x="465.3" y="259" font-size="12.5" font-weight="600" fill="#2d3142">Sparse Attention</text>
-<text x="465.3" y="272" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">DSA: DeepSeek-V3.2, GLM-5</text>
-<text x="465.3" y="283" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">CSA: DeepSeek-V4</text>
+<text x="465.3" y="272" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">DeepSeek-V3.2, GLM-5.2</text>
+<text x="465.3" y="283" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">DeepSeek-V4</text>
 <rect x="692.7" y="238" width="223.3" height="50" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
 <text x="700.7" y="259" font-size="12.5" font-weight="600" fill="#2d3142">KV Cache Compression</text>
 <text x="700.7" y="275" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#76B900">cold-page compression, TriAttention</text>

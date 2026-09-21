@@ -33,5 +33,5 @@
 <text x="841.0" y="132.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">96.2</text>
 <rect x="883.0" y="137.8" width="52" height="142.2" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="909.0" y="131.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">96.4</text>
-<text x="875.0" y="298.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">+0.2 pp</text>
+<text x="875.0" y="298.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">+0.2 points</text>
 </svg>
