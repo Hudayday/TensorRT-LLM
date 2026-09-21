@@ -206,7 +206,7 @@ This whole period belongs to KVCacheManagerV2, introduced above. V2 decides whic
 
 Today we cover the offloading part of the after-request stage (stage 5) with **NVFP4 cold-page compression**, enabled by `quantization_for_cold_page` with `quant: nvfp4`. It is a good example of how the framework interacts with V2. The storage path of V2 exposes two hook points, one when a page leaves the GPU and one when it returns. A codec plugged into these points encodes the page on the way out and decodes it on the way back, and the cache manager never sees the difference. How this works in detail, and how the NVFP4 codec is built, is described in the NVFP4 cold-page compression section below and in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md).
 
-The tool-call stage (stage 4) and the rest of the after-request stage (stage 5), such as KV transfer, will be reached by extending this path.
+The remaining hook points of this path, the tool-call stage (stage 4) and the other events of the after-request stage (stage 5), are reserved for methods that need them.
 
 ### Covering the Other Stages
 
@@ -388,9 +388,9 @@ The KV cache compression framework, NVFP4 cold-page compression, and TriAttentio
 
 ### Future Work
 
-- **Compression fusion.** Further reduce compression and decompression overhead.
-- **Higher compression ratios.** Improve storage efficiency while preserving model quality.
-- **More compression opportunities.** Explore broader uses of KV cache compression.
+The framework is built to grow. We will keep adding compression techniques for the new era of long-context, reasoning and agentic workloads, at every stage of the KV cache's life that the framework already exposes.
+
+The goals do not change: better use of GPU memory and bandwidth, higher throughput and lower latency, and accuracy that holds on real tasks. New methods will land through the same framework, with the same one-block configuration and no changes to the attention kernels, the cache manager or the serving loop.
 
 ## References
 
