@@ -45,7 +45,7 @@ To serve these workloads well, a system has to keep more KV cache and keep it fo
 - **Serving already relies on host and disk tiers.** Prefixes that do not fit on the GPU are kept in host memory or on disk and brought back on the next turn. Compression lets those tiers hold more pages and moves fewer bytes between them.
 - **All models face this pressure.** A method tied to one attention type or one KV data type helps only one deployment. Compression at the level of KV cache pages works for every model.
 
-A wide range of KV cache compression methods have been proposed, from prompt compression and token eviction to low-precision storage, and TensorRT LLM already applies some of them inside the model: the active KV cache can be quantized, and the [sparse attention framework](blog17_Sparse_Attention_in_TensorRT-LLM.md) lets the attention kernel read only part of the cache. This blog is about the other places where compression can act: between prefill chunks, between decoding steps, around tool calls, and after the KV has left the GPU for host or disk memory.
+A wide range of KV cache compression methods have been proposed, from prompt compression and token eviction to low-precision storage, and TensorRT LLM already applies some of them inside the model: the active KV cache can be quantized, and the [sparse attention framework](blog17_Sparse_Attention_in_TensorRT-LLM.md) lets the attention kernel skip part of the cache, as used in DeepSeek-V3.2, GLM-5.2, and DeepSeek-V4. This blog is about the other places where compression can act: between prefill chunks, between decoding steps, around tool calls, and after the KV has left the GPU for host or disk memory.
 
 Two things set our approach apart. First, we introduce concrete methods that compress the KV cache at these points successfully, with accuracy and serving results to back them. Second, and more importantly, the framework treats all of these points the same way: each moment in the life of a KV cache where compression can run is exposed as a well-defined attachment point, a method plugs into the points it needs, and the rest of the serving stack is untouched.
 
@@ -316,34 +316,32 @@ The compression ratio follows from the format. Packed NVFP4 data plus one 8-bit 
 
 The serving effect of a smaller cold page is more capacity in the host and disk tiers, and therefore a higher prefix-cache hit rate when the working set does not fit. We show it in three settings, from a well-provisioned published configuration to a deliberately GPU-limited one.
 
-**A published configuration.** The first setting is GLM-5.2, an MLA model, served at one of the published InferenceX configurations on 32 GB300s, again on the AgentX replay. Figure 11 compares the uncompressed and NVFP4 host caches at this point, averaged over two repeats. Throughput per GPU is unchanged within repeat noise, because the uncompressed host tier already reaches 96.2% of the 97.2% hit rate the trace allows and has little left to gain. What NVFP4 buys here is latency: with more pages resident, the P90 interactivity rises and the P90 time to first token falls. This is the expected behavior of cold-page compression when the host tier is well provisioned. It costs nothing, and it helps as soon as the tier comes under pressure, as the next two settings show.
+**A published configuration.** Figure 11 shows GLM-5.2 at a published InferenceX configuration on 32 GB300s. The uncompressed host tier already hits 96.2% of the trace ceiling, so throughput is neutral. NVFP4 buys latency: P90 interactivity rises and TTFT falls.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_glm_point.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 11: GLM-5.2 at a published InferenceX configuration on 32 GB300s, AgentX replay, mean of two repeats per setting. Throughput per GPU is unchanged within noise; P90 interactivity and P90 time to first token improve.</em></sub></p>
+<p align="center"><sub><em>Figure 11: GLM-5.2 · published InferenceX configuration · 32 GB300s · AgentX replay. Throughput is unchanged; P90 interactivity and TTFT improve.</em></sub></p>
 
-**Pushing the Pareto frontier.** NVFP4 does more than lift a single configuration; it moves the frontier. Figure 12 takes one point from our own configuration search: the same GLM-5.2 AgentX replay at concurrency 288 on 24 GB300s, with four prefill instances at TP4/EP4 and one decode instance at TP8/EP8, again averaged over two repeats. With the uncompressed host cache this configuration sits well inside the frontier, at 41,831 tok/s per GPU and a P90 interactivity of 8.2 tok/s per user, because the host tier reads only 90.2% of the prefixes and requests queue behind recomputation. With NVFP4 the same configuration reaches 58,427 tok/s per GPU at 25.0 tok/s per user. The hit rate rises to 95.5%, the P90 time to first token falls from 38.7 to 6.9 seconds, and 35.6% more requests complete in the hour. No uncompressed configuration in the search reaches this throughput per GPU; the best uncompressed point anywhere is 46,461 tok/s per GPU. The frontier moves because the cold tier stopped thrashing, and it moves most where the uncompressed tier was under the most pressure. The third setting pushes that regime to its end.
+**Beyond the published frontier.** When the host tier is under pressure, NVFP4 moves a configuration onto the Pareto frontier. Figure 12 shows one point from our search: GLM-5.2 at concurrency 288 on 24 GB300s, where the uncompressed tier reads only 90.2% of prefixes. NVFP4 raises that to 95.5%, lifts throughput per GPU by 39.7%, triples P90 interactivity, and cuts TTFT from 38.7 to 6.9 seconds.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_glm_search_point.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 12: GLM-5.2 at one of our own search configurations on 24 GB300s (four prefill instances at TP4/EP4, one decode instance at TP8/EP8, concurrency 288), AgentX replay, mean of two repeats per setting. NVFP4 lifts the cache-read hit rate by 5.2 points and moves this configuration from inside the Pareto frontier to a new frontier point.</em></sub></p>
+<p align="center"><sub><em>Figure 12: GLM-5.2 · 24 GB300s · concurrency 288 · AgentX replay. NVFP4 lifts the cache-read hit rate from 90.2% to 95.5% and improves every serving metric.</em></sub></p>
 
-**A GPU-limited deployment with a growing disk tier.** The third setting is deliberately starved of GPUs. Qwen3.5-397B-A17B is served disaggregated on ten GB300s across three nodes: one prefill worker on two GPUs at TP2/EP2 and one generation worker on eight GPUs at TP8/EP8, at concurrency 192 on the same AgentX replay, for 1,800 seconds per run. Ten GPUs for a 397B model at this concurrency means the GPU KV pool holds only a small slice of the 192 long-context sessions in flight. The host tier, fixed at 128 GiB per prefill rank, and the disk tier carry the working set, so they decide the hit rate. This is not a tuned serving point, and its baseline hit rate is low by construction: with the host tier alone the uncompressed setting reads only 57% of the prefixes, against the 96% the trace allows. That is what a small GPU budget looks like under an agentic replay, and it is the regime cold-page compression is built for. The two GLM-5.2 points above cover the other end, where the tier has headroom.
-
-Figure 13 grows the disk tier from 0 to 1,024 GiB per rank. Both settings run the same configuration; only the cold-page format differs. At every disk size the NVFP4 tier holds more pages, so the cache-read hit rate is higher, fewer prefixes are recomputed, more requests complete in the window, and the average time to first token drops. The gain is largest where the uncompressed tier is under the most pressure: with 512 GiB of disk the NVFP4 setting completes 64% more requests and answers 48% sooner. With 1,024 GiB both settings approach the hit rate the trace allows and the curves flatten. Each point is one closed-loop run, so small differences between neighboring points are within run-to-run variation.
+**A GPU-limited deployment.** The third setting is a resource-constrained configuration: Qwen3.5-397B-A17B served on ten GB300s (one prefill worker at TP2/EP2, one generation worker at TP8/EP8) at concurrency 192. With the host tier alone the uncompressed setting reads only 57% of prefixes. Figure 13 grows the disk tier from 0 to 1,024 GiB. NVFP4 hits more, completes more, and answers sooner at every disk size. The gain peaks at 512 GiB: 64% more requests completed and 48% sooner.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_disk_sweep.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 13: Qwen3.5-397B-A17B on ten GB300s (one prefill worker at TP2/EP2, one generation worker at TP8/EP8), AgentX replay at concurrency 192, with a host tier of 128 GiB per prefill rank and a growing disk tier. Left: requests completed per second. Middle: cache-read hit rate, with the hit rate the trace allows as the dashed line. Right: average time to first token. White bars are uncompressed FP8 cold pages, orange bars are NVFP4 cold pages.</em></sub></p>
+<p align="center"><sub><em>Figure 13: Qwen3.5-397B-A17B · ten GB300s · concurrency 192 · growing disk tier. NVFP4 completes more requests, hits more, and answers sooner at every disk size.</em></sub></p>
 
 #### Accuracy
 
@@ -398,7 +396,7 @@ The KV cache compression framework, NVFP4 cold-page compression, and TriAttentio
 
 ### Future Work
 
-The framework is built to grow. We will keep adding compression techniques for the new era of long-context, reasoning and agentic workloads, at every stage of the KV cache's life that the framework already exposes.
+The framework is built to grow. We will keep adding compression techniques for the new era of long-context, reasoning and agentic workloads, as the workload and the hardware evolve.
 
 The goals do not change: better use of GPU memory and bandwidth, higher throughput and lower latency, and accuracy that holds on real tasks. New methods will land through the same framework, with the same one-block configuration and no changes to the attention kernels, the cache manager or the serving loop.
 
