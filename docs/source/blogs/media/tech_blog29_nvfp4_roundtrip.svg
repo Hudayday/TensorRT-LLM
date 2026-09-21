@@ -67,8 +67,9 @@
 <text x="656.0" y="69.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="start">AIME24</text>
 <rect x="700.6977982954545" y="60" width="11" height="11" fill="#ffffff" stroke="#2d3142"/>
 <text x="716.7" y="69.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="start">AIME25</text>
-<text x="693.3" y="280.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">r0 · none</text>
-<text x="800.0" y="280.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">r1 · one round trip</text>
-<text x="906.7" y="280.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">r2 · two round trips</text>
-<text x="800.0" y="298.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">r1 and r2: identical outputs on all 480 samples</text>
+<text x="693.3" y="280.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">r0</text>
+<text x="800.0" y="280.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">r1</text>
+<text x="906.7" y="280.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">r2</text>
+<text x="800.0" y="298.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">r0 none · r1 one round trip · r2 two round trips</text>
+<text x="800.0" y="312.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">r1 and r2: identical outputs on all 480 samples</text>
 </svg>
