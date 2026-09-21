@@ -42,7 +42,7 @@
 <text x="510.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">batch 32</text>
 <text x="510.0" y="318.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#76B900" text-anchor="middle">+60% at budget 2,048</text>
 <rect x="614.0" y="266" width="44" height="22" fill="none" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="3,3"/>
-<text x="636.0" y="280.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">out of memory</text>
+<text x="636.0" y="280.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle"></text>
 <rect x="664.0" y="173.4" width="44" height="114.6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
 <text x="686.0" y="168.4" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="600" fill="#2d3142" text-anchor="middle">4,911</text>
 <rect x="714.0" y="132.4" width="44" height="155.6" fill="#76B900" stroke="#76B900" stroke-width="1"/>
@@ -50,9 +50,9 @@
 <text x="686.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">batch 64</text>
 <text x="686.0" y="318.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">dense out of memory</text>
 <rect x="790.0" y="266" width="44" height="22" fill="none" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="3,3"/>
-<text x="812.0" y="280.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">out of memory</text>
+<text x="812.0" y="280.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle"></text>
 <rect x="840.0" y="266" width="44" height="22" fill="none" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="3,3"/>
-<text x="862.0" y="280.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">n/a</text>
+<text x="862.0" y="280.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">not run</text>
 <rect x="890.0" y="96.7" width="44" height="191.3" fill="#76B900" stroke="#76B900" stroke-width="1"/>
 <text x="912.0" y="91.7" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="600" fill="#2d3142" text-anchor="middle">8,198</text>
 <text x="862.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">batch 128</text>
