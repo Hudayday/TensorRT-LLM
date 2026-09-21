@@ -335,20 +335,29 @@ The serving effect of a smaller cold page is more capacity in the host and disk 
 </div>
 <p align="center"><sub><em>Figure 12: GLM-5.2 at a published InferenceX configuration on 32 GB300s, AgentX replay, mean of two repeats per setting. Throughput per GPU is unchanged within noise; P90 interactivity and P90 time to first token improve.</em></sub></p>
 
+**A point beyond the published frontier.** The published configurations leave the host tier with headroom, so they show little. Our own configuration search did not. Figure 13 takes one point from that search: the same GLM-5.2 AgentX replay at concurrency 288 on 24 GB300s, with four prefill instances at TP4/EP4 and one decode instance at TP8/EP8, again averaged over two repeats. Here the uncompressed host tier is under real pressure. Its cache-read hit rate is 90.2%, well below the 96 to 97% the published points reach, so prefixes are recomputed and requests queue behind them. The NVFP4 tier holds more pages and reaches 95.5%. That one change lifts throughput per GPU by 39.7%, triples the P90 interactivity, cuts the P90 time to first token from 38.7 to 6.9 seconds, and completes 35.6% more requests in the hour. It is the same mechanism as the disk sweep: the gain is a cache-pressure effect, and it is largest exactly where the uncompressed tier starts to thrash.
+
+<div align="center">
+<figure>
+  <img src="../media/tech_blog29_glm_search_point.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 13: GLM-5.2 at one of our own search configurations on 24 GB300s (four prefill instances at TP4/EP4, one decode instance at TP8/EP8, concurrency 288), AgentX replay, mean of two repeats per setting. With the uncompressed host tier at a 90.2% hit rate, NVFP4 raises the hit rate by 5.2 points and every serving metric improves.</em></sub></p>
+
 #### Accuracy
 
 Cold-page compression is lossy, so the remaining question is how much accuracy it can cost. Two facts bound the answer.
 
 First, a page is quantized only when it leaves the GPU, and at most once per offload. The worst case is a deployment where every page is re-quantized on every turn. Even then a page never carries more than one NVFP4 rounding at a time, so the accuracy of cold-page compression is bounded below by that of a fully NVFP4 KV cache, a configuration TensorRT LLM already ships and whose loss is small and well characterized. In practice most pages are offloaded once or not at all, so the typical case sits far from this bound.
 
-Second, repeated quantize-and-dequantize round trips do not compound. Quantization is a projection onto a finite set of values, not a fresh random error each time. For NVFP4 with 8-bit block scales we showed analytically that after the first round trip the encoded state can change at most once more, and on real KV values it does not change at all. Figure 13 shows the measurement on Qwen3-8B with a BF16 KV cache on AIME24 and AIME25, 30 questions with 8 seeds each, using the NVFP4 quantizer from Transformer Engine in a standalone harness on B200 and applying the round trips to every page. The first round trip changes 98.5% of the 13 billion compared KV values, which is the expected rounding. The second round trip changes none of them, and neither do the fourth or the eighth. End to end, one round trip moves accuracy by 2.08 and 1.67 points on the two sets, within the noise of this setup where most generations hit the 32K output cap. The second round trip reproduces all 480 outputs of the first exactly, so accuracy after two round trips is identical to accuracy after one.
+Second, repeated quantize-and-dequantize round trips do not compound. Quantization is a projection onto a finite set of values, not a fresh random error each time. For NVFP4 with 8-bit block scales we showed analytically that after the first round trip the encoded state can change at most once more, and on real KV values it does not change at all. Figure 14 shows the measurement on Qwen3-8B with a BF16 KV cache on AIME24 and AIME25, 30 questions with 8 seeds each, using the NVFP4 quantizer from Transformer Engine in a standalone harness on B200 and applying the round trips to every page. The first round trip changes 98.5% of the 13 billion compared KV values, which is the expected rounding. The second round trip changes none of them, and neither do the fourth or the eighth. End to end, one round trip moves accuracy by 2.08 and 1.67 points on the two sets, within the noise of this setup where most generations hit the 32K output cap. The second round trip reproduces all 480 outputs of the first exactly, so accuracy after two round trips is identical to accuracy after one.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_nvfp4_roundtrip.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 13: Repeated NVFP4 round trips on Qwen3-8B with a BF16 KV cache. Left: share of KV values changed by one more quantize-and-dequantize round trip; the first changes the expected 98.5%, the second, fourth, and eighth change none. Right: AIME24 and AIME25 accuracy after 0, 1, and 2 round trips; the first and second round trips produce identical outputs on all 480 samples.</em></sub></p>
+<p align="center"><sub><em>Figure 14: Repeated NVFP4 round trips on Qwen3-8B with a BF16 KV cache. Left: share of KV values changed by one more quantize-and-dequantize round trip; the first changes the expected 98.5%, the second, fourth, and eighth change none. Right: AIME24 and AIME25 accuracy after 0, 1, and 2 round trips; the first and second round trips produce identical outputs on all 480 samples.</em></sub></p>
 
 Together, these two facts mean that cold-page compression cannot drift with repeated offloading. Its accuracy cost is at most one NVFP4 rounding of the pages that actually leave the GPU, and it does not grow with the number of times a page is offloaded and brought back.
 
@@ -356,7 +365,7 @@ Together, these two facts mean that cold-page compression cannot drift with repe
 
 #### Performance
 
-TriAttention shrinks the decode KV cache of every running sequence, so it helps in two ways: decoding reads a shorter cache at the same batch size, and more sequences fit on the GPU. We measure both on Qwen3-8B on one B200 with 1,024 input and 16,384 output tokens per request, CUDA graphs and the overlap scheduler on, and three fresh-process runs per point on the same GPU. Figure 14 shows aggregate output throughput per GPU against batch size for the dense cache and for TriAttention with budgets of 4,096 and 2,048 tokens and an eviction period equal to the budget.
+TriAttention shrinks the decode KV cache of every running sequence, so it helps in two ways: decoding reads a shorter cache at the same batch size, and more sequences fit on the GPU. We measure both on Qwen3-8B on one B200 with 1,024 input and 16,384 output tokens per request, CUDA graphs and the overlap scheduler on, and three fresh-process runs per point on the same GPU. Figure 15 shows aggregate output throughput per GPU against batch size for the dense cache and for TriAttention with budgets of 4,096 and 2,048 tokens and an eviction period equal to the budget.
 
 At matched batch sizes the compacted cache decodes faster: at batch size 32, budget 4,096 gives 27% more output throughput than dense and budget 2,048 gives 60% more. Beyond that the dense cache runs out of memory at batch size 64, while TriAttention keeps scaling: budget 2,048 reaches 6,670 tok/s at batch size 64 and 8,198 tok/s at batch size 128, 2.7x the dense peak on the same GPU.
 
@@ -365,18 +374,18 @@ At matched batch sizes the compacted cache decodes faster: at batch size 32, bud
   <img src="../media/tech_blog29_triattention_perf.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 14: TriAttention on Qwen3-8B, one B200, 1,024 input and 16,384 output tokens. Aggregate output throughput per GPU against batch size for the dense KV cache and for TriAttention with budgets of 4,096 and 2,048 tokens. The dense cache runs out of memory at batch size 64; TriAttention continues to batch size 128.</em></sub></p>
+<p align="center"><sub><em>Figure 15: TriAttention on Qwen3-8B, one B200, 1,024 input and 16,384 output tokens. Aggregate output throughput per GPU against batch size for the dense KV cache and for TriAttention with budgets of 4,096 and 2,048 tokens. The dense cache runs out of memory at batch size 64; TriAttention continues to batch size 128.</em></sub></p>
 
 #### Accuracy
 
-Eviction is lossy by design, and the budget sets the trade. Figure 15 shows AIME25 accuracy against the decode KV budget for Qwen3-8B and GPT-OSS-120B in `union` mode, with the dense result as the dashed line. Each point is 30 problems with 4 samples, so single points carry about 4 to 5 points of noise. With aggressive budgets of 1,000 or 2,000 tokens for outputs that run to 32,000 tokens, accuracy drops sharply. At 4,096 tokens, the budget used for the throughput results above, the drop is about 5 points on both models while the decode KV shrinks 7.9 times on Qwen3-8B. From 8,192 tokens on, accuracy is within noise of dense on both models while the decode KV still shrinks 2 to 4 times. The friendly region is therefore wide, and the budget can be chosen per deployment to trade a known amount of accuracy for capacity.
+Eviction is lossy by design, and the budget sets the trade. Figure 16 shows AIME25 accuracy against the decode KV budget for Qwen3-8B and GPT-OSS-120B in `union` mode, with the dense result as the dashed line. Each point is 30 problems with 4 samples, so single points carry about 4 to 5 points of noise. With aggressive budgets of 1,000 or 2,000 tokens for outputs that run to 32,000 tokens, accuracy drops sharply. At 4,096 tokens, the budget used for the throughput results above, the drop is about 5 points on both models while the decode KV shrinks 7.9 times on Qwen3-8B. From 8,192 tokens on, accuracy is within noise of dense on both models while the decode KV still shrinks 2 to 4 times. The friendly region is therefore wide, and the budget can be chosen per deployment to trade a known amount of accuracy for capacity.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_triattention_acc.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 15: AIME25 accuracy against the decode KV budget for TriAttention in union mode with the eviction period equal to the budget, on Qwen3-8B (left) and GPT-OSS-120B (right). The dashed line is the dense cache. The label under each bar is the decode-KV compression relative to dense at that budget.</em></sub></p>
+<p align="center"><sub><em>Figure 16: AIME25 accuracy against the decode KV budget for TriAttention in union mode with the eviction period equal to the budget, on Qwen3-8B (left) and GPT-OSS-120B (right). The dashed line is the dense cache. The label under each bar is the decode-KV compression relative to dense at that budget.</em></sub></p>
 
 For configuration, the calibration workflow, and validated modes, please refer to the [TriAttention example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/triattention.md).
 
