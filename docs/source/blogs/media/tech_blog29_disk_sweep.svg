@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 372" width="1000" height="372">
 <defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
 <rect width="1000" height="372" fill="#f5f5f5"/>
-<text x="52.0" y="30.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Qwen3.5-397B-A17B · 10 GB300 · C192</text>
+<text x="52.0" y="30.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Qwen3.5-397B-A17B · 10 GB300 · concurrency 192</text>
 <text x="52.0" y="66.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Requests completed per second</text>
 <line x1="52" y1="290.0" x2="332" y2="290.0" stroke="#bfc0c0" stroke-width="1"/>
 <text x="46.0" y="293.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">0</text>
