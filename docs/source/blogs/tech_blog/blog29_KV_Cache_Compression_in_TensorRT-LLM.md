@@ -200,7 +200,7 @@ The hooks ride on the executor's existing request cycle, and the framework wires
 
 ### KV Cache Compression in Cross-Request KV Management
 
-Cross-request reuse means that the KV one request produces is kept and read again by a later request instead of being recomputed: the next turn of a conversation, the next step of an agent, or a request from another user that shares the same prefix. The benefit is direct. Every reused page is a prefill that never runs, so the fewer pages the tiers have to evict, the higher the cache hit rate and the lower the time to first token. This is where compression pays off across requests: a smaller cold page means more pages fit in the host and disk tiers, more prefixes are still there when the next request arrives, and the hit rate climbs. The framework brings compression to this path.
+Cross-request reuse means that the KV one request produces is kept and read again by a later request instead of being recomputed: the next turn of a conversation, the next step of an agent, or a request from another user that shares the same prefix. The benefit is direct. Every reused page is a prefill that never runs, so the fewer pages the tiers have to evict, the higher the cache hit rate and the lower the time to first token. Compression can help here. A smaller cold page means more pages fit in the host and disk tiers, so more prefixes are still there when the next request arrives and the hit rate improves. It is one lever among several, next to more host memory, a disk tier, or a different placement of requests, and it stacks with all of them. The framework brings compression to this path.
 
 This path is the cross-request hook of the framework. It serves the stages outside a single request: the tool-call stage (stage 4), when a request pauses and its KV waits for the tool to return, and the after-request stage (stage 5), when a request has finished and its KV is kept for reuse, transferred to another worker, or offloaded to host or disk memory.
 
@@ -327,7 +327,7 @@ The serving effect of a smaller cold page is more capacity in the host and disk 
 </div>
 <p align="center"><sub><em>Figure 11: GLM-5.2 · published InferenceX configuration · 32 GB300s · AgentX replay. Throughput is unchanged; P90 interactivity and TTFT improve.</em></sub></p>
 
-**Beyond the published frontier.** When the host tier is under pressure, NVFP4 moves a configuration onto the Pareto frontier. Figure 12 shows one point from our search: GLM-5.2 at concurrency 288 on 24 GB300s, where the uncompressed tier reads only 90.2% of prefixes. NVFP4 raises that to 95.5%, lifts throughput per GPU by 39.7%, triples P90 interactivity, and cuts TTFT from 38.7 to 6.9 seconds.
+**Beyond the published frontier.** When the host tier is under pressure, NVFP4 raises the hit rate, and the serving metrics follow. Figure 12 shows one point from our search: GLM-5.2 at concurrency 288 on 24 GB300s, where the uncompressed tier reads only 90.2% of prefixes. NVFP4 raises that to 95.5%, lifts throughput per GPU by 39.7%, triples P90 interactivity, and cuts TTFT from 38.7 to 6.9 seconds, which puts this configuration on the Pareto frontier.
 
 <div align="center">
 <figure>
