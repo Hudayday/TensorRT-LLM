@@ -16,6 +16,7 @@
  */
 
 #include "kvCacheManagerV2TestUtils.h"
+#include "tensorrt_llm/batch_manager/kv_cache_compression/nativeColdPageCodec.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/blockRadixTree.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/config.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h"
@@ -32,6 +33,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -42,6 +44,116 @@ using namespace tensorrt_llm::batch_manager::kv_cache_manager_v2;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeConfig;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeTieredConfig;
 using tensorrt_llm::common::TllmException;
+namespace compression = tensorrt_llm::kv_cache_compression;
+
+class SelectedColdPageCodec final : public compression::NativeColdPageCodec
+{
+public:
+    explicit SelectedColdPageCodec(compression::ColdPageSelectionConfig config)
+        : NativeColdPageCodec({LayerId{0}}, std::move(config))
+    {
+    }
+
+    int encodedLayout = -1;
+    int decodedLayout = -1;
+    bool rejectEncode = false;
+    int prepared = 0;
+
+private:
+    std::vector<compression::ColdPageLifecycleProperties> configureProvider(
+        std::vector<compression::ResolvedHotLifecycle> const& lifecycles) override
+    {
+        EXPECT_EQ(lifecycles.size(), 1);
+        return {{1024, PageIndexLocation::kHost, 4096, 4}};
+    }
+
+    std::size_t prepareProvider(
+        std::size_t, int, int validTokens, std::vector<ColdPageTokenRange> const& ranges, std::size_t capacity) override
+    {
+        ++prepared;
+        int raw = 0;
+        for (auto const& [begin, end] : ranges)
+            raw += end - begin;
+        auto const size = static_cast<std::size_t>(raw * 1024 + (validTokens - raw) * 256);
+        EXPECT_LE(size, capacity);
+        return size;
+    }
+
+    void encodeProvider(std::size_t, void*, PageIndexPair const*, std::size_t, cudaStream_t) override {}
+
+    void decodeProvider(std::size_t, void const*, PageIndexPair const*, std::size_t, cudaStream_t) override {}
+
+    void encodeSelectedProvider(std::size_t, int id, void*, PageIndexPair const*, std::size_t, cudaStream_t) override
+    {
+        if (rejectEncode)
+            throw std::runtime_error("Injected selective encode failure");
+        encodedLayout = id;
+    }
+
+    void decodeSelectedProvider(
+        std::size_t, int id, void const*, PageIndexPair const*, std::size_t, cudaStream_t) override
+    {
+        decodedLayout = id;
+    }
+};
+
+TEST(KvCacheManagerV2ColdPageTest, SelectionComposesAndFreezesRelativeToTheSavingRequest)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto codec = std::make_unique<SelectedColdPageCodec>(compression::ColdPageSelectionConfig{6, 2, {{10, 11}}});
+    auto* selected = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(makeConfig(), nullptr, std::move(codec));
+    LifeCycleId const lc{0};
+    auto all = selected->prepareColdPage(lc, ColdPageContext{4, 4, {8, 10}, {}});
+    EXPECT_EQ(all->rawTokens, (std::vector<ColdPageTokenRange>{{0, 4}}));
+    EXPECT_EQ(all->capacityClass, 1);
+    auto interior = selected->prepareColdPage(lc, ColdPageContext{8, 4, {16}, {}});
+    EXPECT_EQ(interior->rawTokens, (std::vector<ColdPageTokenRange>{{2, 3}}));
+    EXPECT_EQ(selected->prepareColdPage(lc, ColdPageContext{8, 4, {16}, {}}), interior);
+    EXPECT_EQ(selected->prepared, 2);
+    auto extended = selected->prepareColdPage(lc, ColdPageContext{4, 4, {12}, {}});
+    EXPECT_EQ(extended->rawTokens, (std::vector<ColdPageTokenRange>{{0, 2}}));
+    EXPECT_EQ(all->rawTokens, (std::vector<ColdPageTokenRange>{{0, 4}}));
+    auto retained = selected->prepareColdPage(lc, ColdPageContext{4, 4, {12}, {{3, 4}}});
+    EXPECT_EQ(retained->rawTokens, (std::vector<ColdPageTokenRange>{{0, 2}, {3, 4}}));
+}
+
+TEST(KvCacheManagerV2ColdPageTest, ShorterReuseStopsBeforeNewlyProtectedLossyTokens)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto codec = std::make_unique<SelectedColdPageCodec>(compression::ColdPageSelectionConfig{0, 2, {}});
+    auto* selected = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(makeConfig(), nullptr, std::move(codec));
+    LifeCycleId const lc{0};
+    auto saved = selected->prepareColdPage(lc, ColdPageContext{0, 4, {4}, {}});
+    EXPECT_EQ(selected->reusablePrefix(lc, 0, 4, 4, saved->rawTokens), 4);
+    EXPECT_EQ(selected->reusablePrefix(lc, 0, 3, 3, saved->rawTokens), 1);
+    EXPECT_EQ(selected->reusablePrefix(lc, 0, 8, 4, saved->rawTokens), 4);
+    EXPECT_EQ(selected->reusablePrefix(lc, 0, 3, 3, {{0, 4}}), 3);
+}
+
+TEST(KvCacheManagerV2ColdPageTest, EquivalentSelectionsShareFrozenLayouts)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto codec = std::make_unique<SelectedColdPageCodec>(compression::ColdPageSelectionConfig{1, 1, {}});
+    auto* selected = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(makeConfig(), nullptr, std::move(codec));
+    auto saved = selected->prepareColdPage(LifeCycleId{0}, ColdPageContext{0, 4, {4}, {}});
+    auto const id = saved->layoutId;
+    // All legal selections for a four-token page are interned and repeated.
+    for (int repeat = 0; repeat < 5; ++repeat)
+        for (int mask = 0; mask < 16; ++mask)
+        {
+            std::vector<ColdPageTokenRange> retained;
+            for (int token = 0; token < 4; ++token)
+                if (mask & (1 << token))
+                    retained.emplace_back(token, token + 1);
+            static_cast<void>(selected->prepareColdPage(LifeCycleId{0}, ColdPageContext{4, 4, {12}, retained}));
+        }
+    EXPECT_EQ(saved->layoutId, id);
+    EXPECT_EQ(saved->rawTokens, (std::vector<ColdPageTokenRange>{{0, 1}, {3, 4}}));
+    EXPECT_EQ(selected->prepared, 16);
+}
 
 KVCacheManagerConfig makeDiskTieredConfig()
 {
@@ -316,6 +428,172 @@ SharedPtr<CommittedPage> makeCommittedPage(KvCacheManager& manager, StorageManag
     block->storage[lifeCycle] = page.get();
     storage.scheduleForEviction(*page);
     return page;
+}
+
+TEST(KvCacheManagerV2ColdPageTest, MixedCapacitiesSurviveHostDiskAndOnboard)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto config = makeConfig();
+    config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
+    config.cacheTiers.emplace_back(DiskCacheTierConfig{4 << 20, "/tmp"});
+    auto codec = std::make_unique<SelectedColdPageCodec>(compression::ColdPageSelectionConfig{1, 1, {}});
+    auto* selected = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(std::move(config), nullptr, std::move(codec));
+    auto& storage = manager->storage();
+    LifeCycleId const lc{0};
+    auto slots = storage.newGpuSlots(TypedVec<LifeCycleId, SlotCount>(LifeCycleId{1}, 2));
+    auto boundary = makeCommittedPage(*manager, storage, kHotLevel, slots[lc][0]);
+    auto interior = makeCommittedPage(*manager, storage, kHotLevel, slots[lc][1], lc, kPriorityDefault, 10);
+    auto sequence = std::make_shared<ColdPageSequence>(ColdPageSequence{16, false});
+    boundary->addSequence(sequence);
+    interior->coldState->startToken = 4;
+    interior->addSequence(sequence);
+    TypedVec<PoolGroupIndex, SlotCount> offload(storage.numPoolGroups(kHotLevel), 2);
+    storage.forceEvict(kHotLevel, offload);
+    ASSERT_EQ(boundary->cacheLevel, CacheLevel{1});
+    ASSERT_EQ(interior->cacheLevel, CacheLevel{1});
+    EXPECT_EQ(boundary->coldCapacityClass(), 1);
+    EXPECT_EQ(interior->coldCapacityClass(), 0);
+    EXPECT_EQ(storage.slotSize(CacheLevel{1}, storage.getPoolGroupIndex(CacheLevel{1}, *boundary))[PoolIndex{0}], 4096);
+    EXPECT_EQ(storage.slotSize(CacheLevel{1}, storage.getPoolGroupIndex(CacheLevel{1}, *interior))[PoolIndex{0}], 1024);
+    auto const saved = boundary->coldState->representation;
+    sequence->length = 20;
+    TypedVec<PoolGroupIndex, SlotCount> toDisk(storage.numPoolGroups(CacheLevel{1}), 0);
+    toDisk[storage.getPoolGroupIndex(CacheLevel{1}, *boundary)] = 1;
+    toDisk[storage.getPoolGroupIndex(CacheLevel{1}, *interior)] = 1;
+    storage.forceEvict(CacheLevel{1}, toDisk);
+    ASSERT_EQ(boundary->cacheLevel, CacheLevel{2});
+    ASSERT_EQ(interior->cacheLevel, CacheLevel{2});
+    storage.excludeFromEviction(*boundary);
+    storage.excludeFromEviction(*interior);
+    storage.batchedMigrateToGpu(
+        {{boundary, kDefaultBeamIndex, BlockOrdinal{0}, lc}, {interior, kDefaultBeamIndex, BlockOrdinal{1}, lc}}, {});
+    storage.scheduleForEviction(*boundary);
+    storage.scheduleForEviction(*interior);
+    EXPECT_EQ(boundary->cacheLevel, kHotLevel);
+    EXPECT_EQ(interior->cacheLevel, kHotLevel);
+    EXPECT_EQ(boundary->coldState->representation, saved);
+    EXPECT_TRUE(boundary->coldState->quantized);
+    EXPECT_EQ(boundary->coldState->losslessTokens, (std::vector<ColdPageTokenRange>{{0, 1}}));
+    EXPECT_EQ(boundary->reusablePrefix(3, 3), 2);
+    EXPECT_GE(selected->decodedLayout, 0);
+
+    auto fresh
+        = makeShared<CommittedPage>(&storage, boundary->block->sharedFromThis(), lc, kHotLevel, 4, kPriorityDefault);
+    EXPECT_TRUE(boundary->block->canReplacePage(lc, 4, fresh.get()));
+    EXPECT_FALSE(boundary->block->canReplacePage(lc, 4, boundary.get()));
+}
+
+TEST(KvCacheManagerV2ColdPageTest, FailedSelectiveEncodePreservesSourceQualityAndCapacity)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto config = makeConfig();
+    config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
+    auto codec = std::make_unique<SelectedColdPageCodec>(compression::ColdPageSelectionConfig{1, 1, {}});
+    auto* selected = codec.get();
+    selected->rejectEncode = true;
+    auto manager = std::make_shared<KvCacheManager>(std::move(config), nullptr, std::move(codec));
+    auto& storage = manager->storage();
+    LifeCycleId const lc{0};
+    auto slots = storage.newGpuSlots(TypedVec<LifeCycleId, SlotCount>(LifeCycleId{1}, 1));
+    auto source = makeCommittedPage(*manager, storage, kHotLevel, slots[lc][0]);
+    auto const originalSlot = source->slotId();
+    auto sequence = std::make_shared<ColdPageSequence>(ColdPageSequence{4, false});
+    source->addSequence(sequence);
+    TypedVec<PoolGroupIndex, SlotCount> offload(storage.numPoolGroups(kHotLevel), 1);
+    EXPECT_THROW(storage.forceEvict(kHotLevel, offload), TllmException);
+    EXPECT_EQ(source->cacheLevel, kHotLevel);
+    EXPECT_EQ(source->slotId(), originalSlot);
+    EXPECT_FALSE(source->coldState->quantized);
+    EXPECT_EQ(source->reusablePrefix(3, 3), 3);
+    EXPECT_TRUE(source->scheduledForEviction());
+    selected->rejectEncode = false;
+    storage.forceEvict(kHotLevel, offload);
+    EXPECT_EQ(source->cacheLevel, CacheLevel{1});
+    EXPECT_TRUE(source->coldState->quantized);
+    EXPECT_EQ(source->reusablePrefix(3, 3), 2);
+}
+
+TEST(KvCacheManagerV2ColdPageTest, SelectiveReuseRecomputesAnIncompatibleShorterPrefix)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto config = makeConfig();
+    config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
+    auto manager = std::make_shared<KvCacheManager>(std::move(config), nullptr,
+        std::make_unique<SelectedColdPageCodec>(compression::ColdPageSelectionConfig{1, 1, {}}));
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto streamGuard = FuncGuard([stream]() { cudaStreamDestroy(stream); });
+    std::vector<TokenIdExt> tokens;
+    for (int token = 0; token < 8; ++token)
+        tokens.emplace_back(TokenId{token});
+
+    auto source = manager->createKvCache();
+    ASSERT_TRUE(source->resume(reinterpret_cast<CUstream>(stream)));
+    ASSERT_TRUE(source->resize(8));
+    source->commit(toSpan(tokens));
+    source->close();
+    auto& storage = manager->storage();
+    storage.forceEvict(kHotLevel, TypedVec<PoolGroupIndex, SlotCount>(storage.numPoolGroups(kHotLevel), 2));
+    EXPECT_EQ(manager->probeReuse({}, toSpan(tokens)), 8);
+
+    auto shorterTokens = tokens;
+    shorterTokens.resize(3);
+    // Last N stays anchored at the three-token request, even after pruning.
+    // Dequantizing the old page must not turn its lossy middle into original KV.
+    EXPECT_EQ(manager->probeReuse({}, toSpan(shorterTokens)), 2);
+    auto shorter = manager->createKvCache({}, toSpan(shorterTokens));
+    EXPECT_EQ(shorter->historyLength(), 2);
+    ASSERT_TRUE(shorter->resume(reinterpret_cast<CUstream>(stream)));
+    ASSERT_TRUE(shorter->resize(3));
+    std::vector<TokenIdExt> remaining(shorterTokens.begin() + 2, shorterTokens.end());
+    shorter->commit(toSpan(remaining), true);
+    EXPECT_EQ(shorter->historyLength(), 3);
+    shorter->close();
+
+    auto const coldGroups = manager->getPoolGroupLifeCycleIds(CacheLevel{1});
+    ASSERT_EQ(coldGroups.size(), PoolGroupIndex{2});
+    EXPECT_EQ(coldGroups[PoolGroupIndex{0}], (std::vector<LifeCycleId>{LifeCycleId{0}}));
+    EXPECT_EQ(coldGroups[PoolGroupIndex{1}], (std::vector<LifeCycleId>{LifeCycleId{0}}));
+}
+
+TEST(KvCacheManagerV2ColdPageTest, SelectionUsesConfirmedHistoryAcrossSpeculativeCapacityChanges)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto config = makeConfig();
+    config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
+    auto manager = std::make_shared<KvCacheManager>(std::move(config), nullptr,
+        std::make_unique<SelectedColdPageCodec>(compression::ColdPageSelectionConfig{0, 1, {}}));
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto streamGuard = FuncGuard([stream]() { cudaStreamDestroy(stream); });
+    auto request = manager->createKvCache();
+    ASSERT_TRUE(request->resume(reinterpret_cast<CUstream>(stream)));
+    ASSERT_TRUE(request->resize(8, 3));
+    // Rejected draft positions reduce capacity, not the confirmed history.
+    ASSERT_TRUE(request->resize(4, 3));
+    auto page = blockPageGetPage(request->blocks()[BlockOrdinal{0}].pages[kDefaultBeamIndex][LifeCycleId{0}]);
+    request->suspend();
+    auto& storage = manager->storage();
+    storage.forceEvict(kHotLevel, TypedVec<PoolGroupIndex, SlotCount>(storage.numPoolGroups(kHotLevel), 1));
+    ASSERT_EQ(page->cacheLevel, CacheLevel{1});
+    auto saved = page->coldState->representation;
+    ASSERT_NE(saved, nullptr);
+    EXPECT_EQ(saved->validTokens, 3);
+    EXPECT_EQ(saved->rawTokens, (std::vector<ColdPageTokenRange>{{2, 3}}));
+
+    ASSERT_TRUE(request->resume(reinterpret_cast<CUstream>(stream)));
+    ASSERT_TRUE(request->resize(4, 4));
+    request->suspend();
+    storage.forceEvict(kHotLevel, TypedVec<PoolGroupIndex, SlotCount>(storage.numPoolGroups(kHotLevel), 1));
+    auto extended = page->coldState->representation;
+    EXPECT_EQ(extended->validTokens, 4);
+    EXPECT_EQ(extended->rawTokens, (std::vector<ColdPageTokenRange>{{3, 4}}));
+    EXPECT_EQ(saved->validTokens, 3);
+    EXPECT_EQ(saved->rawTokens, (std::vector<ColdPageTokenRange>{{2, 3}}));
+    // The newly written tail is original precision; decoding old rows did not upgrade them.
+    EXPECT_EQ(page->coldState->losslessTokens, (std::vector<ColdPageTokenRange>{{3, 4}}));
+    request->close();
 }
 
 TEST(KvCacheManagerV2ColdPageTest, ConstructionFailureDestroysCodec)

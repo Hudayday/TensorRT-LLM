@@ -236,6 +236,8 @@ public:
     TypedVec<PoolGroupIndex, StorageStatistics> getStorageStatistics(CacheLevel cacheLevel = kHotLevel) const;
     // Pool-group numbering is level-specific; cold grouping can differ from the hot layout.
     TypedVec<LifeCycleId, PoolGroupIndex> getLifeCyclePoolGroupIndices(CacheLevel cacheLevel = kHotLevel) const;
+    TypedVec<PoolGroupIndex, std::vector<LifeCycleId>> getPoolGroupLifeCycleIds(
+        CacheLevel cacheLevel = kHotLevel) const;
 
     // Internal commit* and recordDiskPrefetchBlocks helpers require the caller's exclusive API lock.
     void commitStats(KVCacheStatsDelta const& stats, IterationStatsByLifeCycle const& iterationStatsByLifeCycle = {});

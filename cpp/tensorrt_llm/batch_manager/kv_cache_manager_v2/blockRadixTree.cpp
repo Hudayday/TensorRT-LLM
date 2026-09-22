@@ -398,15 +398,46 @@ bool Block::holdsPage(CommittedPage const& page) const
     return getPage(page.lifeCycle) == &page;
 }
 
-bool Block::canReplacePage(LifeCycleId lcIdx, int numTokensInBlock) const
+bool Block::canReplacePage(LifeCycleId lcIdx, int numTokensInBlock, Page const* replacement) const
 {
     auto const* existing = getPage(lcIdx);
-    return existing == nullptr || existing->numTokensInBlock < numTokensInBlock;
+    if (existing == nullptr || existing->numTokensInBlock < numTokensInBlock)
+        return true;
+    if (existing->numTokensInBlock != numTokensInBlock || !existing->coldState || !existing->coldState->quantized
+        || !replacement || !replacement->coldState)
+        return false;
+    if (!replacement->coldState->quantized)
+        return true;
+    // Equal-coverage snapshots may replace a lossy page only when they preserve
+    // every formerly lossless token and add at least one freshly computed token.
+    auto covers = [numTokensInBlock](auto const& required, auto const& available)
+    {
+        for (auto const& [begin, end] : required)
+        {
+            int cursor = begin;
+            int const limit = std::min(end, numTokensInBlock);
+            for (auto const& [first, last] : available)
+            {
+                if (first > cursor)
+                    break;
+                if (last > cursor)
+                    cursor = last;
+                if (cursor >= limit)
+                    break;
+            }
+            if (cursor < limit)
+                return false;
+        }
+        return true;
+    };
+    auto const& oldRanges = existing->coldState->losslessTokens;
+    auto const& newRanges = replacement->coldState->losslessTokens;
+    return covers(oldRanges, newRanges) && !covers(newRanges, oldRanges);
 }
 
 void Block::replacePage(LifeCycleId lcIdx, CommittedPage* page)
 {
-    TLLM_CHECK_DEBUG(canReplacePage(lcIdx, page->numTokensInBlock));
+    TLLM_CHECK_DEBUG(canReplacePage(lcIdx, page->numTokensInBlock, page));
     // Unlink first: excludeFromEviction() below may drop the eviction list's last
     // reference and destroy the page, so the slot must already be empty.
     auto* existing = unlinkPage(lcIdx);
@@ -425,7 +456,7 @@ void Block::adoptPagesFrom(Block& other)
     for (LifeCycleId lcIdx{0}; lcIdx < storage.size(); ++lcIdx)
     {
         auto* page = other.getPage(lcIdx);
-        if (page == nullptr || !canReplacePage(lcIdx, page->numTokensInBlock))
+        if (page == nullptr || !canReplacePage(lcIdx, page->numTokensInBlock, page))
         {
             continue;
         }
@@ -822,7 +853,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
 }
 
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
-    std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const
+    std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId, int requestedLength) const
 {
     // All blocks except the last must be fully matched (mirrors Python: matched[:-1]).
     TLLM_CHECK_DEBUG(matched.size() <= 1
@@ -883,7 +914,11 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
                     continue;
                 }
                 int const numMatched = matched[static_cast<size_t>(i)].numMatchedTokens;
-                int const coverage = matched[static_cast<size_t>(i)].block->pageCoverage(lcId);
+                auto const* page = matched[static_cast<size_t>(i)].block->getPage(lcId);
+                // Selection follows the new request, not the shrinking match.
+                // Moving Last N on each retry would discard compatible KV.
+                int const coverage
+                    = page ? page->reusablePrefix(requestedLength, std::min(numMatched, page->numTokensInBlock)) : 0;
                 if (coverage >= numMatched)
                 {
                     continue;
@@ -954,9 +989,10 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(
     std::optional<int> numReusableTokensBeforeHybridPruning;
     if (ssmLcId.has_value())
     {
-        numReusableTokensBeforeHybridPruning = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
+        numReusableTokensBeforeHybridPruning
+            = numMatchedTokens(pruneMatch(rawMatched, std::nullopt, static_cast<int>(tokens.size())), mTokensPerBlock);
     }
-    auto matched = pruneMatch(std::move(rawMatched), ssmLcId);
+    auto matched = pruneMatch(std::move(rawMatched), ssmLcId, static_cast<int>(tokens.size()));
     ReuseMatch result{};
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());

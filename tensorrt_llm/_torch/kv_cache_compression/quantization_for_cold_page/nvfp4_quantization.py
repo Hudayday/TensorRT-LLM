@@ -18,7 +18,6 @@ from tensorrt_llm.quantization.modelopt_config import (
     read_modelopt_quant_config,
 )
 
-from ...attention.backends.interface import RopeParams
 from ...pyexecutor.resource_manager import DataType
 from .quantization_for_cold_page import ColdPageQuantizationCompression
 
@@ -47,11 +46,6 @@ _INTEGER_FIELDS = 7
 _SCALE_FIELDS = 4
 _NVFP4_TRANSFORM = 0
 _LOSSLESS_TRANSFORM = 1
-
-# Models whose RoPE layout the codec knows. Other models ignore the switch.
-_SKIP_ROPE_QUANTIZATION_MODEL_TYPES = frozenset(
-    {"deepseek_v4", "glm_moe_dsa", "qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}
-)
 
 _DEEPSEEK_V4_PREFIX = "deepseek_v4_"
 _DEEPSEEK_V4_SWA = f"{_DEEPSEEK_V4_PREFIX}swa"
@@ -122,6 +116,10 @@ class _Nvfp4ColdPageCodecState:
     layer_ids: tuple[int, ...]
     runtime_type: int
     lifecycle_metadata: tuple[_Nvfp4ColdPageMetadata, ...] = field(init=False)
+    lifecycles: tuple[object, ...] = field(init=False)
+    selected_metadata: dict[tuple[int, int], tuple[_Nvfp4ColdPageMetadata, ...]] = field(
+        default_factory=dict
+    )
 
 
 def _load_modelopt_nvfp4_scales(
@@ -204,15 +202,6 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
     ) -> None:
         super().__init__(config, pretrained_config=pretrained_config)
         self._model_scales = _load_modelopt_nvfp4_scales(config.scale_checkpoint_path)
-        self._skip_rope_quantization = bool(config.skip_rope_quantization)
-        model_type = getattr(pretrained_config, "model_type", None)
-        if self._skip_rope_quantization and model_type not in _SKIP_ROPE_QUANTIZATION_MODEL_TYPES:
-            logger.warning(
-                "skip_rope_quantization is supported for model types "
-                f"{sorted(_SKIP_ROPE_QUANTIZATION_MODEL_TYPES)} only; ignoring it for "
-                f"{model_type!r} and turning whole K and V vectors into NVFP4."
-            )
-            self._skip_rope_quantization = False
 
     def _calculate_quantized_range(
         self,
@@ -223,48 +212,9 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         key_only: bool = False,
         buffer_name: str,
     ) -> tuple[int, int]:
-        """Return (start, count) of the numbers of each K or V vector that become NVFP4."""
-
-        if not skip_rope:
-            return 0, row_elements
-        if rope is None:
-            # The same RoPE width the attention layers use.
-            text_config = self.pretrained_config.get_text_config()
-            rope_dim = RopeParams.from_config(text_config).dim
-            if key_only:  # MLA latent vector: kv_lora_rank NoPE numbers, then the RoPE numbers.
-                kv_lora_rank = getattr(text_config, "kv_lora_rank", None)
-                if not isinstance(kv_lora_rank, int) or kv_lora_rank + rope_dim != row_elements:
-                    raise NotImplementedError(
-                        f"{buffer_name}: head_dim {row_elements} is not kv_lora_rank + "
-                        f"qk_rope_head_dim ({kv_lora_rank} + {rope_dim}) of an MLA latent vector, "
-                        "so its RoPE part cannot be located; skip_rope_quantization is unsupported here"
-                    )
-                rope = (kv_lora_rank, rope_dim)
-            else:  # GQA head: the leading numbers carry RoPE.
-                rope = (0, rope_dim)
-        rope_start, rope_elements = rope
-        if rope_start < 0 or rope_elements < 0 or rope_start + rope_elements > row_elements:
-            raise ValueError(
-                f"{buffer_name}: RoPE range [{rope_start}, {rope_start + rope_elements}) lies "
-                f"outside the {row_elements}-element row; check partial_rotary_factor and "
-                "qk_rope_head_dim in the model config"
-            )
-        if rope_elements == 0:
-            return 0, row_elements
-        if rope_elements >= row_elements:
-            raise ValueError(
-                f"{buffer_name}: every element is position-encoded, so skip_rope_quantization would "
-                "leave nothing to quantize; the K vectors of this model are entirely RoPE"
-            )
-        if rope_start == 0:  # RoPE leads the row (partial-rotary GQA heads).
-            start, elements = rope_elements, row_elements - rope_elements
-        elif rope_start + rope_elements == row_elements:  # RoPE trails the row (MLA, DeepSeek-V4).
-            start, elements = 0, rope_start
-        else:
-            raise ValueError(
-                f"{buffer_name}: RoPE elements [{rope_start}, {rope_start + rope_elements}) sit "
-                "inside the row; the kernel quantizes one contiguous range per row"
-            )
+        start, elements = super()._calculate_quantized_range(
+            row_elements, skip_rope=skip_rope, rope=rope, key_only=key_only, buffer_name=buffer_name
+        )
         if start % _ELEMENTS_PER_SCALE or elements % _ELEMENTS_PER_SCALE:
             raise ValueError(
                 f"{buffer_name}: the quantized range [{start}, {start + elements}) must start and "
@@ -384,7 +334,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             # A compressed row is 448 NoPE elements followed by 64 RoPE elements.
             range_start, range_elements = self._calculate_quantized_range(
                 _DEEPSEEK_V4_ROW_STRIDE,
-                skip_rope=skip_rope,
+                skip_rope=skip_rope and not self.keep_layer(model_layers[layer_id]),
                 rope=(_DEEPSEEK_V4_NOPE_DIM, _DEEPSEEK_V4_ROW_STRIDE - _DEEPSEEK_V4_NOPE_DIM),
                 buffer_name=f"cold-page layer {layer_id} {_DEEPSEEK_V4_COMPRESS}",
             )
@@ -401,6 +351,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                         quantized_range_elements=range_elements,
                     )
                     if str(buffer.role) == _DEEPSEEK_V4_COMPRESS
+                    and not self.keep_layer(model_layers[layer_id])
                     else _Nvfp4BufferLayout(role=str(buffer.role))
                     for buffer in layer.buffers
                 ),
@@ -420,6 +371,16 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
     ) -> _Nvfp4ColdPageCodecState:
         from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
+        if self.selects_tokens and self.pretrained_config.model_type == "deepseek_v4":
+            raise NotImplementedError(
+                "Token selection requires one cache row per logical token; "
+                "DeepSeek-V4 compressed entries need a separate position mapping. "
+                "Layer and RoPE selection remain supported."
+            )
+        if is_draft and self._keep_layers:
+            raise NotImplementedError(
+                "keep_layers uses target-model layer IDs and cannot be applied to a draft KVCM"
+            )
         runtime_type = {
             DataType.HALF: 0,
             DataType.BF16: 1,
@@ -483,20 +444,21 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             num_kv_heads = int(num_kv_heads_per_layer[layer_id])
             tokens_per_page = int(cache_config.tokens_per_block)
             head_dim = int(head_dim_per_layer[layer_id])
+            preserve_layer = self.keep_layer(int(pp_layers[layer_id])) if not is_draft else False
             if head_dim <= 0 or head_dim % _ELEMENTS_PER_SCALE != 0:
                 raise ValueError(
                     f"NVFP4 cold pages require head_dim divisible by 16, got {head_dim}"
                 )
             key_range = self._calculate_quantized_range(
                 head_dim,
-                skip_rope=skip_rope,
+                skip_rope=skip_rope and not preserve_layer,
                 key_only=compressed_roles == ("key",),
                 buffer_name=f"cold-page layer {layer_id} key",
             )
             buffer_layouts = [
                 _Nvfp4BufferLayout(
                     role=role,
-                    scales=_Nvfp4Scales(*scales[index]),
+                    scales=None if preserve_layer else _Nvfp4Scales(*scales[index]),
                     quantized_range_start=key_range[0] if role == "key" else 0,
                     quantized_range_elements=key_range[1] if role == "key" else head_dim,
                 )
@@ -654,6 +616,249 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             num_buffers=num_buffers,
             max_half_groups_per_tile=max_half_groups_per_tile,
             cold_page_bytes=cold_page_bytes,
+        )
+
+    def selected_storage_properties(
+        self, codec_state: _Nvfp4ColdPageCodecState, lifecycle: object
+    ) -> tuple[int, int]:
+        layouts = [codec_state.layer_layouts[int(layer)] for layer in lifecycle.layers]
+        if not any(buffer.scales for layout in layouts for buffer in layout.buffers):
+            return 0, 0
+        lengths = {layout.tokens_per_page for layout in layouts}
+        if len(lengths) != 1 or not next(iter(lengths)):
+            raise ValueError("Selected cold pages require a common logical token length")
+        maximum = 0
+        for buffers in lifecycle.layers.values():
+            maximum += sum(int(buffer.raw_bytes) for buffer in buffers.values())
+            maximum = (maximum + 15) // 16 * 16
+        return lengths.pop(), maximum
+
+    def prepare_selected_cold_page(
+        self,
+        codec_state: _Nvfp4ColdPageCodecState,
+        lifecycle_index: int,
+        layout_id: int,
+        valid_tokens: int,
+        raw_tokens: Sequence[tuple[int, int]],
+        capacity_bytes: int,
+    ) -> int:
+        """Compile one immutable selection; pages with the same selection share these tables.
+
+        Segment bases include the head and token offset; the hot Slot stride is
+        unchanged. This reuses the existing contiguous-row codec, including RoPE
+        preservation, without another indexing convention in the CUDA kernel.
+        """
+        lifecycle = codec_state.lifecycles[lifecycle_index]
+        full_length, _ = self.selected_storage_properties(codec_state, lifecycle)
+        if valid_tokens == full_length and not raw_tokens:
+            metadata = codec_state.lifecycle_metadata[lifecycle_index]
+            if capacity_bytes != metadata.cold_page_bytes:
+                raise ValueError("Unprotected full pages must use the compact capacity")
+            codec_state.selected_metadata[lifecycle_index, layout_id] = (metadata,)
+            return metadata.cold_page_bytes
+        wide, integers, scales = [], [], []
+        cursor = 0
+        element_bytes = 1 if codec_state.runtime_type == 2 else 2
+        segments = []
+        end = 0
+        for first, last in raw_tokens:
+            if not end <= first < last <= valid_tokens:
+                raise ValueError("Raw token ranges must be sorted, disjoint, and valid")
+            if end < first:
+                segments.append((end, first, False))
+            segments.append((first, last, True))
+            end = last
+        if end < valid_tokens:
+            segments.append((end, valid_tokens, False))
+
+        def append(hot, offset, size, transform, heads=0, tokens=0, stride=0, buffer=None):
+            nonlocal cursor
+            data = cursor
+            scale_offset = 0
+            quantized = buffer.quantized_range_elements if transform == _NVFP4_TRANSFORM else 0
+            start = buffer.quantized_range_start if transform == _NVFP4_TRANSFORM else 0
+            if transform == _NVFP4_TRANSFORM:
+                cursor += heads * tokens * quantized // _ELEMENTS_PER_BYTE
+                scale_offset = cursor
+                cursor += (
+                    heads
+                    * tokens
+                    * (quantized // _ELEMENTS_PER_SCALE + (stride - quantized) * element_bytes)
+                )
+            elif transform == _LOSSLESS_TRANSFORM:
+                cursor += size
+            wide.append(
+                [int(hot.raw_base) + offset, int(hot.raw_slot_bytes), size, data, scale_offset, 0]
+            )
+            integers.append([0, transform, heads, tokens, quantized, stride, start])
+            scale = buffer.scales if transform == _NVFP4_TRANSFORM else _Nvfp4Scales(1.0, 1.0)
+            scales.append(
+                [
+                    scale.nvfp4_orig_quant,
+                    scale.nvfp4_quant_orig,
+                    scale.fp8_orig_quant,
+                    scale.fp8_quant_orig,
+                ]
+            )
+
+        for layer_id, hot_buffers in lifecycle.layers.items():
+            layout = codec_state.layer_layouts[int(layer_id)]
+            if not 0 <= valid_tokens <= layout.tokens_per_page:
+                raise ValueError("Invalid selected cold-page token count")
+            row_bytes = layout.raw_row_stride_elements * element_bytes
+            for buffer in layout.buffers:
+                hot = hot_buffers[buffer.role]
+                if buffer.role not in ("key", "value"):
+                    append(hot, 0, int(hot.raw_bytes), _LOSSLESS_TRANSFORM)
+                    continue
+                if int(hot.raw_bytes) != layout.num_kv_heads * layout.tokens_per_page * row_bytes:
+                    raise ValueError("Selected KV buffer does not have token-row geometry")
+                if valid_tokens == layout.tokens_per_page and (
+                    buffer.scales is None or list(raw_tokens) == [(0, valid_tokens)]
+                ):
+                    append(hot, 0, int(hot.raw_bytes), _LOSSLESS_TRANSFORM)
+                    continue
+                for head in range(layout.num_kv_heads):
+                    head_base = head * layout.tokens_per_page * row_bytes
+                    for first, last, keep in segments:
+                        transform = (
+                            _LOSSLESS_TRANSFORM
+                            if keep or buffer.scales is None
+                            else _NVFP4_TRANSFORM
+                        )
+                        append(
+                            hot,
+                            head_base + first * row_bytes,
+                            (last - first) * row_bytes,
+                            transform,
+                            1,
+                            last - first,
+                            layout.raw_row_stride_elements,
+                            buffer,
+                        )
+                    if valid_tokens < layout.tokens_per_page:
+                        # Transform 2 has no cold payload and clears only the invalid hot rows.
+                        append(
+                            hot,
+                            head_base + valid_tokens * row_bytes,
+                            (layout.tokens_per_page - valid_tokens) * row_bytes,
+                            2,
+                        )
+            aligned = (cursor + 15) // 16 * 16
+            wide[-1][5], integers[-1][0] = cursor, aligned - cursor
+            cursor = aligned
+
+        if cursor > capacity_bytes:
+            raise ValueError("Selected cold-page payload exceeds its allocated capacity")
+        # Initialize all capacity padding before Host/Disk copies can expose it.
+        wide[-1][5] = cursor - integers[-1][0]
+        integers[-1][0] += capacity_bytes - cursor
+        metadata = []
+        for first in range(0, len(wide), _MAX_BUFFERS_PER_LAUNCH):
+            stop = min(first + _MAX_BUFFERS_PER_LAUNCH, len(wide))
+            padding = _MAX_BUFFERS_PER_LAUNCH - (stop - first)
+            half_groups = max(
+                (
+                    row[2] * row[3] * row[4] // _ELEMENTS_PER_HALF_GROUP
+                    for row in integers[first:stop]
+                ),
+                default=0,
+            )
+            metadata.append(
+                _Nvfp4ColdPageMetadata(
+                    wide=torch.tensor(
+                        wide[first:stop] + [[0] * _WIDE_FIELDS] * padding,
+                        dtype=torch.int64,
+                        device="cpu",
+                    ),
+                    integers=torch.tensor(
+                        integers[first:stop] + [[0] * _INTEGER_FIELDS] * padding,
+                        dtype=torch.int32,
+                        device="cpu",
+                    ),
+                    scales=torch.tensor(
+                        scales[first:stop] + [[0.0] * _SCALE_FIELDS] * padding,
+                        dtype=torch.float32,
+                        device="cpu",
+                    ),
+                    num_buffers=stop - first,
+                    max_half_groups_per_tile=min(half_groups, _MAX_HALF_GROUPS_PER_TILE),
+                    cold_page_bytes=capacity_bytes,
+                )
+            )
+        codec_state.selected_metadata[lifecycle_index, layout_id] = tuple(metadata)
+        return cursor
+
+    def _dispatch_selected(
+        self,
+        codec_state: _Nvfp4ColdPageCodecState,
+        lifecycle_index: int,
+        layout_id: int,
+        cold_base: int,
+        page_indices: int,
+        num_pages: int,
+        stream: int,
+        *,
+        decode: bool,
+    ) -> None:
+        from tensorrt_llm.bindings.internal import kv_cache_compression as native
+
+        launch = native.nvfp4_cold_page_decode if decode else native.nvfp4_cold_page_encode
+        for metadata in codec_state.selected_metadata[lifecycle_index, layout_id]:
+            launch(
+                page_indices,
+                num_pages,
+                metadata.wide.data_ptr(),
+                metadata.integers.data_ptr(),
+                metadata.scales.data_ptr(),
+                metadata.num_buffers,
+                metadata.max_half_groups_per_tile,
+                metadata.cold_page_bytes,
+                codec_state.runtime_type,
+                cold_base,
+                stream,
+            )
+
+    def encode_selected_cold_pages(
+        self,
+        codec_state: _Nvfp4ColdPageCodecState,
+        lifecycle_index: int,
+        layout_id: int,
+        cold_base: int,
+        page_indices: int,
+        num_pages: int,
+        stream: int,
+    ) -> None:
+        self._dispatch_selected(
+            codec_state,
+            lifecycle_index,
+            layout_id,
+            cold_base,
+            page_indices,
+            num_pages,
+            stream,
+            decode=False,
+        )
+
+    def decode_selected_cold_pages(
+        self,
+        codec_state: _Nvfp4ColdPageCodecState,
+        lifecycle_index: int,
+        layout_id: int,
+        cold_base: int,
+        page_indices: int,
+        num_pages: int,
+        stream: int,
+    ) -> None:
+        self._dispatch_selected(
+            codec_state,
+            lifecycle_index,
+            layout_id,
+            cold_base,
+            page_indices,
+            num_pages,
+            stream,
+            decode=True,
         )
 
     def encode_cold_pages(

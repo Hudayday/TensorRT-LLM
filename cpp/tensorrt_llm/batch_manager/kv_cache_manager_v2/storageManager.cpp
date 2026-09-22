@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
@@ -44,37 +45,29 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // LifeCyclePoolGroupMapping
 // ---------------------------------------------------------------------------
 
-LifeCyclePoolGroupMapping::LifeCyclePoolGroupMapping(TypedVec<LifeCycleId, PoolGroupIndex> forward)
+LifeCyclePoolGroupMapping::LifeCyclePoolGroupMapping(TypedVec<LifeCycleId, PoolGroupIndex> forward,
+    std::vector<std::pair<LifeCycleId, PoolGroupIndex>> const& additional)
     : mForward(std::move(forward))
 {
-    size_t numPoolGroups = 0;
-    for (PoolGroupIndex poolGroup : mForward)
+    auto pairs = additional;
+    for (LifeCycleId lc{0}; lc < mForward.size(); ++lc)
+        pairs.emplace_back(lc, mForward[lc]);
+    size_t numGroups = 0;
+    for (auto const& [lc, pg] : pairs)
     {
-        TLLM_CHECK_WITH_INFO(poolGroup >= PoolGroupIndex{0}, "Pool group index must be non-negative");
-        numPoolGroups = std::max(numPoolGroups, static_cast<size_t>(poolGroup.value()) + 1);
+        TLLM_CHECK(lc >= LifeCycleId{0} && lc < mForward.size() && pg >= PoolGroupIndex{0});
+        numGroups = std::max(numGroups, static_cast<size_t>(pg.value()) + 1);
     }
-    TLLM_CHECK_WITH_INFO(numPoolGroups <= static_cast<size_t>(std::numeric_limits<int>::max()), "Too many pool groups");
-    TLLM_CHECK_WITH_INFO(
-        mForward.stdSize() <= static_cast<size_t>(std::numeric_limits<int>::max()), "Too many lifecycles");
-
-    mPoolGroupOffsets.assign(numPoolGroups + 1, 0);
-    for (PoolGroupIndex poolGroup : mForward)
-    {
-        ++mPoolGroupOffsets.at(static_cast<size_t>(poolGroup.value()) + 1);
-    }
-    for (size_t poolGroup = 0; poolGroup < numPoolGroups; ++poolGroup)
-    {
-        TLLM_CHECK_WITH_INFO(mPoolGroupOffsets[poolGroup + 1] > 0, "Pool group indices must be canonical");
-    }
+    mPoolGroupOffsets.assign(numGroups + 1, 0);
+    for (auto const& [lc, pg] : pairs)
+        ++mPoolGroupOffsets.at(pg.value() + 1);
+    for (size_t pg = 0; pg < numGroups; ++pg)
+        TLLM_CHECK(mPoolGroupOffsets[pg + 1] > 0);
     std::partial_sum(mPoolGroupOffsets.begin(), mPoolGroupOffsets.end(), mPoolGroupOffsets.begin());
-
-    mInverse.resize(mForward.stdSize());
+    mInverse.resize(pairs.size());
     auto next = mPoolGroupOffsets;
-    for (LifeCycleId lifeCycle{0}; lifeCycle < mForward.size(); ++lifeCycle)
-    {
-        size_t const poolGroup = static_cast<size_t>(mForward[lifeCycle].value());
-        mInverse[next[poolGroup]++] = lifeCycle;
-    }
+    for (auto const& [lc, pg] : pairs)
+        mInverse[next[pg.value()]++] = lc;
 }
 
 PoolGroupIndex LifeCyclePoolGroupMapping::poolGroup(LifeCycleId lifeCycle) const
@@ -105,7 +98,7 @@ CacheLevelManager::CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const
     TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator)
     : cacheLevel(cl)
     , cacheTier(CacheTier(tierConfig.index()))
-    , controller(lifeCycleGrouping, cl)
+    , controller(lifeCycleGrouping, cl, slotDescList.size())
 {
     TLLM_CHECK((cacheTier == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
     storage = createCacheLevelStorage(tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator);
@@ -232,6 +225,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     : mLifeCycles(lifeCycles)
     , mEventSink(std::move(eventSink))
     , mHotPoolGroupMapping(config.lifeCycleGrouping())
+    , mTokensPerBlock(tokensPerBlock)
     , mSwaScratchReuse(std::move(swaScratchReuse))
     , mColdPageCodec(coldPageCodec ? std::move(coldPageCodec) : createDefaultKvCacheColdPageCodec())
 {
@@ -352,7 +346,8 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         size_t const coldPageBytes = codec.queryColdPageBytes(lifeCycle);
         TLLM_CHECK_WITH_INFO(coldPageBytes > 0, "Cold-page codec returned an invalid page size");
         coldPageBytesByLifeCycle[lifeCycle] = coldPageBytes;
-        maxColdPageBytes = std::max(maxColdPageBytes, coldPageBytes);
+        for (size_t bytes : codec.coldPageCapacities(lifeCycle))
+            maxColdPageBytes = std::max(maxColdPageBytes, bytes);
 
         LayerGroupId const batchingLayerGroupId = codec.getBatchingLayerGroupId(lifeCycle);
         TLLM_CHECK_WITH_INFO(batchingLayerGroupId.value() >= 0 && batchingLayerGroupId < numLifeCycles()
@@ -416,6 +411,30 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         coldSlotDescList[coldPgIdx].variants.push_back(std::move(variant));
     }
 
+    mColdCapacityGroups.resize(numLifeCycles());
+    std::vector<std::pair<LifeCycleId, PoolGroupIndex>> additional;
+    for (LifeCycleId lc{0}; lc < numLifeCycles(); ++lc)
+    {
+        mColdCapacityGroups[lc].push_back(coldGrouping[lc]);
+        auto const capacities = codec.coldPageCapacities(lc);
+        TLLM_CHECK(!capacities.empty() && capacities.front() == coldPageBytesByLifeCycle[lc]);
+        for (size_t index = 1; index < capacities.size(); ++index)
+        {
+            size_t const bytes = capacities[index];
+            TLLM_CHECK(bytes > capacities[index - 1]);
+            auto [it, inserted] = coldGroupByPageBytes.emplace(bytes, coldSlotDescList.size());
+            auto const pg = it->second;
+            if (inserted)
+                coldSlotDescList.push_back(SlotDesc{});
+            mColdCapacityGroups[lc].push_back(pg);
+            additional.emplace_back(lc, pg);
+            SlotDescVariant variant;
+            variant.lifeCycleId = lc;
+            variant.coalescedBuffers.push_back(
+                CoalescedBuffer{bytes, std::vector<BufferId>{BufferId{-1, "__cold_page__"}}});
+            coldSlotDescList[pg].variants.push_back(std::move(variant));
+        }
+    }
     TypedVec<PoolGroupIndex, SlotCount> coldMinSlots(coldSlotDescList.size(), 1);
 
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> coldSlotSizeLists;
@@ -427,12 +446,20 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         coldSlotSizeLists.push_back(std::move(sizes));
     }
 
-    mColdPoolGroupMapping = LifeCyclePoolGroupMapping(std::move(coldGrouping));
+    mColdPoolGroupMapping = LifeCyclePoolGroupMapping(std::move(coldGrouping), additional);
 
     for (CacheLevel level{1}; level < config.cacheTiers.size(); ++level)
     {
         TLLM_CHECK(appendLevelSlotDescList(coldSlotDescList) == level);
-        auto const coldRatio = projectPoolGroupRatio(kHotLevel, level, lifeCycleRatio);
+        int referenceLength = 0;
+        if (typicalBatch && !typicalBatch->kvCaches.empty())
+        {
+            int64_t total = 0;
+            for (auto const& cache : typicalBatch->kvCaches)
+                total += cache.historyLength;
+            referenceLength = static_cast<int>(total / typicalBatch->kvCaches.size());
+        }
+        auto const coldRatio = projectPoolGroupRatio(kHotLevel, level, lifeCycleRatio, referenceLength);
         auto slotCounts
             = computeSlotCountForLevel(config.cacheTiers[level], coldSlotSizeLists, coldRatio, coldMinSlots);
         auto* gpuPhysMemAllocator
@@ -577,11 +604,13 @@ Address StorageManager::slotAddress(CacheLevel level, PoolGroupIndex pgIdx, Slot
 }
 
 void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
-    PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
+    PageIndexPair const* pageIndices, size_t numPages, CUstream stream, ColdPageRepresentation const* representation)
 {
     TLLM_CHECK_DEBUG(pageIndices != nullptr && numPages > 0);
-    PoolGroupIndex const srcPgIdx = getPoolGroupIndex(srcLevel, batchingLayerGroupId);
-    PoolGroupIndex const dstPgIdx = getPoolGroupIndex(dstLevel, batchingLayerGroupId);
+    PoolGroupIndex const srcPgIdx
+        = getPoolGroupIndex(srcLevel, batchingLayerGroupId, representation ? representation->capacityClass : 0);
+    PoolGroupIndex const dstPgIdx
+        = getPoolGroupIndex(dstLevel, batchingLayerGroupId, representation ? representation->capacityClass : 0);
     CacheTier const srcTier = cacheTier(srcLevel);
     CacheTier const dstTier = cacheTier(dstLevel);
     bool const srcIsHot = srcLevel == kHotLevel;
@@ -618,26 +647,26 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
     CacheTier const coldTier = srcIsHot ? dstTier : srcTier;
     size_t const coldPageBytes = slotSize(coldLevel, coldPgIdx).at(PoolIndex{0});
     PageIndexLocation const pageIndexLocation = mPageIndexLocations.at(batchingLayerGroupId);
-    auto encodeBatch = [this, batchingLayerGroupId, pageIndexLocation](
+    auto encodeBatch = [this, batchingLayerGroupId, pageIndexLocation, representation](
                            void* dstBasePtr, PageIndexPair const* indices, size_t count, CUstream batchStream)
     {
         return submitColdPageCodec(pageIndexLocation, indices, count, batchStream,
-            [this, batchingLayerGroupId, dstBasePtr](
+            [this, batchingLayerGroupId, dstBasePtr, representation](
                 PageIndexPair const* submittedIndices, size_t submittedPages, CUstream submittedStream)
             {
-                return mColdPageCodec->encode(batchingLayerGroupId, dstBasePtr, submittedIndices, submittedPages,
-                    reinterpret_cast<cudaStream_t>(submittedStream));
+                return mColdPageCodec->encodeSelected(batchingLayerGroupId, representation, dstBasePtr,
+                    submittedIndices, submittedPages, reinterpret_cast<cudaStream_t>(submittedStream));
             });
     };
-    auto decodeBatch = [this, batchingLayerGroupId, pageIndexLocation](
+    auto decodeBatch = [this, batchingLayerGroupId, pageIndexLocation, representation](
                            void const* srcBasePtr, PageIndexPair const* indices, size_t count, CUstream batchStream)
     {
         return submitColdPageCodec(pageIndexLocation, indices, count, batchStream,
-            [this, batchingLayerGroupId, srcBasePtr](
+            [this, batchingLayerGroupId, srcBasePtr, representation](
                 PageIndexPair const* submittedIndices, size_t submittedPages, CUstream submittedStream)
             {
-                return mColdPageCodec->decode(batchingLayerGroupId, srcBasePtr, submittedIndices, submittedPages,
-                    reinterpret_cast<cudaStream_t>(submittedStream));
+                return mColdPageCodec->decodeSelected(batchingLayerGroupId, representation, srcBasePtr,
+                    submittedIndices, submittedPages, reinterpret_cast<cudaStream_t>(submittedStream));
             });
     };
 
@@ -717,11 +746,11 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
 }
 
 void StorageManager::copySlotData(LifeCycleId lifeCycle, CacheLevel dstLevel, CacheLevel srcLevel, SlotId dstSlotId,
-    SlotId srcSlotId, CUstream stream)
+    SlotId srcSlotId, CUstream stream, ColdPageRepresentation const* representation)
 {
     LayerGroupId const batchingLayerGroupId = getMigrationBatchingLayerGroupId(dstLevel, srcLevel, lifeCycle);
     PageIndexPair const pageIndex{slotIdToPageIndexValue(dstSlotId), slotIdToPageIndexValue(srcSlotId)};
-    submitMigrationBatch(dstLevel, srcLevel, batchingLayerGroupId, &pageIndex, 1, stream);
+    submitMigrationBatch(dstLevel, srcLevel, batchingLayerGroupId, &pageIndex, 1, stream, representation);
 }
 
 CacheTier StorageManager::cacheTier(CacheLevel level) const
@@ -729,9 +758,9 @@ CacheTier StorageManager::cacheTier(CacheLevel level) const
     return mLevels.at(level).cacheTier;
 }
 
-void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
+void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot, int capacityClass)
 {
-    PoolGroupIndex pg = getPoolGroupIndex(level, lc);
+    PoolGroupIndex pg = getPoolGroupIndex(level, lc, capacityClass);
     mLevels.at(level).storage->release(pg, std::move(slot));
 }
 
@@ -896,12 +925,17 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     bool const isLast = isLastLevel(lvlId);
     auto const& grouping = poolGroupMapping(lvlId);
 
+    for (auto const& pages : fallenPages)
+        for (auto const& page : pages)
+            prepareColdPage(*page);
+    auto belongs = [&](auto const& page, PoolGroupIndex pg) { return getPoolGroupIndex(lvlId, *page) == pg; };
     auto countPages = [&](PoolGroupIndex pgIdx, PagesByLifeCycle const& pagesByLifeCycle)
     {
-        auto const lifeCycles = grouping.lifeCycles(pgIdx);
-        return std::accumulate(lifeCycles.begin(), lifeCycles.end(), SlotCount{0},
-            [&](SlotCount count, LifeCycleId lifeCycle)
-            { return count + slotCountValueFromSize(pagesByLifeCycle.at(lifeCycle).size()); });
+        SlotCount count = 0;
+        for (LifeCycleId lc : grouping.lifeCycles(pgIdx))
+            count += std::count_if(pagesByLifeCycle.at(lc).begin(), pagesByLifeCycle.at(lc).end(),
+                [&](auto const& page) { return belongs(page, pgIdx); });
+        return count;
     };
 
     TypedVec<PoolGroupIndex, SlotCount> numToEvict(numPoolGroups(lvlId), 0);
@@ -929,7 +963,8 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                 {
                     auto page = std::move(pages.front());
                     pages.pop_front();
-                    (page->status() == PageStatus::HELD ? held : remaining).push_back(std::move(page));
+                    (belongs(page, pgIdx) && page->status() == PageStatus::HELD ? held : remaining)
+                        .push_back(std::move(page));
                 }
                 pages = std::move(remaining);
             }
@@ -956,35 +991,27 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     auto acceptFallenPages = [&](PoolGroupIndex pgIdx, SlotCount count)
     {
         auto const lifeCycles = grouping.lifeCycles(pgIdx);
-        auto backPriority = [&](LifeCycleId lifeCycle) -> std::optional<Priority>
-        {
-            auto const& fallen = fallenPages.at(lifeCycle);
-            return fallen.empty() ? std::nullopt : std::optional<Priority>{fallen.back()->priority};
-        };
         while (count > 0)
         {
-            auto const bestLifeCycle = std::max_element(lifeCycles.begin(), lifeCycles.end(),
-                [&](LifeCycleId lhs, LifeCycleId rhs) { return backPriority(lhs) < backPriority(rhs); });
-            TLLM_CHECK_DEBUG(bestLifeCycle != lifeCycles.end() && backPriority(*bestLifeCycle).has_value());
-            Priority const bestPriority = *backPriority(*bestLifeCycle);
-            for (LifeCycleId lifeCycle : lifeCycles)
+            std::optional<Priority> best;
+            LifeCycleId bestLc{-1};
+            PageQueue::iterator bestPage;
+            for (LifeCycleId lc : lifeCycles)
             {
-                auto& fallen = fallenPages.at(lifeCycle);
-                auto matchingBegin = std::lower_bound(fallen.begin(), fallen.end(), bestPriority,
-                    [](auto const& page, Priority priority) { return page->priority < priority; });
-                SlotCount const numAccepted
-                    = std::min(count, slotCountValueFromSize(std::distance(matchingBegin, fallen.end())));
-                matchingBegin = fallen.end() - numAccepted;
-                auto& accepted = acceptedPages.at(lifeCycle);
-                accepted.insert(
-                    accepted.end(), std::make_move_iterator(matchingBegin), std::make_move_iterator(fallen.end()));
-                fallen.erase(matchingBegin, fallen.end());
-                count -= numAccepted;
-                if (count == 0)
+                auto& queue = fallenPages.at(lc);
+                auto it = std::find_if(
+                    queue.rbegin(), queue.rend(), [&](auto const& page) { return belongs(page, pgIdx); });
+                if (it != queue.rend() && (!best || (*it)->priority > *best))
                 {
-                    break;
+                    best = (*it)->priority;
+                    bestLc = lc;
+                    bestPage = std::prev(it.base());
                 }
             }
+            TLLM_CHECK_DEBUG(best.has_value());
+            acceptedPages.at(bestLc).push_back(std::move(*bestPage));
+            fallenPages.at(bestLc).erase(bestPage);
+            --count;
         }
     };
 
@@ -1029,10 +1056,20 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             {
                 auto& accepted = acceptedPages.at(lifeCycle);
                 auto& held = heldPages.at(lifeCycle);
-                accepted.insert(
-                    accepted.end(), std::make_move_iterator(held.begin()), std::make_move_iterator(held.end()));
-                held.clear();
-                fallenPages.at(lifeCycle).clear();
+                for (auto it = held.begin(); it != held.end();)
+                {
+                    if (belongs(*it, pgIdx))
+                    {
+                        accepted.push_back(std::move(*it));
+                        it = held.erase(it);
+                    }
+                    else
+                        ++it;
+                }
+                auto& fallen = fallenPages.at(lifeCycle);
+                fallen.erase(std::remove_if(
+                                 fallen.begin(), fallen.end(), [&](auto const& page) { return belongs(page, pgIdx); }),
+                    fallen.end());
             }
         }
         else
@@ -1063,14 +1100,20 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         for (LifeCycleId lifeCycle : grouping.lifeCycles(pgIdx))
         {
             auto& pages = acceptedPages.at(lifeCycle);
-            for (auto& page : pages)
+            for (auto it = pages.begin(); it != pages.end();)
             {
+                if (!belongs(*it, pgIdx))
+                {
+                    ++it;
+                    continue;
+                }
+                auto page = std::move(*it);
+                it = pages.erase(it);
                 TLLM_CHECK_DEBUG(page->lifeCycle == lifeCycle);
                 LayerGroupId const batchingLayerGroupId
                     = getMigrationBatchingLayerGroupId(lvlId, page->cacheLevel, lifeCycle);
                 migrationBatches[{page->cacheLevel, batchingLayerGroupId}].push_back(std::move(page));
             }
-            pages.clear();
         }
         for (auto& [batchKey, pages] : migrationBatches)
         {
@@ -1097,7 +1140,7 @@ LayerGroupId StorageManager::getMigrationBatchingLayerGroupId(
 {
     bool const srcIsHot = srcLevel == kHotLevel;
     bool const dstIsHot = dstLevel == kHotLevel;
-    if (srcIsHot != dstIsHot)
+    if (srcIsHot != dstIsHot || mColdPageCodec->selectsTokens(lifeCycle))
     {
         return mBatchingLayerGroupIds.at(lifeCycle);
     }
@@ -1124,16 +1167,41 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         return updateSrc ? std::nullopt : std::optional<std::vector<Slot>>{std::in_place};
     }
 
+    if (std::any_of(srcPages.begin(), srcPages.end(), [](auto const& page) { return bool(page->coldState); }))
+    {
+        // Keep each launch homogeneous in frozen representation as well as lifecycle.
+        // Encoding selection is resolved before any destination allocation.
+        using SelectionKey = std::tuple<PoolGroupIndex, PoolGroupIndex, LayerGroupId, int>;
+        std::map<SelectionKey, std::vector<SharedPtr<Page>>> selectedBatches;
+        for (auto const& page : srcPages)
+        {
+            if (srcLevel == kHotLevel && dstLevel != kHotLevel)
+                prepareColdPage(*page);
+            auto const* rep = page->coldState ? page->coldState->representation.get() : nullptr;
+            selectedBatches[{getPoolGroupIndex(srcLevel, *page), getPoolGroupIndex(dstLevel, *page),
+                                getMigrationBatchingLayerGroupId(dstLevel, srcLevel, page->lifeCycle),
+                                rep ? rep->layoutId : -1}]
+                .push_back(page);
+        }
+        if (selectedBatches.size() > 1)
+        {
+            TLLM_CHECK_WITH_INFO(updateSrc, "Heterogeneous migration requires in-place page ownership updates");
+            for (auto const& [key, pages] : selectedBatches)
+                _batchedMigrate(dstLevel, srcLevel, pages, true, migrationRecorder, defrag);
+            return std::nullopt;
+        }
+    }
+    auto const* representation
+        = srcPages.front()->coldState ? srcPages.front()->coldState->representation.get() : nullptr;
     SlotCount const numSlots = slotCountValueFromSize(srcPages.size());
     LifeCycleId const firstLifeCycle = srcPages.front()->lifeCycle;
     LayerGroupId const batchingLayerGroupId = getMigrationBatchingLayerGroupId(dstLevel, srcLevel, firstLifeCycle);
-    PoolGroupIndex const srcPgIdx = getPoolGroupIndex(srcLevel, batchingLayerGroupId);
-    PoolGroupIndex const dstPgIdx = getPoolGroupIndex(dstLevel, batchingLayerGroupId);
+    PoolGroupIndex const srcPgIdx = getPoolGroupIndex(srcLevel, *srcPages.front());
+    PoolGroupIndex const dstPgIdx = getPoolGroupIndex(dstLevel, *srcPages.front());
     TLLM_CHECK_DEBUG(std::all_of(srcPages.begin(), srcPages.end(),
         [this, srcLevel, dstLevel, srcPgIdx, dstPgIdx, batchingLayerGroupId](auto const& page)
         {
-            return getPoolGroupIndex(srcLevel, page->lifeCycle) == srcPgIdx
-                && getPoolGroupIndex(dstLevel, page->lifeCycle) == dstPgIdx
+            return getPoolGroupIndex(srcLevel, *page) == srcPgIdx && getPoolGroupIndex(dstLevel, *page) == dstPgIdx
                 && getMigrationBatchingLayerGroupId(dstLevel, srcLevel, page->lifeCycle) == batchingLayerGroupId;
         }));
     auto& srcPoolGroup = poolGroup(srcLevel, srcPgIdx);
@@ -1142,6 +1210,15 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
     if (dstPoolGroup.numFreeSlots() < numSlots)
         throw OutOfPagesError("Not enough free slots for migration");
 
+    // Allocate provenance before publishing any slot changes. Failure leaves
+    // every source page and its previous quality intact.
+    std::vector<std::unique_ptr<ColdPageState>> encodedStates;
+    if (updateSrc && srcLevel == kHotLevel && dstLevel != kHotLevel && representation)
+    {
+        encodedStates.reserve(srcPages.size());
+        for (auto const& page : srcPages)
+            encodedStates.push_back(page->coldStateAfterEncode());
+    }
     auto dstSlots = dstPoolGroup.allocateMultiple(numSlots);
     // A15: allocated slot count must match the request.
     TLLM_CHECK_DEBUG_WITH_INFO(slotCountValueFromSize(dstSlots.size()) == numSlots, "dst_slots size mismatch");
@@ -1179,8 +1256,8 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         {
             auto scope = tempStream.enter();
             CUstream const stream = tempStream.get();
-            submitMigrationBatch(
-                dstLevel, srcLevel, batchingLayerGroupId, pageIndices.data(), pageIndices.size(), stream);
+            submitMigrationBatch(dstLevel, srcLevel, batchingLayerGroupId, pageIndices.data(), pageIndices.size(),
+                stream, representation);
         }
         updateReadyEvents.run();
 
@@ -1200,6 +1277,8 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         {
             if (updateSrc)
             {
+                if (!encodedStates.empty())
+                    srcPages.at(i)->coldState = std::move(encodedStates.at(i));
                 bool wasScheduled = srcPages.at(i)->scheduledForEviction();
                 if (wasScheduled)
                     excludeFromEviction(*srcPages.at(i));
@@ -1296,7 +1375,7 @@ int64_t StorageManager::prefetch(
                 }
                 if (level != dstLevel)
                 {
-                    auto const dstPgIdx = getPoolGroupIndex(dstLevel, lifeCycle);
+                    auto const dstPgIdx = getPoolGroupIndex(dstLevel, *page);
                     ++numSlotsToMigrate.at(dstPgIdx);
                 }
             }
@@ -1346,6 +1425,41 @@ LifeCycle const& StorageManager::getLifeCycle(LifeCycleId lc) const
 PoolGroupIndex StorageManager::getPoolGroupIndex(CacheLevel level, LifeCycleId lc) const
 {
     return poolGroupMapping(level).poolGroup(lc);
+}
+
+PoolGroupIndex StorageManager::getPoolGroupIndex(CacheLevel level, LifeCycleId lc, int capacityClass) const
+{
+    return level == kHotLevel ? getPoolGroupIndex(level, lc) : mColdCapacityGroups.at(lc).at(capacityClass);
+}
+
+PoolGroupIndex StorageManager::getPoolGroupIndex(CacheLevel level, Page const& page) const
+{
+    return getPoolGroupIndex(level, page.lifeCycle, page.coldCapacityClass());
+}
+
+void StorageManager::prepareColdPage(Page& page)
+{
+    if (page.cacheLevel != kHotLevel || !page.coldState)
+        return;
+    auto& state = *page.coldState;
+    if (!page.isCommitted())
+    {
+        auto const& uncommitted = static_cast<UncommittedPage const&>(page);
+        state.validTokens = std::clamp(uncommitted.kvCache->historyLength() - state.startToken, 0, mTokensPerBlock);
+    }
+    ColdPageContext context{state.startToken, state.validTokens, {}, state.retainedProtection};
+    for (auto const& sequence : state.sequences)
+        if (sequence->closed)
+            context.sequenceLengths.push_back(sequence->length);
+    state.retainedProtection = mColdPageCodec->protectedTokens(page.lifeCycle, context);
+    state.sequences.erase(std::remove_if(state.sequences.begin(), state.sequences.end(),
+                              [](auto const& sequence) { return sequence->closed; }),
+        state.sequences.end());
+    context.retainedProtection = state.retainedProtection;
+    context.sequenceLengths.clear();
+    for (auto const& sequence : state.sequences)
+        context.sequenceLengths.push_back(sequence->length);
+    state.representation = mColdPageCodec->prepareColdPage(page.lifeCycle, context);
 }
 
 PoolGroupIndex StorageManager::getPoolGroupIndex(LifeCycleId lc) const
@@ -1501,7 +1615,7 @@ void StorageManager::shrinkPoolGroup(
         persistentPages.size() <= slotCountToSizeT(newNumSlots), "Not enough slots to hold all persistent pages");
     TLLM_CHECK_WITH_INFO(std::all_of(persistentPages.begin(), persistentPages.end(),
                              [this, level, pgIdx](auto const& p)
-                             { return p->cacheLevel == level && getPoolGroupIndex(level, p->lifeCycle) == pgIdx; }),
+                             { return p->cacheLevel == level && getPoolGroupIndex(level, *p) == pgIdx; }),
         "Persistent page cache level or pool group mismatch");
 
     // Fast path: when no slot id has ever been issued in the to-be-removed
@@ -1682,38 +1796,31 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromLength(
 }
 
 TypedVec<PoolGroupIndex, float> StorageManager::toPoolGroupRatio(
-    CacheLevel level, TypedVec<LifeCycleId, float> const& lifeCycleRatio) const
+    CacheLevel level, TypedVec<LifeCycleId, float> const& lifeCycleRatio, int historyLength) const
 {
-    TLLM_CHECK_WITH_INFO(
-        lifeCycleRatio.size() == numLifeCycles(), "Lifecycle ratio length must match the number of lifecycles");
-    TypedVec<PoolGroupIndex, float> poolGroupRatio(numPoolGroups(level), 0.0F);
-    for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
-    {
-        poolGroupRatio[getPoolGroupIndex(level, lifeCycle)] += lifeCycleRatio[lifeCycle];
-    }
-    return normalizeToRatio(poolGroupRatio);
+    return projectPoolGroupRatio(level, level, lifeCycleRatio, historyLength);
 }
 
-TypedVec<PoolGroupIndex, float> StorageManager::projectPoolGroupRatio(
-    CacheLevel srcLevel, CacheLevel dstLevel, TypedVec<LifeCycleId, float> const& srcLifeCycleRatio) const
+TypedVec<PoolGroupIndex, float> StorageManager::projectPoolGroupRatio(CacheLevel srcLevel, CacheLevel dstLevel,
+    TypedVec<LifeCycleId, float> const& srcLifeCycleRatio, int historyLength) const
 {
-    TLLM_CHECK_WITH_INFO(
-        srcLifeCycleRatio.size() == numLifeCycles(), "Lifecycle ratio length must match the number of lifecycles");
-    TypedVec<PoolGroupIndex, double> dstPoolGroupWeights(numPoolGroups(dstLevel), 0.0);
-    for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
+    TLLM_CHECK_WITH_INFO(srcLifeCycleRatio.size() == numLifeCycles(), "Lifecycle ratio length mismatch");
+    TypedVec<PoolGroupIndex, double> weights(numPoolGroups(dstLevel), 0.0);
+    for (LifeCycleId lc{0}; lc < numLifeCycles(); ++lc)
     {
-        auto bytesPerSlot = [&](CacheLevel level)
+        auto const srcSizes = slotSize(srcLevel, getPoolGroupIndex(srcLevel, lc));
+        auto const srcBytes = std::accumulate(srcSizes.begin(), srcSizes.end(), size_t{0});
+        auto const fractions = dstLevel == kHotLevel ? std::vector<double>{1.0}
+                                                     : mColdPageCodec->coldPageCapacityFractions(lc, historyLength);
+        for (size_t index = 0; index < fractions.size(); ++index)
         {
-            auto const sizes = slotSize(level, getPoolGroupIndex(level, lifeCycle));
-            return std::accumulate(sizes.begin(), sizes.end(), size_t{0});
-        };
-        size_t const srcBytesPerSlot = bytesPerSlot(srcLevel);
-        size_t const dstBytesPerSlot = bytesPerSlot(dstLevel);
-        TLLM_CHECK_WITH_INFO(srcBytesPerSlot > 0 && dstBytesPerSlot > 0, "Cache slot size must be positive");
-        dstPoolGroupWeights[getPoolGroupIndex(dstLevel, lifeCycle)] += static_cast<double>(srcLifeCycleRatio[lifeCycle])
-            * static_cast<double>(dstBytesPerSlot) / static_cast<double>(srcBytesPerSlot);
+            auto const pg = getPoolGroupIndex(dstLevel, lc, static_cast<int>(index));
+            auto const dstSizes = slotSize(dstLevel, pg);
+            auto const dstBytes = std::accumulate(dstSizes.begin(), dstSizes.end(), size_t{0});
+            weights[pg] += srcLifeCycleRatio[lc] * fractions[index] * static_cast<double>(dstBytes) / srcBytes;
+        }
     }
-    return normalizeToRatio(dstPoolGroupWeights);
+    return normalizeToRatio(weights);
 }
 
 TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,

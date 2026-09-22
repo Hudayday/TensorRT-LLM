@@ -34,9 +34,9 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 namespace
 {
 
-int64_t sumSlotBytes(StorageManager const& storage, CacheLevel level, LifeCycleId lifeCycle)
+int64_t sumSlotBytes(StorageManager const& storage, CacheLevel level, LifeCycleId lifeCycle, int capacityClass = 0)
 {
-    PoolGroupIndex const poolGroup = storage.getPoolGroupIndex(level, lifeCycle);
+    PoolGroupIndex const poolGroup = storage.getPoolGroupIndex(level, lifeCycle, capacityClass);
     int64_t pageSize = 0;
     for (size_t const size : storage.slotSize(level, poolGroup))
     {
@@ -398,6 +398,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
 
         // Phase 1: Copy GPU→GPU from locked source pages to pre-allocated slots.
         std::vector<SharedPageLock*> srcLocks;
+        TypedVec<LifeCycleId, SharedPtr<Page>> copiedPages(numLc);
         for (LifeCycleId lcIdx{0}; lcIdx < numLc; ++lcIdx)
         {
             if (!deferredSlots[lcIdx].has_value())
@@ -419,6 +420,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
             TLLM_CHECK_DEBUG(lock && lock->isValid());
             bool const hasPartialReuseSource = _hasReuseSource(*sourcePage);
             srcLocks.push_back(lock);
+            copiedPages[lcIdx] = lock->page();
 
             storageMgr.copySlotData(lcIdx, kHotLevel, kHotLevel, newSlot.slotId(), lock->page()->slotId(), cudaStr);
             if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && (recordManagerStats || recordRequestStats))
@@ -467,6 +469,12 @@ bool KvCache::resume(std::optional<CUstream> stream)
             }
 
             auto newPage = makeShared<UncommittedPage>(*this, blockOrdinal, lcIdx, kHotLevel, beamIdx);
+            if (copiedPages[lcIdx])
+            {
+                newPage->copyColdState(*copiedPages[lcIdx], numCommittedTokens() % mTokensPerBlock, true);
+                if (newPage->coldState)
+                    newPage->addSequence(coldPageSequence());
+            }
             newPage->setSlot(newSlot);
             auto newLock = newPage->lock(*this, beamIdx, blockOrdinal, lcIdx, /*skipWait=*/true);
             *targetBp = std::move(newLock);
@@ -593,6 +601,8 @@ void KvCache::close()
         return;
 
     discardPendingStats();
+    if (mColdPageSequence)
+        mColdPageSequence->closed = true;
     stopCommitting();
     TLLM_CHECK_DEBUG(_checkSanity());
 
@@ -721,7 +731,8 @@ void KvCache::_recordMigratedSlots(
         {
             auto& iterationStats = iterationStatsByLifeCycle[lifeCycle];
             iterationStats.iterOffloadBlocks += 1;
-            iterationStats.iterOffloadBytes += sumSlotBytes(mManager->storage(), dstLevel, lifeCycle);
+            iterationStats.iterOffloadBytes
+                += sumSlotBytes(mManager->storage(), dstLevel, lifeCycle, page->coldCapacityClass());
             recorded = true;
         }
         else if (dstLevel == kHotLevel)
@@ -739,7 +750,8 @@ void KvCache::_recordMigratedSlots(
             if (srcLevel > kHotLevel)
             {
                 iterationStats.iterOnboardBlocks += 1;
-                iterationStats.iterOnboardBytes += sumSlotBytes(mManager->storage(), srcLevel, lifeCycle);
+                iterationStats.iterOnboardBytes
+                    += sumSlotBytes(mManager->storage(), srcLevel, lifeCycle, page->coldCapacityClass());
             }
             else if (srcLevel == kHotLevel)
             {
@@ -769,7 +781,8 @@ void KvCache::_recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, Cac
         LifeCycleId const lifeCycle = page->lifeCycle;
         auto& iterationStats = iterationStatsByLifeCycle[lifeCycle];
         iterationStats.iterHostDroppedBlocks += 1;
-        iterationStats.iterHostDroppedBytes += sumSlotBytes(mManager->storage(), cacheLevel, lifeCycle);
+        iterationStats.iterHostDroppedBytes
+            += sumSlotBytes(mManager->storage(), cacheLevel, lifeCycle, page->coldCapacityClass());
     }
     mManager->commitStats({}, iterationStatsByLifeCycle);
 }
@@ -851,7 +864,7 @@ void KvCache::_clearBlocks()
 CommittedPage* KvCache::_copyPageToTreeBlock(
     SharedPtr<Block> const& treeBlock, LifeCycleId lcIdx, SharedPtr<Page> const& srcPage, int numTokensInBlock)
 {
-    if (!treeBlock->canReplacePage(lcIdx, numTokensInBlock))
+    if (!treeBlock->canReplacePage(lcIdx, numTokensInBlock, srcPage.get()))
     {
         return treeBlock->getPage(lcIdx);
     }
@@ -860,7 +873,17 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
 
     for (CacheLevel lvl = srcPage->cacheLevel; lvl < storageMgr.numCacheLevels(); ++lvl)
     {
-        PoolGroupIndex const pgIdx = storageMgr.getPoolGroupIndex(lvl, lcIdx);
+        auto committed = makeShared<CommittedPage>(&storageMgr, treeBlock, lcIdx, srcPage->cacheLevel, numTokensInBlock,
+            getPriority(treeBlock->ordinal(), lcIdx));
+        committed->copyColdState(*srcPage, numTokensInBlock);
+        if (lvl != kHotLevel && srcPage->cacheLevel == kHotLevel)
+        {
+            storageMgr.prepareColdPage(*committed);
+            committed->markColdEncoded();
+        }
+        if (!treeBlock->canReplacePage(lcIdx, numTokensInBlock, committed.get()))
+            continue;
+        PoolGroupIndex const pgIdx = storageMgr.getPoolGroupIndex(lvl, *committed);
         Slot newSlot;
         try
         {
@@ -873,21 +896,26 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
         }
 
         CUstream stream = cudaStream();
+        auto releaseOnFailure = FuncGuard(
+            [&]()
+            {
+                newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
+                storageMgr.releaseSlot(lcIdx, lvl, std::move(newSlot), committed->coldCapacityClass());
+            });
         newSlot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
-        storageMgr.copySlotData(lcIdx, lvl, srcPage->cacheLevel, newSlot.slotId(), srcPage->slotId(), stream);
-
+        srcPage->readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
+        storageMgr.copySlotData(lcIdx, lvl, srcPage->cacheLevel, newSlot.slotId(), srcPage->slotId(), stream,
+            committed->coldState ? committed->coldState->representation.get() : nullptr);
         newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
-        auto committed = makeShared<CommittedPage>(
-            &storageMgr, treeBlock, lcIdx, lvl, numTokensInBlock, getPriority(treeBlock->ordinal(), lcIdx));
+        srcPage->readyEvent = newSlot.readyEvent;
+        committed->cacheLevel = lvl;
         committed->setSlot(newSlot);
-        // Drops the superseded page, deferred until the copy is issued: an
-        // OutOfPagesError above must not destroy a usable shorter snapshot.
+        releaseOnFailure.cancel();
+        // Drops the superseded page after the copy has been issued. Existing
+        // readers retain their old physical page and its own protection state.
         treeBlock->replacePage(lcIdx, committed.get());
-
-        // Schedule for eviction so eviction controller keeps a strong reference,
-        // preventing the page from being destroyed.
         storageMgr.scheduleForEviction(*committed);
-        return committed.get(); // success
+        return committed.get();
     }
     // No pages available in any level, silently skip snapshot (matches Python).
     return nullptr;
@@ -1026,7 +1054,7 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
     {
         (void) attn;
         auto& bp = beamBlock[lcIdx];
-        if (blockPageIsNull(bp) || treeBlock->pageCoverage(lcIdx) >= numTokens)
+        if (blockPageIsNull(bp) || !treeBlock->canReplacePage(lcIdx, numTokens, blockPageGetPage(bp).get()))
         {
             continue;
         }
@@ -1320,6 +1348,8 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
 
     mCapacity = newCap;
     mHistoryLength = newHist;
+    if (mColdPageSequence)
+        mColdPageSequence->length = newHist;
     _refreshGenerationAllocReady();
     TLLM_CHECK_DEBUG(_checkSanity());
     return true;
@@ -1385,6 +1415,8 @@ bool KvCache::_shortcutSetHistoryLength(int newHist)
             return false;
     }
     mHistoryLength = newHist;
+    if (mColdPageSequence)
+        mColdPageSequence->length = newHist;
     return true;
 }
 
@@ -1617,13 +1649,21 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
             // sibling) is NOT a substitute for our own full page: adopting it would feed
             // uninitialized KV for the uncovered tail into a live request.
             auto* existingPage = newBlock->getPage(lc);
-            if (existingPage != nullptr && existingPage->numTokensInBlock < numTokens)
+            auto const sourcePage = blockPageGetPage(bp);
+            if (existingPage != nullptr
+                && (existingPage->numTokensInBlock < numTokens
+                    || existingPage->reusablePrefix(mHistoryLength, numTokens) < numTokens
+                    || newBlock->canReplacePage(lc, numTokens, sourcePage.get())))
             {
                 existingPage = nullptr;
             }
             bool isLocked = std::holds_alternative<SharedPageLock>(bp);
             if (existingPage == nullptr)
             {
+                // Keep our private page when the two representations have
+                // incomparable quality; the tree still serves other requests.
+                if (!newBlock->canReplacePage(lc, numTokens, sourcePage.get()))
+                    continue;
                 // Existing page gone — put our uncommitted page into the tree block.
                 if (auto* lock = std::get_if<SharedPageLock>(&bp))
                 {
@@ -2173,6 +2213,8 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
             TLLM_CHECK_WITH_INFO(page, "Expected page in non-stale block");
             CacheLevel const level = page->cacheLevel;
             auto& bpSlot = mBlocks[ordinal].pages[beamIdx][lcId];
+            if (page->coldState)
+                page->addSequence(coldPageSequence());
             bpSlot = page->hold();
             if (!isAttention)
             {
@@ -2261,6 +2303,8 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
     mCommittedTokens = _getMatchedTokens(match);
     mNumCommittedBlocks = numTokens / mTokensPerBlock;
     mHistoryLength = numTokens;
+    if (mColdPageSequence)
+        mColdPageSequence->length = numTokens;
     mCapacity = numTokens;
 }
 

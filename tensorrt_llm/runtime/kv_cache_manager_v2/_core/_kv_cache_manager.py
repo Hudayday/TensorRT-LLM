@@ -745,6 +745,16 @@ class KVCacheManager:
             for life_cycle in typed_range(self._storage.num_life_cycles)
         ]
 
+    def get_pool_group_life_cycle_ids(
+        self, cache_level: CacheLevel = GPU_LEVEL
+    ) -> list[list[LifeCycleId]]:
+        """Return every lifecycle associated with each physical pool group."""
+        mapping = self.get_life_cycle_pool_group_indices(cache_level)
+        return [
+            [LifeCycleId(lc) for lc, pg in enumerate(mapping) if pg == group]
+            for group in range(len(self.get_storage_statistics(cache_level)))
+        ]
+
     def get_and_reset_iteration_peak_block_stats(
         self, cache_level: CacheLevel
     ) -> TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]:

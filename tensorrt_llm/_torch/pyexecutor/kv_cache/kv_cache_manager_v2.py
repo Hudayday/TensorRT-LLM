@@ -1537,6 +1537,11 @@ class KVCacheManagerV2(BaseResourceManager):
         def create_cold_page_codec(cache_config: object) -> Optional[object]:
             if cold_page_codec_provider is None:
                 return None
+            if getattr(cold_page_codec_provider, "selects_tokens", False) and mapping.cp_size > 1:
+                raise NotImplementedError(
+                    "Cold-page token selection requires global token positions; "
+                    "context-parallel cache position mapping is not supported yet"
+                )
             return cold_page_codec_provider.create_cold_page_codec(
                 cache_config,
                 runtime_dtype=self.dtype,
@@ -4225,11 +4230,10 @@ class KVCacheManagerV2(BaseResourceManager):
         if self._cold_pool_group_membership_cache is None:
             membership: tuple[tuple[int, frozenset[int]], ...] = ()
             if len(self.impl.cache_tier_list) > 1:
-                grouped: dict[int, set[int]] = defaultdict(set)
-                mapping = self.impl.get_life_cycle_pool_group_indices(CacheLevel(1))
-                for life_cycle_id, pool_group_id in enumerate(mapping):
-                    grouped[pool_group_id].add(life_cycle_id)
-                membership = tuple(sorted((pg, frozenset(lcs)) for pg, lcs in grouped.items()))
+                membership = tuple(
+                    (pg, frozenset(lcs))
+                    for pg, lcs in enumerate(self.impl.get_pool_group_life_cycle_ids(CacheLevel(1)))
+                )
             self._cold_pool_group_membership_cache = membership
         return self._cold_pool_group_membership_cache
 

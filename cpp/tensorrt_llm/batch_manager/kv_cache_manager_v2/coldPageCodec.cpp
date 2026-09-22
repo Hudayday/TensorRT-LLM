@@ -30,6 +30,16 @@
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+std::vector<ColdPageTokenRange> IKvCacheColdPageCodec::protectedTokens(LayerGroupId, ColdPageContext const&) const
+{
+    return {};
+}
+
+std::vector<double> IKvCacheColdPageCodec::coldPageCapacityFractions(LayerGroupId, int) const
+{
+    return {1.0};
+}
+
 namespace
 {
 
@@ -273,6 +283,40 @@ private:
 
 IKvCacheColdPageCodec::IKvCacheColdPageCodec() = default;
 IKvCacheColdPageCodec::~IKvCacheColdPageCodec() = default;
+
+std::vector<size_t> IKvCacheColdPageCodec::coldPageCapacities(LayerGroupId layerGroupId) const
+{
+    return {queryColdPageBytes(layerGroupId)};
+}
+
+bool IKvCacheColdPageCodec::selectsTokens(LayerGroupId) const noexcept
+{
+    return false;
+}
+
+std::shared_ptr<ColdPageRepresentation const> IKvCacheColdPageCodec::prepareColdPage(
+    LayerGroupId, ColdPageContext const&)
+{
+    return nullptr;
+}
+
+int IKvCacheColdPageCodec::reusablePrefix(
+    LayerGroupId, int, int, int validTokens, std::vector<ColdPageTokenRange> const&) const
+{
+    return validTokens;
+}
+
+bool IKvCacheColdPageCodec::encodeSelected(LayerGroupId layerGroupId, ColdPageRepresentation const* representation,
+    void* dstBasePtr, PageIndexPair const* pageIndices, size_t numBasePages, cudaStream_t stream) noexcept
+{
+    return representation == nullptr && encode(layerGroupId, dstBasePtr, pageIndices, numBasePages, stream);
+}
+
+bool IKvCacheColdPageCodec::decodeSelected(LayerGroupId layerGroupId, ColdPageRepresentation const* representation,
+    void const* srcBasePtr, PageIndexPair const* pageIndices, size_t numBasePages, cudaStream_t stream) noexcept
+{
+    return representation == nullptr && decode(layerGroupId, srcBasePtr, pageIndices, numBasePages, stream);
+}
 
 LayerGroupId IKvCacheColdPageCodec::getBatchingLayerGroupId(LayerGroupId layerGroupId) const noexcept
 {

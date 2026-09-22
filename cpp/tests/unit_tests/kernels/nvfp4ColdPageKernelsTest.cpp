@@ -65,6 +65,7 @@ enum class Nvfp4ColdPageTransform : std::int32_t
 {
     kNvfp4 = 0,
     kLosslessCopy = 1,
+    kZero = 2,
 };
 
 struct Nvfp4ColdPageTestBuffer
@@ -188,12 +189,12 @@ std::size_t roundUp(std::size_t value, std::size_t alignment)
 class CudaStream
 {
 public:
-    CudaStream()
+    explicit CudaStream(unsigned int flags = cudaStreamDefault)
     {
         // A blocking stream: the fixtures upload inputs with pageable cudaMemcpy and fill canaries with
         // cudaMemset, both of which run on the legacy stream and may still be in flight when the copy
         // call returns. A non-blocking stream would let the kernels read the slot before the DMA lands.
-        TLLM_CUDA_CHECK(cudaStreamCreateWithFlags(&mStream, cudaStreamDefault));
+        TLLM_CUDA_CHECK(cudaStreamCreateWithFlags(&mStream, flags));
     }
 
     ~CudaStream()
@@ -1312,6 +1313,98 @@ void runPrefixSuffixStridedRoundTrip(RawKind kind, PageGeometry const& geometry,
     rawInput.expectCanaries();
     rawOutput.expectCanaries();
     coldStorage.expectCanaries();
+}
+
+TEST(Nvfp4ColdPageWholePageTest, SelectiveTokenSegmentsPreserveHeadsRopeAndSlotStrides)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    if (!tensorrt_llm::common::isSM100Family())
+        GTEST_SKIP() << "NVFP4 cold-page kernels require an SM100-family GPU";
+    PageGeometry const geometry{2, 8, 32};
+    constexpr int rowElements = 64;
+    constexpr int quantizedStart = 16;
+    for (auto kind : {RawKind::kBfloat16, RawKind::kFloat16, RawKind::kFp8})
+    {
+        SCOPED_TRACE(static_cast<int>(kind));
+        auto params = makeParams(geometry);
+        params.rawRowStrideElements = rowElements;
+        params.quantizedRangeStart = quantizedStart;
+        params.fp8ScaleOrigQuant = 1.0F;
+        params.fp8ScaleQuantOrig = 1.0F;
+        auto const elementBytes = rawElementBytes(kind);
+        auto const rowBytes = rowElements * elementBytes;
+        auto const pageBytes = geometry.numHeads * geometry.tokensPerPage * rowBytes;
+        auto const slotBytes = pageBytes + 32U;
+        auto const coldBytes = pageBytes;
+        DeviceRegion input(4U * slotBytes), output(4U * slotBytes);
+        MappedHostRegion cold(4U * coldBytes);
+        auto const original = makeStridedRawPage(kind, 3U, rowElements, quantizedStart, params, geometry);
+        input.copyFrom(2U * slotBytes, original);
+        auto quantized = extractRowSpan(original, kind, 16U, rowElements, quantizedStart, 32U);
+        auto const reference = compressReference(quantized, kind, params, geometry);
+        auto expected = original;
+        replaceRowSpan(expected, kind, 16U, rowElements, quantizedStart, 32U,
+            decompressReference(reference, kind, params, geometry));
+        for (int head = 0; head < geometry.numHeads; ++head)
+            for (int token = 0; token < geometry.tokensPerPage; ++token)
+            {
+                auto const offset = (head * geometry.tokensPerPage + token) * rowBytes;
+                if (token == 0 || token == 4)
+                    std::copy_n(original.begin() + offset, rowBytes, expected.begin() + offset);
+                else if (token >= 6)
+                    std::fill_n(expected.begin() + offset, rowBytes, 0);
+            }
+        auto makeMetadata = [&](DeviceRegion const& raw)
+        {
+            std::vector<Nvfp4ColdPageTestBuffer> buffers;
+            size_t cursor = 0;
+            for (int head = 0; head < geometry.numHeads; ++head)
+            {
+                for (auto const& segment :
+                    std::vector<std::array<int, 3>>{{0, 1, 1}, {1, 4, 0}, {4, 5, 1}, {5, 6, 0}, {6, 8, 2}})
+                {
+                    auto const [begin, end, mode] = segment;
+                    auto segmentParams = params;
+                    segmentParams.numKvHeads = 1;
+                    segmentParams.tokensPerPage = end - begin;
+                    auto const rawOffset = (head * geometry.tokensPerPage + begin) * rowBytes;
+                    auto const segmentBytes = (end - begin) * rowBytes;
+                    auto const dataOffset = cursor;
+                    size_t scaleOffset = 0;
+                    if (mode == 0)
+                    {
+                        cursor += (end - begin) * 16U;
+                        scaleOffset = cursor;
+                        cursor += (end - begin) * (2U + 32U * elementBytes);
+                    }
+                    else if (mode == 1)
+                        cursor += segmentBytes;
+                    else
+                        segmentParams = {};
+                    buffers.push_back(
+                        {reinterpret_cast<std::uintptr_t>(raw.data()) + rawOffset, slotBytes, segmentBytes, dataOffset,
+                            scaleOffset, 0U, 0U, static_cast<Nvfp4ColdPageTransform>(mode), segmentParams});
+                }
+            }
+            buffers.back().coldPaddingOffset = cursor;
+            buffers.back().coldPaddingBytes = static_cast<std::uint32_t>(coldBytes - cursor);
+            return makeNvfp4ColdPageTestMetadata(buffers, coldBytes, runtimeType(kind));
+        };
+        auto const encodeMetadata = makeMetadata(input);
+        auto const decodeMetadata = makeMetadata(output);
+        PageIndexPair const encode{3, 2}, decode{1, 3};
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess); // Complete fixture uploads before the independent stream.
+        CudaStream stream(cudaStreamNonBlocking);
+        invokeNvfp4ColdPageEncode(&encode, 1, encodeMetadata, cold.data(), stream);
+        invokeNvfp4ColdPageDecode(&decode, 1, decodeMetadata, cold.data(), stream);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        EXPECT_EQ(output.copyToHost(slotBytes, pageBytes), expected);
+        auto const untouched = output.copyToHost(slotBytes + pageBytes, slotBytes - pageBytes);
+        EXPECT_TRUE(std::all_of(untouched.begin(), untouched.end(), [](auto byte) { return byte == kCanary; }));
+        input.expectCanaries();
+        output.expectCanaries();
+        cold.expectCanaries();
+    }
 }
 
 struct RoundTripCase

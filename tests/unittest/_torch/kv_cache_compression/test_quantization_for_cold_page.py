@@ -1276,6 +1276,17 @@ def test_runtime_admission_is_checked_before_manager_creation(monkeypatch) -> No
     assert manager.pretrained_config is model_engine.model.model_config.pretrained_config
 
 
+def test_token_selection_rejects_vanilla_nhd_before_manager_creation() -> None:
+    engine = _factory_model_engine()
+    engine.model.model_config.attn_backend = "VANILLA"
+    with pytest.raises(NotImplementedError, match="HND KV geometry"):
+        util_mod.create_kv_cache_compression_manager(
+            ColdPageQuantizationCompressionConfig(selective_compression=dict(keep_first_tokens=1)),
+            model_engine=engine,
+            kv_cache_config=SimpleNamespace(enable_block_reuse=False),
+        )
+
+
 def test_speculative_admission_accepts_verified_one_model_modes(monkeypatch) -> None:
     monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
 
@@ -1553,7 +1564,7 @@ def test_skip_rope_quantization_is_ignored_with_a_warning_outside_the_supported_
     )
     with patch(
         "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
-        "nvfp4_quantization.logger"
+        "quantization_for_cold_page.logger"
     ) as mock_logger:
         (layout,) = _create(
             _manager(pretrained_config=config, skip_rope_quantization=True),
@@ -1699,3 +1710,186 @@ def test_measured_glm52_and_deepseek_v4_pages_are_reproduced() -> None:
         head_dim_per_layer=(),
     )
     assert _configure_lifecycle(native, hot).cold_page_bytes == 384_512
+
+
+# --- Selective Compression ---------------------------------------------------
+
+
+@pytest.mark.parametrize("first", [False, True])
+@pytest.mark.parametrize("last", [False, True])
+@pytest.mark.parametrize("layer", [False, True])
+@pytest.mark.parametrize("rope", [False, True])
+def test_selective_compression_controls_compose(first, last, layer, rope):
+    """The byte descriptors must partition each hot buffer exactly once."""
+    native, _ = _native()
+    model = _partial_rotary_config()
+    model.num_hidden_layers = 8
+    manager = Nvfp4ColdPageQuantizationCompression(
+        ColdPageQuantizationCompressionConfig(
+            skip_rope_quantization=rope,
+            selective_compression=dict(
+                keep_first_tokens=100 if first else 0,
+                keep_last_tokens=12 if last else 0,
+                keep_layers=[7] if layer else [],
+                keep_token_ranges=[(72, 80)],
+            ),
+        ),
+        pretrained_config=model,
+    )
+    heads, tokens, dim = 2, 64, 256
+    raw_bytes = heads * tokens * dim * 2
+    config = SimpleNamespace(
+        tokens_per_block=tokens,
+        layers=tuple(
+            AttentionLayerConfig(
+                layer_id=i, buffers=[BufferConfig(role=r, size=raw_bytes) for r in ("key", "value")]
+            )
+            for i in range(2)
+        ),
+    )
+    _create(
+        manager,
+        config,
+        native,
+        runtime_dtype=DataType.BF16,
+        pp_layers=(3, 7),
+        num_kv_heads_per_layer=(heads, heads),
+        head_dim_per_layer=(dim, dim),
+    )
+    assert native.create_python_cold_page_codec.call_args.args[2:] == (
+        100 if first else 0,
+        12 if last else 0,
+        [(72, 80)],
+    )
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        _configure_lifecycle(native, {i: {"key": raw_bytes, "value": raw_bytes} for i in range(2)})
+    state = _codec_state(native)
+    ranges = [(0, 36)] if first else [(8, 16)]
+    if last:
+        ranges.append((52, 64))
+    _, capacity = manager.selected_storage_properties(state, state.lifecycles[0])
+    encoded_bytes = manager.prepare_selected_cold_page(state, 0, 0, tokens, ranges, capacity)
+    assert encoded_bytes <= capacity
+    locations = {}
+    for layer_id, buffers in state.lifecycles[0].layers.items():
+        for role, hot in buffers.items():
+            locations[hot.raw_base] = (layer_id, role, hot)
+    coverage = {base: torch.zeros(raw_bytes // 2, dtype=torch.int16) for base in locations}
+    quantized = {base: torch.zeros(raw_bytes // 2, dtype=torch.bool) for base in locations}
+    cold_spans = []
+    for metadata in state.selected_metadata[0, 0]:
+        for w, i in zip(
+            metadata.wide[: metadata.num_buffers].tolist(),
+            metadata.integers[: metadata.num_buffers].tolist(),
+        ):
+            base = next(base for base in locations if base <= w[0] < base + raw_bytes)
+            offset = (w[0] - base) // 2
+            count = w[2] // 2
+            coverage[base][offset : offset + count] += 1
+            if i[1] == 0:
+                view = quantized[base][offset : offset + count].view(i[2] * i[3], i[5])
+                view[:, i[6] : i[6] + i[4]] = True
+                cold_spans.extend(
+                    [
+                        (w[3], w[3] + i[2] * i[3] * i[4] // 2),
+                        (w[4], w[4] + i[2] * i[3] * (i[4] // 16 + (i[5] - i[4]) * 2)),
+                    ]
+                )
+            else:
+                assert i[1] == 1
+                cold_spans.append((w[3], w[3] + w[2]))
+    for base, (layer_id, role, _) in locations.items():
+        assert torch.all(coverage[base] == 1)
+        expected = torch.ones((heads, tokens, dim), dtype=torch.bool)
+        for start, end in ranges:
+            expected[:, start:end] = False
+        if layer and layer_id == 1:
+            expected[:] = False
+        if rope and role == "key":
+            expected[:, :, :64] = False
+        assert torch.equal(quantized[base].view_as(expected), expected)
+    cold_spans.sort()
+    assert all(a[1] <= b[0] for a, b in zip(cold_spans, cold_spans[1:]))
+    assert cold_spans[-1][1] <= capacity
+
+
+def test_selective_config_validates_and_normalizes():
+    from pydantic import ValidationError
+
+    from tensorrt_llm.llmapi.llm_args import ColdPageSelectiveCompressionConfig
+
+    config = ColdPageSelectiveCompressionConfig(
+        keep_layers=[3, 1, 3], keep_token_ranges=[(9, 12), (1, 5), (4, 9)]
+    )
+    assert config.keep_layers == [1, 3]
+    assert config.keep_token_ranges == [(1, 12)]
+    for invalid in (
+        dict(keep_first_tokens=-1),
+        dict(keep_last_tokens=True),
+        dict(keep_layers=[-1]),
+        dict(keep_token_ranges=[(4, 4)]),
+        dict(keep_token_ranges=[(8, 3)]),
+        dict(unknown_control=True),
+    ):
+        with pytest.raises(ValidationError):
+            ColdPageSelectiveCompressionConfig(**invalid)
+
+
+def test_selective_full_unprotected_page_uses_existing_tables():
+    native, _ = _native()
+    manager = _manager(pretrained_config=_partial_rotary_config())
+    # Validate the nested public config instead of relying on assignment coercion.
+    manager.config = ColdPageQuantizationCompressionConfig(
+        selective_compression=dict(keep_first_tokens=100)
+    )
+    _create(
+        manager,
+        _kv_layer(256),
+        native,
+        runtime_dtype=DataType.BF16,
+        pp_layers=(0,),
+        num_kv_heads_per_layer=(1,),
+        head_dim_per_layer=(256,),
+    )
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        original = _configure_default_lifecycle(native, 64 * 256 * 2)
+    state = _codec_state(native)
+    assert (
+        manager.prepare_selected_cold_page(state, 0, 0, 64, [], original.cold_page_bytes)
+        == original.cold_page_bytes
+    )
+    assert len(state.selected_metadata[0, 0]) == 1
+    assert state.selected_metadata[0, 0][0] is original
+
+
+def test_selective_partial_valid_page_zeroes_tail_and_batches_descriptors():
+    native, _ = _native()
+    model = _partial_rotary_config(head_dim=32)
+    manager = Nvfp4ColdPageQuantizationCompression(
+        ColdPageQuantizationCompressionConfig(selective_compression=dict(keep_first_tokens=3)),
+        pretrained_config=model,
+    )
+    heads, tokens, dim = 160, 64, 32
+    config = _kv_layer(dim)
+    _create(
+        manager,
+        config,
+        native,
+        runtime_dtype=DataType.BF16,
+        pp_layers=(0,),
+        num_kv_heads_per_layer=(heads,),
+        head_dim_per_layer=(dim,),
+    )
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        _configure_default_lifecycle(native, heads * tokens * dim * 2)
+    state = _codec_state(native)
+    _, capacity = manager.selected_storage_properties(state, state.lifecycles[0])
+    manager.prepare_selected_cold_page(state, 0, 0, 41, [(0, 3)], capacity)
+    tables = state.selected_metadata[0, 0]
+    assert len(tables) == 4  # 2 buffers * 160 heads * (raw, quantized, zero tail)
+    rows = [row for table in tables for row in table.integers[: table.num_buffers].tolist()]
+    assert sum(row[1] == 2 for row in rows) == 2 * heads
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        manager.encode_selected_cold_pages(state, 0, 0, 100, 200, 4096, 300)
+    assert native.nvfp4_cold_page_encode.call_count == 4
+    assert all(call.args[1] == 4096 for call in native.nvfp4_cold_page_encode.call_args_list)

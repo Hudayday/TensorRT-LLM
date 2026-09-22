@@ -25,6 +25,8 @@
 #include <cstdint>
 #include <memory>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -74,6 +76,35 @@ struct alignas(8) PageIndexPair
 static_assert(sizeof(PageIndexPair) == 8);
 static_assert(std::is_trivially_copyable_v<PageIndexPair>);
 
+//! Half-open token interval in a page, independent of its physical slot.
+using ColdPageTokenRange = std::pair<int, int>;
+
+//! A request's confirmed KV endpoint. Closed requests leave a frozen endpoint.
+struct ColdPageSequence
+{
+    int length = 0;
+    bool closed = false;
+};
+
+//! Frozen selection describing stored bytes. A larger dtype does not undo this history.
+struct ColdPageRepresentation
+{
+    int validTokens = 0;
+    std::vector<ColdPageTokenRange> rawTokens;
+    int layoutId = 0;
+    int capacityClass = 0;
+    size_t encodedBytes = 0;
+};
+
+//! Logical inputs supplied before allocating a cold destination.
+struct ColdPageContext
+{
+    int startToken = 0;
+    int validTokens = 0;
+    std::vector<int> sequenceLengths;
+    std::vector<ColdPageTokenRange> retainedProtection;
+};
+
 //! Transforms KV pages between hot multi-pool and cold single-blob representations.
 class IKvCacheColdPageCodec
 {
@@ -92,6 +123,29 @@ public:
 
     //! Returns the fixed cold-page size for a layer group. Zero indicates failure or an unknown layer group.
     [[nodiscard]] virtual size_t queryColdPageBytes(LayerGroupId layerGroupId) const noexcept = 0;
+
+    //! Capacity classes, in increasing byte size; the default codec has one fixed class.
+    [[nodiscard]] virtual std::vector<size_t> coldPageCapacities(LayerGroupId layerGroupId) const;
+
+    //! Whether logical token selection is enabled for this lifecycle.
+    [[nodiscard]] virtual bool selectsTokens(LayerGroupId layerGroupId) const noexcept;
+    virtual std::vector<double> coldPageCapacityFractions(LayerGroupId layerGroupId, int historyLength) const;
+    virtual std::vector<ColdPageTokenRange> protectedTokens(
+        LayerGroupId layerGroupId, ColdPageContext const& context) const;
+
+    //! Resolve and intern a representation before destination allocation. Null selects the fixed format.
+    [[nodiscard]] virtual std::shared_ptr<ColdPageRepresentation const> prepareColdPage(
+        LayerGroupId layerGroupId, ColdPageContext const& context);
+
+    //! First reusable token prefix under the requested endpoint, accounting for prior lossy storage.
+    [[nodiscard]] virtual int reusablePrefix(LayerGroupId layerGroupId, int startToken, int sequenceLength,
+        int validTokens, std::vector<ColdPageTokenRange> const& losslessTokens) const;
+
+    //! Execute a batch with one frozen representation. Existing codecs retain their fixed-format path.
+    virtual bool encodeSelected(LayerGroupId layerGroupId, ColdPageRepresentation const* representation,
+        void* dstBasePtr, PageIndexPair const* pageIndices, size_t numBasePages, cudaStream_t stream) noexcept;
+    virtual bool decodeSelected(LayerGroupId layerGroupId, ColdPageRepresentation const* representation,
+        void const* srcBasePtr, PageIndexPair const* pageIndices, size_t numBasePages, cudaStream_t stream) noexcept;
 
     //! Returns the representative layer-group ID used for cross-lifecycle batching.
     //!

@@ -18,6 +18,7 @@
 #pragma once
 
 #include "kv_cache_manager_v2/blockRadixTree.h"
+#include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/evictionController.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
@@ -39,6 +40,19 @@ class PageHolder;
 class UniqPageLock;
 class SharedPageLock;
 
+// Allocated only for lifecycles with token selection. Representation describes
+// saved bytes; losslessTokens tracks numerical provenance even after onboarding.
+struct ColdPageState
+{
+    int startToken = 0;
+    int validTokens = 0;
+    bool quantized = false;
+    std::vector<ColdPageTokenRange> losslessTokens;
+    std::vector<ColdPageTokenRange> retainedProtection;
+    std::vector<std::shared_ptr<ColdPageSequence>> sequences;
+    std::shared_ptr<ColdPageRepresentation const> representation;
+};
+
 // ---------------------------------------------------------------------------
 // Page — base class for all KV-cache pages.
 // Inherits from Slot (holds slotId + readyEvent).
@@ -55,6 +69,14 @@ public:
     Priority const priority;
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
+    std::unique_ptr<ColdPageState> coldState;
+
+    void addSequence(std::shared_ptr<ColdPageSequence> const& sequence);
+    void copyColdState(Page const& source, int validTokens, bool newTail = false);
+    int reusablePrefix(int sequenceLength, int validTokens) const;
+    int coldCapacityClass() const noexcept;
+    void markColdEncoded();
+    std::unique_ptr<ColdPageState> coldStateAfterEncode() const;
 
     Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio);
 

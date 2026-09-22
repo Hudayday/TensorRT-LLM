@@ -159,7 +159,8 @@ class PerLevelEvictionController
 public:
     // lifeCycleGrouping: maps LifeCycleId → PoolGroupIndex.
     // cacheLevel: the level this controller manages.
-    PerLevelEvictionController(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel);
+    PerLevelEvictionController(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel,
+        PoolGroupIndex numPoolGroups = PoolGroupIndex{0});
 
     ~PerLevelEvictionController();
 

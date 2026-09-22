@@ -2568,6 +2568,12 @@ def _create_kv_cache_manager(
             "Cold-page quantization requires the resolved KV cache manager "
             f"to be KVCacheManagerV2; selected {kv_cache_manager_cls.__name__}")
 
+    if (is_disagg and cold_page_codec_provider is not None
+            and getattr(cold_page_codec_provider, "selects_tokens", False)):
+        raise NotImplementedError(
+            "Cold-page token selection requires compression provenance across "
+            "KV transfers; disaggregated serving is not supported yet")
+
     if (estimating_kv_cache
             and issubclass(kv_cache_manager_cls, KVCacheManagerV2)
             and kv_cache_config.pool_ratio is None
@@ -3240,6 +3246,16 @@ def create_kv_cache_compression_manager(
                 "Skipping cold-page NVFP4 quantization because the active KV "
                 "cache already uses NVFP4; KVCM will migrate it losslessly.")
             return None
+
+        selection = config.selective_compression
+        if (selection
+                and (selection.keep_first_tokens or selection.keep_last_tokens
+                     or selection.keep_token_ranges)
+                and getattr(model_engine.model.model_config, "attn_backend",
+                            None) == "VANILLA"):
+            raise NotImplementedError(
+                "Cold-page token selection requires HND KV geometry; "
+                "the VANILLA backend uses NHD")
 
         validate_kv_cache_compression_compatibility(config, kv_cache_config,
                                                     model_engine.spec_config)

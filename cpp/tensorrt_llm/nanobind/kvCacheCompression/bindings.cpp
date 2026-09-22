@@ -22,6 +22,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/map.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
@@ -51,8 +52,8 @@ static_assert(std::is_trivially_copyable_v<kv::PageIndexPair>);
 class PythonColdPageCodec final : public compression::NativeColdPageCodec
 {
 public:
-    PythonColdPageCodec(nb::handle provider, nb::handle codecState)
-        : NativeColdPageCodec(readLayerIds(codecState))
+    PythonColdPageCodec(nb::handle provider, nb::handle codecState, compression::ColdPageSelectionConfig selection)
+        : NativeColdPageCodec(readLayerIds(codecState), std::move(selection))
         , mProvider(provider.ptr())
         , mCodecState(codecState.ptr())
     {
@@ -71,6 +72,50 @@ public:
     }
 
 private:
+    std::size_t prepareProvider(std::size_t lifecycleIndex, int layoutId, int validTokens,
+        std::vector<kv::ColdPageTokenRange> const& rawTokens, std::size_t capacityBytes) override
+    {
+        nb::gil_scoped_acquire acquire;
+        try
+        {
+            return nb::cast<std::size_t>(nb::borrow<nb::object>(mProvider).attr("prepare_selected_cold_page")(
+                nb::borrow<nb::object>(mCodecState), lifecycleIndex, layoutId, validTokens, rawTokens, capacityBytes));
+        }
+        catch (nb::python_error const& error)
+        {
+            throw std::runtime_error(error.what());
+        }
+    }
+
+    void encodeSelectedProvider(std::size_t lifecycleIndex, int layoutId, void* coldBase,
+        kv::PageIndexPair const* indices, std::size_t numPages, cudaStream_t stream) override
+    {
+        invokeSelected("encode_selected_cold_pages", lifecycleIndex, layoutId, coldBase, indices, numPages, stream);
+    }
+
+    void decodeSelectedProvider(std::size_t lifecycleIndex, int layoutId, void const* coldBase,
+        kv::PageIndexPair const* indices, std::size_t numPages, cudaStream_t stream) override
+    {
+        invokeSelected("decode_selected_cold_pages", lifecycleIndex, layoutId, coldBase, indices, numPages, stream);
+    }
+
+    template <typename ColdPointer>
+    void invokeSelected(char const* method, std::size_t lifecycleIndex, int layoutId, ColdPointer coldBase,
+        kv::PageIndexPair const* indices, std::size_t numPages, cudaStream_t stream)
+    {
+        nb::gil_scoped_acquire acquire;
+        try
+        {
+            nb::borrow<nb::object>(mProvider).attr(method)(nb::borrow<nb::object>(mCodecState), lifecycleIndex,
+                layoutId, reinterpret_cast<std::uintptr_t>(coldBase), reinterpret_cast<std::uintptr_t>(indices),
+                numPages, reinterpret_cast<std::uintptr_t>(stream));
+        }
+        catch (nb::python_error const& error)
+        {
+            throw std::runtime_error(error.what());
+        }
+    }
+
     static std::set<kv::LayerId> readLayerIds(nb::handle codecState)
     {
         if (codecState.is_none())
@@ -157,13 +202,20 @@ void initBindings(nb::module_& module)
     nb::class_<compression::ColdPageLifecycleProperties>(module, "ColdPageLifecycleProperties")
         .def(nb::init<>())
         .def_rw("cold_page_bytes", &compression::ColdPageLifecycleProperties::coldPageBytes)
+        .def_rw("max_cold_page_bytes", &compression::ColdPageLifecycleProperties::maxColdPageBytes)
+        .def_rw("tokens_per_page", &compression::ColdPageLifecycleProperties::tokensPerPage)
         .def_rw("page_index_location", &compression::ColdPageLifecycleProperties::pageIndexLocation);
 
     module.def(
         "create_python_cold_page_codec",
-        [](nb::handle provider, nb::handle codecState) -> std::unique_ptr<kv::IKvCacheColdPageCodec>
-        { return std::make_unique<PythonColdPageCodec>(provider, codecState); },
-        nb::arg("provider"), nb::arg("codec_state"));
+        [](nb::handle provider, nb::handle codecState, int first, int last,
+            std::vector<kv::ColdPageTokenRange> ranges) -> std::unique_ptr<kv::IKvCacheColdPageCodec>
+        {
+            return std::make_unique<PythonColdPageCodec>(
+                provider, codecState, compression::ColdPageSelectionConfig{first, last, std::move(ranges)});
+        },
+        nb::arg("provider"), nb::arg("codec_state"), nb::arg("keep_first_tokens") = 0, nb::arg("keep_last_tokens") = 0,
+        nb::arg("keep_token_ranges") = std::vector<kv::ColdPageTokenRange>{});
 
     // The Python provider traffics in raw KVCM addresses, so the launcher trampolines take scalar integers.
     module.def("nvfp4_cold_page_encode",

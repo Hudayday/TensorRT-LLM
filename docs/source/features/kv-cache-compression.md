@@ -226,7 +226,7 @@ changes accuracy depends on the model and the workload, so measure it on yours.
 The option is available for DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the Qwen3.5
 series, whose RoPE layout the codec knows; any other model ignores it with a
 warning. To add a model, add its `model_type` to
-`_SKIP_ROPE_QUANTIZATION_MODEL_TYPES` in `nvfp4_quantization.py`. The KV cache of
+`_SKIP_ROPE_QUANTIZATION_MODEL_TYPES` in `quantization_for_cold_page.py`. The KV cache of
 a draft model (speculative decoding) always quantizes whole vectors.
 
 ```yaml
@@ -235,6 +235,57 @@ kv_cache_compression_config:
   quant: nvfp4
   skip_rope_quantization: true
 ```
+
+#### Selective Compression
+
+Cold-page compression can preserve selected tokens and layers in their runtime
+precision. These controls compose with `skip_rope_quantization`: a value is
+copied unchanged if **any** protection rule selects it. The remaining values
+use the configured cold-page codec. All controls default to disabled.
+
+```yaml
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  quant: nvfp4
+  skip_rope_quantization: true
+  selective_compression:
+    keep_first_tokens: 100
+    keep_last_tokens: 32
+    keep_layers: [0, 1]
+    keep_token_ranges: [[256, 288]]
+```
+
+Layer IDs are zero-based global model layer IDs, including with pipeline
+parallelism. Token ranges are zero-based, half-open positions in the request's
+logical history; they are not page IDs or semantic message spans. Counts must
+be non-negative and ranges must be non-empty. Overlapping ranges are merged.
+`keep_last_tokens` uses the confirmed history length when the page is offloaded.
+Shared pages preserve the union of their request requirements. These settings
+do not trigger compression at turn boundaries or change active GPU KV storage
+or Attention execution.
+
+Selections can cross page boundaries exactly. For example, with 64-token pages,
+`keep_first_tokens: 100` preserves all of page 0 and tokens 0–35 of page 1.
+The rest of page 1 is quantized, except for protected layers and RoPE channels.
+Cold storage uses a compact capacity for ordinary pages and a larger capacity
+for pages containing protected token rows. The latter can contain padding, so
+the encoded payload size and allocated capacity are not always equal.
+
+Each saved page retains its encoding layout across Host/Disk migration and
+onboarding. Decoding uses that saved layout even if the request has grown.
+Copying decoded values in their runtime dtype does not recover lost precision.
+If prefix reuse would put previously quantized tokens in a newly protected
+region (for example, a shorter request's last tokens), reuse stops before the
+incompatible prefix and the request recomputes the remainder. This may reduce
+the cache hit rate for workloads with many differing prefix lengths.
+
+Token selection currently requires HND token-row KV geometry and local
+request history. The NHD-based VANILLA backend, context parallelism,
+disaggregated KV transfers, and DeepSeek-V4's compressed-position token mapping
+are rejected when token rules are enabled. Layer/RoPE selection retains the
+existing geometry support.
+Selecting global target-model layers for a separate speculative draft cache is
+also rejected; a draft cache needs its own layer mapping.
 
 ### TriAttention
 

@@ -1765,7 +1765,7 @@ def test_live_storage_stats_use_the_manager_api() -> None:
         cache.resume(CudaStream(torch.cuda.Stream().cuda_stream))
         cache.resize(TOKENS_PER_BLOCK)
         after = manager.get_kv_cache_stats()
-        manager.impl.get_life_cycle_pool_group_indices.assert_called_once_with(CacheLevel(1))
+        manager.impl.get_pool_group_life_cycle_ids.assert_called_once_with(CacheLevel(1))
         assert manager.impl.get_storage_statistics.call_args_list == [
             call(CacheLevel(0)),
             call(CacheLevel(0)),

@@ -2385,6 +2385,21 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_and_reset_iteration_disk_prefetch_blocks",
             &kv::KvCacheManager::getAndResetIterationDiskPrefetchBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def(
+            "get_pool_group_life_cycle_ids",
+            [](kv::KvCacheManager const& self, int cacheLevel)
+            {
+                std::vector<std::vector<int>> result;
+                for (auto const& ids : self.getPoolGroupLifeCycleIds(kv::CacheLevel{cacheLevel}))
+                {
+                    std::vector<int> group;
+                    for (auto id : ids)
+                        group.push_back(id.value());
+                    result.push_back(std::move(group));
+                }
+                return result;
+            },
+            nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>())
+        .def(
             "get_life_cycle_pool_group_indices",
             [](kv::KvCacheManager const& self, int cacheLevel)
             {

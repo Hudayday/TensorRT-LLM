@@ -19,6 +19,7 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/page.h"
+#include "kv_cache_manager_v2/storageManager.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include <cstddef>
@@ -126,8 +127,8 @@ SlotCount PrioritizedEvictionPolicy::size() const noexcept
 // PerLevelEvictionController
 // ---------------------------------------------------------------------------
 
-PerLevelEvictionController::PerLevelEvictionController(
-    TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel)
+PerLevelEvictionController::PerLevelEvictionController(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping,
+    CacheLevel cacheLevel, PoolGroupIndex capacityGroups)
     : mCacheLevel(cacheLevel)
     , mLifeCycleGrouping(lifeCycleGrouping)
 {
@@ -142,7 +143,7 @@ PerLevelEvictionController::PerLevelEvictionController(
     TLLM_CHECK_DEBUG(numPoolGroups
         == PoolGroupIndex{
             static_cast<int>(std::set<PoolGroupIndex>(mLifeCycleGrouping.begin(), mLifeCycleGrouping.end()).size())});
-    mPolicies.resize(numPoolGroups);
+    mPolicies.resize(std::max(numPoolGroups, capacityGroups));
 }
 
 PerLevelEvictionController::~PerLevelEvictionController()
@@ -163,7 +164,7 @@ void PerLevelEvictionController::scheduleForEviction(Page& page, bool evictFirst
     TLLM_CHECK_DEBUG(page.nodeRef == std::nullopt);
     TLLM_CHECK_DEBUG(page.cacheLevel == mCacheLevel);
     auto sharedPage = page.sharedFromThis();
-    NodeRef ref = getPolicy(page.lifeCycle).push(sharedPage, evictFirst);
+    NodeRef ref = mPolicies.at(page.manager->getPoolGroupIndex(mCacheLevel, page)).push(sharedPage, evictFirst);
     page.nodeRef = ref;
     TLLM_CHECK_DEBUG_WITH_INFO(*ref == sharedPage, "stored iterator must dereference to this page");
 }
@@ -231,7 +232,7 @@ void PerLevelEvictionController::remove(NodeRef node)
     auto page = *node;
     TLLM_CHECK_DEBUG_WITH_INFO(
         page->nodeRef.has_value() && page->nodeRef.value() == node, "page's nodeRef must match the node being removed");
-    getPolicy(page->lifeCycle).remove(node);
+    mPolicies.at(page->manager->getPoolGroupIndex(mCacheLevel, *page)).remove(node);
     page->nodeRef = std::nullopt;
 }
 

@@ -351,6 +351,15 @@ public:
         return mHistoryLength;
     }
 
+    std::shared_ptr<ColdPageSequence> const& coldPageSequence()
+    {
+        if (!mColdPageSequence)
+        {
+            mColdPageSequence = std::make_shared<ColdPageSequence>(ColdPageSequence{mHistoryLength, false});
+        }
+        return mColdPageSequence;
+    }
+
     int capacity() const noexcept
     {
         return mCapacity;
@@ -618,6 +627,7 @@ private:
     BeamIndex mBeamWidth;
     int mCapacity;
     int mHistoryLength;
+    std::shared_ptr<ColdPageSequence> mColdPageSequence;
     std::optional<int> mExpectedPromptLength;
     bool mGenerationAllocReady = false;
 

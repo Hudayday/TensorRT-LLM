@@ -3849,6 +3849,57 @@ class KvCacheCompressionConfig(StrictBaseModel):
         return False
 
 
+class ColdPageSelectiveCompressionConfig(StrictBaseModel):
+    """Keep selected cold-page values in their incoming runtime precision."""
+
+    keep_first_tokens: int = Field(
+        default=0,
+        ge=0,
+        strict=True,
+        description=
+        "Keep the first N logical sequence tokens unchanged during offload.")
+    keep_last_tokens: int = Field(
+        default=0,
+        ge=0,
+        strict=True,
+        description=
+        "Keep the last N confirmed KV tokens unchanged during offload.")
+    keep_layers: List[Annotated[int, PydanticField(ge=0, strict=True)]] = Field(
+        default_factory=list,
+        description=
+        "Zero-based global model layers whose cold KV buffers remain unchanged."
+    )
+    keep_token_ranges: List[Tuple[
+        Annotated[int, PydanticField(ge=0, strict=True)],
+        Annotated[int, PydanticField(ge=0, strict=True)],
+    ]] = Field(
+        default_factory=list,
+        description=
+        "Half-open logical token intervals [start, end) to keep unchanged. "
+        "All preservation rules, including RoPE, combine by union.")
+
+    @field_validator("keep_layers")
+    @classmethod
+    def normalize_layers(cls, layers: List[int]) -> List[int]:
+        return sorted(set(layers))
+
+    @field_validator("keep_token_ranges")
+    @classmethod
+    def normalize_ranges(
+            cls, ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        merged: List[Tuple[int, int]] = []
+        for start, end in sorted(ranges):
+            if start >= end:
+                raise ValueError(
+                    "keep_token_ranges requires nonempty [start, end) intervals"
+                )
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
+
 class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     """Quantize Host and Disk KV pages without changing the active GPU cache."""
 
@@ -3857,6 +3908,12 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",
         description="Quantization format stored in the compressed cache tier.")
+    selective_compression: Optional[ColdPageSelectiveCompressionConfig] = Field(
+        default=None,
+        description=
+        "Preserve selected layers and logical token ranges when encoding cold "
+        "pages. Unselected values use the configured codec. Attention is unchanged."
+    )
     skip_rope_quantization: bool = Field(
         default=False,
         description=
@@ -3874,7 +3931,7 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         "K/V global scales. Omit it to use identity global scales.")
 
     def supports_block_reuse(self) -> bool:
-        """Block reuse is unchanged because token identity is preserved."""
+        """Reuse preserves token identity and recomputes quality-incompatible prefixes."""
         return True
 
     def supports_speculative_decoding(self) -> bool:

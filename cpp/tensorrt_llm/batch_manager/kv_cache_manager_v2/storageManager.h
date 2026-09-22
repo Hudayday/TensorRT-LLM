@@ -54,7 +54,8 @@ class LifeCyclePoolGroupMapping
 {
 public:
     LifeCyclePoolGroupMapping() = default;
-    explicit LifeCyclePoolGroupMapping(TypedVec<LifeCycleId, PoolGroupIndex> forward);
+    explicit LifeCyclePoolGroupMapping(TypedVec<LifeCycleId, PoolGroupIndex> forward,
+        std::vector<std::pair<LifeCycleId, PoolGroupIndex>> const& additional = {});
 
     [[nodiscard]] PoolGroupIndex poolGroup(LifeCycleId lifeCycle) const;
     [[nodiscard]] Span<LifeCycleId const> lifeCycles(PoolGroupIndex poolGroup) const;
@@ -158,7 +159,7 @@ public:
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
     // Release a slot back to its pool.
-    void releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot);
+    void releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot, int capacityClass = 0);
 
     // ---- Eviction ----------------------------------------------------------
 
@@ -248,6 +249,20 @@ public:
     }
 
     PoolGroupIndex getPoolGroupIndex(CacheLevel level, LifeCycleId lc) const;
+    PoolGroupIndex getPoolGroupIndex(CacheLevel level, Page const& page) const;
+    PoolGroupIndex getPoolGroupIndex(CacheLevel level, LifeCycleId lc, int capacityClass) const;
+    void prepareColdPage(Page& page);
+
+    IKvCacheColdPageCodec& coldPageCodec() const noexcept
+    {
+        return *mColdPageCodec;
+    }
+
+    int tokensPerBlock() const noexcept
+    {
+        return mTokensPerBlock;
+    }
+
     PoolGroupIndex getPoolGroupIndex(LifeCycleId lc) const;
     PoolIndex numPools(CacheLevel level, PoolGroupIndex pgIdx) const;
     PoolIndex numPools(PoolGroupIndex pgIdx) const;
@@ -277,7 +292,7 @@ public:
     TypedVec<LifeCycleId, float> ratioFromLength(
         CacheLevel level, int tokensPerBlock, int historyLength, int capacity) const;
     TypedVec<PoolGroupIndex, float> toPoolGroupRatio(
-        CacheLevel level, TypedVec<LifeCycleId, float> const& lifeCycleRatio) const;
+        CacheLevel level, TypedVec<LifeCycleId, float> const& lifeCycleRatio, int historyLength = 0) const;
 
     // Apply stored min_slots constraint to a ratio list for GPU level.
     TypedVec<PoolGroupIndex, float> constrainPoolGroupRatio(TypedVec<PoolGroupIndex, float> const& ratio) const;
@@ -286,7 +301,7 @@ public:
     MemAddress getMemPoolBaseAddress(LayerId layerId, DataRole role) const;
 
     void copySlotData(LifeCycleId lifeCycle, CacheLevel dstLevel, CacheLevel srcLevel, SlotId dstSlotId,
-        SlotId srcSlotId, CUstream stream);
+        SlotId srcSlotId, CUstream stream, ColdPageRepresentation const* representation = nullptr);
     // Pool group base address without per-layer offset.
     MemAddress getMemPoolBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
 
@@ -349,8 +364,8 @@ private:
         std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t granularity) const;
     // Project source-level lifecycle byte weights onto destination pool groups while preserving the implied
     // lifecycle slot-count proportions.
-    TypedVec<PoolGroupIndex, float> projectPoolGroupRatio(
-        CacheLevel srcLevel, CacheLevel dstLevel, TypedVec<LifeCycleId, float> const& srcLifeCycleRatio) const;
+    TypedVec<PoolGroupIndex, float> projectPoolGroupRatio(CacheLevel srcLevel, CacheLevel dstLevel,
+        TypedVec<LifeCycleId, float> const& srcLifeCycleRatio, int historyLength = 0) const;
     TypedVec<LifeCycleId, size_t> slotsToBytes(
         TypedVec<LifeCycleId, SlotCount> const& numSlots, size_t granularity) const;
     TypedVec<PoolGroupIndex, size_t> slotsToBytes(
@@ -380,7 +395,8 @@ private:
     [[nodiscard]] LayerGroupId getMigrationBatchingLayerGroupId(
         CacheLevel dstLevel, CacheLevel srcLevel, LifeCycleId lifeCycle) const;
     void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
-        PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
+        PageIndexPair const* pageIndices, size_t numPages, CUstream stream,
+        ColdPageRepresentation const* representation = nullptr);
 
     template <typename Submit>
     bool submitColdPageCodec(PageIndexLocation location, PageIndexPair const* pageIndices, size_t numPages,
@@ -399,6 +415,8 @@ private:
     std::shared_ptr<EventSink> mEventSink;
     LifeCyclePoolGroupMapping mHotPoolGroupMapping;
     LifeCyclePoolGroupMapping mColdPoolGroupMapping;
+    TypedVec<LifeCycleId, std::vector<PoolGroupIndex>> mColdCapacityGroups;
+    int mTokensPerBlock;
     // Codec batching representative for each lifecycle.
     TypedVec<LifeCycleId, LayerGroupId> mBatchingLayerGroupIds;
     // Codec-selected PageIndexPair memory location for each lifecycle.

@@ -545,6 +545,19 @@ TypedVec<LifeCycleId, PoolGroupIndex> KvCacheManager::getLifeCyclePoolGroupIndic
     return result;
 }
 
+TypedVec<PoolGroupIndex, std::vector<LifeCycleId>> KvCacheManager::getPoolGroupLifeCycleIds(CacheLevel cacheLevel) const
+{
+    auto const apiLock = lockShared();
+    TypedVec<PoolGroupIndex, std::vector<LifeCycleId>> result;
+    auto const& mapping = mStorage->poolGroupMapping(cacheLevel);
+    for (PoolGroupIndex pg{0}; pg < mapping.numPoolGroups(); ++pg)
+    {
+        auto const ids = mapping.lifeCycles(pg);
+        result.push_back(std::vector<LifeCycleId>(ids.begin(), ids.end()));
+    }
+    return result;
+}
+
 void KvCacheManager::commitReusedBlocksByLevel(ReusedBlocksByLevelByLifeCycle const& byLifeCycle)
 {
     for (auto const& [lifeCycle, byLevel] : byLifeCycle)
@@ -902,7 +915,7 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLa
                     {
                         continue;
                     }
-                    PoolGroupIndex pgIdx = mStorage->getPoolGroupIndex(lastLevel, lc);
+                    PoolGroupIndex pgIdx = mStorage->getPoolGroupIndex(lastLevel, *pg);
                     result[pgIdx].push_back(pg);
                 }
             }
@@ -946,7 +959,7 @@ void KvCacheManager::tryUpdateTargetRatios()
         CacheLevel const coldLevel = mStorage->numCacheLevels() > CacheLevel{1} ? CacheLevel{1} : kHotLevel;
         auto const lifeCycleRatio
             = mStorage->ratioFromLength(coldLevel, tokensPerBlock, avgReusedLength, avgReusedLength);
-        mTargetRatioListCold = mStorage->toPoolGroupRatio(coldLevel, lifeCycleRatio);
+        mTargetRatioListCold = mStorage->toPoolGroupRatio(coldLevel, lifeCycleRatio, avgReusedLength);
     }
 }
 

@@ -22,6 +22,7 @@
 #include "kv_cache_manager_v2/storageManager.h" // for StorageManager
 
 #include "tensorrt_llm/common/assert.h"
+#include <algorithm>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -37,6 +38,101 @@ Page::Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio)
     , priority(prio)
     , nodeRef(std::nullopt)
 {
+    if (manager->coldPageCodec().selectsTokens(lifeCycle))
+    {
+        coldState = std::make_unique<ColdPageState>();
+    }
+}
+
+void Page::addSequence(std::shared_ptr<ColdPageSequence> const& sequence)
+{
+    if (coldState)
+    {
+        ColdPageContext context{coldState->startToken, coldState->validTokens, {}, coldState->retainedProtection};
+        for (auto const& previous : coldState->sequences)
+            if (previous->closed)
+                context.sequenceLengths.push_back(previous->length);
+        if (!context.sequenceLengths.empty())
+        {
+            coldState->retainedProtection = manager->coldPageCodec().protectedTokens(lifeCycle, context);
+            auto& sequences = coldState->sequences;
+            sequences.erase(std::remove_if(sequences.begin(), sequences.end(),
+                                [](auto const& previous) { return previous->closed; }),
+                sequences.end());
+        }
+    }
+    if (coldState && sequence
+        && std::find(coldState->sequences.begin(), coldState->sequences.end(), sequence) == coldState->sequences.end())
+    {
+        coldState->sequences.push_back(sequence);
+    }
+}
+
+void Page::copyColdState(Page const& source, int validTokens, bool newTail)
+{
+    if (source.coldState)
+    {
+        coldState = std::make_unique<ColdPageState>(*source.coldState);
+        // The representation remains unchanged for a cold-to-cold byte copy.
+        // A later hot-to-cold encode compiles a new selection for this coverage.
+        coldState->validTokens = validTokens;
+        if (newTail && coldState->quantized)
+        {
+            auto& ranges = coldState->losslessTokens;
+            ranges.erase(std::remove_if(ranges.begin(), ranges.end(),
+                             [validTokens](auto const& range) { return range.first >= validTokens; }),
+                ranges.end());
+            for (auto& range : ranges)
+                range.second = std::min(range.second, validTokens);
+            if (validTokens < manager->tokensPerBlock())
+                ranges.emplace_back(validTokens, manager->tokensPerBlock());
+        }
+    }
+}
+
+int Page::reusablePrefix(int sequenceLength, int validTokens) const
+{
+    if (!coldState || !coldState->quantized)
+    {
+        return validTokens;
+    }
+    return manager->coldPageCodec().reusablePrefix(
+        lifeCycle, coldState->startToken, sequenceLength, validTokens, coldState->losslessTokens);
+}
+
+int Page::coldCapacityClass() const noexcept
+{
+    return coldState && coldState->representation ? coldState->representation->capacityClass : 0;
+}
+
+std::unique_ptr<ColdPageState> Page::coldStateAfterEncode() const
+{
+    if (!coldState || !coldState->representation)
+        return nullptr;
+    auto state = std::make_unique<ColdPageState>(*coldState);
+    auto const& representation = *state->representation;
+    auto ranges = representation.rawTokens;
+    // Future writes to a reused partial page are fresh KV, not decoded values.
+    if (representation.validTokens < manager->tokensPerBlock())
+        ranges.emplace_back(representation.validTokens, manager->tokensPerBlock());
+    if (state->quantized)
+    {
+        std::vector<ColdPageTokenRange> intersection;
+        for (auto const& [begin, end] : ranges)
+            for (auto const& [oldBegin, oldEnd] : state->losslessTokens)
+                if (std::max(begin, oldBegin) < std::min(end, oldEnd))
+                    intersection.emplace_back(std::max(begin, oldBegin), std::min(end, oldEnd));
+        ranges = std::move(intersection);
+    }
+    state->losslessTokens = std::move(ranges);
+    state->quantized = true;
+    return state;
+}
+
+void Page::markColdEncoded()
+{
+    if (coldState)
+        coldState = coldStateAfterEncode();
 }
 
 Page::~Page()
@@ -52,7 +148,7 @@ Page::~Page()
                 s.setSlotId(slotId());
                 s.readyEvent = std::move(readyEvent);
                 resetSlot();
-                manager->releaseSlot(lifeCycle, cacheLevel, std::move(s));
+                manager->releaseSlot(lifeCycle, cacheLevel, std::move(s), coldCapacityClass());
             }
         });
 }
@@ -106,6 +202,11 @@ CommittedPage::CommittedPage(
     , numTokensInBlock(numTokensInBlock_)
 {
     TLLM_CHECK_DEBUG(0 < numTokensInBlock_ && numTokensInBlock_ <= static_cast<int>(blk->tokens.size()));
+    if (coldState)
+    {
+        coldState->startToken = blk->ordinal().value() * mgr->tokensPerBlock();
+        coldState->validTokens = numTokensInBlock_;
+    }
 }
 
 CommittedPage::~CommittedPage()
@@ -142,6 +243,11 @@ UncommittedPage::UncommittedPage(KvCache& kvc, BlockOrdinal ord, LifeCycleId lc,
     , ordinal(ord)
     , beamIndex(bi)
 {
+    if (coldState)
+    {
+        coldState->startToken = ord.value() * kvc.tokensPerBlock();
+        addSequence(kvc.coldPageSequence());
+    }
 }
 
 UncommittedPage::~UncommittedPage()
@@ -188,7 +294,7 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     TLLM_CHECK_DEBUG(!scheduledForEviction());
     // Check before building: replacePage() below drops the superseded page, so a failure
     // in between must not lose a usable snapshot.
-    TLLM_CHECK_DEBUG_WITH_INFO(blk->canReplacePage(lifeCycle, numTokensInBlock),
+    TLLM_CHECK_DEBUG_WITH_INFO(blk->canReplacePage(lifeCycle, numTokensInBlock, this),
         "Block slot for this lifecycle already has a page covering more tokens");
     TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE, "Release holder/lock before converting");
 
@@ -196,6 +302,7 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     this->readyEvent = std::move(readyEv);
 
     auto committed = makeShared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, numTokensInBlock, priority);
+    committed->copyColdState(*this, numTokensInBlock);
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid
     committed->readyEvent = std::move(readyEvent);
@@ -352,6 +459,8 @@ SharedPageLock::SharedPageLock(SharedPtr<UniqPageLock> ul, KvCache& kvCache, Bea
     if (!skipWait)
         page()->readyEvent.waitInStream(reinterpret_cast<CudaStream>(kvCache.cudaStream()));
 
+    if (page()->coldState)
+        page()->addSequence(kvCache.coldPageSequence());
     acquirePageIndex();
 }
 

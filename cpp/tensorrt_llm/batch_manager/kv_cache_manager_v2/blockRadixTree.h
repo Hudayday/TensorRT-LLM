@@ -40,6 +40,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 // Forward declarations
 class CommittedPage;
+class Page;
 class BlockRadixTree;
 struct NodeBase;
 struct RootBlock;
@@ -309,7 +310,7 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
     // keeps only the page with the largest recorded token count; for SSM that means only
     // the latest checkpoint, and a rare second endpoint in one block is a reuse miss.
     // Pure; use replacePage() to install. Mirrors Python's Block.can_replace_page().
-    bool canReplacePage(LifeCycleId lcIdx, int numTokensInBlock) const;
+    bool canReplacePage(LifeCycleId lcIdx, int numTokensInBlock, Page const* replacement = nullptr) const;
 
     // Install `page` in slot `lcIdx`, detaching whatever it supersedes. The superseded
     // page may outlive this call while a request still holds it, so unlinkPage() must
@@ -427,7 +428,8 @@ private:
     // Shorten `matched` to the prefix that is actually reusable. Passing
     // std::nullopt for `ssmLcId` skips the recurrent-snapshot constraint and
     // yields the attention-only prefix (used for numReusableTokensBeforeHybridPruning).
-    std::vector<MatchResult> pruneMatch(std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const;
+    std::vector<MatchResult> pruneMatch(
+        std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId, int requestedLength) const;
 
     // Erase any pending empty root blocks from mRoots.
     // Const-qualified: deferred cleanup is not a logical mutation.

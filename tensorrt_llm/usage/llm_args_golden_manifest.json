@@ -540,6 +540,26 @@
       "path": "kv_cache_compression_config.quant"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_compression_config.selective_compression.keep_first_tokens"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_compression_config.selective_compression.keep_last_tokens"
+    },
+    {
+      "capture_policy": "list[int]",
+      "kind": "value",
+      "path": "kv_cache_compression_config.selective_compression.keep_layers"
+    },
+    {
+      "capture_policy": "list[tuple[int]]",
+      "kind": "value",
+      "path": "kv_cache_compression_config.selective_compression.keep_token_ranges"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_compression_config.skip_rope_quantization"

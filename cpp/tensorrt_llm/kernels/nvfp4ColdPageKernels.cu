@@ -119,6 +119,7 @@ enum class Nvfp4ColdPageTransform : std::int32_t
 {
     kNvfp4 = 0,        // Quantize one range per row and preserve the prefix and suffix around it.
     kLosslessCopy = 1, // Copy the entire buffer byte-for-byte.
+    kZero = 2,         // Invalid token tail: no payload, initialize the hot destination on decode.
 };
 
 struct Nvfp4ColdPageBuffer
@@ -664,6 +665,11 @@ __global__ void offloadFrom16BitTiledKernel(
     auto const task = resolveOffloadTask(pages[blockIdx.z], buffer, coldBase, coldPageBytes);
 
     asm volatile("griddepcontrol.wait;\n" : : : "memory");
+    if (buffer.transform == Nvfp4ColdPageTransform::kZero)
+    {
+        clearColdPadding(task, buffer);
+        return;
+    }
     if (buffer.transform == Nvfp4ColdPageTransform::kLosslessCopy)
     {
         copyLosslessBytes(task.raw, task.coldData, buffer.rawBytes);
@@ -751,6 +757,11 @@ __global__ void offloadFromFp8TiledKernel(
     auto const task = resolveOffloadTask(pages[blockIdx.z], buffer, coldBase, coldPageBytes);
 
     asm volatile("griddepcontrol.wait;\n" : : : "memory");
+    if (buffer.transform == Nvfp4ColdPageTransform::kZero)
+    {
+        clearColdPadding(task, buffer);
+        return;
+    }
     if (buffer.transform == Nvfp4ColdPageTransform::kLosslessCopy)
     {
         copyLosslessBytes(task.raw, task.coldData, buffer.rawBytes);
@@ -900,6 +911,14 @@ __global__ void onboardTiledKernel(std::array<PageIndexPairView, kMaxTasksPerLau
     auto const task = resolveOnboardTask(pages[blockIdx.z], buffer, coldBase, coldPageBytes);
 
     asm volatile("griddepcontrol.wait;\n" : : : "memory");
+    if (buffer.transform == Nvfp4ColdPageTransform::kZero)
+    {
+        for (std::size_t byte = threadIdx.x; byte < buffer.rawBytes; byte += blockDim.x)
+        {
+            task.raw[byte] = 0;
+        }
+        return;
+    }
     if (buffer.transform == Nvfp4ColdPageTransform::kLosslessCopy)
     {
         copyLosslessBytes(task.coldData, task.raw, buffer.rawBytes);
