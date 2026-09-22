@@ -278,6 +278,10 @@ If prefix reuse would put previously quantized tokens in a newly protected
 region (for example, a shorter request's last tokens), reuse stops before the
 incompatible prefix and the request recomputes the remainder. This may reduce
 the cache hit rate for workloads with many differing prefix lengths.
+Hybrid models also need a recurrent-state snapshot at or before the compatible
+prefix. If their only snapshot lies after the precision check's cutoff, the
+request must recompute from the start. Configure snapshot points appropriate
+for the intended reuse boundaries.
 
 Token selection currently requires HND token-row KV geometry and local
 request history. The NHD-based VANILLA backend, context parallelism,
