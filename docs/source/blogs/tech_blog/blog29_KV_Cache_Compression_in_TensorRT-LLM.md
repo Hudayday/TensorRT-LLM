@@ -128,7 +128,7 @@ TensorRT LLM provides a general framework for KV cache compression, built around
 
 ### Design Philosophy
 
-The design starts from one observation: compression does not need to live inside the model or the attention kernel. It only needs to run at the right moment, on the KV that is already there. This holds for methods that decide from the stored KV itself, or from statistics the method keeps on its own. Methods that need a tensor from the current forward pass, for example the query tensor of the running step, still have to sit inside the attention path; the sparse attention framework covers that class, and this blog does not. So the runtime pauses at a well-defined point, hands the KV cache to the compression method, and continues once the method returns. Compression is extra work inserted at the right points of the runtime, and the whole serving system benefits from the smaller cache.
+The design starts from one observation: compression does not need to live inside the model or the attention kernel. It only needs to run at the right moment, on the KV that is already there. This holds for methods that decide from the stored KV itself, or from statistics the method keeps on its own. Methods that need a tensor from the current forward pass, for example the query tensor of the running step, still have to sit inside the attention path. RocketKV is one such method: it scores KV with the current query, and it is catalogued and supported through the [sparse attention framework](blog17_Sparse_Attention_in_TensorRT-LLM.md), which this blog does not cover. So the runtime pauses at a well-defined point, hands the KV cache to the compression method, and continues once the method returns. Compression is extra work inserted at the right points of the runtime, and the whole serving system benefits from the smaller cache.
 
 Three principles follow from this.
 
@@ -405,4 +405,5 @@ The goals do not change: better use of GPU memory and bandwidth, higher throughp
 - W. Nixon, J. Durbin, F. Standhartinger, H. S. Gunawi, and J. Yang. A Year in LLM Serving: Workload Evolution, Caching and Load-Balancing. [arXiv:2608.13573](https://arxiv.org/abs/2608.13573), 2026.
 - W. Mao et al. TriAttention. ICML 2026. [arXiv:2604.04921](https://arxiv.org/abs/2604.04921).
 - KVCOMM: Online Cross-context KV-cache Communication for Efficient LLM-based Multi-Agent Systems. NeurIPS 2025. [arXiv:2510.12872](https://arxiv.org/abs/2510.12872).
+- RocketKV: Accelerating Long-Context LLM Inference via Two-Stage KV Cache Compression. ICML 2025. [arXiv:2502.14051](https://arxiv.org/abs/2502.14051).
 - TensorRT LLM, [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md) and [examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/kv_cache_compression).
