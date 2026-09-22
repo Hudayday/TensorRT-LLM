@@ -128,7 +128,7 @@ TensorRT LLM provides a general framework for KV cache compression, built around
 
 ### Design Philosophy
 
-The design starts from one observation: compression does not need to live inside the model or the attention kernel. It only needs to run at the right moment, on the KV that is already there. So the runtime pauses at a well-defined point, hands the KV cache to the compression method, and continues once the method returns. Compression is extra work inserted at the right points of the runtime, and the whole serving system benefits from the smaller cache.
+The design starts from one observation: compression does not need to live inside the model or the attention kernel. It only needs to run at the right moment, on the KV that is already there. This holds for methods that decide from the stored KV itself, or from statistics the method keeps on its own. Methods that need a tensor from the current forward pass, for example the query tensor of the running step, still have to sit inside the attention path; the sparse attention framework covers that class, and this blog does not. So the runtime pauses at a well-defined point, hands the KV cache to the compression method, and continues once the method returns. Compression is extra work inserted at the right points of the runtime, and the whole serving system benefits from the smaller cache.
 
 Three principles follow from this.
 
@@ -165,7 +165,7 @@ Configuration is deliberately small. One block, `kv_cache_compression_config`, c
 
 The cache manager and the attention backend are outside the framework. The compression manager is designed to adapt to any cache manager and any attention backend. It changes only the contents of KV pages, and it never owns pages, tiers, or the kernels that read them.
 
-Today the framework integrates with KVCacheManagerV2, the KV cache manager built around a flexible, hierarchical storage model. V2 can give different layers pools of different types and sizes, groups layers by their lifecycle, and coalesces buffers of the same size within each group, which keeps fragmentation low even for models that mix full-attention, sliding-window, and recurrent layers. It also manages the host and disk tiers and the migration of pages between them, and it exposes a clean Python API for per-layer buffer configuration. These properties are what make cross-request compression possible. The compression manager binds to V2 once V2 is built, and the cold-page codec plugs into V2's page migration path, so V2 keeps ownership of pools, mappings, and migration while the codec decides how a page is stored off the GPU.
+Today the framework integrates with KVCacheManagerV2, the KV cache manager built around a flexible, hierarchical storage model. V2 can give different layers pools of different types and sizes, groups layers by their lifecycle, and coalesces buffers of the same size within each group, which keeps fragmentation low even for models that mix full-attention, sliding-window, and recurrent layers. It also manages the host and disk tiers and the migration of pages between them, and it exposes a clean Python API for per-layer buffer configuration. These properties are what make compression on the cross-request path possible, that is, compression that acts on KV after it has left the request that produced it. Today that is cold-page compression as pages move between tiers. It also opens the door to methods that carry KV from one request into another. One published example is KVCOMM, which reuses a block's KV in a new context by correcting it with offsets estimated from online anchors, so the block is not prefilled again. Methods of that kind are future work and are not part of the framework today. The compression manager binds to V2 once V2 is built, and the cold-page codec plugs into V2's page migration path, so V2 keeps ownership of pools, mappings, and migration while the codec decides how a page is stored off the GPU.
 
 ### KV Cache Compression in the Executor Iteration Loop
 
@@ -226,7 +226,7 @@ Cold-page compression applies this format at a different point in the system. At
 
 Host and disk offloading is a good place for compression for four reasons.
 
-- **Compress only under pressure.** A page is compressed once, when it goes cold, and only if it goes cold. The active cache is never touched, so no error accumulates step after step, and the accuracy impact stays smaller than compressing the cache every step.
+- **Friendly to accuracy.** Only pages that go cold are compressed, and a page goes cold only when the tier is under pressure. Everything else stays at full precision: the active cache, and every page that never leaves the GPU. In a normally provisioned deployment most pages are never compressed at all, and the ones that are carry one NVFP4 rounding rather than one per step. The accuracy impact is therefore smaller than compressing the whole cache, and far smaller than compressing it on every step.
 - **Fused with the transfer.** The page has to be copied anyway. The encode happens inside that copy, so compression adds no separate pass over the data.
 - **Less to move.** A smaller page means fewer bytes over PCIe and the storage link, so offloading and onboarding get faster as well as more capacity.
 - **One payload per page.** The compressed page is a single fixed-size block with one base address per tier, instead of separate data and scale buffers. Storage tiers address it like any other page.
@@ -404,4 +404,5 @@ The goals do not change: better use of GPU memory and bandwidth, higher throughp
 
 - W. Nixon, J. Durbin, F. Standhartinger, H. S. Gunawi, and J. Yang. A Year in LLM Serving: Workload Evolution, Caching and Load-Balancing. [arXiv:2608.13573](https://arxiv.org/abs/2608.13573), 2026.
 - W. Mao et al. TriAttention. ICML 2026. [arXiv:2604.04921](https://arxiv.org/abs/2604.04921).
+- KVCOMM: Online Cross-context KV-cache Communication for Efficient LLM-based Multi-Agent Systems. NeurIPS 2025. [arXiv:2510.12872](https://arxiv.org/abs/2510.12872).
 - TensorRT LLM, [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md) and [examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/kv_cache_compression).
