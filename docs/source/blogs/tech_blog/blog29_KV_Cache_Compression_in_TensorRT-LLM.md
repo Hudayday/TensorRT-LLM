@@ -200,7 +200,7 @@ The hooks ride on the executor's existing request cycle, and the framework wires
 
 ### KV Cache Compression in Cross-Request KV Management
 
-The KV a request leaves behind is not spent. It can be kept, reused, shared or reshaped for the requests that come after it, and in real workloads, above all multi-turn and agentic ones, that is where much of the serving benefit lies. Cross-request compression is compression that acts on this KV after it has left the request that produced it.
+Cross-request reuse means that the KV one request produces is kept and read again by a later request instead of being recomputed: the next turn of a conversation, the next step of an agent, or a request from another user that shares the same prefix. The benefit is direct. Every reused page is a prefill that never runs, so the fewer pages the tiers have to evict, the higher the cache hit rate and the lower the time to first token. This is where compression pays off across requests: a smaller cold page means more pages fit in the host and disk tiers, more prefixes are still there when the next request arrives, and the hit rate climbs. The framework brings compression to this path.
 
 This path is the cross-request hook of the framework. It serves the stages outside a single request: the tool-call stage (stage 4), when a request pauses and its KV waits for the tool to return, and the after-request stage (stage 5), when a request has finished and its KV is kept for reuse, transferred to another worker, or offloaded to host or disk memory.
 
@@ -208,7 +208,7 @@ This whole period belongs to KVCacheManagerV2, introduced above. V2 decides whic
 
 Today we cover the offloading part of the after-request stage (stage 5) with **NVFP4 cold-page compression**, enabled by `quantization_for_cold_page` with `quant: nvfp4`. It is a good example of how the framework interacts with V2. The storage path of V2 exposes two hook points, one when a page leaves the GPU and one when it returns. A codec plugged into these points encodes the page on the way out and decodes it on the way back, and the cache manager never sees the difference. How this works in detail, and how the NVFP4 codec is built, is described in the NVFP4 cold-page compression section below and in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md).
 
-The remaining hook points of this path, the tool-call stage (stage 4) and the other events of the after-request stage (stage 5), are reserved for methods that need them. Methods that carry KV from one request into another are the natural occupants. One published example is KVCOMM, which reuses a block's KV in a new context by correcting it with offsets estimated from online anchors, so the block is not prefilled again. Methods of that kind are future work and are not part of the framework today.
+The remaining hook points of this path, the tool-call stage (stage 4) and the other events of the after-request stage (stage 5), are reserved for methods that need them. The same path could also carry KV across contexts that are similar but not identical, so that one cached block serves prompts that differ around it; KVCOMM is a published example, correcting a reused block with offsets estimated from online anchors so it is not prefilled again. Methods of that kind are future work and are not part of the framework today.
 
 ### Covering the Other Stages
 
