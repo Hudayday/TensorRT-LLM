@@ -50,8 +50,12 @@ void Page::addSequence(std::shared_ptr<ColdPageSequence> const& sequence)
     {
         ColdPageContext context{coldState->startToken, coldState->validTokens, {}, coldState->retainedProtection};
         for (auto const& previous : coldState->sequences)
+        {
             if (previous->closed)
+            {
                 context.sequenceLengths.push_back(previous->length);
+            }
+        }
         if (!context.sequenceLengths.empty())
         {
             coldState->retainedProtection = manager->coldPageCodec().protectedTokens(lifeCycle, context);
@@ -83,9 +87,13 @@ void Page::copyColdState(Page const& source, int validTokens, bool newTail)
                              [validTokens](auto const& range) { return range.first >= validTokens; }),
                 ranges.end());
             for (auto& range : ranges)
+            {
                 range.second = std::min(range.second, validTokens);
+            }
             if (validTokens < manager->tokensPerBlock())
+            {
                 ranges.emplace_back(validTokens, manager->tokensPerBlock());
+            }
         }
     }
 }
@@ -108,20 +116,32 @@ int Page::coldCapacityClass() const noexcept
 std::unique_ptr<ColdPageState> Page::coldStateAfterEncode() const
 {
     if (!coldState || !coldState->representation)
+    {
         return nullptr;
+    }
     auto state = std::make_unique<ColdPageState>(*coldState);
     auto const& representation = *state->representation;
     auto ranges = representation.rawTokens;
     // Future writes to a reused partial page are fresh KV, not decoded values.
     if (representation.validTokens < manager->tokensPerBlock())
+    {
         ranges.emplace_back(representation.validTokens, manager->tokensPerBlock());
+    }
     if (state->quantized)
     {
         std::vector<ColdPageTokenRange> intersection;
         for (auto const& [begin, end] : ranges)
+        {
             for (auto const& [oldBegin, oldEnd] : state->losslessTokens)
-                if (std::max(begin, oldBegin) < std::min(end, oldEnd))
-                    intersection.emplace_back(std::max(begin, oldBegin), std::min(end, oldEnd));
+            {
+                int const overlapBegin = std::max(begin, oldBegin);
+                int const overlapEnd = std::min(end, oldEnd);
+                if (overlapBegin < overlapEnd)
+                {
+                    intersection.emplace_back(overlapBegin, overlapEnd);
+                }
+            }
+        }
         ranges = std::move(intersection);
     }
     state->losslessTokens = std::move(ranges);
@@ -132,7 +152,9 @@ std::unique_ptr<ColdPageState> Page::coldStateAfterEncode() const
 void Page::markColdEncoded()
 {
     if (coldState)
+    {
         coldState = coldStateAfterEncode();
+    }
 }
 
 Page::~Page()

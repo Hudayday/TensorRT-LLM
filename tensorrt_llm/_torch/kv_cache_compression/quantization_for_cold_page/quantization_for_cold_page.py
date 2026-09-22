@@ -164,13 +164,13 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
             self.build_lifecycle_metadata(codec_state, lifecycle) for lifecycle in lifecycles
         )
         properties = []
-        for index, metadata in enumerate(codec_state.lifecycle_metadata):
+        for hot_lifecycle, metadata in zip(codec_state.lifecycles, codec_state.lifecycle_metadata):
             lifecycle = native.ColdPageLifecycleProperties()
             lifecycle.cold_page_bytes = metadata.cold_page_bytes
             lifecycle.page_index_location = native.ColdPageIndexLocation.HOST
             if self.selects_tokens:
                 lifecycle.tokens_per_page, lifecycle.max_cold_page_bytes = (
-                    self.selected_storage_properties(codec_state, lifecycles[index])
+                    self.selected_storage_properties(codec_state, hot_lifecycle)
                 )
             properties.append(lifecycle)
         return properties

@@ -46,6 +46,7 @@ _INTEGER_FIELDS = 7
 _SCALE_FIELDS = 4
 _NVFP4_TRANSFORM = 0
 _LOSSLESS_TRANSFORM = 1
+_ZERO_TRANSFORM = 2
 
 _DEEPSEEK_V4_PREFIX = "deepseek_v4_"
 _DEEPSEEK_V4_SWA = f"{_DEEPSEEK_V4_PREFIX}swa"
@@ -106,6 +107,46 @@ class _Nvfp4ColdPageMetadata:
     num_buffers: int
     max_half_groups_per_tile: int
     cold_page_bytes: int
+
+    @classmethod
+    def from_rows(
+        cls,
+        wide_rows: list[list[int]],
+        integer_rows: list[list[int]],
+        scale_rows: list[list[float]],
+        *,
+        cold_page_bytes: int,
+    ) -> "_Nvfp4ColdPageMetadata":
+        """Pack one launch's descriptors into the fixed-capacity native ABI."""
+        num_buffers = len(wide_rows)
+        if not 0 < num_buffers <= _MAX_BUFFERS_PER_LAUNCH:
+            raise ValueError(
+                f"NVFP4 cold-page lifecycle has {num_buffers} buffers; "
+                f"the maximum is {_MAX_BUFFERS_PER_LAUNCH}"
+            )
+        padding = _MAX_BUFFERS_PER_LAUNCH - num_buffers
+        half_groups = max(
+            heads * tokens * quantized // _ELEMENTS_PER_HALF_GROUP
+            for _, _, heads, tokens, quantized, _, _ in integer_rows
+        )
+        return cls(
+            wide=torch.tensor(
+                wide_rows + [[0] * _WIDE_FIELDS] * padding, dtype=torch.int64, device="cpu"
+            ),
+            integers=torch.tensor(
+                integer_rows + [[0] * _INTEGER_FIELDS] * padding,
+                dtype=torch.int32,
+                device="cpu",
+            ),
+            scales=torch.tensor(
+                scale_rows + [[0.0] * _SCALE_FIELDS] * padding,
+                dtype=torch.float32,
+                device="cpu",
+            ),
+            num_buffers=num_buffers,
+            max_half_groups_per_tile=min(half_groups, _MAX_HALF_GROUPS_PER_TILE),
+            cold_page_bytes=cold_page_bytes,
+        )
 
 
 @dataclass
@@ -493,7 +534,6 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         integer_rows: list[list[int]] = []
         scale_rows: list[list[float]] = []
         cold_page_bytes = 0
-        max_half_groups_per_tile = 0
 
         for layer_id, hot_buffers in lifecycle.layers.items():
             layout = codec_state.layer_layouts[int(layer_id)]
@@ -541,11 +581,6 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                         raise ValueError(
                             "NVFP4 hot address and Slot stride must be 16-byte aligned"
                         )
-                    half_groups = rows * buffer.quantized_range_elements // _ELEMENTS_PER_HALF_GROUP
-                    max_half_groups_per_tile = max(
-                        max_half_groups_per_tile,
-                        min(half_groups, _MAX_HALF_GROUPS_PER_TILE),
-                    )
                 else:
                     data_offset = cursor
                     scale_offset = 0
@@ -590,32 +625,8 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             integer_rows[-1][0] = layer_end - cursor
             cold_page_bytes = layer_end
 
-        num_buffers = len(wide_rows)
-        if not 0 < num_buffers <= _MAX_BUFFERS_PER_LAUNCH:
-            raise ValueError(
-                f"NVFP4 cold-page lifecycle has {num_buffers} buffers; "
-                f"the maximum is {_MAX_BUFFERS_PER_LAUNCH}"
-            )
-        padding = _MAX_BUFFERS_PER_LAUNCH - num_buffers
-        return _Nvfp4ColdPageMetadata(
-            wide=torch.tensor(
-                wide_rows + [[0] * _WIDE_FIELDS for _ in range(padding)],
-                dtype=torch.int64,
-                device="cpu",
-            ),
-            integers=torch.tensor(
-                integer_rows + [[0] * _INTEGER_FIELDS for _ in range(padding)],
-                dtype=torch.int32,
-                device="cpu",
-            ),
-            scales=torch.tensor(
-                scale_rows + [[0.0] * _SCALE_FIELDS for _ in range(padding)],
-                dtype=torch.float32,
-                device="cpu",
-            ),
-            num_buffers=num_buffers,
-            max_half_groups_per_tile=max_half_groups_per_tile,
-            cold_page_bytes=cold_page_bytes,
+        return _Nvfp4ColdPageMetadata.from_rows(
+            wide_rows, integer_rows, scale_rows, cold_page_bytes=cold_page_bytes
         )
 
     def selected_storage_properties(
@@ -630,7 +641,9 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         maximum = 0
         for buffers in lifecycle.layers.values():
             maximum += sum(int(buffer.raw_bytes) for buffer in buffers.values())
-            maximum = (maximum + 15) // 16 * 16
+            maximum = (
+                (maximum + _COLD_PAGE_ALIGNMENT - 1) // _COLD_PAGE_ALIGNMENT * _COLD_PAGE_ALIGNMENT
+            )
         return lengths.pop(), maximum
 
     def prepare_selected_cold_page(
@@ -649,14 +662,18 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         preservation, without another indexing convention in the CUDA kernel.
         """
         lifecycle = codec_state.lifecycles[lifecycle_index]
-        full_length, _ = self.selected_storage_properties(codec_state, lifecycle)
+        # configure() already validated a common token length for this lifecycle.
+        first_layer = next(iter(lifecycle.layers))
+        full_length = codec_state.layer_layouts[int(first_layer)].tokens_per_page
         if valid_tokens == full_length and not raw_tokens:
             metadata = codec_state.lifecycle_metadata[lifecycle_index]
             if capacity_bytes != metadata.cold_page_bytes:
                 raise ValueError("Unprotected full pages must use the compact capacity")
             codec_state.selected_metadata[lifecycle_index, layout_id] = (metadata,)
             return metadata.cold_page_bytes
-        wide, integers, scales = [], [], []
+        wide_rows: list[list[int]] = []
+        integer_rows: list[list[int]] = []
+        scale_rows: list[list[float]] = []
         cursor = 0
         element_bytes = 1 if codec_state.runtime_type == 2 else 2
         segments = []
@@ -671,10 +688,21 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         if end < valid_tokens:
             segments.append((end, valid_tokens, False))
 
-        def append(hot, offset, size, transform, heads=0, tokens=0, stride=0, buffer=None):
+        def append_buffer(
+            hot: object,
+            buffer: _Nvfp4BufferLayout,
+            *,
+            offset: int = 0,
+            size: int,
+            transform: int,
+            tokens: int = 0,
+            stride: int = 0,
+        ) -> None:
             nonlocal cursor
-            data = cursor
+            data_offset = cursor
             scale_offset = 0
+            # Each token segment belongs to one head; opaque and zero-fill entries have no rows.
+            heads = 1 if tokens else 0
             quantized = buffer.quantized_range_elements if transform == _NVFP4_TRANSFORM else 0
             start = buffer.quantized_range_start if transform == _NVFP4_TRANSFORM else 0
             if transform == _NVFP4_TRANSFORM:
@@ -687,12 +715,19 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 )
             elif transform == _LOSSLESS_TRANSFORM:
                 cursor += size
-            wide.append(
-                [int(hot.raw_base) + offset, int(hot.raw_slot_bytes), size, data, scale_offset, 0]
+            wide_rows.append(
+                [
+                    int(hot.raw_base) + offset,
+                    int(hot.raw_slot_bytes),
+                    size,
+                    data_offset,
+                    scale_offset,
+                    0,
+                ]
             )
-            integers.append([0, transform, heads, tokens, quantized, stride, start])
+            integer_rows.append([0, transform, heads, tokens, quantized, stride, start])
             scale = buffer.scales if transform == _NVFP4_TRANSFORM else _Nvfp4Scales(1.0, 1.0)
-            scales.append(
+            scale_rows.append(
                 [
                     scale.nvfp4_orig_quant,
                     scale.nvfp4_quant_orig,
@@ -709,14 +744,18 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             for buffer in layout.buffers:
                 hot = hot_buffers[buffer.role]
                 if buffer.role not in ("key", "value"):
-                    append(hot, 0, int(hot.raw_bytes), _LOSSLESS_TRANSFORM)
+                    append_buffer(
+                        hot, buffer, size=int(hot.raw_bytes), transform=_LOSSLESS_TRANSFORM
+                    )
                     continue
                 if int(hot.raw_bytes) != layout.num_kv_heads * layout.tokens_per_page * row_bytes:
                     raise ValueError("Selected KV buffer does not have token-row geometry")
                 if valid_tokens == layout.tokens_per_page and (
                     buffer.scales is None or list(raw_tokens) == [(0, valid_tokens)]
                 ):
-                    append(hot, 0, int(hot.raw_bytes), _LOSSLESS_TRANSFORM)
+                    append_buffer(
+                        hot, buffer, size=int(hot.raw_bytes), transform=_LOSSLESS_TRANSFORM
+                    )
                     continue
                 for head in range(layout.num_kv_heads):
                     head_base = head * layout.tokens_per_page * row_bytes
@@ -726,63 +765,43 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                             if keep or buffer.scales is None
                             else _NVFP4_TRANSFORM
                         )
-                        append(
+                        append_buffer(
                             hot,
-                            head_base + first * row_bytes,
-                            (last - first) * row_bytes,
-                            transform,
-                            1,
-                            last - first,
-                            layout.raw_row_stride_elements,
                             buffer,
+                            offset=head_base + first * row_bytes,
+                            size=(last - first) * row_bytes,
+                            transform=transform,
+                            tokens=last - first,
+                            stride=layout.raw_row_stride_elements,
                         )
                     if valid_tokens < layout.tokens_per_page:
-                        # Transform 2 has no cold payload and clears only the invalid hot rows.
-                        append(
+                        # Zero-fill has no cold payload and clears only the invalid hot rows.
+                        append_buffer(
                             hot,
-                            head_base + valid_tokens * row_bytes,
-                            (layout.tokens_per_page - valid_tokens) * row_bytes,
-                            2,
+                            buffer,
+                            offset=head_base + valid_tokens * row_bytes,
+                            size=(layout.tokens_per_page - valid_tokens) * row_bytes,
+                            transform=_ZERO_TRANSFORM,
                         )
-            aligned = (cursor + 15) // 16 * 16
-            wide[-1][5], integers[-1][0] = cursor, aligned - cursor
+            aligned = (
+                (cursor + _COLD_PAGE_ALIGNMENT - 1) // _COLD_PAGE_ALIGNMENT * _COLD_PAGE_ALIGNMENT
+            )
+            wide_rows[-1][5], integer_rows[-1][0] = cursor, aligned - cursor
             cursor = aligned
 
         if cursor > capacity_bytes:
             raise ValueError("Selected cold-page payload exceeds its allocated capacity")
         # Initialize all capacity padding before Host/Disk copies can expose it.
-        wide[-1][5] = cursor - integers[-1][0]
-        integers[-1][0] += capacity_bytes - cursor
+        wide_rows[-1][5] = cursor - integer_rows[-1][0]
+        integer_rows[-1][0] += capacity_bytes - cursor
         metadata = []
-        for first in range(0, len(wide), _MAX_BUFFERS_PER_LAUNCH):
-            stop = min(first + _MAX_BUFFERS_PER_LAUNCH, len(wide))
-            padding = _MAX_BUFFERS_PER_LAUNCH - (stop - first)
-            half_groups = max(
-                (
-                    row[2] * row[3] * row[4] // _ELEMENTS_PER_HALF_GROUP
-                    for row in integers[first:stop]
-                ),
-                default=0,
-            )
+        for first in range(0, len(wide_rows), _MAX_BUFFERS_PER_LAUNCH):
+            stop = first + _MAX_BUFFERS_PER_LAUNCH
             metadata.append(
-                _Nvfp4ColdPageMetadata(
-                    wide=torch.tensor(
-                        wide[first:stop] + [[0] * _WIDE_FIELDS] * padding,
-                        dtype=torch.int64,
-                        device="cpu",
-                    ),
-                    integers=torch.tensor(
-                        integers[first:stop] + [[0] * _INTEGER_FIELDS] * padding,
-                        dtype=torch.int32,
-                        device="cpu",
-                    ),
-                    scales=torch.tensor(
-                        scales[first:stop] + [[0.0] * _SCALE_FIELDS] * padding,
-                        dtype=torch.float32,
-                        device="cpu",
-                    ),
-                    num_buffers=stop - first,
-                    max_half_groups_per_tile=min(half_groups, _MAX_HALF_GROUPS_PER_TILE),
+                _Nvfp4ColdPageMetadata.from_rows(
+                    wide_rows[first:stop],
+                    integer_rows[first:stop],
+                    scale_rows[first:stop],
                     cold_page_bytes=capacity_bytes,
                 )
             )

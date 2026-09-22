@@ -74,10 +74,16 @@ NativeColdPageCodec::NativeColdPageCodec(std::set<kv::LayerId> layerIds, ColdPag
     , mSelection(std::move(selection))
 {
     if (mSelection.keepFirstTokens < 0 || mSelection.keepLastTokens < 0)
+    {
         throw std::invalid_argument("Cold-page token counts must be non-negative");
+    }
     for (auto const& [begin, end] : mSelection.keepTokenRanges)
+    {
         if (begin < 0 || begin >= end)
+        {
             throw std::invalid_argument("Invalid cold-page token range");
+        }
+    }
 }
 
 bool NativeColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolGroupIndex numGpuDescs) noexcept
@@ -216,11 +222,15 @@ bool NativeColdPageCodec::selectsTokens(kv::LayerGroupId layerGroupId) const noe
 std::vector<double> NativeColdPageCodec::coldPageCapacityFractions(kv::LayerGroupId layerGroupId, int length) const
 {
     if (coldPageCapacities(layerGroupId).size() == 1)
+    {
         return {1.0};
+    }
     // Before any length observation, reserve both representations. The normal
     // KVCM ratio update uses observed reuse lengths thereafter.
     if (length <= 0)
+    {
         return {0.5, 0.5};
+    }
     int const pageTokens = mLayerGroups.at(layerGroupId).tokensPerPage;
     int64_t const pages = (int64_t{length} + pageTokens - 1) / pageTokens;
     int64_t rawPages = 0, lastPage = 0;
@@ -306,13 +316,16 @@ std::shared_ptr<kv::ColdPageRepresentation const> NativeColdPageCodec::prepareCo
     auto representation = std::make_shared<kv::ColdPageRepresentation>();
     representation->validTokens = context.validTokens;
     representation->rawTokens = std::move(rawTokens);
-    // Recycle unused layouts once the cache reaches 64 entries. Live pages hold shared ownership, so
+    // Recycle unused layouts once the cache reaches its retention limit. Live pages hold shared ownership, so
     // their frozen decode tables cannot be recycled. Reusing an unreferenced
     // ID also replaces the provider's corresponding metadata allocation.
+    constexpr size_t kRetainedLayouts = 64;
     auto reusable = state.representations.end();
-    if (state.representations.size() >= 64)
+    if (state.representations.size() >= kRetainedLayouts)
+    {
         reusable = std::find_if(state.representations.begin(), state.representations.end(),
             [](auto const& item) { return item.second.use_count() == 1; });
+    }
     if (reusable != state.representations.end())
     {
         representation->layoutId = reusable->second->layoutId;
@@ -321,7 +334,9 @@ std::shared_ptr<kv::ColdPageRepresentation const> NativeColdPageCodec::prepareCo
     else
     {
         if (state.nextLayoutId == std::numeric_limits<int>::max())
+        {
             throw std::overflow_error("Cold-page layout ID exhausted");
+        }
         representation->layoutId = state.nextLayoutId++;
     }
     representation->capacityClass

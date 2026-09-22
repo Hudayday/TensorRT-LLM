@@ -49,7 +49,9 @@ using MigrationRecorder
     = std::function<void(std::vector<SharedPtr<Page>> const&, std::vector<Slot> const&, CacheLevel, CacheLevel)>;
 using DropRecorder = std::function<void(std::vector<SharedPtr<Page>> const&, CacheLevel)>;
 
-// Immutable bidirectional mapping between lifecycles and pool groups.
+// Immutable mapping from each lifecycle to its primary pool group, and from
+// every pool group to its lifecycles. Additional cold capacity classes participate
+// in the inverse mapping without changing the primary (compact) group.
 class LifeCyclePoolGroupMapping
 {
 public:

@@ -50,24 +50,38 @@ LifeCyclePoolGroupMapping::LifeCyclePoolGroupMapping(TypedVec<LifeCycleId, PoolG
     : mForward(std::move(forward))
 {
     auto pairs = additional;
-    for (LifeCycleId lc{0}; lc < mForward.size(); ++lc)
-        pairs.emplace_back(lc, mForward[lc]);
-    size_t numGroups = 0;
-    for (auto const& [lc, pg] : pairs)
+    for (LifeCycleId lifeCycle{0}; lifeCycle < mForward.size(); ++lifeCycle)
     {
-        TLLM_CHECK(lc >= LifeCycleId{0} && lc < mForward.size() && pg >= PoolGroupIndex{0});
-        numGroups = std::max(numGroups, static_cast<size_t>(pg.value()) + 1);
+        pairs.emplace_back(lifeCycle, mForward[lifeCycle]);
     }
-    mPoolGroupOffsets.assign(numGroups + 1, 0);
-    for (auto const& [lc, pg] : pairs)
-        ++mPoolGroupOffsets.at(pg.value() + 1);
-    for (size_t pg = 0; pg < numGroups; ++pg)
-        TLLM_CHECK(mPoolGroupOffsets[pg + 1] > 0);
+    size_t numPoolGroups = 0;
+    for (auto const& [lifeCycle, poolGroup] : pairs)
+    {
+        TLLM_CHECK_WITH_INFO(lifeCycle >= LifeCycleId{0} && lifeCycle < mForward.size(),
+            "Pool group membership refers to an unknown lifecycle");
+        TLLM_CHECK_WITH_INFO(poolGroup >= PoolGroupIndex{0}, "Pool group index must be non-negative");
+        numPoolGroups = std::max(numPoolGroups, toSizeT(poolGroup) + 1);
+    }
+    TLLM_CHECK_WITH_INFO(numPoolGroups <= static_cast<size_t>(std::numeric_limits<int>::max()), "Too many pool groups");
+    TLLM_CHECK_WITH_INFO(
+        mForward.stdSize() <= static_cast<size_t>(std::numeric_limits<int>::max()), "Too many lifecycles");
+
+    mPoolGroupOffsets.assign(numPoolGroups + 1, 0);
+    for (auto const& [lifeCycle, poolGroup] : pairs)
+    {
+        ++mPoolGroupOffsets.at(toSizeT(poolGroup) + 1);
+    }
+    for (size_t poolGroup = 0; poolGroup < numPoolGroups; ++poolGroup)
+    {
+        TLLM_CHECK_WITH_INFO(mPoolGroupOffsets[poolGroup + 1] > 0, "Pool group indices must be canonical");
+    }
     std::partial_sum(mPoolGroupOffsets.begin(), mPoolGroupOffsets.end(), mPoolGroupOffsets.begin());
     mInverse.resize(pairs.size());
     auto next = mPoolGroupOffsets;
-    for (auto const& [lc, pg] : pairs)
-        mInverse[next[pg.value()]++] = lc;
+    for (auto const& [lifeCycle, poolGroup] : pairs)
+    {
+        mInverse[next[toSizeT(poolGroup)]++] = lifeCycle;
+    }
 }
 
 PoolGroupIndex LifeCyclePoolGroupMapping::poolGroup(LifeCycleId lifeCycle) const
@@ -347,7 +361,9 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         TLLM_CHECK_WITH_INFO(coldPageBytes > 0, "Cold-page codec returned an invalid page size");
         coldPageBytesByLifeCycle[lifeCycle] = coldPageBytes;
         for (size_t bytes : codec.coldPageCapacities(lifeCycle))
+        {
             maxColdPageBytes = std::max(maxColdPageBytes, bytes);
+        }
 
         LayerGroupId const batchingLayerGroupId = codec.getBatchingLayerGroupId(lifeCycle);
         TLLM_CHECK_WITH_INFO(batchingLayerGroupId.value() >= 0 && batchingLayerGroupId < numLifeCycles()
@@ -412,27 +428,30 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     }
 
     mColdCapacityGroups.resize(numLifeCycles());
-    std::vector<std::pair<LifeCycleId, PoolGroupIndex>> additional;
-    for (LifeCycleId lc{0}; lc < numLifeCycles(); ++lc)
+    std::vector<std::pair<LifeCycleId, PoolGroupIndex>> additionalGroups;
+    for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
     {
-        mColdCapacityGroups[lc].push_back(coldGrouping[lc]);
-        auto const capacities = codec.coldPageCapacities(lc);
-        TLLM_CHECK(!capacities.empty() && capacities.front() == coldPageBytesByLifeCycle[lc]);
+        mColdCapacityGroups[lifeCycle].push_back(coldGrouping[lifeCycle]);
+        auto const capacities = codec.coldPageCapacities(lifeCycle);
+        TLLM_CHECK_WITH_INFO(!capacities.empty() && capacities.front() == coldPageBytesByLifeCycle[lifeCycle],
+            "The first cold capacity class must match the codec's compact page size");
         for (size_t index = 1; index < capacities.size(); ++index)
         {
             size_t const bytes = capacities[index];
-            TLLM_CHECK(bytes > capacities[index - 1]);
+            TLLM_CHECK_WITH_INFO(bytes > capacities[index - 1], "Cold capacity classes must be strictly increasing");
             auto [it, inserted] = coldGroupByPageBytes.emplace(bytes, coldSlotDescList.size());
-            auto const pg = it->second;
+            PoolGroupIndex const poolGroup = it->second;
             if (inserted)
+            {
                 coldSlotDescList.push_back(SlotDesc{});
-            mColdCapacityGroups[lc].push_back(pg);
-            additional.emplace_back(lc, pg);
+            }
+            mColdCapacityGroups[lifeCycle].push_back(poolGroup);
+            additionalGroups.emplace_back(lifeCycle, poolGroup);
             SlotDescVariant variant;
-            variant.lifeCycleId = lc;
+            variant.lifeCycleId = lifeCycle;
             variant.coalescedBuffers.push_back(
                 CoalescedBuffer{bytes, std::vector<BufferId>{BufferId{-1, "__cold_page__"}}});
-            coldSlotDescList[pg].variants.push_back(std::move(variant));
+            coldSlotDescList[poolGroup].variants.push_back(std::move(variant));
         }
     }
     TypedVec<PoolGroupIndex, SlotCount> coldMinSlots(coldSlotDescList.size(), 1);
@@ -446,19 +465,21 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         coldSlotSizeLists.push_back(std::move(sizes));
     }
 
-    mColdPoolGroupMapping = LifeCyclePoolGroupMapping(std::move(coldGrouping), additional);
+    mColdPoolGroupMapping = LifeCyclePoolGroupMapping(std::move(coldGrouping), additionalGroups);
 
+    int referenceLength = 0;
+    if (typicalBatch && !typicalBatch->kvCaches.empty())
+    {
+        int64_t totalLength = 0;
+        for (auto const& cache : typicalBatch->kvCaches)
+        {
+            totalLength += cache.historyLength;
+        }
+        referenceLength = static_cast<int>(totalLength / typicalBatch->kvCaches.size());
+    }
     for (CacheLevel level{1}; level < config.cacheTiers.size(); ++level)
     {
         TLLM_CHECK(appendLevelSlotDescList(coldSlotDescList) == level);
-        int referenceLength = 0;
-        if (typicalBatch && !typicalBatch->kvCaches.empty())
-        {
-            int64_t total = 0;
-            for (auto const& cache : typicalBatch->kvCaches)
-                total += cache.historyLength;
-            referenceLength = static_cast<int>(total / typicalBatch->kvCaches.size());
-        }
         auto const coldRatio = projectPoolGroupRatio(kHotLevel, level, lifeCycleRatio, referenceLength);
         auto slotCounts
             = computeSlotCountForLevel(config.cacheTiers[level], coldSlotSizeLists, coldRatio, coldMinSlots);
@@ -926,15 +947,21 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     auto const& grouping = poolGroupMapping(lvlId);
 
     for (auto const& pages : fallenPages)
+    {
         for (auto const& page : pages)
+        {
             prepareColdPage(*page);
+        }
+    }
     auto belongs = [&](auto const& page, PoolGroupIndex pg) { return getPoolGroupIndex(lvlId, *page) == pg; };
     auto countPages = [&](PoolGroupIndex pgIdx, PagesByLifeCycle const& pagesByLifeCycle)
     {
         SlotCount count = 0;
         for (LifeCycleId lc : grouping.lifeCycles(pgIdx))
+        {
             count += std::count_if(pagesByLifeCycle.at(lc).begin(), pagesByLifeCycle.at(lc).end(),
                 [&](auto const& page) { return belongs(page, pgIdx); });
+        }
         return count;
     };
 
@@ -1187,7 +1214,9 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         {
             TLLM_CHECK_WITH_INFO(updateSrc, "Heterogeneous migration requires in-place page ownership updates");
             for (auto const& [key, pages] : selectedBatches)
+            {
                 _batchedMigrate(dstLevel, srcLevel, pages, true, migrationRecorder, defrag);
+            }
             return std::nullopt;
         }
     }
@@ -1217,7 +1246,9 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
     {
         encodedStates.reserve(srcPages.size());
         for (auto const& page : srcPages)
+        {
             encodedStates.push_back(page->coldStateAfterEncode());
+        }
     }
     auto dstSlots = dstPoolGroup.allocateMultiple(numSlots);
     // A15: allocated slot count must match the request.
@@ -1278,7 +1309,9 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
             if (updateSrc)
             {
                 if (!encodedStates.empty())
+                {
                     srcPages.at(i)->coldState = std::move(encodedStates.at(i));
+                }
                 bool wasScheduled = srcPages.at(i)->scheduledForEviction();
                 if (wasScheduled)
                     excludeFromEviction(*srcPages.at(i));
@@ -1440,7 +1473,9 @@ PoolGroupIndex StorageManager::getPoolGroupIndex(CacheLevel level, Page const& p
 void StorageManager::prepareColdPage(Page& page)
 {
     if (page.cacheLevel != kHotLevel || !page.coldState)
+    {
         return;
+    }
     auto& state = *page.coldState;
     if (!page.isCommitted())
     {
@@ -1449,8 +1484,12 @@ void StorageManager::prepareColdPage(Page& page)
     }
     ColdPageContext context{state.startToken, state.validTokens, {}, state.retainedProtection};
     for (auto const& sequence : state.sequences)
+    {
         if (sequence->closed)
+        {
             context.sequenceLengths.push_back(sequence->length);
+        }
+    }
     state.retainedProtection = mColdPageCodec->protectedTokens(page.lifeCycle, context);
     state.sequences.erase(std::remove_if(state.sequences.begin(), state.sequences.end(),
                               [](auto const& sequence) { return sequence->closed; }),
@@ -1458,7 +1497,9 @@ void StorageManager::prepareColdPage(Page& page)
     context.retainedProtection = state.retainedProtection;
     context.sequenceLengths.clear();
     for (auto const& sequence : state.sequences)
+    {
         context.sequenceLengths.push_back(sequence->length);
+    }
     state.representation = mColdPageCodec->prepareColdPage(page.lifeCycle, context);
 }
 
@@ -1817,6 +1858,7 @@ TypedVec<PoolGroupIndex, float> StorageManager::projectPoolGroupRatio(CacheLevel
             auto const pg = getPoolGroupIndex(dstLevel, lc, static_cast<int>(index));
             auto const dstSizes = slotSize(dstLevel, pg);
             auto const dstBytes = std::accumulate(dstSizes.begin(), dstSizes.end(), size_t{0});
+            TLLM_CHECK_WITH_INFO(srcBytes > 0 && dstBytes > 0, "Cache slot size must be positive");
             weights[pg] += srcLifeCycleRatio[lc] * fractions[index] * static_cast<double>(dstBytes) / srcBytes;
         }
     }
