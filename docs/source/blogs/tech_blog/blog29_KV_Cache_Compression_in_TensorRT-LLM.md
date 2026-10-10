@@ -22,11 +22,7 @@
 
 ## Introduction and Motivation
 
-The tasks handed to Large Language Models (LLMs) keep getting more complex and more expensive to serve. Models grow, the text they read and write grows with them, and nowhere is this more visible than in agentic workflows, where a model works through a task in many steps instead of one reply.
-
-An agent job is a chain of model calls separated by tool calls, and each tool result is appended to one growing conversation. Input length grows turn by turn, tool calls repeat dozens of times per job, and most of every prompt is text the system has already seen.
-
-In the [InferenceX](https://inferencex.semianalysis.com/) AgentX coding traces, for example, the median input length per request is 14.4k tokens and over 96% of the prompt tokens are reusable prefix. Our earlier blog on [evaluating agentic serving with trace replay](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html) characterizes these workloads and the role of KV cache reuse in detail. Figure 1 shows that the same shift is visible at the scale of a whole serving platform.
+Agentic workloads are changing what an LLM serving system has to do. An agent does not answer once. It works through a job in many steps, calls the model again after every tool result, and each call carries the whole conversation so far. Figure 1 shows what this looks like in production traces.
 
 <div align="center">
 <figure>
@@ -34,6 +30,8 @@ In the [InferenceX](https://inferencex.semianalysis.com/) AgentX coding traces, 
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: LLM serving today. On a one-year production trace, requests are prompt-heavy, outputs are getting shorter, a single long context carries tens of gigabytes of KV, and almost all reuse arrives within minutes. In agentic coding traces, almost the entire prompt is reusable prefix. Sources: <a href="https://arxiv.org/abs/2608.13573">Nixon et al., A Year in LLM Serving (2026)</a> for the first six tiles, and our <a href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">trace-replay blog</a> for the last one.</em></sub></p>
+
+Three things stand out. Prompts are long and keep growing, while outputs stay short. Almost all of each prompt is text the system has already processed: in the InferenceX AgentX coding traces, over 96% of prompt tokens are a prefix seen before. And the reuse comes back fast, usually within minutes. So the serving system has to hold far more KV cache than before, and hold it long enough for the next turn to find it.
 
 This pressure grows while the space for the KV cache does not: GPU memory is fixed, and the DRAM behind it is finite too. When the KV cache no longer fits, the consequences are severe.
 
