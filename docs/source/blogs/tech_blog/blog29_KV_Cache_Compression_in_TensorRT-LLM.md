@@ -22,7 +22,7 @@
 
 ## Introduction and Motivation
 
-Agentic workloads change what a serving system has to do. Instead of answering once, an agent works through a job in many steps, and it calls the model again with every tool result. Each call carries the whole conversation so far, so the prompt grows turn by turn while the answer stays short. Figure 1 shows how far production traffic has already moved in this direction: prompts dominate, almost every prompt is a prefix the system has seen before, and that prefix comes back within minutes. For this traffic, **keeping the KV cache of earlier turns matters more than anything else**.
+Agentic workloads change what a serving system has to do. Instead of answering once, an agent works through a job in many steps, and it calls the model again with every tool result. Each call carries the whole conversation so far, so the prompt grows turn by turn while the answer stays short. Figure 1 shows how far production traffic has already moved in this direction: prompts dominate, almost every prompt is a prefix the system has seen before, and that prefix comes back within minutes. This is a workload where **every byte of KV cache saved pays back many times**: a smaller cache keeps more turns resident, more turns resident means more prefixes reused instead of recomputed, and the memory freed serves more requests.
 
 <div align="center">
 <figure>
@@ -31,7 +31,7 @@ Agentic workloads change what a serving system has to do. Instead of answering o
 </div>
 <p align="center"><sub><em>Figure 1: LLM serving today. On a one-year production trace, requests are prompt-heavy, outputs are getting shorter, a single long context carries tens of gigabytes of KV, and almost all reuse arrives within minutes. In agentic coding traces, almost the entire prompt is reusable prefix. Sources: <a href="https://arxiv.org/abs/2608.13573">Nixon et al., A Year in LLM Serving (2026)</a> for the first six tiles, and our <a href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">trace-replay blog</a> for the last one.</em></sub></p>
 
-The takeaway is simple. GPU memory does not grow with the conversation, and once a prefix is evicted it is computed again on the next turn, on almost every turn of the job. So the goal is to **hold more KV cache in the same memory**, and to hold it long enough for the next turn to find it. TensorRT LLM already shrinks the active cache with low-precision storage and [sparse attention](blog17_Sparse_Attention_in_TensorRT-LLM.md). This blog adds a **KV cache compression framework** for the rest of the cache's life, between prefill chunks, between decode steps, around tool calls, and after a page has left the GPU for host or disk memory. Each of these moments is a well-defined attachment point. A method plugs into the points it needs and the serving loop and attention kernels stay untouched, so one framework serves every model. Two methods ship on it today:
+That is why this blog is about compressing the KV cache. TensorRT LLM already shrinks the active cache with low-precision storage and [sparse attention](blog17_Sparse_Attention_in_TensorRT-LLM.md), but a KV cache lives far beyond the attention kernel: between prefill chunks, between decode steps, around tool calls, and after a page has left the GPU for host or disk memory. This blog introduces a **KV cache compression framework** that exposes each of these moments as a well-defined attachment point. A method plugs into the points it needs and the serving loop and attention kernels stay untouched, so one framework serves every model. Two methods ship on it today:
 
 - **[NVFP4 cold-page compression](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md#cold-page-quantization)**: keeps attention KV pages in NVFP4 only while they are **cold**, that is, while they sit in host or disk memory. The conversion runs inside the copy, and the page returns to its original precision when it comes back to the GPU. On an agentic replay with a growing disk tier it completes up to **1.64x the requests** with up to **1.9x lower time to first token** on the same hardware.
 - **[TriAttention](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md#triattention)**: a training-free method that periodically scores the tokens generated so far and **evicts the least useful ones** between decoding steps once a sequence exceeds its budget. On Qwen3-8B it delivers up to **1.6x the decode throughput** at the same batch size and **2.7x the dense peak** once the dense cache runs out of memory, with accuracy within noise of dense from an 8k-token budget on.
@@ -40,9 +40,7 @@ The next section gives an overview of what ships, followed by the framework desi
 
 ## Overview of KV Cache Compression in TensorRT LLM
 
-KV cache compression, as used in this blog, means shrinking the KV cache at any point in a workflow, however complex the workflow is. The goal is to cut KV cache pressure while keeping the information in the cache accurate.
-
-Figure 2 shows where this sits in TensorRT LLM. It is one of three ways to cut memory and compute, next to quantization and sparse attention. It works on the KV pages that the cache manager owns.
+KV cache compression, as used here, means **shrinking the KV cache at any point of a workflow** while keeping what it holds accurate. Figure 2 places it in the TensorRT LLM stack: it sits next to quantization and sparse attention, it works on the KV pages the cache manager owns, and it touches neither the kernels below nor the serving layers above.
 
 <div align="center">
 <figure>
@@ -51,9 +49,7 @@ Figure 2 shows where this sits in TensorRT LLM. It is one of three ways to cut m
 </div>
 <p align="center"><sub><em>Figure 2: The TensorRT LLM stack. KV cache compression sits in the compression layer next to quantization and sparse attention. It changes what is stored in the KV cache and touches neither the kernels below nor the serving layers above.</em></sub></p>
 
-KV cache compression in TensorRT LLM covers the whole life of a KV cache, not only the gap between two forward steps. It can run during inference, after prefill and between decode steps. It can also run when the system moves KV around, for example when pages are offloaded or transferred, and after a request ends and its KV is kept for reuse. The result is one optimization for the whole serving system rather than for one kernel.
-
-In detail, we define five stages in the life of a KV cache, shown in Figure 3: the prefill-chunk stage (stage 1), the after-prefill stage (stage 2), the decode stage (stage 3), the tool-call stage (stage 4), and the after-request stage (stage 5). Each stage is a moment when nothing is reading the cache, so compression can run there safely. Together the five stages cover every KV cache in the system, and they apply to any large language model.
+The key idea is to follow a KV cache through its **whole life**, not only the gap between two forward steps. That life has five stages, shown in Figure 3: prefill chunks (1), after prefill (2), decode steps (3), tool calls (4), and after the request ends (5). At each of them nothing is reading the cache, so compression can run safely. The stages inside a request are driven from the executor loop; the stages after it, where pages are kept, offloaded and reused, are driven from the cache manager. Either way the **cache manager keeps ownership of every page** and a method only changes its contents, which is what lets one framework serve every model.
 
 <div align="center">
 <figure>
@@ -62,16 +58,10 @@ In detail, we define five stages in the life of a KV cache, shown in Figure 3: t
 </div>
 <p align="center"><sub><em>Figure 3: Five stages in the life of a KV cache where compression can run. TriAttention acts at the decode stage (stage 3) and cold-page compression at the after-request stage (stage 5). The dashed stages are in scope and have no method yet.</em></sub></p>
 
-Working in stages has two benefits. A method picks only the stages it needs, and a stage works the same way for every model.
+Two methods ship today, at two of the five stages:
 
-We defined the stages this way so that the framework needs one small contract per kind of stage and nothing more. Stages inside a request are reached by compression in the executor iteration loop. Stages beyond a single request, where the KV cache is kept and managed across requests, are reached through the KV cache manager, for example when pages are offloaded and onboarded.
-
-In both cases the cache manager keeps full ownership of pages. It allocates them, moves them between tiers, and reuses them. A compression method only changes their contents.
-
-We have built two methods on the framework, using two of the five stages. NVFP4 cold-page compression works at the after-request stage (stage 5) and TriAttention at the decode stage (stage 3). The same framework lets us add methods at the other stages and support more complex algorithms in the future. The two methods are:
-
-*   **NVFP4 cold-page compression**: stores attention KV pages as NVFP4 while they sit in host or disk memory. A page is converted on the way out and restored on the way back. The GPU cache and the attention kernels keep the model's normal KV data type.
-*   **TriAttention**: runs between decoding steps. It scores the generated tokens with an importance measure calibrated offline for each attention head and keeps only a fixed budget of them. The prompt is never touched.
+*   **NVFP4 cold-page compression** (stage 5, after the request): stores attention KV pages as NVFP4 while they sit in host or disk memory. A page is converted on the way out and restored on the way back, so the GPU cache and the attention kernels keep the model's normal KV data type.
+*   **TriAttention** (stage 3, between decode steps): scores the generated tokens with an importance measure calibrated offline per attention head and keeps only a fixed budget of them. The prompt is never touched.
 
 The two tables below summarize the current coverage.
 
@@ -100,7 +90,7 @@ The two tables below summarize the current coverage.
 
 **Note**: Currently, this design targets and is validated on NVIDIA Blackwell GPUs (B200 and GB300).
 
-This blog covers the framework design shared by all methods, with NVFP4 cold-page compression as the main worked example. The C++ interface between the cache manager and a page encoder is documented in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md). The APIs for adding a new method are in the [KV Cache Compression Development Guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md).
+The rest of the blog covers the framework design shared by all methods, with cold-page compression as the worked example. The C++ interface between the cache manager and a page encoder is in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md), and the APIs for adding a method are in the [KV Cache Compression Development Guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md).
 
 ## KV Cache Compression Framework Design
 
