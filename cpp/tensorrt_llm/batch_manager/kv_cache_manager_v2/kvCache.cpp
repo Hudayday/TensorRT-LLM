@@ -244,13 +244,13 @@ std::vector<CachePageInfo> KvCache::getPageInfo() const
             for (LifeCycleId lc{0}; lc < block.pages[beam].size(); ++lc)
             {
                 auto const* attention = std::get_if<AttnLifeCycle>(&mManager->lifeCycles().getLifeCycle(lc));
-                auto const page = blockPageGetPage(block.pages[beam][lc]);
+                auto const* page = blockPageGetPage(block.pages[beam][lc]).get();
                 if (!attention || !page)
                 {
                     continue;
                 }
                 int validTokens = std::clamp(mHistoryLength - ordinal.value() * mTokensPerBlock, 0, mTokensPerBlock);
-                if (auto const committed = dynamicPointerCast<CommittedPage>(page))
+                if (auto const* committed = dynamic_cast<CommittedPage const*>(page))
                 {
                     validTokens = std::min(validTokens, committed->numTokensInBlock);
                 }
