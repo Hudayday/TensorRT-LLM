@@ -233,6 +233,11 @@ def test_cold_page_provider_bounds_validated_before_cache_construction(
 
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
     provider = SimpleNamespace(gpu_resident_token_bounds=bounds)
+    provider.validate_gpu_resident_token_bounds = (
+        lambda block_size: KVCacheCompressionManager.validate_gpu_resident_token_bounds(
+            provider, block_size
+        )
+    )
     invalid = any(value < 0 or value % 64 for value in bounds)
     expected_error = ValueError if invalid else RuntimeError
     expected_message = "nonnegative multiple" if invalid else "bounds validated"
@@ -256,17 +261,16 @@ def test_cold_page_provider_bounds_validated_before_cache_construction(
             mapping=MagicMock(),
             cold_page_codec_provider=provider,
         )
-    assert manager._gpu_resident_token_bounds == bounds
+    assert manager._cold_page_codec_provider is provider
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("bounds", [(0, 0), (64, 256)])
 @pytest.mark.parametrize("is_draft", [False, True])
-def test_cold_page_bounds_installed_before_cache_admission(
-    bounds: tuple[int, int], is_draft: bool
-) -> None:
+def test_cold_page_policy_applied_after_resume(bounds: tuple[int, int], is_draft: bool) -> None:
     manager = _v2_manager(is_draft=is_draft)
-    manager._gpu_resident_token_bounds = bounds
+    provider = MagicMock(gpu_resident_token_bounds=bounds)
+    manager._cold_page_codec_provider = provider
     manager._swa_endpoint_rewind = 0
     manager.kv_cache_map = {}
     manager.index_mapper = MagicMock()
@@ -281,24 +285,23 @@ def test_cold_page_bounds_installed_before_cache_admission(
         lambda *args, **kwargs: calls.append("create") or cache
     )
 
-    def set_bounds(first_n: int, last_n: int) -> None:
-        assert 7 not in manager.kv_cache_map
-        assert (first_n, last_n) == bounds
-        calls.append("bounds")
-
-    cache.set_gpu_resident_token_bounds.side_effect = set_bounds
+    provider.update_gpu_page_protection.side_effect = lambda *_args, **_kwargs: calls.append(
+        "protect"
+    )
     manager.index_mapper.add_new_sequence.side_effect = lambda *_args: calls.append("publish") or 0
     result = manager._create_kv_cache(7, None, [1] * 512)
 
     assert result is cache
     assert manager.kv_cache_map[7] is cache
-    assert calls == (["create", "bounds", "publish"] if any(bounds) else ["create", "publish"])
+    assert calls == ["create", "publish"]
     cache.resume.assert_not_called()
     cache.resize.assert_not_called()
-    if any(bounds):
-        cache.set_gpu_resident_token_bounds.assert_called_once_with(*bounds)
-    else:
-        cache.set_gpu_resident_token_bounds.assert_not_called()
+    cache.is_active = False
+    cache.resume.side_effect = lambda *_args: calls.append("resume") or True
+    manager._stream = SimpleNamespace(cuda_stream=123)
+    assert manager._resume_and_restore(7, cache)
+    assert calls == ["create", "publish", "resume", "protect"]
+    provider.update_gpu_page_protection.assert_called_once_with(cache, confirmed_length=None)
 
 
 # ---------------------------------------------------------------------- #

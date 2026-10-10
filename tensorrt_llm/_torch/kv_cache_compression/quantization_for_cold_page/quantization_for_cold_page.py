@@ -59,8 +59,13 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
             lifecycle = native.ColdPageLifecycleProperties()
             lifecycle.cold_page_bytes = metadata.cold_page_bytes
             lifecycle.page_index_location = native.ColdPageIndexLocation.HOST
+            lifecycle.is_lossless = self.is_lifecycle_lossless(codec_state, metadata)
             properties.append(lifecycle)
         return properties
+
+    def is_lifecycle_lossless(self, codec_state: object, metadata: object) -> bool:
+        """Whether the format preserves every value in this lifecycle exactly."""
+        return False
 
     def build_codec_state(
         self,

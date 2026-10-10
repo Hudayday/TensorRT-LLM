@@ -71,6 +71,7 @@ if TYPE_CHECKING:
         AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                               KvCacheCompressionConfig)
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import CachePageInfo, _KVCache
 
     from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
@@ -2919,12 +2920,105 @@ class KVCacheCompressionManager(BaseResourceManager):
 
     @property
     def gpu_resident_token_bounds(self) -> tuple[int, int]:
-        """First/last confirmed-token counts protected from cold migration.
-
-        Storage-bound subclasses can override this to protect dense pages
-        while a request is live. Zero disables each bound independently.
-        """
+        """First/last confirmed-token counts protected from cold migration."""
         return 0, 0
+
+    def validate_gpu_resident_token_bounds(self, tokens_per_block: int) -> None:
+        """Validate whole-page protection against this manager's block size."""
+        for name, value in zip(("first_n", "last_n"),
+                               self.gpu_resident_token_bounds):
+            if value < 0 or value % tokens_per_block:
+                raise ValueError(
+                    f"{name} must be a nonnegative multiple of the KV block size "
+                    f"({tokens_per_block}), got {value}")
+
+    def select_gpu_resident_pages(
+        self,
+        page_info: Sequence["CachePageInfo"],
+        *,
+        confirmed_length: int,
+        tokens_per_block: int,
+    ) -> list[tuple[int, int, int]]:
+        """Select whole Attention pages for the current head, tail and pending writes.
+
+        The confirmed length includes prefill and accepted generation writes.
+        Allocated pages beyond it remain protected until their writes are settled.
+        """
+        first_n, last_n = self.gpu_resident_token_bounds
+        if not (first_n or last_n):
+            return []
+        tail_start = max(0, confirmed_length - last_n)
+        selected = []
+        for page in page_info:
+            start = page.block_ordinal * tokens_per_block
+            end = start + tokens_per_block
+            if (start < first_n or start >= confirmed_length
+                    or (last_n and end > tail_start)):
+                selected.append(
+                    (page.beam_index, page.block_ordinal, page.layer_group_id))
+        return selected
+
+    def update_gpu_page_protection(
+        self,
+        kv_cache: "_KVCache",
+        *,
+        confirmed_length: int | None = None,
+    ) -> None:
+        """Apply the common protection decision before native migration or commit."""
+        if not any(self.gpu_resident_token_bounds):
+            return
+        page_info = kv_cache.get_page_info()
+        pages = self.select_gpu_resident_pages(
+            page_info,
+            confirmed_length=(kv_cache.history_length if confirmed_length
+                              is None else confirmed_length),
+            tokens_per_block=kv_cache.tokens_per_block,
+        )
+        selected = set(pages)
+        exited = [
+            page for page in kv_cache.get_private_pages()
+            if page not in selected
+        ]
+        if exited:
+            restored = set(kv_cache.restore_shared_pages(exited))
+            shared = {(page.beam_index, page.block_ordinal, page.layer_group_id)
+                      for page in page_info if page.has_shared_page}
+            # Keep private pages whose shared replacement could not be restored.
+            # A later update retries without discarding the request's valid KV.
+            pages.extend(page for page in exited
+                         if page in shared and page not in restored)
+        kv_cache.set_private_pages(pages)
+        kv_cache.set_gpu_resident_pages(pages)
+
+    def get_precision_reuse_limit(
+        self,
+        page_info: Sequence["CachePageInfo"],
+        *,
+        reused_length: int,
+        protected_length: int,
+        tokens_per_block: int,
+    ) -> int:
+        """Cap reuse before a protected page that has undergone lossy encoding.
+
+        ``protected_length`` is the first match's endpoint. Keep it fixed across
+        retries: a shorter match is replay input, not a new tail to reconstruct.
+        Unknown provenance also requires replay of the protected page.
+        """
+        protected = set(
+            self.select_gpu_resident_pages(
+                page_info,
+                confirmed_length=protected_length,
+                tokens_per_block=tokens_per_block,
+            ))
+        limit = reused_length
+        for page in page_info:
+            start = page.block_ordinal * tokens_per_block
+            coordinates = (page.beam_index, page.block_ordinal,
+                           page.layer_group_id)
+            if (start < limit and coordinates in protected
+                    and page.lossy_encode_count != 0):
+                limit = start
+        return limit
 
     def __init__(
         self,
@@ -2936,6 +3030,10 @@ class KVCacheCompressionManager(BaseResourceManager):
         self.pretrained_config = pretrained_config
         self.kv_cache_manager: Optional["KVCacheManagerV2"] = None
         self.draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None
+
+    def shutdown(self) -> None:
+        self.kv_cache_manager = None
+        self.draft_kv_cache_manager = None
 
     def bind_kv_cache_managers(
         self,

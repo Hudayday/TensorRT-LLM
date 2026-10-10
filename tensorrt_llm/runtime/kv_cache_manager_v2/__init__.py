@@ -78,6 +78,7 @@ BufferConfig = _cpp.BufferConfig
 BufferId = _cpp.BufferId
 CoalescedBuffer = _cpp.CoalescedBuffer
 CacheTier = _cpp.CacheTier
+CachePageInfo = _cpp.CachePageInfo
 CorruptedError = _cpp.CorruptedError
 CuError = _cpp.CuError
 DiskCacheTierConfig = _cpp.DiskCacheTierConfig
@@ -215,6 +216,7 @@ __all__ = [
     "CoalescedBuffer",
     "CacheLevel",
     "CacheTier",
+    "CachePageInfo",
     "CacheTierConfig",
     "CudaStream",
     "DEFAULT_BEAM_INDEX",
