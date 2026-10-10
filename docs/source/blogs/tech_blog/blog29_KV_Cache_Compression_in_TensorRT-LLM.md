@@ -366,6 +366,15 @@ Figure 13b shows the same comparison for every configuration we measured, 51 for
 </div>
 <p align="center"><sub><em>Figure 14: Qwen3.5-397B-A17B · ten GB300s · concurrency 192 · growing disk tier. NVFP4 completes more requests, hits more, and answers sooner at every disk size.</em></sub></p>
 
+**Where the hits come from.** A hit rate alone does not say which tier served the prefix. TensorRT LLM now counts every full-block hit by the tier it came from. Figure 14b uses these counters on one GB300 node (4 GPUs, TP4/EP4) serving Qwen3.5-397B-A17B at concurrency 128, with the GPU cache capped at 35% of free memory, 16 GiB of host cache per GPU and a 512 GiB disk tier. Both settings reach a similar hit rate: 81% and 85% of blocks. Uncompressed, 14% of the hits come back from disk. With NVFP4 cold pages the same host memory holds more pages, so no hit is served from disk, p90 TTFT drops from 34 s to 21 s, and the server completes 4,621 requests in the 30-minute window instead of 3,070.
+
+<div align="center">
+<figure>
+  <img src="../media/tech_blog29_tier_hits_qwen.svg" width="700">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 14b: Qwen3.5-397B-A17B · 4 GB300 · concurrency 128 · where reuse hits are served from. Each bar splits the full-block hits of a 30-minute AgentX replay by tier. The hit rate is similar in both settings; with NVFP4 cold pages none of the hits are served from disk.</em></sub></p>
+
 #### Accuracy
 
 Cold-page compression is lossy, so the remaining question is how much accuracy it can cost. Two facts bound the answer.
