@@ -348,14 +348,14 @@ The serving effect of a smaller cold page is more capacity in the host and disk 
 </figure>
 </div>
 <p align="center"><sub><em>Figure 13: The four serving configurations with the largest NVFP4 gains · AgentX replay. Each panel is one configuration run with the uncompressed host cache and with the NVFP4 host cache, two or three repeats per setting; bars are throughput per GPU and P90 interactivity, with the cache-read hit rate and P90 TTFT below.</em></sub></p>
-Figure 13b shows the same comparison for every configuration we measured, 51 for GLM-5.2 and 29 for Qwen3.5-397B-A17B, each with two or more repeats per setting. Where the uncompressed tier already reads most prefixes the two settings land on the same point; where it does not, NVFP4 moves the point up and to the right. No configuration lost more than 5% of its throughput.
+Figure 13b shows where NVFP4 moves the Pareto frontier. For each model it draws the NVFP4 configurations that no other NVFP4 configuration beats on both throughput per GPU and P90 interactivity, and next to each of them the uncompressed run of the same configuration. On the high-throughput end of the frontier the uncompressed point sits well below and to the left; on the latency end the two coincide.
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog29_pareto_pairs_all.svg" width="1000">
+  <img src="../media/tech_blog29_pareto_frontier.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 13b: The same comparison for every measured configuration. GLM-5.2 (left) and Qwen3.5-397B-A17B (right) · 3 to 60 GB300s · AgentX replay. One pair per serving configuration: the hollow marker is the uncompressed host cache, the green marker is the NVFP4 host cache, and the line joins the two. Squares are published InferenceX configurations; the numbered pairs are listed under each panel.</em></sub></p>
+<p align="center"><sub><em>Figure 13b: The NVFP4 frontier and the uncompressed point of each frontier configuration. GLM-5.2 (left) and Qwen3.5-397B-A17B (right) · AgentX replay · repeat means. Green points and line: NVFP4 host cache configurations that are not dominated by any other NVFP4 configuration. Hollow markers: the same configuration with the uncompressed host cache, joined by a thin line. Squares are published InferenceX configurations. The numbered list under each panel names every frontier configuration.</em></sub></p>
 
 **A GPU-limited deployment.** The third setting is a resource-constrained configuration: Qwen3.5-397B-A17B served on ten GB300s (prefill on 2 GPUs, generation on 8 GPUs) at concurrency 192. With the host tier alone the uncompressed setting reads only 57% of prefixes. Figure 14 grows the disk tier from 0 to 1,024 GiB. NVFP4 hits more, completes more, and answers sooner at every disk size. The gain peaks at 512 GiB: 64% more requests completed and 48% sooner.
 
