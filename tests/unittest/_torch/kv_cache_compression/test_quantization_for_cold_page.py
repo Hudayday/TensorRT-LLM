@@ -50,7 +50,14 @@ def test_common_first_last_page_selection(first_n, last_n, length, expected):
         ColdPageQuantizationCompressionConfig(first_n=first_n, last_n=last_n)
     )
     pages = [
-        SimpleNamespace(beam_index=0, block_ordinal=block, layer_group_id=2) for block in range(6)
+        SimpleNamespace(
+            beam_index=0,
+            block_ordinal=block,
+            layer_group_id=2,
+            is_sparse=False,
+            window_size=None,
+        )
+        for block in range(6)
     ]
     selected = manager.select_gpu_resident_pages(
         pages, confirmed_length=length, tokens_per_block=64
@@ -72,7 +79,14 @@ def test_common_moving_tail_restores_shared_before_release(replacement_ready):
     manager = ColdPageQuantizationCompression(ColdPageQuantizationCompressionConfig(last_n=64))
     cache = MagicMock(history_length=256, tokens_per_block=64)
     cache.get_page_info.return_value = [
-        SimpleNamespace(beam_index=0, block_ordinal=block, layer_group_id=2, has_shared_page=True)
+        SimpleNamespace(
+            beam_index=0,
+            block_ordinal=block,
+            layer_group_id=2,
+            has_shared_page=True,
+            is_sparse=False,
+            window_size=None,
+        )
         for block in range(4)
     ]
     cache.get_private_pages.return_value = [(0, 2, 2)]
@@ -93,7 +107,14 @@ def test_common_protection_uses_projected_commit_length():
     manager = ColdPageQuantizationCompression(ColdPageQuantizationCompressionConfig(last_n=64))
     cache = MagicMock(history_length=128, tokens_per_block=64)
     cache.get_page_info.return_value = [
-        SimpleNamespace(beam_index=1, block_ordinal=block, layer_group_id=2, has_shared_page=False)
+        SimpleNamespace(
+            beam_index=1,
+            block_ordinal=block,
+            layer_group_id=2,
+            has_shared_page=False,
+            is_sparse=False,
+            window_size=None,
+        )
         for block in range(4)
     ]
     cache.get_private_pages.return_value = []
@@ -120,7 +141,12 @@ def test_common_precision_reuse_limit(first_n, last_n, matched, original, counts
     )
     pages = [
         SimpleNamespace(
-            beam_index=0, block_ordinal=block, layer_group_id=2, lossy_encode_count=count
+            beam_index=0,
+            block_ordinal=block,
+            layer_group_id=2,
+            lossy_encode_count=count,
+            is_sparse=False,
+            window_size=None,
         )
         for block, count in enumerate(counts)
     ]
@@ -132,6 +158,41 @@ def test_common_precision_reuse_limit(first_n, last_n, matched, original, counts
     )
 
 
+def test_common_first_last_ignores_sparse_and_sliding_window_pages():
+    manager = ColdPageQuantizationCompression(
+        ColdPageQuantizationCompressionConfig(first_n=64, last_n=64)
+    )
+    pages = [
+        SimpleNamespace(
+            beam_index=0,
+            block_ordinal=block,
+            layer_group_id=group,
+            lossy_encode_count=0 if group == 2 else -1,
+            is_sparse=is_sparse,
+            window_size=window_size,
+        )
+        for group, is_sparse, window_size in ((2, False, None), (3, True, None), (4, False, 128))
+        for block in range(4)
+    ]
+    assert manager.select_gpu_resident_pages(pages, confirmed_length=256, tokens_per_block=64) == [
+        (0, 0, 2),
+        (0, 3, 2),
+    ]
+    assert (
+        manager.get_precision_reuse_limit(
+            pages, reused_length=256, protected_length=256, tokens_per_block=64
+        )
+        == 256
+    )
+    pages[3].lossy_encode_count = 1
+    assert (
+        manager.get_precision_reuse_limit(
+            pages, reused_length=256, protected_length=256, tokens_per_block=64
+        )
+        == 192
+    )
+
+
 @pytest.mark.parametrize("encoded_before_pin", [False, True])
 def test_precision_reclaim_keeps_original_tail_endpoint(encoded_before_pin):
     provider = ColdPageQuantizationCompression(ColdPageQuantizationCompressionConfig(last_n=64))
@@ -140,7 +201,12 @@ def test_precision_reclaim_keeps_original_tail_endpoint(encoded_before_pin):
         cache = MagicMock(num_committed_tokens=length)
         cache.get_page_info.return_value = [
             SimpleNamespace(
-                beam_index=0, block_ordinal=block, layer_group_id=2, lossy_encode_count=1
+                beam_index=0,
+                block_ordinal=block,
+                layer_group_id=2,
+                lossy_encode_count=1,
+                is_sparse=False,
+                window_size=None,
             )
             for block in range(length // 64)
         ]
@@ -1509,7 +1575,7 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -
         creator._fp8_ctx_mla_kv_len_cap = None
         creator._is_encoder_decoder = MagicMock(return_value=False)
         creator._should_create_separate_draft_kv_cache = MagicMock(return_value=False)
-        creator._create_kv_cache_manager = MagicMock(return_value=SimpleNamespace())
+        creator._create_kv_cache_manager = MagicMock(return_value=MagicMock(spec=KVCacheManagerV2))
         creator.configure_kv_cache_capacity = MagicMock()
         resources = {}
         creator.build_managers(resources, estimating_kv_cache=estimating)
@@ -1521,6 +1587,9 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -
     assert isinstance(manager, ColdPageQuantizationCompression)
     assert manager.provides_cold_page_codec
     assert not manager.uses_iteration_lifecycle
+    assert manager.kv_cache_manager is resources[util_mod.ResourceManagerType.KV_CACHE_MANAGER]
+    assert manager.draft_kv_cache_manager is None
+    assert not manager.kv_cache_manager.kv_compression_manages_history
     assert util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in resources
     _, estimation_creator = build(estimating=True)
     assert (

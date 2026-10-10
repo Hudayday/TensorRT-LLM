@@ -471,6 +471,25 @@ class TestNoBatching(TestKVCacheManagerV2):
             or (last > 0 and (page.block_ordinal + 1) * block_size > tail_begin)
         ]
 
+    def _evict_unprotected_gpu_pages(
+        self, cache: _KVCache, protected: Sequence[int], stream: CudaStream
+    ) -> None:
+        # Host prefetch only onboards colder pages. Fill the GPU pool to exercise real offload.
+        pools = self.manager.get_storage_statistics(GPU_LEVEL)
+        self.assertEqual(len(pools), 1)
+        pressure = self.manager.create_kv_cache()
+        try:
+            self.assertTrue(pressure.resume(stream))
+            pressure.stop_committing()
+            self.assertTrue(pressure.resize(pools[0].available * self.manager.tokens_per_block))
+            for page in cache.get_page_info():
+                self.assertEqual(
+                    page.cache_level,
+                    GPU_LEVEL if page.block_ordinal in protected else CacheLevel(1),
+                )
+        finally:
+            pressure.close()
+
     @parameterized.expand(
         [
             ("disabled", 0, 0, 10, 12, []),
@@ -497,7 +516,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                 cache.suspend()
                 indices = list(cache.get_base_page_indices(group))
                 self.assertTrue(all(value == BAD_PAGE_INDEX for value in indices))
-                self.assertTrue(cache.prefetch(CacheLevel(1)))
+                self._evict_unprotected_gpu_pages(cache, protected, cast(CudaStream, stream.handle))
                 self.assertEqual(
                     sorted(
                         {
@@ -543,7 +562,9 @@ class TestNoBatching(TestKVCacheManagerV2):
                     cache.suspend()
                     indices = list(cache.get_base_page_indices(group))
                     self.assertTrue(all(value == BAD_PAGE_INDEX for value in indices))
-                    self.assertTrue(cache.prefetch(CacheLevel(1)))
+                    self._evict_unprotected_gpu_pages(
+                        cache, protected, cast(CudaStream, stream.handle)
+                    )
                     self.assertEqual(
                         sorted(
                             {
@@ -560,7 +581,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                 self.assertTrue(
                     all(value == BAD_PAGE_INDEX for value in cache.get_base_page_indices(group))
                 )
-                self.assertTrue(self.manager.resize(0, self.manager.get_quota(0)))
+                self._evict_unprotected_gpu_pages(cache, [], cast(CudaStream, stream.handle))
                 self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
             finally:
                 cache.close()
@@ -586,7 +607,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                 reused.set_gpu_resident_pages(self._resident_pages(reused, 4, 4))
                 self.assertTrue(reused.resume(cast(CudaStream, stream.handle)))
                 reused.suspend()
-                self.assertTrue(reused.prefetch(CacheLevel(1)))
+                self._evict_unprotected_gpu_pages(reused, [0, 2], cast(CudaStream, stream.handle))
                 self.assertEqual(
                     sorted(
                         {

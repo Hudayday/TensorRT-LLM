@@ -633,8 +633,10 @@ def test_build_routes_compression_manager_by_capabilities(
     assert resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER] is draft_manager
     if provides_cold_page_codec:
         assert ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in resources
-        compression_manager.bind_kv_cache_managers.assert_not_called()
-        assert build_order == ["factory", "target", "draft"]
+        compression_manager.bind_kv_cache_managers.assert_called_once_with(
+            target_manager, draft_manager
+        )
+        assert build_order == ["factory", "target", "draft", "bind"]
     else:
         assert resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] is compression_manager
         compression_manager.bind_kv_cache_managers.assert_not_called()

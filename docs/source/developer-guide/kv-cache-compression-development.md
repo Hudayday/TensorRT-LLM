@@ -197,18 +197,26 @@ defines its compressed format and implements the relevant APIs below.
 Storage-bound subclasses can override the shared
 `KVCacheCompressionManager.gpu_resident_token_bounds` property to return
 `(first_n, last_n)` confirmed-token counts. The default is `(0, 0)`.
-`KVCacheManagerV2` validates nonnegative KV-block-size multiples once at
-construction and applies the pair to each native cache before its first
-resume or resize. This mechanism is independent of the cold-page format.
-`ColdPageQuantizationCompression` supplies the pair from the public
-`ColdPageQuantizationCompressionConfig.first_n` and `last_n` options, so its
-format subclasses do not need their own protection logic. No iteration hooks
-are required.
+Counts must be nonnegative KV-block-size multiples and include prefill and
+accepted decode tokens. `ColdPageQuantizationCompression` supplies them from
+its `first_n` and `last_n` configuration options, so format subclasses need no
+separate protection logic or iteration hooks.
 
-The bounds retain intersecting dense, non-SWA pages on the GPU while the cache
-is live; they do not change independent state lifecycles or reconstruct values
-from previously lossy reused pages. KVCM owns the page references, capacity
-accounting, moving confirmed-token tail, and release.
+The compression manager selects protected dense, non-sliding-window pages and
+moves the tail window as confirmed tokens advance. KVCM supplies page
+information, GPU residency protection, and private/shared page switching; it
+does not decide the protection policy.
+
+For reuse, the compression manager checks each required protected page's
+`lossy_encode_count`. A nonzero count, including `-1` for unknown history,
+caps reuse at the earliest affected page. Normal prefill recomputes the suffix
+using the restored prefix as input. Protected recomputed pages remain private
+without overwriting existing shared entries. When they leave the window, the
+manager requests a switch back to existing shared pages; if that switch fails,
+the valid private pages remain available for a later retry.
+
+This revision covers local dense Attention. Precision history is not yet
+tracked across disaggregated-serving or connector transfers.
 
 ## Ownership and failure boundaries
 

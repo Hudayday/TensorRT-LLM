@@ -2950,6 +2950,8 @@ class KVCacheCompressionManager(BaseResourceManager):
         tail_start = max(0, confirmed_length - last_n)
         selected = []
         for page in page_info:
+            if page.is_sparse or page.window_size is not None:
+                continue
             start = page.block_ordinal * tokens_per_block
             end = start + tokens_per_block
             if (start < first_n or start >= confirmed_length

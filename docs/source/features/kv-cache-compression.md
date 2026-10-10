@@ -234,10 +234,16 @@ suspension. Sliding-window Attention and independent recurrent/compressor
 state keep their existing lifecycles. Finishing or cancelling the request
 releases its protection.
 
-Block reuse stays enabled. These bounds prevent future cold-page conversion
-while the request is live, but do not recover original values from previously
-compressed reused pages or reconstruct a private high-precision tail. After
-the request releases its pages, they may be compressed for later reuse.
+Block reuse stays enabled. If a required first or last page was previously
+compressed, or its precision history is unknown, reuse stops before that page
+and normal prefill recomputes the remaining tokens using the restored prefix.
+Recomputed protected pages stay private to the request instead of replacing
+existing shared cache entries. As pages leave the protected window, the request
+can return to those shared entries. After the request finishes, its pages may
+be compressed for later reuse.
+
+This revision covers local dense Attention. Precision history is not yet
+tracked across disaggregated-serving or connector transfers.
 
 #### Skipping RoPE Quantization
 
