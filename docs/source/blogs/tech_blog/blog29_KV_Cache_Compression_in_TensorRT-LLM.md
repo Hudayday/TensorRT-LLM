@@ -355,7 +355,7 @@ Figure 14 shows the effect along the GLM-5.2 Pareto frontier. Each green point i
   <img src="../media/tech_blog29_pareto_frontier.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 14: GLM-5.2 · 8 to 48 GB300 · AgentX replay. The ten highest-throughput points of the NVFP4 Pareto frontier, each joined to the uncompressed run of the same configuration; labels give the change in throughput per GPU.</em></sub></p>
+<p align="center"><sub><em>Figure 14: GLM-5.2 · 8 to 48 GB300 · the ten highest-throughput points of the NVFP4 Pareto frontier. Top: each green numbered point is an NVFP4 configuration, the hollow point is the same configuration with an uncompressed host cache, and the arrow shows the change. Bottom: the gain of each numbered configuration in tok/s/GPU (green) and in P90 interactivity (blue). Two repeats per setting; AgentX replay.</em></sub></p>
 
 **A GPU-limited deployment.** The third setting is a resource-constrained configuration: Qwen3.5-397B-A17B served on ten GB300s (prefill on 2 GPUs, generation on 8 GPUs) at concurrency 192. With the host tier alone the uncompressed setting reads only 57% of prefixes. Figure 15 grows the disk tier from 0 to 1,024 GiB. NVFP4 hits more, completes more, and answers sooner at every disk size. The gain peaks at 512 GiB: 64% more requests completed and 48% sooner.
 
