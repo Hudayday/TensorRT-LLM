@@ -460,6 +460,132 @@ class TestStorageStatistics(TestKVCacheManagerV2):
 
 
 class TestNoBatching(TestKVCacheManagerV2):
+    @parameterized.expand(
+        [
+            ("disabled", 0, 0, 10, 12, []),
+            ("head_only", 4, 0, 10, 12, [0]),
+            ("tail_only", 0, 4, 10, 12, [1, 2]),
+            ("short_sequence", 4, 4, 6, 8, [0, 1]),
+            ("aligned", 4, 4, 12, 12, [0, 2]),
+            ("partial_tail", 4, 4, 13, 16, [0, 2, 3]),
+            ("reserved_tail", 0, 4, 8, 12, [1, 2]),
+        ]
+    )
+    def test_gpu_resident_token_bounds(
+        self, _name: str, first: int, last: int, history: int, capacity: int, protected: list[int]
+    ) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
+        group = self.manager.get_layer_group_id(LayerId(0))
+        cache = self.manager.create_kv_cache()
+        with TemporaryCudaStream([]) as stream:
+            try:
+                if first or last:
+                    cache.set_gpu_resident_token_bounds(first, last)
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                cache.stop_committing()
+                self.assertTrue(cache.resize(capacity, history))
+                original = list(cache.get_base_page_indices(group))
+                cache.suspend()
+                indices = list(cache.get_base_page_indices(group))
+                self.assertEqual(
+                    [i for i, value in enumerate(indices) if value != BAD_PAGE_INDEX], protected
+                )
+                for i in protected:
+                    self.assertEqual(indices[i], original[i])
+                if protected:
+                    self.assertFalse(self.manager.need_adjustment)
+                    self.manager.adjust()
+                    for level in (0, 1):
+                        quota = self.manager.get_quota(level)
+                        self.assertFalse(self.manager.resize(level, quota))
+                        self.assertEqual(self.manager.get_quota(level), quota)
+                with self.assertRaises(LogicError):
+                    cache.set_gpu_resident_token_bounds()
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                resumed = list(cache.get_base_page_indices(group))
+                self.assertNotIn(BAD_PAGE_INDEX, resumed)
+                for i in protected:
+                    self.assertEqual(resumed[i], original[i])
+            finally:
+                cache.close()
+        stream.take_finish_event().synchronize()
+        self.assertEqual(sum(pool.unavailable for pool in self.manager.get_storage_statistics()), 0)
+
+    def test_gpu_resident_tail_moves_and_releases(self) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
+        group = self.manager.get_layer_group_id(LayerId(0))
+        cache = self.manager.create_kv_cache()
+        with TemporaryCudaStream([]) as stream:
+            try:
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                cache.stop_committing()
+                cache.set_gpu_resident_token_bounds(4, 4)
+                for history, capacity, protected in ((10, 12, [0, 1, 2]), (14, 16, [0, 2, 3])):
+                    self.assertTrue(cache.resize(capacity, history))
+                    cache.suspend()
+                    indices = list(cache.get_base_page_indices(group))
+                    self.assertEqual(
+                        [i for i, value in enumerate(indices) if value != BAD_PAGE_INDEX], protected
+                    )
+                    self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                cache.set_gpu_resident_token_bounds()
+                cache.suspend()
+                self.assertTrue(
+                    all(value == BAD_PAGE_INDEX for value in cache.get_base_page_indices(group))
+                )
+                # Pool resizing becomes available again after protection is released.
+                self.assertTrue(self.manager.resize(0, self.manager.get_quota(0)))
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+            finally:
+                cache.close()
+        stream.take_finish_event().synchronize()
+        self.assertEqual(sum(pool.unavailable for pool in self.manager.get_storage_statistics()), 0)
+
+    def test_gpu_resident_token_bounds_before_reused_cache_resume(self) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
+        group = self.manager.get_layer_group_id(LayerId(0))
+        tokens = [TokenId(i) for i in range(12)]
+        source = self.manager.create_kv_cache(None, tokens)
+        with TemporaryCudaStream([]) as stream:
+            try:
+                self.assertTrue(source.resume(cast(CudaStream, stream.handle)))
+                self.assertTrue(source.resize(12, 12))
+                source.commit(tokens)
+                source.stop_committing()
+            finally:
+                source.close()
+            reused = self.manager.create_kv_cache(None, tokens)
+            try:
+                self.assertEqual(reused.num_committed_tokens, 12)
+                self.assertEqual(reused.capacity, 12)
+                reused.set_gpu_resident_token_bounds(4, 4)
+                self.assertTrue(reused.resume(cast(CudaStream, stream.handle)))
+                reused.suspend()
+                self.assertEqual(
+                    [
+                        i
+                        for i, value in enumerate(reused.get_base_page_indices(group))
+                        if value != BAD_PAGE_INDEX
+                    ],
+                    [0, 2],
+                )
+            finally:
+                reused.close()
+        stream.take_finish_event().synchronize()
+
+    def test_gpu_resident_token_bounds_validation(self) -> None:
+        self.prepare(8 << 20, 0, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
+        cache = self.manager.create_kv_cache()
+        try:
+            for first, last in ((-4, 0), (0, -4), (1, 4), (4, 3)):
+                with self.assertRaisesRegex(ValueError, "nonnegative multiples"):
+                    cache.set_gpu_resident_token_bounds(first, last)
+            cache.set_gpu_resident_token_bounds()
+        finally:
+            cache.close()
+        with self.assertRaises(LogicError):
+            cache.set_gpu_resident_token_bounds()
+
     def test_batch_publishes_sparse_gpu_metadata(self) -> None:
         import torch
 

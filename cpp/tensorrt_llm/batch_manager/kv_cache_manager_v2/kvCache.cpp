@@ -223,6 +223,40 @@ CacheLevel KvCache::_lockLevel(Page const& page, BlockOrdinal ordinal) const
     return mIsDecoding && readOnly ? page.queryLockLevel() : kHotLevel;
 }
 
+void KvCache::setGpuResidentTokenBounds(int firstN, int lastN)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    if (firstN < 0 || lastN < 0 || firstN % mTokensPerBlock != 0 || lastN % mTokensPerBlock != 0)
+    {
+        throw std::invalid_argument("GPU-resident token bounds must be nonnegative multiples of tokens_per_block");
+    }
+    if (mStatus == Status::CLOSED || (mStatus == Status::SUSPENDED && !mNeverResumed))
+    {
+        throw LogicError("Set GPU-resident token bounds while active or before the cache's first resume");
+    }
+    mGpuResidentFirstTokens = firstN;
+    mGpuResidentLastTokens = lastN;
+}
+
+bool KvCache::_isGpuResidentBlock(BlockOrdinal ordinal, LifeCycleId lifeCycle) const
+{
+    if ((mGpuResidentFirstTokens == 0 && mGpuResidentLastTokens == 0) || ordinal == kBadBlockOrdinal)
+    {
+        return false;
+    }
+    auto const* attention = std::get_if<AttnLifeCycle>(&mManager->lifeCycles().getLifeCycle(lifeCycle));
+    if (!attention || attention->isSparse || attention->windowSize.has_value())
+    {
+        return false;
+    }
+    // Include intersecting pages and any reserved/in-flight tail beyond confirmed history.
+    // Those reservations do not count as accepted tokens and stop being protected after reconciliation.
+    BlockOrdinal const firstEnd{mGpuResidentFirstTokens / mTokensPerBlock};
+    BlockOrdinal const tailBegin{std::max(0, mHistoryLength - mGpuResidentLastTokens) / mTokensPerBlock};
+    return ordinal < firstEnd || (mGpuResidentLastTokens > 0 && ordinal >= tailBegin);
+}
+
 void KvCache::_offloadSparseHistory(HalfOpenRange<BlockOrdinal> range, int historyLength)
 {
     TLLM_CHECK_DEBUG(range.end <= BlockOrdinal{historyLength / mTokensPerBlock});
@@ -350,6 +384,11 @@ void KvCache::activate()
         {
             bp = &mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId];
         }
+        if (std::holds_alternative<SharedPageLock>(*bp))
+        {
+            TLLM_CHECK_DEBUG(_isGpuResidentBlock(ap.ordinal, ap.lcId));
+            continue;
+        }
         auto& holder = std::get<SharedPtr<PageHolder>>(*bp);
         TLLM_CHECK_DEBUG(holder);
         // A reused partial block is only a copy source. resume() replaces it with a private GPU
@@ -399,14 +438,46 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
     mIsDecoding = isDecoding.value_or(mIsDecoding);
 
     // Check utilization against threshold.
-    auto const utilizations = mManager->storage().getUtilization(kHotLevel);
+    auto& storageMgr = mManager->storage();
+    auto utilizations = storageMgr.getUtilization(kHotLevel);
+    if (mHasGpuResidentPages)
+    {
+        TypedVec<PoolGroupIndex, SlotCount> residentSlots(storageMgr.numPoolGroups(kHotLevel), 0);
+        std::set<Page*> seen;
+        for (auto const& activePage : _activePages())
+        {
+            if (activePage.ordinal == kBadBlockOrdinal)
+            {
+                continue;
+            }
+            auto const& bp = mBlocks[activePage.ordinal].pages[activePage.beamIdx][activePage.lcId];
+            auto const* pageLock = std::get_if<SharedPageLock>(&bp);
+            if (!pageLock || !pageLock->isValid() || pageLock->page()->cacheLevel != kHotLevel
+                || !seen.insert(pageLock->page().get()).second)
+            {
+                continue;
+            }
+            TLLM_CHECK_DEBUG(pageLock->page()->cacheLevel == kHotLevel);
+            ++residentSlots[storageMgr.getPoolGroupIndex(kHotLevel, activePage.lcId)];
+        }
+        for (PoolGroupIndex pool{0}; pool < residentSlots.size(); ++pool)
+        {
+            if (residentSlots[pool] == 0)
+            {
+                continue;
+            }
+            // These slots already belong to this request; allocation still checks actual free capacity.
+            utilizations[pool] = std::max(0.f,
+                utilizations[pool]
+                    - static_cast<float>(residentSlots[pool]) / static_cast<float>(storageMgr.numSlots(pool)));
+        }
+    }
     float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
     if (utilization > mManager->config().maxUtilForResume)
     {
         return false;
     }
 
-    auto& storageMgr = mManager->storage();
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     LifeCycleId numLc = storageMgr.numLifeCycles();
 
@@ -681,6 +752,10 @@ bool KvCache::prefetch(CacheLevel target)
         {
             continue;
         }
+        if (_isGpuResidentBlock(activePage.ordinal, activePage.lcId) && mHasGpuResidentPages)
+        {
+            continue;
+        }
         CacheLevel const destination = std::max(target, _lockLevel(*page, activePage.ordinal));
         if (page->cacheLevel < destination || !seen.insert(page.get()).second)
         {
@@ -731,6 +806,7 @@ void KvCache::suspend()
 
 void KvCache::_deactivate()
 {
+    mHasGpuResidentPages = false;
     // Copy data from external buffers back to internal vectors (mirrors Python's suspend).
     for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
         for (LifeCycleId lcId{0}; lcId < mBasePageIndices[bi].size(); ++lcId)
@@ -749,6 +825,12 @@ void KvCache::_deactivate()
         {
             auto& bp = (ap.lcId != ssmLcId) ? mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId]
                                             : mSsmBlocks[ap.beamIdx][ap.lcId];
+            if (_isGpuResidentBlock(ap.ordinal, ap.lcId))
+            {
+                TLLM_CHECK_DEBUG(blockPageGetPage(bp)->cacheLevel == kHotLevel);
+                mHasGpuResidentPages = true;
+                continue;
+            }
             // expect_type(_SharedPageLock, beam_block[lc_idx]) → std::get raises on wrong type
             auto& lock = std::get<SharedPageLock>(bp);
             auto holder = lock.page()->hold();
@@ -2832,10 +2914,11 @@ bool KvCache::_checkSanity() const
                 }
                 else
                 {
-                    // The page must be present, and locked exactly when the cache is
-                    // active; a suspended cache holds it instead.
+                    // Suspended requests retain GPU locks only for their protected dense pages.
+                    bool const locked
+                        = mStatus == Status::ACTIVE || (mHasGpuResidentPages && _isGpuResidentBlock(ordinal, lc));
                     TLLM_CHECK_DEBUG(!std::holds_alternative<std::monostate>(bp)
-                        && ((mStatus == Status::ACTIVE) == std::holds_alternative<SharedPageLock>(bp)));
+                        && (locked == std::holds_alternative<SharedPageLock>(bp)));
                 }
 
                 if (!blockPageIsNull(bp))

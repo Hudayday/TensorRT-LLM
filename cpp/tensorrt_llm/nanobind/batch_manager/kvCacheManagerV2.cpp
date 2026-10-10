@@ -1898,6 +1898,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("record_page_storage_read", &kv::KvCache::recordPageStorageRead, nb::arg("cuda_stream"),
             nb::call_guard<nb::gil_scoped_release>())
         .def("suspend", &kv::KvCache::suspend, nb::call_guard<nb::gil_scoped_release>())
+        .def("set_gpu_resident_token_bounds", &kv::KvCache::setGpuResidentTokenBounds, nb::arg("first_n") = 0,
+            nb::arg("last_n") = 0, nb::call_guard<nb::gil_scoped_release>(),
+            "Prototype: keep dense non-SWA first/last token pages on GPU across request suspension.")
         .def(
             "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },
             nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())

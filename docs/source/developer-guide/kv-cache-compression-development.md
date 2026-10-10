@@ -194,6 +194,22 @@ defines its compressed format and implements the relevant APIs below.
 | `encode_cold_pages()` | Encode a batch of KV Pages into the cold-page representation |
 | `decode_cold_pages()` | Decode a batch of cold Pages back into the hot KV representation |
 
+Storage-bound subclasses can override the shared
+`KVCacheCompressionManager.gpu_resident_token_bounds` property to return
+`(first_n, last_n)` confirmed-token counts. The default is `(0, 0)`.
+`KVCacheManagerV2` validates nonnegative KV-block-size multiples once at
+construction and applies the pair to each native cache before its first
+resume or resize. This mechanism is independent of the cold-page format.
+`ColdPageQuantizationCompression` supplies the pair from the public
+`ColdPageQuantizationCompressionConfig.first_n` and `last_n` options, so its
+format subclasses do not need their own protection logic. No iteration hooks
+are required.
+
+The bounds retain intersecting dense, non-SWA pages on the GPU while the cache
+is live; they do not change independent state lifecycles or reconstruct values
+from previously lossy reused pages. KVCM owns the page references, capacity
+accounting, moving confirmed-token tail, and release.
+
 ## Ownership and failure boundaries
 
 | Component | Owns | Does not own |

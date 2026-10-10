@@ -466,6 +466,9 @@ bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
             "defragment, which relocates pages and invalidates indices an ACTIVE cache holds");
     if (bestEfforts)
         throw std::runtime_error("best_efforts resize not implemented");
+    if (std::any_of(mLivingKvCaches.begin(), mLivingKvCaches.end(),
+            [](KvCache const* kvc) { return kvc->hasRetainedGpuPages(); }))
+        return false;
     try
     {
         _adjustLevel(level, quota);
@@ -1046,6 +1049,9 @@ bool KvCacheManager::_needAdjustment(CacheLevel level) const
 bool KvCacheManager::needAdjustment() const
 {
     auto const apiLock = lockShared();
+    if (std::any_of(mLivingKvCaches.begin(), mLivingKvCaches.end(),
+            [](KvCache const* kvc) { return kvc->hasRetainedGpuPages(); }))
+        return false;
     if (mNumSampledKvCaches < 2000)
         return false;
     double now = nowSeconds();
@@ -1063,6 +1069,11 @@ void KvCacheManager::adjust()
         TLLM_CHECK_WITH_INFO(kvc->status() == KvCache::Status::SUSPENDED,
             "level adjustment requires every KvCache to be SUSPENDED: _adjustLevel may "
             "defragment, which relocates pages and invalidates indices an ACTIVE cache holds");
+
+    // Suspended protected pages still own GPU slots and cannot be defragmented.
+    if (std::any_of(mLivingKvCaches.begin(), mLivingKvCaches.end(),
+            [](KvCache const* kvc) { return kvc->hasRetainedGpuPages(); }))
+        return;
 
     CacheLevel numLevels = mStorage->numCacheLevels();
     for (CacheLevel level{0}; level < numLevels; ++level)

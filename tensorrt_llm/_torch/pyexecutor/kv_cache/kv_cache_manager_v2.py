@@ -1222,6 +1222,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # connector-reservation cap read it on instances tests build without
     # running __init__. Zero disables the spec recompute tail.
     _spec_recompute_tail: int = 0
+    _gpu_resident_token_bounds: tuple[int, int] = (0, 0)
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
@@ -1265,6 +1266,14 @@ class KVCacheManagerV2(BaseResourceManager):
         max_cuda_graph_batch_size: Optional[int] = None,
         **kwargs,
     ) -> None:
+        if cold_page_codec_provider is not None:
+            self._gpu_resident_token_bounds = cold_page_codec_provider.gpu_resident_token_bounds
+            for name, value in zip(("first_n", "last_n"), self._gpu_resident_token_bounds):
+                if value < 0 or value % tokens_per_block:
+                    raise ValueError(
+                        f"{name} must be a nonnegative multiple of the KV block size "
+                        f"({tokens_per_block}), got {value}"
+                    )
         self.mapping = mapping
         self.dtype = dtype
         self._validate_speculative_config(spec_config)
@@ -6464,6 +6473,10 @@ class KVCacheManagerV2(BaseResourceManager):
             expected_prompt_length=expected_prompt_length,
             **priority_kwargs,
         )
+        first_n, last_n = self._gpu_resident_token_bounds
+        if first_n or last_n:
+            # Install before resume/resize can migrate pages during admission.
+            kv_cache.set_gpu_resident_token_bounds(first_n, last_n)
         self.kv_cache_map[request_id] = kv_cache
         if enable_request_stats and not self.enable_stats:
             self._request_stats_enabled_ids.add(request_id)

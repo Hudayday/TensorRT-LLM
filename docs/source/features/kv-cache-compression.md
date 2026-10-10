@@ -207,6 +207,38 @@ NVFP4. See [Quantization](quantization.md) for active KV-cache quantization.
 For complete single-GPU and disaggregated-serving configurations, see the
 [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md).
 
+#### First/Last-N Protection
+
+Set `first_n` and `last_n` in `ColdPageQuantizationCompressionConfig` to keep
+dense, non-sliding-window Attention pages that intersect the first or last N
+confirmed tokens on the GPU while a request is live. Both options default to
+`0` and must be multiples of the KV block size. Counts include prefill and
+decode; the last-token window moves as confirmed tokens are added. A page that
+partly overlaps either window is protected in full. If the confirmed sequence
+length is at most `first_n + last_n`, every dense Attention page is protected.
+Allocated padding and unaccepted speculative tokens do not extend the window.
+
+For example, with a 64-token KV block size:
+
+```yaml
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  quant: nvfp4
+  first_n: 64
+  last_n: 256
+```
+
+Protection preserves the existing hot-cache precision; it does not upgrade FP8
+to BF16. Protected pages remain charged to GPU capacity, including during
+suspension. Sliding-window Attention and independent recurrent/compressor
+state keep their existing lifecycles. Finishing or cancelling the request
+releases its protection.
+
+Block reuse stays enabled. These bounds prevent future cold-page conversion
+while the request is live, but do not recover original values from previously
+compressed reused pages or reconstruct a private high-precision tail. After
+the request releases its pages, they may be compressed for later reuse.
+
 #### Skipping RoPE Quantization
 
 In some models, part of each K vector carries positional information (RoPE).

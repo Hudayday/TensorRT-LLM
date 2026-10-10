@@ -143,6 +143,7 @@ class TestBaseABC:
     def test_lifecycle_hooks_default_noop(self, fake_kv_cache_manager):
         m = KVCacheCompressionManager(_compression_config())
         m.bind_kv_cache_managers(fake_kv_cache_manager)
+        assert m.gpu_resident_token_bounds == (0, 0)
         assert m.on_request_init(MagicMock()) is None
         assert m.on_context_step_end([MagicMock()]) is None
         assert m.on_generation_step_begin(MagicMock()) is None
@@ -205,6 +206,99 @@ class TestBaseABC:
             is_streaming=False,
         )
         assert request.py_num_compressed_tokens == 0
+
+
+@pytest.mark.cpu_only
+def test_cold_page_base_supplies_first_last_n_without_iteration_hooks() -> None:
+    from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.quantization_for_cold_page import (
+        ColdPageQuantizationCompression,
+    )
+
+    default = ColdPageQuantizationCompression(ColdPageQuantizationCompressionConfig())
+    protected = ColdPageQuantizationCompression(
+        ColdPageQuantizationCompressionConfig(first_n=64, last_n=256)
+    )
+    assert default.gpu_resident_token_bounds == (0, 0)
+    assert protected.gpu_resident_token_bounds == (64, 256)
+    assert protected.provides_cold_page_codec
+    assert not protected.uses_iteration_lifecycle
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("bounds", [(-64, 0), (0, -64), (1, 0), (0, 65), (0, 0), (64, 256)])
+def test_cold_page_provider_bounds_validated_before_cache_construction(
+    bounds: tuple[int, int],
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    provider = SimpleNamespace(gpu_resident_token_bounds=bounds)
+    invalid = any(value < 0 or value % 64 for value in bounds)
+    expected_error = ValueError if invalid else RuntimeError
+    expected_message = "nonnegative multiple" if invalid else "bounds validated"
+    with (
+        patch.object(
+            KVCacheManagerV2,
+            "_validate_speculative_config",
+            side_effect=RuntimeError("bounds validated"),
+        ),
+        pytest.raises(expected_error, match=expected_message),
+    ):
+        manager.__init__(
+            kv_cache_config=SimpleNamespace(),
+            kv_cache_type=None,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            tokens_per_block=64,
+            max_seq_len=1024,
+            max_batch_size=1,
+            mapping=MagicMock(),
+            cold_page_codec_provider=provider,
+        )
+    assert manager._gpu_resident_token_bounds == bounds
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("bounds", [(0, 0), (64, 256)])
+@pytest.mark.parametrize("is_draft", [False, True])
+def test_cold_page_bounds_installed_before_cache_admission(
+    bounds: tuple[int, int], is_draft: bool
+) -> None:
+    manager = _v2_manager(is_draft=is_draft)
+    manager._gpu_resident_token_bounds = bounds
+    manager._swa_endpoint_rewind = 0
+    manager.kv_cache_map = {}
+    manager.index_mapper = MagicMock()
+    manager.index_mapper.num_free_slots.return_value = 1
+    manager.impl = MagicMock()
+    manager._set_page_index_bufs = MagicMock()
+    calls = []
+    cache = MagicMock()
+    # Prefix matches may already have capacity before their first resume.
+    cache.capacity = 512
+    manager.impl.create_kv_cache.side_effect = (
+        lambda *args, **kwargs: calls.append("create") or cache
+    )
+
+    def set_bounds(first_n: int, last_n: int) -> None:
+        assert 7 not in manager.kv_cache_map
+        assert (first_n, last_n) == bounds
+        calls.append("bounds")
+
+    cache.set_gpu_resident_token_bounds.side_effect = set_bounds
+    manager.index_mapper.add_new_sequence.side_effect = lambda *_args: calls.append("publish") or 0
+    result = manager._create_kv_cache(7, None, [1] * 512)
+
+    assert result is cache
+    assert manager.kv_cache_map[7] is cache
+    assert calls == (["create", "bounds", "publish"] if any(bounds) else ["create", "publish"])
+    cache.resume.assert_not_called()
+    cache.resize.assert_not_called()
+    if any(bounds):
+        cache.set_gpu_resident_token_bounds.assert_called_once_with(*bounds)
+    else:
+        cache.set_gpu_resident_token_bounds.assert_not_called()
 
 
 # ---------------------------------------------------------------------- #

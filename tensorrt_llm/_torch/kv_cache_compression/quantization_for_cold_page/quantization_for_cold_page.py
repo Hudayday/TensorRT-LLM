@@ -2,9 +2,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Common runtime pipeline for cold-page quantization."""
 
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from ...pyexecutor.resource_manager import DataType, KVCacheCompressionManager
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
 
 
 class ColdPageQuantizationCompression(KVCacheCompressionManager):
@@ -12,6 +15,12 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
 
     uses_iteration_lifecycle = False
     provides_cold_page_codec = True
+    config: "ColdPageQuantizationCompressionConfig"
+
+    @property
+    def gpu_resident_token_bounds(self) -> tuple[int, int]:
+        """Share first/last-token protection across cold-page quantizers."""
+        return self.config.first_n, self.config.last_n
 
     def create_cold_page_codec(
         self,

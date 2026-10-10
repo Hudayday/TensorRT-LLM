@@ -258,6 +258,12 @@ public:
     // Suspend: detach from CUDA stream, unlock pages → PageHolder.
     void suspend();
 
+    //! Prototype: retain first/last token pages on GPU while this request is suspended.
+    //! Counts include prefill and decode, must be nonnegative block-size multiples, and default to zero.
+    //! Applies only to dense, non-SWA attention. Does not restore precision lost before this call.
+    //! Set while active or before the first resume, including prefix hits. No prefix-reuse policy is changed.
+    void setGpuResidentTokenBounds(int firstN = 0, int lastN = 0);
+
     // Close: release all blocks back to KvCacheManager.
     void close();
 
@@ -344,6 +350,12 @@ public:
     Status status() const noexcept
     {
         return mStatus;
+    }
+
+    // Pool resizing must wait until these suspended-request GPU locks are released.
+    bool hasRetainedGpuPages() const noexcept
+    {
+        return mStatus == Status::SUSPENDED && mHasGpuResidentPages;
     }
 
     CommitState commitState() const noexcept
@@ -472,13 +484,12 @@ public:
 
     CUstream cudaStream() const;
 
-    // Mirrors Python's cuda_stream setter: if already on a stream AND active,
-    // make the new stream wait for the old one before switching (cross-stream sync).
+    // Order stream handoff for active work and GPU-resident pages retained across suspension.
     void setCudaStream(CUstream stream)
     {
         if (mCudaStream.has_value())
         {
-            if (mStatus == Status::ACTIVE)
+            if (mStatus == Status::ACTIVE || mHasGpuResidentPages)
             {
                 CachedCudaEvent ev(reinterpret_cast<CudaStream>(*mCudaStream));
                 ev.waitInStream(reinterpret_cast<CudaStream>(stream));
@@ -642,6 +653,7 @@ private:
 
     std::vector<ActivePage> _activePages() const;
     SharedPtr<Page> _page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycleId lcId) const;
+    bool _isGpuResidentBlock(BlockOrdinal ordinal, LifeCycleId lifeCycle) const;
 
     bool _shortcutSetHistoryLength(int historyLength);
     bool _shouldRecordManagerStats() const;
@@ -741,6 +753,9 @@ private:
     BeamIndex mBeamWidth;
     int mCapacity;
     int mHistoryLength;
+    int mGpuResidentFirstTokens = 0;
+    int mGpuResidentLastTokens = 0;
+    bool mHasGpuResidentPages = false;
     bool mIsDecoding = false;
     // Retry by scanning current blocks; deferred work does not retain pages or other requests.
     bool mHasDeferredSparseOffload = false;

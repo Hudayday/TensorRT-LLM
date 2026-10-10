@@ -2917,6 +2917,15 @@ class KVCacheCompressionManager(BaseResourceManager):
     uses_iteration_lifecycle = True
     provides_cold_page_codec = False
 
+    @property
+    def gpu_resident_token_bounds(self) -> tuple[int, int]:
+        """First/last confirmed-token counts protected from cold migration.
+
+        Storage-bound subclasses can override this to protect dense pages
+        while a request is live. Zero disables each bound independently.
+        """
+        return 0, 0
+
     def __init__(
         self,
         config: "KvCacheCompressionConfig",
