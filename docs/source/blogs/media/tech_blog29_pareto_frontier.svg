@@ -6,6 +6,7 @@
 <text x="96.0" y="51.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">NVFP4 host cache (Pareto frontier)</text>
 <circle cx="345" cy="47" r="4.5" fill="#ffffff" stroke="#2d3142"/>
 <text x="356.0" y="51.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">same configuration, uncompressed</text>
+<text x="600.0" y="51.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" fill="#76B900" text-anchor="start">label = gain in tok/s/GPU / gain in P90 interactivity</text>
 <line x1="80.0" y1="70" x2="80.0" y2="400" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
 <text x="80.0" y="414.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">1</text>
 <line x1="510.0" y1="70" x2="510.0" y2="400" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
@@ -55,16 +56,16 @@
 <circle cx="804.7" cy="263.1" r="4.5" fill="#76B900" stroke="#76B900" stroke-width="1"/>
 <circle cx="802.5" cy="292.3" r="4" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
 <circle cx="809.5" cy="289.6" r="4.5" fill="#76B900" stroke="#76B900" stroke-width="1"/>
-<text x="540.7" y="66.2" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+84%</text>
-<text x="614.2" y="73.6" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+55%</text>
-<text x="690.2" y="75.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+40%</text>
-<text x="740.6" y="102.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+19%</text>
-<text x="765.1" y="156.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+4%</text>
-<text x="777.6" y="207.4" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+2%</text>
-<text x="791.4" y="219.6" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+3%</text>
-<text x="797.1" y="246.7" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+3%</text>
-<text x="813.7" y="277.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">same</text>
-<text x="818.5" y="303.6" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">same</text>
+<text x="540.7" y="66.2" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+84% / +311%</text>
+<text x="614.2" y="95.6" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+55% / +205%</text>
+<text x="690.2" y="75.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+40% / +205%</text>
+<text x="740.6" y="102.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+19% / +108%</text>
+<text x="765.1" y="156.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+4% / +22%</text>
+<text x="777.6" y="207.4" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+2% / +12%</text>
+<text x="791.4" y="219.6" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+3% / +20%</text>
+<text x="797.1" y="246.7" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+3% / +23%</text>
+<text x="813.7" y="277.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+1% / +10%</text>
+<text x="818.5" y="303.6" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="700" fill="#76B900" text-anchor="start">+1% / +4%</text>
 <text x="92.0" y="366.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="600" fill="#2d3142" text-anchor="start">average over these ten configurations: +21% tok/s/GPU, +92% P90 interactivity</text>
 <text x="92.0" y="382.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#4f5d75" text-anchor="start">largest single gain: +84% tok/s/GPU, +311% P90 interactivity</text>
 </svg>
