@@ -108,3 +108,20 @@ def add_mixed_precision_windows(
         )
         pairs.append(MixedPrecisionLayerPair(LayerId(history_id), high_id))
     return replace(config, layers=layers), tuple(pairs)
+
+
+def cold_page_quantizer_config(
+    config: KVCacheManagerConfig, pairs: Sequence[MixedPrecisionLayerPair]
+) -> KVCacheManagerConfig:
+    """Leave high windows to the native raw-copy codec, keeping layer IDs intact.
+
+    The full configuration still goes to KVCM. Only the quantizer's view omits
+    the additional windows, whose OPTIONAL lifetime keeps them separate from
+    the REQUIRED history. Model-specific quantizers need no First/Last logic.
+    """
+    if not pairs:
+        return config
+    high_ids = {int(pair.high_layer) for pair in pairs}
+    return replace(
+        config, layers=[layer for layer in config.layers if int(layer.layer_id) not in high_ids]
+    )

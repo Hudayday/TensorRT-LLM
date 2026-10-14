@@ -19,6 +19,8 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.quantiz
     ColdPageQuantizationCompression,
 )
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mixed_precision_cache import cold_page_quantizer_config
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._torch.speculative.utils import update_spec_config_from_model_config
@@ -28,6 +30,8 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
+    GpuCacheTierConfig,
+    KVCacheManagerConfig,
     SsmLayerConfig,
 )
 
@@ -1432,6 +1436,44 @@ def _create_kv(
         is_draft=is_draft,
     )
     return layout
+
+
+@pytest.mark.parametrize("skip_rope_quantization", (False, True))
+def test_mixed_precision_windows_use_raw_copy_without_changing_rope(skip_rope_quantization):
+    """The common layout hook excludes high windows, not original model layers."""
+    original = KVCacheManagerConfig(
+        tokens_per_block=64,
+        layers=list(_kv_layer(256).layers),
+        cache_tiers=[GpuCacheTierConfig(quota=4 << 20)],
+    )
+    manager = object.__new__(KVCacheManagerV2)
+    paired = manager._add_mixed_precision_windows(
+        original, {0: original.layers[0].buffers}, first_n=256, last_n=256
+    )
+    assert len(original.layers) == 1 and len(paired.layers) == 2
+    filtered = cold_page_quantizer_config(paired, manager._mixed_precision_layers)
+    assert [int(layer.layer_id) for layer in filtered.layers] == [0]
+    assert paired.layers[1].sliding_window_size == 257
+    assert paired.layers[1].num_sink_tokens == 256
+    assert cold_page_quantizer_config(original, ()) is original
+    native, _ = _native()
+    (layout,) = _create(
+        _manager(
+            pretrained_config=_partial_rotary_config(),
+            skip_rope_quantization=skip_rope_quantization,
+        ),
+        filtered,
+        native,
+        runtime_dtype=DataType.BF16,
+        pp_layers=(0,),
+        num_kv_heads_per_layer=(1,),
+        head_dim_per_layer=(256,),
+    )
+    assert _codec_state(native).layer_ids == (0,)
+    assert [_quantized_range(buffer) for buffer in layout.buffers] == [
+        (64, 192) if skip_rope_quantization else (0, 256),
+        (0, 256),
+    ]
 
 
 @pytest.mark.parametrize("skip_rope_quantization", (False, True))

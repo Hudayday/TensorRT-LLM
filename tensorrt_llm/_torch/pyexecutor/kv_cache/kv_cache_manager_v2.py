@@ -133,6 +133,11 @@ from ..resource_manager import (
     request_context,
 )
 from ..scheduler import ScheduledRequests
+from .mixed_precision_cache import (
+    MixedPrecisionLayerPair,
+    add_mixed_precision_windows,
+    cold_page_quantizer_config,
+)
 from .mixed_precision_reuse import (
     MixedPrecisionReuseDecision,
     MixedPrecisionReusePolicy,
@@ -1245,6 +1250,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # running __init__. Zero disables the spec recompute tail.
     _spec_recompute_tail: int = 0
     _mixed_precision_reuse_policy: MixedPrecisionReusePolicy | None = None
+    _mixed_precision_layers: tuple[MixedPrecisionLayerPair, ...] = ()
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
@@ -1302,6 +1308,7 @@ class KVCacheManagerV2(BaseResourceManager):
         **kwargs,
     ) -> None:
         self._mixed_precision_reuse_policy = None
+        self._mixed_precision_layers = ()
         self._mixed_precision_reuse_decisions: dict[int, MixedPrecisionReuseDecision] = {}
         self.mapping = mapping
         self.dtype = dtype
@@ -1720,7 +1727,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if cold_page_codec_provider is None:
                 return None
             return cold_page_codec_provider.create_cold_page_codec(
-                cache_config,
+                cold_page_quantizer_config(cache_config, self._mixed_precision_layers),
                 runtime_dtype=self.dtype,
                 pp_layers=self.pp_layers,
                 num_kv_heads_per_layer=self.num_kv_heads_per_layer,
@@ -3080,6 +3087,27 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
+        return config
+
+    def _add_mixed_precision_windows(
+        self,
+        config: KVCacheManagerConfigPy,
+        high_buffers: dict[LayerId, Sequence[BufferConfig]],
+        *,
+        first_n: int,
+        last_n: int,
+    ) -> KVCacheManagerConfigPy:
+        """Use inside the layout hook, after registering the model's history.
+
+        Attention supplies its high buffer format and writes both copies.
+        KVCM owns their SWA/sink storage; the cold quantizer sees history only.
+        Configure reuse after construction, when native group IDs are known.
+        """
+        if self._mixed_precision_layers:
+            raise ValueError("Mixed-precision windows are already registered")
+        config, self._mixed_precision_layers = add_mixed_precision_windows(
+            config, high_buffers, first_n=first_n, last_n=last_n
+        )
         return config
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
