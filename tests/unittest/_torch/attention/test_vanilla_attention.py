@@ -23,6 +23,34 @@ from tensorrt_llm.mapping import Mapping
 
 class TestVanillaAttention(unittest.TestCase):
 
+    def test_rocketkv_preserves_integer_cache_access(self):
+        from tensorrt_llm._torch.attention.backends.sparse.rocket.backend import \
+            RocketVanillaAttention
+        from tensorrt_llm._torch.attention.backends.sparse.rocket.params import \
+            RocketKVParams
+
+        attention = RocketVanillaAttention(
+            layer_idx=0,
+            num_heads=1,
+            head_dim=2,
+            num_kv_heads=1,
+            sparse_params=RocketKVParams(page_size=2,
+                                         kt_cache_dtype="bfloat16"),
+        )
+        keys = torch.tensor([[1., 4.], [3., 2.], [5., 6.]],
+                            dtype=torch.bfloat16).reshape(1, 3, 1, 2)
+        cache = torch.zeros(1, 2, 1, 4, dtype=torch.bfloat16)
+        actual = attention._single_request_update_kt_cache(keys,
+                                                           cache,
+                                                           torch.tensor([0]),
+                                                           3,
+                                                           torch.tensor([0, 1]),
+                                                           update=False)
+        expected = torch.tensor([[1., 2., 3., 4.], [5., 6., 5., 6.]],
+                                dtype=torch.bfloat16).reshape(1, 2, 1, 4)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(cache, expected)
+
     def test_sparse_gqa_deduplicates_blocks(self):
         result = VanillaAttention._single_token_sparse_attn_forward(
             torch.zeros(1, 1),

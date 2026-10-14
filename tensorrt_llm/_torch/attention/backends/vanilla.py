@@ -81,6 +81,14 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
     Metadata = VanillaAttentionMetadata
 
+    # RocketKV also uses these integer views for bit-preserving cache writes.
+    _access_type = {
+        1: torch.int8,
+        2: torch.int16,
+        4: torch.int32,
+        8: torch.int64
+    }
+
     def __init__(
         self,
         layer_idx: int,
