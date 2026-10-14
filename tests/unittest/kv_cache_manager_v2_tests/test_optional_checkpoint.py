@@ -258,7 +258,7 @@ def test_optional_working_values_and_initialized_snapshot(missing_high: bool) ->
         check(next_reader, 0, 1, 12)
         check(next_reader, 1, 1, 99 if missing_high else 78)
         reader.suspend()
-        with pytest.raises(RuntimeError):
+        with pytest.raises(kv.LogicError, match="active cache"):
             reader.publish_optional_pages([groups[1]])
         assert reader.resume(stream.cuda_stream)
         check(reader, 1, 1, 99)
@@ -512,14 +512,15 @@ def test_optional_host_restore_oom_retry_preserves_payload() -> None:
             )
         source.commit(list(range(8)))
         source.suspend()
+        manager.get_and_reset_iteration_stats()
         for _ in range(64):
-            if all(level == 1 for level in source.get_page_storage_snapshot(high).cache_levels):
-                break
             blocker = manager.create_kv_cache(None, [])
             pressure.append(blocker)
-            assert blocker.resume(stream.cuda_stream) and blocker.resize(4)
+            if not blocker.resume(stream.cuda_stream) or not blocker.resize(4):
+                break
         else:
-            pytest.fail("Storage pressure did not move the protected source to Host")
+            pytest.fail("Storage pressure did not exhaust the GPU pool")
+        assert manager.get_and_reset_iteration_stats()[high].iter_offload_blocks > 0
         reader = manager.create_kv_cache(None, list(range(8)), allow_partial_optional_reuse=True)
         caches.append(reader)
         assert not reader.resume(stream.cuda_stream, optional_reuse_groups=[high])

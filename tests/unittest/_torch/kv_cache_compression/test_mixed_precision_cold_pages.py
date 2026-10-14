@@ -100,6 +100,7 @@ def test_mixed_precision_cold_pages_keep_high_values_through_host(skip_rope_quan
                         copy_page(source, high, role, ordinal, original[role][ordinal], write=True)
         source.commit(list(range(source_blocks * block)))
         source.suspend()
+        manager.get_and_reset_iteration_stats()
 
         # Build pressure a block at a time so the native SWA allocator can recycle
         # obsolete working pages; the test does not manage a second window itself.
@@ -113,13 +114,16 @@ def test_mixed_precision_cold_pages_keep_high_values_through_host(skip_rope_quan
                     copy_page(pressure, high, role, ordinal, original[role][0], write=True)
             pressure.commit(list(range(10000 + ordinal * block, 10000 + (ordinal + 1) * block)))
         stream.synchronize()
-        # Evidence of actual Host migration, not merely a configured Host tier.
+        # Suspended caches do not expose page locations; use native migration counters.
+        offloads = manager.get_and_reset_iteration_stats()
         for group in groups:
-            assert 1 in source.get_page_storage_snapshot(group).cache_levels
+            assert offloads[group].iter_offload_blocks > 0
         pressure.close()
         caches.remove(pressure)
         assert source.resume(stream.cuda_stream)
+        onboards = manager.get_and_reset_iteration_stats()
         for group in groups:
+            assert onboards[group].iter_onboard_blocks > 0
             assert 1 not in source.get_page_storage_snapshot(group).cache_levels
 
         restored = {role: torch.empty_like(values) for role, values in original.items()}
