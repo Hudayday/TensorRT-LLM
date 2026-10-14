@@ -17,6 +17,12 @@ pytestmark = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def cuda_context():
+    # The native manager expects its caller to establish the current context.
+    torch.cuda.current_stream()
+
+
 @pytest.mark.parametrize("high_bytes", [64, 128])
 def test_mixed_precision_uses_native_swa_tables_and_pool_addresses(high_bytes: int) -> None:
     """Storage/selection QA, not a quantizer or model-accuracy test.
@@ -58,7 +64,7 @@ def test_mixed_precision_uses_native_swa_tables_and_pool_addresses(high_bytes: i
                 if slot >= 0:
                     assert (
                         cudart.cudaMemsetAsync(
-                            base + slot * stride,
+                            base + int(slot) * stride,
                             20 + 100 * high + ordinal,
                             high_bytes if high else 64,
                             stream.cuda_stream,
@@ -83,7 +89,7 @@ def test_mixed_precision_uses_native_swa_tables_and_pool_addresses(high_bytes: i
                 assert (
                     cudart.cudaMemcpyAsync(
                         readback.data_ptr() + ordinal,
-                        base + slot * stride,
+                        base + int(slot) * stride,
                         1,
                         cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
                         stream.cuda_stream,
@@ -190,7 +196,7 @@ def test_optional_working_values_and_initialized_snapshot(missing_high: bool) ->
         slot = cache.get_base_page_indices(groups[layer])[ordinal]
         assert (
             cudart.cudaMemsetAsync(
-                bases[layer] + slot * strides[layer], value, sizes[layer], stream.cuda_stream
+                bases[layer] + int(slot) * strides[layer], value, sizes[layer], stream.cuda_stream
             )[0]
             == cudart.cudaError_t.cudaSuccess
         )
@@ -201,7 +207,7 @@ def test_optional_working_values_and_initialized_snapshot(missing_high: bool) ->
         assert (
             cudart.cudaMemcpyAsync(
                 values.data_ptr(),
-                bases[layer] + slot * strides[layer],
+                bases[layer] + int(slot) * strides[layer],
                 sizes[layer],
                 cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
                 stream.cuda_stream,
@@ -308,7 +314,7 @@ def test_original_window_partial_source_preserves_shared_payload(endpoint: int) 
                 uploads.append(payload)
                 assert (
                     cudart.cudaMemcpyAsync(
-                        bases[layer] + slot * strides[layer],
+                        bases[layer] + int(slot) * strides[layer],
                         payload.data_ptr(),
                         buffer_bytes[layer],
                         cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
@@ -338,7 +344,7 @@ def test_original_window_partial_source_preserves_shared_payload(endpoint: int) 
                 assert (
                     cudart.cudaMemcpyAsync(
                         readback.data_ptr(),
-                        bases[layer] + slot * strides[layer],
+                        bases[layer] + int(slot) * strides[layer],
                         count,
                         cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
                         stream.cuda_stream,
@@ -389,7 +395,7 @@ def test_missing_tail_publication_excludes_low_fallback_head() -> None:
         assert slot >= 0
         assert (
             cudart.cudaMemsetAsync(
-                bases[layer] + slot * strides[layer], value, sizes[layer], stream.cuda_stream
+                bases[layer] + int(slot) * strides[layer], value, sizes[layer], stream.cuda_stream
             )[0]
             == cudart.cudaError_t.cudaSuccess
         )
@@ -400,7 +406,7 @@ def test_missing_tail_publication_excludes_low_fallback_head() -> None:
         assert (
             cudart.cudaMemcpyAsync(
                 values.data_ptr(),
-                bases[layer] + slot * strides[layer],
+                bases[layer] + int(slot) * strides[layer],
                 sizes[layer],
                 cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
                 stream.cuda_stream,
@@ -499,7 +505,9 @@ def test_optional_host_restore_oom_retry_preserves_payload() -> None:
         assert source.resume(stream.cuda_stream) and source.resize(8)
         for slot in source.get_base_page_indices(high):
             assert (
-                cudart.cudaMemsetAsync(base + slot * stride, 45, page_bytes, stream.cuda_stream)[0]
+                cudart.cudaMemsetAsync(
+                    base + int(slot) * stride, 45, page_bytes, stream.cuda_stream
+                )[0]
                 == cudart.cudaError_t.cudaSuccess
             )
         source.commit(list(range(8)))
@@ -525,7 +533,7 @@ def test_optional_host_restore_oom_retry_preserves_payload() -> None:
             assert (
                 cudart.cudaMemcpyAsync(
                     values.data_ptr(),
-                    base + slot * stride,
+                    base + int(slot) * stride,
                     page_bytes,
                     cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
                     stream.cuda_stream,

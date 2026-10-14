@@ -95,7 +95,7 @@ def test_two_pool_vanilla_prefill_and_decode(history_dtype, high_dtype):
         manager.add_dummy_requests([0], [length], is_gen=False)
         forward(0, length, context=True)
         cache = manager.kv_cache_map[0]
-        cache.commit(list(range(length)))
+        assert cache.resize(None, length)
         cache.suspend()
         assert cache.resume(torch.cuda.current_stream().cuda_stream, is_decoding=True)
         assert cache.resize(length + 1)

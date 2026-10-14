@@ -56,8 +56,8 @@ def test_mixed_precision_cold_pages_keep_high_values_through_host(skip_rope_quan
         num_kv_heads_per_layer=(heads,),
         head_dim_per_layer=(width,),
     )
-    manager = kv.KVCacheManager(config, cold_page_codec=codec)
     stream = torch.cuda.current_stream()
+    manager = kv.KVCacheManager(config, cold_page_codec=codec)
     caches = []
     groups = [manager.get_layer_group_id(layer) for layer in (pair.history_layer, pair.high_layer)]
     generator = torch.Generator(device="cuda").manual_seed(42)
@@ -73,7 +73,7 @@ def test_mixed_precision_cold_pages_keep_high_values_through_host(skip_rope_quan
         slots = cache.get_base_page_indices(groups[high])
         slot = converter([slots[ordinal]], kv.PageIndexMode.SHARED)[0]
         assert slot >= 0
-        address = base + slot * stride
+        address = base + int(slot) * stride
         source, destination = (
             (values.data_ptr(), address) if write else (address, values.data_ptr())
         )
