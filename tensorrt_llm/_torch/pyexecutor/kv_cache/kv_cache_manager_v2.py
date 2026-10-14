@@ -1309,6 +1309,8 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> None:
         self._mixed_precision_reuse_policy = None
         self._mixed_precision_layers = ()
+        self._mixed_precision_high_dtype: DataType | None = None
+        self._mixed_precision_written_layers: dict[int, set[int]] = {}
         self._mixed_precision_reuse_decisions: dict[int, MixedPrecisionReuseDecision] = {}
         self.mapping = mapping
         self.dtype = dtype
@@ -3096,6 +3098,7 @@ class KVCacheManagerV2(BaseResourceManager):
         *,
         first_n: int,
         last_n: int,
+        high_dtype: DataType | None = None,
     ) -> KVCacheManagerConfigPy:
         """Use inside the layout hook, after registering the model's history.
 
@@ -3108,6 +3111,7 @@ class KVCacheManagerV2(BaseResourceManager):
         config, self._mixed_precision_layers = add_mixed_precision_windows(
             config, high_buffers, first_n=first_n, last_n=last_n
         )
+        self._mixed_precision_high_dtype = high_dtype
         return config
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
@@ -3246,38 +3250,43 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
         layer_offset = self.layer_offsets[layer_idx]
-        addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY, PageIndexMode.SHARED)
+        return self._get_kv_buffer_view(layer_offset, layer_offset, self.dtype, kv_layout)
+
+    def _get_kv_buffer_view(
+        self, layer_id: int, geometry_layer: int, dtype: DataType, kv_layout: str
+    ) -> torch.Tensor:
+        """View native K/V storage; virtual windows share the history's head geometry."""
+        addr_key = self.impl.get_mem_pool_base_address(layer_id, Role.KEY, PageIndexMode.SHARED)
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
             addr_value = self.impl.get_mem_pool_base_address(
-                layer_offset, Role.VALUE, PageIndexMode.SHARED
+                layer_id, Role.VALUE, PageIndexMode.SHARED
             )
-            page_size_key = self.impl.get_page_stride(layer_offset, Role.KEY)
-            page_size_value = self.impl.get_page_stride(layer_offset, Role.VALUE)
+            page_size_key = self.impl.get_page_stride(layer_id, Role.KEY)
+            page_size_value = self.impl.get_page_stride(layer_id, Role.VALUE)
 
             assert addr_key + page_size_value == addr_value and page_size_key == page_size_value
 
         assert kv_layout in ["NHD", "HND"], f"Unsupported kv_layout: {kv_layout}"
 
         element_per_container = 1
-        dtype = self.dtype
         if dtype == DataType.NVFP4:
             element_per_container = 2
             dtype = torch.int8
 
-        layer_head_dim = self.head_dim_per_layer[layer_offset]
+        layer_head_dim = self.head_dim_per_layer[geometry_layer]
         if kv_layout == "NHD":
             shape = [
-                self.impl.get_page_index_upper_bound(layer_offset, Role.KEY) // self.kv_factor,
+                self.impl.get_page_index_upper_bound(layer_id, Role.KEY) // self.kv_factor,
                 self.kv_factor,
                 self.tokens_per_block,
-                self.num_kv_heads_per_layer[layer_offset],
+                self.num_kv_heads_per_layer[geometry_layer],
                 layer_head_dim // element_per_container,
             ]
         else:
             shape = [
-                self.impl.get_page_index_upper_bound(layer_offset, Role.KEY) // self.kv_factor,
+                self.impl.get_page_index_upper_bound(layer_id, Role.KEY) // self.kv_factor,
                 self.kv_factor,
-                self.num_kv_heads_per_layer[layer_offset],
+                self.num_kv_heads_per_layer[geometry_layer],
                 self.tokens_per_block,
                 layer_head_dim // element_per_container,
             ]
@@ -3289,6 +3298,60 @@ class KVCacheManagerV2(BaseResourceManager):
                 shape,
             )
         )
+
+    def get_mixed_precision_window(
+        self, layer_idx: int, request_ids: list[int], kv_layout: str = "NHD"
+    ) -> tuple[torch.Tensor, list[list[int]], list[list[tuple[int, int]]]] | None:
+        """Expose the native high pool and logical page indices to eager Attention.
+
+        The third result lists reused token ranges that must be filled from
+        history before reading. Window ownership and eviction remain native SWA.
+        This view supports ordinary K/V rows, not packed NVFP4 or MLA layouts.
+        """
+        layer_offset = self.layer_offsets[layer_idx]
+        pair = next(
+            (pair for pair in self._mixed_precision_layers if pair.history_layer == layer_offset),
+            None,
+        )
+        if pair is None:
+            return None
+        if self._mixed_precision_high_dtype not in (DataType.FP8, DataType.BF16, DataType.HALF):
+            raise ValueError("The mixed-precision writer must declare its high buffer dtype")
+        if self.kv_factor != 2 or self.dtype == DataType.NVFP4:
+            raise NotImplementedError("The eager mixed-precision view requires ordinary K/V rows")
+        group = int(self.impl.get_layer_group_id(pair.high_layer))
+        view = self._get_kv_buffer_view(
+            pair.high_layer, layer_offset, self._mixed_precision_high_dtype, kv_layout
+        )
+        expected_stride = view[0, 0].numel() * view.element_size()
+        if self.impl.get_page_stride(pair.high_layer, Role.KEY) != expected_stride:
+            raise ValueError("High buffer size does not match its declared dtype and head geometry")
+        indices = self._get_batch_cache_indices_by_pool_id(
+            request_ids,
+            pool_id=group,
+            index_scale=int(self.impl.get_page_index_converter(pair.high_layer, Role.KEY).scale),
+        )
+        missing = []
+        for request_id in request_ids:
+            decision = self.get_mixed_precision_reuse_decision(request_id)
+            if decision is not None and decision.selection_pending:
+                raise RuntimeError("Mixed-precision reuse must resume before Attention")
+            missing.append(
+                [(begin, end) for lc, begin, end in decision.missing_ranges if lc == group]
+                if decision is not None
+                else []
+            )
+        return view, indices, missing
+
+    def record_mixed_precision_layer_written(self, request_id: int, layer_idx: int) -> None:
+        """Acknowledge both writes and gap fills, after this layer enqueues them."""
+        written = self._mixed_precision_written_layers.setdefault(request_id, set())
+        written.add(self.layer_offsets[layer_idx])
+        if not all(int(pair.history_layer) in written for pair in self._mixed_precision_layers):
+            return
+        decision = self.get_mixed_precision_reuse_decision(request_id)
+        if decision is not None and decision.missing_ranges:
+            self.record_mixed_precision_reuse_initialized(request_id, copied_from_low=True)
 
     def get_index_k_buffer(
         self,
@@ -4002,6 +4065,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.index_mapper.remove_sequence(request_id)
         self.impl.clear_stats_excluded(request_id)
         self._mixed_precision_reuse_decisions.pop(request_id, None)
+        self._mixed_precision_written_layers.pop(request_id, None)
 
     def context_replay_tokens(self, req: LlmRequest) -> int | None:
         """Pending recovery rows fixed at resume; None keeps ordinary budgeting."""
@@ -5844,6 +5908,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._allocated_draft_lens.pop(request.py_request_id, None)
         if self._mixed_precision_reuse_policy is not None:
             self._mixed_precision_reuse_decisions.pop(request.py_request_id, None)
+            self._mixed_precision_written_layers.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
         # The next owner of these pages fills them again; keeping the set would
         # both leak and let a recycled page skip its fill.
@@ -6114,6 +6179,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_cache_map.clear()
         if self._mixed_precision_reuse_policy is not None:
             self._mixed_precision_reuse_decisions.clear()
+            self._mixed_precision_written_layers.clear()
         self._disagg_receive_ready.clear()
         self._request_stats_enabled_ids.clear()
         self._fresh_pages_filled.clear()
@@ -6530,6 +6596,12 @@ class KVCacheManagerV2(BaseResourceManager):
             if should_commit:
                 self.try_commit_blocks(req)
             if req.context_remaining_length == 0:
+                if should_block_reuse and self._mixed_precision_layers:
+                    written = self._mixed_precision_written_layers.get(req.py_request_id, set())
+                    if all(
+                        int(pair.history_layer) in written for pair in self._mixed_precision_layers
+                    ):
+                        self.publish_mixed_precision_pages(req.py_request_id)
                 if self.conversation_manager is not None:
                     self.conversation_manager.save_drop_plan(req, kv_cache)
                 # Scratch blocks are only for prefill chunks. Disable them at

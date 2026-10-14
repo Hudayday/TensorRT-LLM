@@ -7,6 +7,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
@@ -79,13 +81,6 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
     Metadata = VanillaAttentionMetadata
 
-    _access_type = {
-        1: torch.int8,
-        2: torch.int16,
-        4: torch.int32,
-        8: torch.int64
-    }
-
     def __init__(
         self,
         layer_idx: int,
@@ -133,8 +128,13 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         raise NotImplementedError
 
     @staticmethod
-    def _gather_paged_kv(kv_cache_tensor, block_ids, kv_idx, num_tokens,
-                         tokens_per_block):
+    def _gather_paged_kv(kv_cache_tensor,
+                         block_ids,
+                         kv_idx,
+                         num_tokens,
+                         tokens_per_block,
+                         high_cache=None,
+                         high_block_ids=None):
         """Materialize the first ``num_tokens`` logical K (``kv_idx=0``) or V
         (``kv_idx=1``) tokens from the paged pool as a contiguous
         ``[num_tokens, num_kv_heads, head_dim]`` tensor (NHD view).
@@ -151,14 +151,23 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         chunks = []
         read = 0
         while read < num_tokens:
-            blk = block_ids[read // tokens_per_block]
+            ordinal = read // tokens_per_block
+            pool = kv_cache_tensor
+            blk = block_ids[ordinal]
+            if high_cache is not None and high_block_ids[
+                    ordinal] != BAD_PAGE_INDEX:
+                pool = high_cache
+                blk = high_block_ids[ordinal]
             off = read % tokens_per_block
             n = min(tokens_per_block - off, num_tokens - read)
             if blk == BAD_PAGE_INDEX:
                 chunks.append(
                     kv_cache_tensor.new_zeros((n, *kv_cache_tensor.shape[3:])))
             else:
-                chunks.append(kv_cache_tensor[blk, kv_idx, off:off + n])
+                values = pool[blk, kv_idx, off:off + n]
+                chunks.append(
+                    values.to(high_cache.dtype
+                              ) if high_cache is not None else values)
             read += n
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
 
@@ -205,26 +214,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         tokens_per_block = kv_cache_tensor.shape[2]
 
         if k is not None and v is not None:
-            access_type = self._access_type[k_selected.dtype.itemsize]
-            written = 0
-            while written < kv_len:
-                pos = past_seen_token + written
-                blk = block_ids[pos // tokens_per_block]
-                off = pos % tokens_per_block
-                n = min(tokens_per_block - off, kv_len - written)
-                # New tokens must land in a live page; fail loudly rather than
-                # writing into the last page via negative indexing.
-                assert blk != BAD_PAGE_INDEX, (
-                    f"Writing new KV into an evicted/invalid page (pos {pos}); "
-                    "block_ids/metadata are inconsistent.")
-                dst = torch.arange(off, off + n, device=kv_cache_tensor.device)
-                kv_cache_tensor[blk, 0].view(dtype=access_type).index_copy_(
-                    0, dst,
-                    k_selected[0, written:written + n].view(dtype=access_type))
-                kv_cache_tensor[blk, 1].view(dtype=access_type).index_copy_(
-                    0, dst,
-                    v_selected[0, written:written + n].view(dtype=access_type))
-                written += n
+            self._write_paged_kv(kv_cache_tensor, block_ids, past_seen_token,
+                                 k_selected[0], v_selected[0])
 
         if sparse_kv_indices is not None:
             k_states = torch.cat([
@@ -245,6 +236,32 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             v_states = self._gather_paged_kv(kv_cache_tensor, block_ids, 1,
                                              seq_len, tokens_per_block)[None]
         return k_states, v_states
+
+    @staticmethod
+    def _write_paged_kv(cache,
+                        block_ids,
+                        begin,
+                        key,
+                        value,
+                        *,
+                        allow_missing=False):
+        """Append K/V; an OPTIONAL SWA pool may omit pages outside its window."""
+        block_size = cache.shape[2]
+        written = 0
+        while written < key.shape[0]:
+            position = begin + written
+            block = block_ids[position // block_size]
+            offset = position % block_size
+            count = min(block_size - offset, key.shape[0] - written)
+            if block != BAD_PAGE_INDEX:
+                cache[block, 0,
+                      offset:offset + count].copy_(key[written:written + count])
+                cache[block, 1, offset:offset + count].copy_(
+                    value[written:written + count])
+            elif not allow_missing:
+                raise ValueError(
+                    f"Writing new KV into an invalid page at token {position}")
+            written += count
 
     def _single_request_preprocess_inputs(self, q, k, v, kv_dtype):
         bsz = 1
@@ -409,7 +426,12 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                 block_ids,
                                 sample_idx,
                                 metadata: AttentionMetadata,
-                                attention_window_size: Optional[int] = None):
+                                attention_window_size: Optional[int] = None,
+                                *,
+                                high_cache=None,
+                                high_block_ids=None,
+                                missing_high_ranges=()):
+        original_k, original_v = k, v
         # preprocess inputs
         q, k, v, kv_len = self._single_request_preprocess_inputs(
             q, k, v, kv_cache_tensor.dtype)
@@ -424,6 +446,31 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         key_states, value_states = self._single_request_update_kv_cache(
             k, v, kv_cache_tensor, past_seen_token, kv_len, block_ids,
             sparse_kv_indices)
+
+        if high_cache is not None:
+            # Resume allocates missing OPTIONAL pages but does not initialize them.
+            for begin, end in missing_high_ranges:
+                self._write_paged_kv(high_cache,
+                                     high_block_ids,
+                                     begin,
+                                     key_states[0, begin:end],
+                                     value_states[0, begin:end],
+                                     allow_missing=True)
+            if original_k is not None and original_v is not None:
+                self._write_paged_kv(high_cache,
+                                     high_block_ids,
+                                     past_seen_token,
+                                     original_k.reshape(-1, self.num_kv_heads,
+                                                        self.head_dim),
+                                     original_v.reshape(-1, self.num_kv_heads,
+                                                        self.head_dim),
+                                     allow_missing=True)
+            key_states, value_states = [
+                self._gather_paged_kv(kv_cache_tensor, block_ids, role,
+                                      past_seen_token + kv_len,
+                                      kv_cache_tensor.shape[2], high_cache,
+                                      high_block_ids)[None] for role in (0, 1)
+            ]
 
         # predict sparse attn indices
         sparse_indices = None
@@ -795,6 +842,18 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 **kwargs) -> torch.Tensor:
         forward_args = merge_attention_forward_args(forward_args, kwargs)
 
+        manager = metadata.kv_cache_manager
+        mixed_window = (manager.get_mixed_precision_window(
+            self.layer_idx, metadata.request_ids, metadata.kv_layout)
+                        if isinstance(manager, KVCacheManagerV2) else None)
+        if mixed_window is not None and (
+                self.is_mla_enable or self.sparse_params is not None
+                or metadata.is_cross
+                or forward_args.attention_window_size is not None):
+            raise NotImplementedError(
+                "Mixed-precision VANILLA Attention currently supports full-history dense K/V"
+            )
+
         if metadata.multi_item_part_lens is not None:
             raise ValueError(
                 "Vanilla Attention does not support multi-item scoring")
@@ -860,9 +919,25 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             block_ids = cache_indices[sample_idx]
 
             attn_output = self._single_request_forward(
-                single_q, single_k, single_v, forward_args.attention_mask,
-                kv_cache_tensor, past_seen_token, block_ids, sample_idx,
-                metadata, forward_args.attention_window_size)
+                single_q,
+                single_k,
+                single_v,
+                forward_args.attention_mask,
+                kv_cache_tensor,
+                past_seen_token,
+                block_ids,
+                sample_idx,
+                metadata,
+                forward_args.attention_window_size,
+                high_cache=mixed_window[0]
+                if mixed_window is not None else None,
+                high_block_ids=mixed_window[1][sample_idx]
+                if mixed_window is not None else None,
+                missing_high_ranges=mixed_window[2][sample_idx]
+                if mixed_window is not None else ())
+            if mixed_window is not None:
+                manager.record_mixed_precision_layer_written(
+                    metadata.request_ids[sample_idx], self.layer_idx)
 
             attn_outputs.append(attn_output)
 

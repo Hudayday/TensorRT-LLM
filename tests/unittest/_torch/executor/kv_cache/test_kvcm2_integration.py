@@ -1030,6 +1030,7 @@ def test_mixed_precision_prepare_uses_one_decision_and_real_claim_protocol(
     manager = object.__new__(KVCacheManagerV2)
     manager._mixed_precision_reuse_policy = MixedPrecisionReusePolicy((1, 2), 4, 8, mode)
     manager._mixed_precision_reuse_decisions = {}
+    manager._mixed_precision_written_layers = {}
     manager.tokens_per_block = 4
     manager.conversation_manager = None
     manager.kv_connector_manager = None
@@ -1102,6 +1103,7 @@ def _mixed_precision_manager(high_window: int = 9, sink: int = 4) -> KVCacheMana
     manager.kv_cache_map = {}
     manager._mixed_precision_reuse_policy = None
     manager._mixed_precision_reuse_decisions = {}
+    manager._mixed_precision_written_layers = {}
     manager.tokens_per_block = 4
     manager.kv_cache_manager_py_config = SimpleNamespace(
         layers=[
@@ -1211,6 +1213,28 @@ def test_mixed_precision_initialization_requires_successful_resume() -> None:
     manager.kv_cache_map[2] = Mock(is_active=False)
     with pytest.raises(ValueError, match="resumed"):
         manager.record_mixed_precision_reuse_initialized(2, copied_from_low=False)
+
+
+@pytest.mark.cpu_only
+def test_mixed_precision_gap_initialization_waits_for_every_layer() -> None:
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mixed_precision_cache import (
+        MixedPrecisionLayerPair,
+    )
+
+    manager = _mixed_precision_manager()
+    manager._mixed_precision_layers = (MixedPrecisionLayerPair(0, 2), MixedPrecisionLayerPair(1, 3))
+    manager.layer_offsets = {0: 0, 1: 1}
+    manager._mixed_precision_reuse_policy = MixedPrecisionReusePolicy((7,), 4, 8, "reuse_low")
+    missing = ((7, 24, 32),)
+    manager._mixed_precision_reuse_decisions[2] = MixedPrecisionReuseDecision(
+        32, (7,), missing, selection_pending=False
+    )
+    manager.kv_cache_map[2] = Mock(is_active=True)
+    manager.record_mixed_precision_layer_written(2, 0)
+    assert manager.get_mixed_precision_reuse_decision(2).missing_ranges == missing
+    manager.record_mixed_precision_layer_written(2, 1)
+    decision = manager.get_mixed_precision_reuse_decision(2)
+    assert decision.missing_ranges == () and decision.low_copy_ranges == missing
 
 
 def test_extend_swa_windows_for_reuse_preserves_non_attention_windows() -> None:
