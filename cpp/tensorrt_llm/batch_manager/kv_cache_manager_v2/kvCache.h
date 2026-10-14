@@ -31,6 +31,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <variant>
 #include <vector>
 
@@ -219,7 +220,8 @@ struct ReuseGroupStatus
     // False for an empty prefix, PRIVATE groups, or missing/discarded OPTIONAL candidates.
     bool complete;
     // Retained token ranges [begin, end), including block-rounded SWA windows and sinks.
-    // SSM uses (endpoint, endpoint) for its exact state; empty when complete is false.
+    // SSM uses (endpoint, endpoint) for its exact state. Incomplete OPTIONAL groups expose
+    // available ranges only when partial optional reuse was enabled for this request.
     std::vector<std::pair<int, int>> coverage;
 };
 
@@ -248,7 +250,8 @@ public:
 
     KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
         std::optional<RequestIdType> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt,
-        std::optional<bool> textOnly = std::nullopt, bool enableRequestStats = false);
+        std::optional<bool> textOnly = std::nullopt, bool enableRequestStats = false,
+        bool allowPartialOptionalReuse = false);
 
     ~KvCache();
 
@@ -264,6 +267,19 @@ public:
     // Returns false if utilization too high or out of memory.
     bool resume(std::optional<CUstream> stream = std::nullopt, std::optional<bool> isDecoding = std::nullopt,
         std::optional<std::vector<LifeCycleId>> optionalReuseGroups = std::nullopt);
+
+    //! Keep these OPTIONAL groups request-local during commit; publish them only through publishOptionalPages().
+    //! This also prevents rebasing initialized working values to old shared pages.
+    //! It does not make shared pages writable or change their eviction policy.
+    void setOptionalWorkingGroups(std::vector<LifeCycleId> groups);
+
+    //! Publish missing OPTIONAL snapshots from initialized live pages in the committed prefix.
+    //! Call only after writes on this cache's stream; resume() does not initialize page values.
+    //! Existing snapshots with sufficient coverage are unchanged. OOM skips that snapshot.
+    //! Excluded (group, begin token, end token) ranges skip every intersecting whole page.
+    //! Returns the number of snapshots added or extended, without changing working mappings.
+    int publishOptionalPages(std::vector<LifeCycleId> const& groups,
+        std::vector<std::tuple<LifeCycleId, int, int>> const& excludedRanges = {});
 
     // Enter decode only after prefill has submitted its final KV accesses. Offloads complete sparse
     // history, deferring pages still needed on GPU by another owner. Retries deferred pages even
@@ -810,10 +826,13 @@ private:
     std::vector<ReuseGroupStatus> mReuseStatus;
     TypedVec<LifeCycleId, std::vector<std::pair<BlockOrdinal, SharedPtr<PageHolder>>>> mOptionalCandidates;
     std::vector<LifeCycleId> mSelectedOptionalGroups;
+    std::vector<LifeCycleId> mOptionalWorkingGroups;
+    bool mAllowPartialOptionalReuse = false;
+    void _validateOptionalGroups(std::vector<LifeCycleId> const& groups) const;
     void _collectReuseCandidates();
     void _selectOptionalGroups(std::vector<LifeCycleId> const& groups);
-    // PRIVATE and unselected OPTIONAL groups need fresh pages for the claimed prefix.
-    bool _needsFreshPrefixPages(LifeCycleId lc) const;
+    // PRIVATE and unavailable OPTIONAL pages need fresh storage for the claimed prefix.
+    bool _needsFreshPrefixPage(LifeCycleId lc, BlockOrdinal ordinal) const;
 
     // SWA scratch slot support.
     bool mEnableSwaScratchReuse = false;

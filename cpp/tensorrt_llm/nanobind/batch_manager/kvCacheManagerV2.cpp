@@ -1909,6 +1909,38 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("cuda_stream") = nb::none(), nb::arg("is_decoding") = nb::none(),
             nb::arg("optional_reuse_groups") = nb::none())
+        .def(
+            "set_optional_working_groups",
+            [](kv::KvCache& self, std::vector<int> const& groups)
+            {
+                std::vector<kv::LifeCycleId> selected;
+                for (int group : groups)
+                {
+                    selected.emplace_back(group);
+                }
+                nb::gil_scoped_release release;
+                self.setOptionalWorkingGroups(std::move(selected));
+            },
+            nb::arg("group_ids"))
+        .def(
+            "publish_optional_pages",
+            [](kv::KvCache& self, std::vector<int> const& groups,
+                std::vector<std::tuple<int, int, int>> const& excludedRanges)
+            {
+                std::vector<kv::LifeCycleId> selected;
+                for (int group : groups)
+                {
+                    selected.emplace_back(group);
+                }
+                std::vector<std::tuple<kv::LifeCycleId, int, int>> excluded;
+                for (auto const& [group, begin, end] : excludedRanges)
+                {
+                    excluded.emplace_back(kv::LifeCycleId{group}, begin, end);
+                }
+                nb::gil_scoped_release release;
+                return self.publishOptionalPages(selected, excluded);
+            },
+            nb::arg("group_ids"), nb::arg("excluded_ranges") = std::vector<std::tuple<int, int, int>>{})
         .def("enter_decode", &kv::KvCache::enterDecode, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("is_decoding", &kv::KvCache::isDecoding)
         .def_prop_ro("page_storage_version", &kv::KvCache::pageStorageVersion, nb::call_guard<nb::gil_scoped_release>())
@@ -2584,7 +2616,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "create_kv_cache",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,
                 std::optional<kv::RequestIdType> id, nb::object customPriorityCallback,
-                std::optional<int> expectedPromptLength, std::optional<bool> textOnly, bool enableRequestStats)
+                std::optional<int> expectedPromptLength, std::optional<bool> textOnly, bool enableRequestStats,
+                bool allowPartialOptionalReuse)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 kv::KvCache::PriorityCb priorityCb = castPriorityCallback(*self, std::move(customPriorityCallback));
@@ -2592,7 +2625,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 {
                     nb::gil_scoped_release release;
                     return self->createKvCache(std::move(reuseScope), kv::TokenSpan{}, id, std::move(priorityCb),
-                        expectedPromptLength, textOnly, enableRequestStats);
+                        expectedPromptLength, textOnly, enableRequestStats, allowPartialOptionalReuse);
                 }
                 return withTokens(inputTokens,
                     [&](kv::TokenSpan view, bool knownNoDigest)
@@ -2609,12 +2642,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         }
                         nb::gil_scoped_release release;
                         return self->createKvCache(std::move(reuseScope), view, id, std::move(priorityCb), promptLen,
-                            textOnly, enableRequestStats);
+                            textOnly, enableRequestStats, allowPartialOptionalReuse);
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
             nb::arg("custom_priority_callback") = nb::none(), nb::arg("expected_prompt_length") = std::nullopt,
-            nb::arg("text_only") = std::nullopt, nb::arg("enable_request_stats") = false)
+            nb::arg("text_only") = std::nullopt, nb::arg("enable_request_stats") = false,
+            nb::arg("allow_partial_optional_reuse") = false)
         .def(
             "probe_reuse",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)

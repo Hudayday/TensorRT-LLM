@@ -185,7 +185,7 @@ void KvCacheManager::clearReusableBlocks()
 
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
     std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
-    std::optional<bool> textOnly, bool enableRequestStats)
+    std::optional<bool> textOnly, bool enableRequestStats, bool allowPartialOptionalReuse)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
@@ -209,7 +209,7 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
     }
 
     return std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::move(id),
-        std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats);
+        std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats, allowPartialOptionalReuse);
 }
 
 BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(

@@ -25,6 +25,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Literal,
     NamedTuple,
     Optional,
     Sequence,
@@ -66,6 +67,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX,
     GPU_LEVEL,
     AttentionLayerConfig,
+    AttentionReusePolicy,
     AttnLifeCycle,
     Batch,
     BatchDesc,
@@ -131,6 +133,12 @@ from ..resource_manager import (
     request_context,
 )
 from ..scheduler import ScheduledRequests
+from .mixed_precision_reuse import (
+    MixedPrecisionReuseDecision,
+    MixedPrecisionReusePolicy,
+    decide_mixed_precision_reuse,
+    mixed_precision_publication_exclusions,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -1236,6 +1244,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # connector-reservation cap read it on instances tests build without
     # running __init__. Zero disables the spec recompute tail.
     _spec_recompute_tail: int = 0
+    _mixed_precision_reuse_policy: MixedPrecisionReusePolicy | None = None
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
@@ -1292,6 +1301,8 @@ class KVCacheManagerV2(BaseResourceManager):
         max_cuda_graph_batch_size: Optional[int] = None,
         **kwargs,
     ) -> None:
+        self._mixed_precision_reuse_policy = None
+        self._mixed_precision_reuse_decisions: dict[int, MixedPrecisionReuseDecision] = {}
         self.mapping = mapping
         self.dtype = dtype
         self._validate_speculative_config(spec_config)
@@ -3711,7 +3722,105 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _resume_context_cache(self, req: LlmRequest, kv_cache: _KVCache) -> bool:
         """Resume context pages; subclasses may select model-specific reuse groups."""
+        decision = self.get_mixed_precision_reuse_decision(req.py_request_id)
+        if decision is not None and decision.selection_pending:
+            success = self._resume_and_restore(
+                req.py_request_id, kv_cache, decision.selected_groups
+            )
+            if success:
+                self._mixed_precision_reuse_decisions[req.py_request_id] = replace(
+                    decision, selection_pending=False
+                )
+            return success
         return self._resume_and_restore(req.py_request_id, kv_cache)
+
+    def get_mixed_precision_reuse_decision(
+        self, request_id: int
+    ) -> MixedPrecisionReuseDecision | None:
+        """Return high-window gaps the caller must initialize before Attention.
+
+        Native resume prepares storage only. Missing high values must be
+        recomputed, filled from low history, or bypassed by the consumer.
+        """
+        if self._mixed_precision_reuse_policy is None:
+            return None
+        return self._mixed_precision_reuse_decisions.get(request_id)
+
+    def configure_mixed_precision_reuse(
+        self,
+        high_layer_ids: Sequence[int],
+        *,
+        first_n: int,
+        last_n: int,
+        missing_high: Literal["recompute", "reuse_low"] = "recompute",
+    ) -> None:
+        """Enable the internal policy for already registered OPTIONAL high layers.
+
+        The caller registers full REQUIRED history and original-value OPTIONAL
+        buffers before constructing this manager. This method changes neither
+        pool sizes nor formats; writers must fill high buffers before quantizing.
+        """
+        if self.kv_cache_map:
+            raise RuntimeError("Cannot change mixed-precision reuse while requests own caches")
+        layers = {int(layer.layer_id): layer for layer in self.kv_cache_manager_py_config.layers}
+        if not any(
+            isinstance(layer, AttentionLayerConfig)
+            and layer.reuse_policy == AttentionReusePolicy.REQUIRED
+            and layer.sliding_window_size is None
+            for layer in layers.values()
+        ):
+            raise ValueError("Mixed-precision reuse requires a full REQUIRED Attention history")
+        groups = []
+        for layer_id in high_layer_ids:
+            layer = layers.get(int(layer_id))
+            if not isinstance(layer, AttentionLayerConfig) or (
+                layer.reuse_policy != AttentionReusePolicy.OPTIONAL
+            ):
+                raise ValueError(f"High layer {layer_id} must be registered as OPTIONAL Attention")
+            if layer.sliding_window_size != last_n + 1 or (layer.num_sink_tokens or 0) != first_n:
+                raise ValueError(
+                    f"High layer {layer_id} requires window={last_n + 1} and sink={first_n}"
+                )
+            groups.append(int(self.impl.get_layer_group_id(LayerId(layer_id))))
+        policy = MixedPrecisionReusePolicy(
+            tuple(sorted(set(groups))), first_n, last_n, missing_high
+        )
+        self._mixed_precision_reuse_policy = policy
+        self._mixed_precision_reuse_decisions.clear()
+
+    def record_mixed_precision_reuse_initialized(
+        self, request_id: int, *, copied_from_low: bool
+    ) -> None:
+        """Acknowledge actual writes to the returned missing high ranges.
+
+        Enqueue them on this cache's stream before calling. Copies from low
+        history are readable but must not become original-value snapshots.
+        """
+        decision = self.get_mixed_precision_reuse_decision(request_id)
+        cache = self.kv_cache_map[request_id]
+        if decision is None or decision.selection_pending or not cache.is_active:
+            raise ValueError("Mixed-precision reuse storage must be resumed before initialization")
+        low_copies = decision.low_copy_ranges
+        if copied_from_low:
+            low_copies += decision.missing_ranges
+        self._mixed_precision_reuse_decisions[request_id] = replace(
+            decision, missing_ranges=(), low_copy_ranges=low_copies
+        )
+
+    def publish_mixed_precision_pages(self, request_id: int) -> int:
+        """Publish initialized original/fresh high windows without replacing old pages.
+
+        Call after actual high writes and commit/history updates, on the same
+        request stream. Resume or low-to-high conversion alone is insufficient.
+        """
+        policy = self._mixed_precision_reuse_policy
+        decision = self.get_mixed_precision_reuse_decision(request_id)
+        if policy is None or decision is None:
+            raise ValueError("Mixed-precision reuse is not configured for this request")
+        cache = self.kv_cache_map[request_id]
+        return cache.publish_optional_pages(
+            policy.high_groups, excluded_ranges=mixed_precision_publication_exclusions(decision)
+        )
 
     def _context_reuse_tokens(
         self, req: LlmRequest, reuse_limit: int | None = None
@@ -3767,29 +3876,50 @@ class KVCacheManagerV2(BaseResourceManager):
             # matched, which is also the case where no branch point applies.
             num_lookup_tokens = None
             if kv_cache is None:
-                if self.enable_block_reuse:
-                    # Empty (not None) for a zero limit: lookup is off, but
-                    # newly computed blocks may still be committed.
-                    tokens = self._context_reuse_tokens(req, reuse_limit)
-                else:
-                    tokens = None
-                # Taken from the augmented sequence rather than derived as
-                # prompt_len - 1, because augmentation can change the length
-                # for multimodal requests.
-                num_lookup_tokens = len(tokens) if tokens is not None else None
-                kv_cache = self._create_kv_cache(
-                    req.py_request_id,
-                    req.lora_task_id,
-                    tokens,
-                    cache_salt=req.cache_salt,
-                    is_dummy=req.is_dummy,
-                    enable_request_stats=req.return_perf_metrics,
-                    expected_prompt_length=(
-                        req.total_input_len_cp if self._has_cp_helix else req.prompt_len
-                    ),
-                )
-                if kv_cache is None:
-                    return None
+                protected_length = None
+                while True:
+                    if self.enable_block_reuse:
+                        # Empty (not None) disables this lookup, not future commits.
+                        tokens = self._context_reuse_tokens(req, reuse_limit)
+                    else:
+                        tokens = None
+                    num_lookup_tokens = len(tokens) if tokens is not None else None
+                    kv_cache = self._create_kv_cache(
+                        req.py_request_id,
+                        req.lora_task_id,
+                        tokens,
+                        cache_salt=req.cache_salt,
+                        is_dummy=req.is_dummy,
+                        enable_request_stats=req.return_perf_metrics,
+                        expected_prompt_length=(
+                            req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+                        ),
+                    )
+                    if kv_cache is None:
+                        return None
+                    policy = self._mixed_precision_reuse_policy
+                    if (
+                        policy is None
+                        or not self.enable_block_reuse
+                        or req.is_disagg_generation_init_state
+                        or req.is_dummy
+                    ):
+                        break
+                    matched = kv_cache.num_committed_tokens
+                    if protected_length is None:
+                        protected_length = matched
+                    decision = decide_mixed_precision_reuse(
+                        policy,
+                        {status.group_id: status.coverage for status in kv_cache.reuse_status},
+                        reused_length=matched,
+                        protected_length=protected_length,
+                        tokens_per_block=self.tokens_per_block,
+                    )
+                    if decision.reuse_depth >= matched:
+                        self._mixed_precision_reuse_decisions[req.py_request_id] = decision
+                        break
+                    self._discard_tentative_context_cache(req.py_request_id, kv_cache)
+                    reuse_limit = decision.reuse_depth
                 kv_cache.cuda_stream = self._stream.cuda_stream
 
             if not self.enable_block_reuse:
@@ -3832,6 +3962,18 @@ class KVCacheManagerV2(BaseResourceManager):
         if not self._resume_context_cache(req, kv_cache):
             return None
         return kv_cache.num_committed_tokens
+
+    def _discard_tentative_context_cache(self, request_id: int, kv_cache: _KVCache) -> None:
+        """Release an unexecuted claim without changing request or connector state."""
+        if self.sparse_metadata_batch is not None:
+            self.sparse_metadata_batch.remove(kv_cache)
+        kv_cache.discard_pending_stats()
+        kv_cache.close()
+        self.kv_cache_map.pop(request_id)
+        self._request_stats_enabled_ids.discard(request_id)
+        self.index_mapper.remove_sequence(request_id)
+        self.impl.clear_stats_excluded(request_id)
+        self._mixed_precision_reuse_decisions.pop(request_id, None)
 
     def context_replay_tokens(self, req: LlmRequest) -> int | None:
         """Pending recovery rows fixed at resume; None keeps ordinary budgeting."""
@@ -5672,6 +5814,8 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
+        if self._mixed_precision_reuse_policy is not None:
+            self._mixed_precision_reuse_decisions.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
         # The next owner of these pages fills them again; keeping the set would
         # both leak and let a recycled page skip its fill.
@@ -5940,6 +6084,8 @@ class KVCacheManagerV2(BaseResourceManager):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
+        if self._mixed_precision_reuse_policy is not None:
+            self._mixed_precision_reuse_decisions.clear()
         self._disagg_receive_ready.clear()
         self._request_stats_enabled_ids.clear()
         self._fresh_pages_filled.clear()
@@ -6528,6 +6674,8 @@ class KVCacheManagerV2(BaseResourceManager):
         salt_int = 0 if is_dummy else self._derive_reuse_salt(cache_salt)
         enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
         priority_kwargs = {}
+        if self._mixed_precision_reuse_policy is not None and not is_dummy:
+            priority_kwargs["allow_partial_optional_reuse"] = True
         if (
             self._swa_endpoint_rewind > 0
             and self.enable_block_reuse
@@ -6547,6 +6695,8 @@ class KVCacheManagerV2(BaseResourceManager):
             expected_prompt_length=expected_prompt_length,
             **priority_kwargs,
         )
+        if self._mixed_precision_reuse_policy is not None and not is_dummy:
+            kv_cache.set_optional_working_groups(self._mixed_precision_reuse_policy.high_groups)
         self.kv_cache_map[request_id] = kv_cache
         if enable_request_stats and not self.enable_stats:
             self._request_stats_enabled_ids.add(request_id)

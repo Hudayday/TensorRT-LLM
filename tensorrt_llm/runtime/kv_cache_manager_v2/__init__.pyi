@@ -637,6 +637,27 @@ class _KVCache:
         optional_reuse_groups: Sequence[LayerGroupId] | None = None,
     ) -> bool: ...
     def enter_decode(self) -> bool: ...
+    def set_optional_working_groups(self, group_ids: Sequence[LayerGroupId]) -> None:
+        """Keep OPTIONAL groups request-local until explicit publication.
+
+        Ordinary commit neither publishes nor rebases these groups' working pages.
+        This does not make shared pages writable or stop ordinary eviction.
+        """
+        ...
+    def publish_optional_pages(
+        self,
+        group_ids: Sequence[LayerGroupId],
+        excluded_ranges: Sequence[tuple[LayerGroupId, int, int]] = (),
+    ) -> int:
+        """Snapshot initialized live OPTIONAL pages missing from the committed prefix.
+
+        Call after actual writes on this cache's stream. Resume only prepares
+        storage. Existing sufficient snapshots are unchanged; OOM skips a copy.
+        Excluded (group, begin token, end token) ranges skip intersecting pages,
+        including low-precision values merely converted to the high storage type.
+        The return value counts snapshots added or extended, not initialized pages.
+        """
+        ...
     @property
     def is_decoding(self) -> bool: ...
     @property
@@ -804,6 +825,7 @@ class KVCacheManager:
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
         enable_request_stats: bool = False,
+        allow_partial_optional_reuse: bool = False,
     ) -> _KVCache:
         """Create a suspended cache with a prefill-to-generation boundary.
 
@@ -813,6 +835,10 @@ class KVCacheManager:
         It defaults to the non-empty input length; without either value, the beam
         sharing boundary is zero and the statistics boundary is unset. When set,
         it also marks generation-phase allocation stats.
+
+        ``allow_partial_optional_reuse`` retains available OPTIONAL window pages
+        even if the window is incomplete. The caller must initialize missing
+        pages after resume before inference; no value conversion is performed.
         """
         ...
     def probe_reuse(

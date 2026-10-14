@@ -142,12 +142,14 @@ public:
     //                       nullopt inherits the manager config default.
     // enableRequestStats:   collect request-local allocation and reuse statistics even when
     //                       manager-level statistics are disabled.
+    // allowPartialOptionalReuse: retain available OPTIONAL pages when other window pages are missing.
+    //                       The caller must initialize fresh recovery pages before inference.
     // inputTokens is a non-owning view; the caller must keep the underlying buffer alive for the
     // duration of the call (matching reads it but never stores it).
     std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, TokenSpan inputTokens = {},
         std::optional<RequestIdType> id = std::nullopt, KvCache::PriorityCb priorityCb = {},
         std::optional<int> expectedPromptLength = std::nullopt, std::optional<bool> textOnly = std::nullopt,
-        bool enableRequestStats = false);
+        bool enableRequestStats = false, bool allowPartialOptionalReuse = false);
 
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
     // Defaults false (safe: the scanning path is taken).

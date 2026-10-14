@@ -36,6 +36,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _sync_kv_cache_manager_init_status,
     _update_kv_cache_draft_token_location,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.mixed_precision_reuse import (
+    MixedPrecisionReuseDecision,
+    MixedPrecisionReusePolicy,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -1007,6 +1011,206 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
         manager._context_reuse_tokens.assert_called_once_with(request, 2)
     else:
         manager._context_reuse_tokens.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "mode,high_complete,expected_depth,expected_claims",
+    [
+        ("recompute", True, 32, 1),
+        ("recompute", False, 24, 2),
+        ("recompute", False, 20, 2),
+        ("reuse_low", False, 32, 1),
+    ],
+)
+def test_mixed_precision_prepare_uses_one_decision_and_real_claim_protocol(
+    mode: str, high_complete: bool, expected_depth: int, expected_claims: int
+) -> None:
+    """Mock only native calls; exercise the production preparation and getter."""
+    manager = object.__new__(KVCacheManagerV2)
+    manager._mixed_precision_reuse_policy = MixedPrecisionReusePolicy((1, 2), 4, 8, mode)
+    manager._mixed_precision_reuse_decisions = {}
+    manager.tokens_per_block = 4
+    manager.conversation_manager = None
+    manager.kv_connector_manager = None
+    manager.is_draft = False
+    manager.enable_block_reuse = True
+    manager.is_estimating_kv_cache = False
+    manager._has_cp_helix = False
+    manager.kv_cache_map = {}
+    manager.sparse_metadata_batch = None
+    manager._request_stats_enabled_ids = set()
+    manager.index_mapper = Mock()
+    manager.impl = Mock()
+    manager._stream = SimpleNamespace(cuda_stream=1)
+    manager._context_reuse_tokens = Mock(return_value=list(range(32)))
+    manager._record_branch_snapshot_point = Mock()
+    manager._resume_and_restore = Mock(return_value=True)
+    request = SimpleNamespace(
+        py_request_id=7,
+        lora_task_id=None,
+        cache_salt=None,
+        is_dummy=False,
+        return_perf_metrics=False,
+        prompt_len=40,
+        context_current_position=0,
+        is_first_context_chunk=True,
+        is_disagg_generation_init_state=False,
+    )
+    created = []
+
+    def create_claim(*args, **kwargs):
+        depth = 32 if not created else expected_depth
+        coverage = [(0, 4), (24, 32)] if high_complete else [(0, 4)]
+        cache = Mock(
+            num_committed_tokens=depth,
+            reuse_status=[SimpleNamespace(group_id=group, coverage=coverage) for group in (1, 2)],
+        )
+        manager.kv_cache_map[7] = cache
+        created.append(cache)
+        return cache
+
+    manager._create_kv_cache = Mock(side_effect=create_claim)
+    assert manager.prepare_context_cache(request) == expected_depth
+    assert len(created) == expected_claims
+    decision = manager.get_mixed_precision_reuse_decision(7)
+    assert decision.reuse_depth == expected_depth
+    assert decision.selected_groups == (1, 2)
+    assert not decision.selection_pending
+    assert bool(decision.missing_ranges) is not high_complete
+    assert request.context_current_position == 0
+    manager._resume_and_restore.assert_called_once_with(7, created[-1], (1, 2))
+    if expected_claims == 2:
+        created[0].close.assert_called_once()
+        created[0].discard_pending_stats.assert_called_once()
+        manager.index_mapper.remove_sequence.assert_called_once_with(7)
+        manager._context_reuse_tokens.assert_has_calls([call(request, None), call(request, 24)])
+    # Later resume must not repeat native first-resume-only OPTIONAL selection.
+    assert manager.prepare_context_cache(request) == expected_depth
+    assert manager._resume_and_restore.call_args == call(7, created[-1])
+
+
+def _mixed_precision_manager(high_window: int = 9, sink: int = 4) -> KVCacheManagerV2:
+    """CPU fixture with explicit native-config and cache ownership contracts."""
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        AttentionLayerConfig,
+        AttentionReusePolicy,
+        BufferConfig,
+    )
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.kv_cache_map = {}
+    manager._mixed_precision_reuse_policy = None
+    manager._mixed_precision_reuse_decisions = {}
+    manager.tokens_per_block = 4
+    manager.kv_cache_manager_py_config = SimpleNamespace(
+        layers=[
+            AttentionLayerConfig(
+                layer_id=0,
+                buffers=[BufferConfig(role="key", size=64)],
+                reuse_policy=AttentionReusePolicy.REQUIRED,
+            ),
+            AttentionLayerConfig(
+                layer_id=1,
+                buffers=[BufferConfig(role="key", size=128)],
+                sliding_window_size=high_window,
+                num_sink_tokens=sink,
+                reuse_policy=AttentionReusePolicy.OPTIONAL,
+            ),
+        ]
+    )
+    manager.impl = Mock()
+    manager.impl.get_layer_group_id.return_value = 7
+    return manager
+
+
+@pytest.mark.cpu_only
+def test_mixed_precision_activation_uses_actual_native_group_ids() -> None:
+    manager = _mixed_precision_manager()
+    manager.configure_mixed_precision_reuse([1, 1], first_n=4, last_n=8, missing_high="reuse_low")
+    assert manager._mixed_precision_reuse_policy == MixedPrecisionReusePolicy(
+        (7,), 4, 8, "reuse_low"
+    )
+    assert manager._mixed_precision_reuse_decisions == {}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "high_ids,window,sink", [([0], 9, 4), ([99], 9, 4), ([1], 8, 4), ([1], 9, 8), ([], 9, 4)]
+)
+def test_mixed_precision_activation_rejects_wrong_registration(
+    high_ids: list[int], window: int, sink: int
+) -> None:
+    manager = _mixed_precision_manager(window, sink)
+    with pytest.raises(ValueError):
+        manager.configure_mixed_precision_reuse(high_ids, first_n=4, last_n=8)
+    assert manager._mixed_precision_reuse_policy is None
+
+
+@pytest.mark.cpu_only
+def test_mixed_precision_activation_cannot_change_existing_cache_owners() -> None:
+    manager = _mixed_precision_manager()
+    manager.kv_cache_map[7] = Mock()
+    with pytest.raises(RuntimeError, match="own caches"):
+        manager.configure_mixed_precision_reuse([1], first_n=4, last_n=8)
+
+
+@pytest.mark.cpu_only
+def test_mixed_precision_resume_keeps_selection_pending_after_capacity_failure() -> None:
+    manager = _mixed_precision_manager()
+    manager._mixed_precision_reuse_policy = MixedPrecisionReusePolicy((7,), 4, 8)
+    manager._mixed_precision_reuse_decisions[2] = MixedPrecisionReuseDecision(32, (7,), ())
+    manager._resume_and_restore = Mock(side_effect=[False, True, True])
+    request, cache = SimpleNamespace(py_request_id=2), Mock()
+    assert not manager._resume_context_cache(request, cache)
+    assert manager.get_mixed_precision_reuse_decision(2).selection_pending
+    assert manager._resume_context_cache(request, cache)
+    assert not manager.get_mixed_precision_reuse_decision(2).selection_pending
+    assert manager._resume_context_cache(request, cache)
+    assert manager._resume_and_restore.call_args_list == [
+        call(2, cache, (7,)),
+        call(2, cache, (7,)),
+        call(2, cache),
+    ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("copied_from_low", [False, True])
+def test_mixed_precision_initialization_records_source_before_explicit_publication(
+    copied_from_low: bool,
+) -> None:
+    manager = _mixed_precision_manager()
+    manager._mixed_precision_reuse_policy = MixedPrecisionReusePolicy((7,), 4, 8, "reuse_low")
+    missing = ((7, 0, 4),)
+    manager._mixed_precision_reuse_decisions[2] = MixedPrecisionReuseDecision(
+        32, (7,), missing, selection_pending=False
+    )
+    cache = Mock(is_active=True)
+    cache.publish_optional_pages.return_value = 1
+    manager.kv_cache_map[2] = cache
+    with pytest.raises(ValueError, match="initialized"):
+        manager.publish_mixed_precision_pages(2)
+    cache.publish_optional_pages.assert_not_called()
+    manager.record_mixed_precision_reuse_initialized(2, copied_from_low=copied_from_low)
+    decision = manager.get_mixed_precision_reuse_decision(2)
+    assert decision.missing_ranges == ()
+    assert decision.low_copy_ranges == (missing if copied_from_low else ())
+    assert manager.publish_mixed_precision_pages(2) == 1
+    cache.publish_optional_pages.assert_called_once_with(
+        (7,), excluded_ranges=missing if copied_from_low else ()
+    )
+
+
+@pytest.mark.cpu_only
+def test_mixed_precision_initialization_requires_successful_resume() -> None:
+    manager = _mixed_precision_manager()
+    manager._mixed_precision_reuse_policy = MixedPrecisionReusePolicy((7,), 4, 8)
+    manager._mixed_precision_reuse_decisions[2] = MixedPrecisionReuseDecision(
+        32, (7,), ((7, 24, 32),)
+    )
+    manager.kv_cache_map[2] = Mock(is_active=False)
+    with pytest.raises(ValueError, match="resumed"):
+        manager.record_mixed_precision_reuse_initialized(2, copied_from_low=False)
 
 
 def test_extend_swa_windows_for_reuse_preserves_non_attention_windows() -> None:
