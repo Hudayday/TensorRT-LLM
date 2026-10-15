@@ -603,6 +603,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             and attn.head_dim != 512
             and not has_q_only
             and meta.num_generations == 0
+            and not getattr(meta.kv_cache_manager, "prefer_trtllm_gen_context", False)
         ):
             # NVBug 6579626: the per-layer host overhead of the FlashInfer
             # TRTLLM-Gen context path regresses TTFT for small BF16 batches.
@@ -611,6 +612,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             # Keep mixed batches on FlashInfer: the monolithic fallback also
             # switches decoding to C++ kernels that generation-only warmup
             # does not cover, causing first-use JIT stalls (NVBug 6716104).
+            # A staged cache can request this paged implementation: its dtype
+            # differs from the model's usual cache and may lack a C++ context kernel.
             return False, (
                 "small-batch BF16 context attention uses the fallback FMHA for "
                 "performance because the FlashInfer TRTLLM-Gen context path "

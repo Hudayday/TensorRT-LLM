@@ -1310,6 +1310,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self._mixed_precision_reuse_policy = None
         self._mixed_precision_layers = ()
         self._mixed_precision_high_dtype: DataType | None = None
+        self._mixed_precision_staging_bytes = 0
+        self._mixed_precision_staging_buffer: torch.Tensor | None = None
+        self._mixed_precision_staging_stream: int | None = None
         self._mixed_precision_written_layers: dict[int, set[int]] = {}
         self._mixed_precision_reuse_decisions: dict[int, MixedPrecisionReuseDecision] = {}
         self.mapping = mapping
@@ -3099,12 +3102,16 @@ class KVCacheManagerV2(BaseResourceManager):
         first_n: int,
         last_n: int,
         high_dtype: DataType | None = None,
+        stage_for_attention: bool = False,
     ) -> KVCacheManagerConfigPy:
         """Use inside the layout hook, after registering the model's history.
 
         Attention supplies its high buffer format and writes both copies.
         KVCM owns their SWA/sink storage; the cold quantizer sees history only.
         Configure reuse after construction, when native group IDs are known.
+        Set ``stage_for_attention`` for the eager TRTLLM/FlashInfer reader. It
+        reserves one 16-bit layer at maximum batch/sequence capacity and shares
+        that workspace between layers, outside both KV pools.
         """
         if self._mixed_precision_layers:
             raise ValueError("Mixed-precision windows are already registered")
@@ -3112,7 +3119,54 @@ class KVCacheManagerV2(BaseResourceManager):
             config, high_buffers, first_n=first_n, last_n=last_n
         )
         self._mixed_precision_high_dtype = high_dtype
+        if stage_for_attention:
+            if high_dtype not in (DataType.FP8, DataType.BF16, DataType.HALF):
+                raise ValueError("Attention staging requires a declared high buffer dtype")
+            element_bytes = 1 if high_dtype == DataType.FP8 else 2
+            page_elements = (
+                max(sum(buf.size for buf in buffers) for buffers in high_buffers.values())
+                // element_bytes
+            )
+            pages = self.max_batch_size * math.ceil(self.max_seq_len / self.tokens_per_block)
+            self._mixed_precision_staging_bytes = pages * page_elements * 2
+            # One layer, all attended tokens, including reused prefixes. Reserve
+            # additional page-sized conversion temporaries; do not rely on an
+            # empty-cache profiling step to measure a long reused prefix.
+            reserve = self._mixed_precision_staging_bytes + page_elements * 12
+            tiers = []
+            for tier in config.cache_tiers:
+                if isinstance(tier, GpuCacheTierConfig):
+                    if tier.quota <= reserve:
+                        raise ValueError("KV budget cannot cover mixed-precision Attention staging")
+                    tier = GpuCacheTierConfig(quota=tier.quota - reserve)
+                tiers.append(tier)
+            config = replace(config, cache_tiers=tiers)
+            logger.info(
+                f"Mixed-precision Attention staging reserves {reserve} bytes outside the KV pools"
+            )
         return config
+
+    def get_mixed_precision_staging_buffer(
+        self, shape: Sequence[int], dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Reuse one layer's bounded Attention workspace on one execution stream."""
+        size = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        if size > self._mixed_precision_staging_bytes:
+            raise ValueError(
+                "Mixed-precision Attention staging exceeds its reservation; "
+                "register windows with stage_for_attention=True"
+            )
+        stream = torch.cuda.current_stream()
+        if self._mixed_precision_staging_buffer is None:
+            self._mixed_precision_staging_buffer = torch.empty(
+                self._mixed_precision_staging_bytes, dtype=torch.uint8, device=stream.device
+            )
+            self._mixed_precision_staging_stream = stream.cuda_stream
+        elif stream.cuda_stream != self._mixed_precision_staging_stream:
+            raise NotImplementedError(
+                "Mixed-precision Attention staging requires one execution stream"
+            )
+        return self._mixed_precision_staging_buffer[:size].view(dtype).view(shape)
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Exclude empty buffers before creating the runtime storage pools."""
@@ -3298,6 +3352,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 shape,
             )
         )
+
+    def has_mixed_precision_layer(self, layer_idx: int) -> bool:
+        """Whether this layer has a native OPTIONAL high-precision window."""
+        layer_offset = self.layer_offsets[layer_idx]
+        return any(pair.history_layer == layer_offset for pair in self._mixed_precision_layers)
 
     def get_mixed_precision_window(
         self, layer_idx: int, request_ids: list[int], kv_layout: str = "NHD"
@@ -6188,6 +6247,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
         self.impl.shutdown()
+        self._mixed_precision_staging_buffer = None
         # Shut the streaming event manager down last so removals emitted during
         # cache / impl teardown (via the radix tree's own event-manager
         # reference) are still flushed before the publisher stops. Do not null
