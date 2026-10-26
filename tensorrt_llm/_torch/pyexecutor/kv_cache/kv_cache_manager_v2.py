@@ -1461,6 +1461,8 @@ class KVCacheManagerV2(BaseResourceManager):
     # _init_mixed_precision assigns fresh per-instance values.
     low_precision_dtype: Optional[DataType] = None
     high_layers: dict[int, int] = {}
+    # Set by each manager class that hosts retained-token twins; not inherited.
+    _supports_mixed_precision_kv = True
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -1565,6 +1567,13 @@ class KVCacheManagerV2(BaseResourceManager):
             if len(set(self.pp_layers)) != len(self.pp_layers):
                 raise ValueError(f"layer-spec global layer ids must be unique: {self.pp_layers}")
             self.num_layers = max(num_layers, max(self.pp_layers, default=-1) + 1)
+        # Draft layers appended to this manager keep a plain cache.
+        self._first_spec_layer_id: Optional[int] = None
+        if layer_mask is None and spec_config is not None:
+            from tensorrt_llm._torch.speculative import get_num_spec_layers
+
+            if get_num_spec_layers(spec_config) > 0:
+                self._first_spec_layer_id = num_layers
         self.is_draft = is_draft
         self._legacy_draft_layer_ids = {
             global_layer_id
@@ -3529,11 +3538,10 @@ class KVCacheManagerV2(BaseResourceManager):
         mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
         if mixed is None:
             return
-        # Managers with their own pools (hybrid, sparse) are not wired up yet.
-        if type(self) is not KVCacheManagerV2:
+        if not type(self).__dict__.get("_supports_mixed_precision_kv", False):
             raise NotImplementedError(
-                f"kv_cache_config.dtype={kv_cache_config.dtype!r} is only supported by the "
-                f"standard KV cache manager, not {type(self).__name__}"
+                f"kv_cache_config.dtype={kv_cache_config.dtype!r} is not supported by "
+                f"{type(self).__name__}"
             )
         self.first_n, self.last_n = mixed.first_n, mixed.last_n
         if torch.cuda.get_device_capability()[0] not in (10, 12):
@@ -3559,11 +3567,13 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
         """Whether this local layer stores its history in the low-precision pool."""
+        layer_id = self.pp_layers[local_layer_idx]
         return (
             self.low_precision_dtype is not None
             and self.num_kv_heads_per_layer[local_layer_idx] > 0
             and self.max_attention_window_vec[local_layer_idx] is None
-            and self.pp_layers[local_layer_idx] not in self._shared_kv_layers
+            and layer_id not in self._shared_kv_layers
+            and (self._first_spec_layer_id is None or layer_id < self._first_spec_layer_id)
         )
 
     def _mixed_precision_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:

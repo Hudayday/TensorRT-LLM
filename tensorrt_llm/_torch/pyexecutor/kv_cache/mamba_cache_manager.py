@@ -3147,6 +3147,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # Set per instance on a disaggregated context server of a KDA model.
     kda_context_only = False
 
+    # Mixed-precision KV: the retained-token group is appended like any attention group.
+    _supports_mixed_precision_kv = True
+
     def _disagg_transfer_overwrites_whole_cached_prefix(self) -> bool:
         # The incoming recurrent state overwrites the whole local slot and summarizes the
         # complete prefix, so none of those tokens count as a local cache hit.
@@ -4031,7 +4034,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         )
 
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
-        return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
+        # Layer ids past the local layers are appended attention groups, not recurrent state.
+        return (local_layer_idx < len(self.pp_layers)
+                and self._mamba_layer_mask[self.pp_layers[local_layer_idx]])
 
     def _get_pool_roles(self,
                         pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
@@ -4495,11 +4500,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def get_buffers(self,
                     layer_idx: int,
-                    kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+                    kv_layout: str = "NHD",
+                    **kwargs) -> Optional[torch.Tensor]:
         local_layer_idx = self.layer_offsets[layer_idx]
         if self._is_local_mamba_layer(local_layer_idx):
             return None
-        return super().get_buffers(layer_idx, kv_layout)
+        return super().get_buffers(layer_idx, kv_layout, **kwargs)
 
     def _iter_cache_buffers_for_invalid_check(
             self) -> Iterable[Tuple[int, torch.Tensor]]:

@@ -403,7 +403,9 @@ class AttentionMetadata:
             self, layer_idx: int) -> Optional["MixedPrecisionKVStaging"]:
         """Return the staging cache of a mixed-precision layer, else None."""
         staging = self.mixed_precision_staging
-        if staging is None or layer_idx not in staging.pools:
+        if (staging is None or layer_idx not in staging.pools
+                or staging.manager is not self.kv_cache_manager):
+            # Draft layers keep a plain cache on their own manager: no staging for them.
             return None
         return staging
 
