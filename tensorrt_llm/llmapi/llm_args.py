@@ -7173,10 +7173,6 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "Mixed-precision KV supports the TRTLLM and FLASHINFER attention "
                 f"backends; got attn_backend={self.attn_backend!r}.")
-        if self.sparse_attention_config is not None:
-            raise ValueError(
-                "Mixed-precision KV is not supported together with sparse attention."
-            )
         # The connector layout maps every cache layer to one model layer; the
         # retained-token layers break that mapping.
         if self.kv_connector_config is not None:

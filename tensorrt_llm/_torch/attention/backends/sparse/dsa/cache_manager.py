@@ -390,6 +390,9 @@ class DSACacheManager(KVCacheManager):
 class DSACacheManagerV2(KVCacheManagerV2):
     """KVCacheManagerV2-backed cache manager with a DSA indexer K-cache."""
 
+    # Mixed-precision KV: the NVFP4 pool stays low precision; retained twins are plain FP8 groups.
+    _supports_mixed_precision_kv = True
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,

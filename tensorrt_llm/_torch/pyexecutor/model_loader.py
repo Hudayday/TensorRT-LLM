@@ -178,6 +178,11 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     # PyTorch configuration quantization
     valid_pyt_quant = bool(pyt_kv_cache_dtype in _VALID_KV_CACHE_DTYPES)
     mapped_pyt_quant = _KV_CACHE_MAP.get(pyt_kv_cache_dtype, None)
+    if (pyt_kv_cache_dtype.startswith("mixed_")
+            and getattr(model_config.sparse_attention_config, "algorithm",
+                        None) in ("dsa", "deepseek_v4")):
+        # Native NVFP4 pools: the retained tokens are overlaid after the top-k gather.
+        mapped_pyt_quant = QuantAlgo.NVFP4.value
 
     effective_kv_cache_quant = (kv_cache_quant if pyt_kv_cache_dtype == "auto"
                                 else mapped_pyt_quant)

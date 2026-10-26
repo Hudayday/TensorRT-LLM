@@ -307,6 +307,20 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self._compress_ratios_sorted
             if is_compress_layer(compress_ratio)
         }
+        # Mixed-precision KV: page table of the retained twins, -1 where a page is not retained.
+        self.mixed_high_block_table = None
+        if getattr(self.kv_cache_manager, "high_layers", None):
+            # Twins of the two compression ratios have different page sizes and pools.
+            self.mixed_high_block_table = {
+                compress_ratio: self.get_empty(
+                    self.cuda_graph_buffers,
+                    compress_block_table_shape,
+                    cache_name=f"mixed_high_block_table_{compress_ratio}",
+                    dtype=torch.int32,
+                    capture_graph=capture_graph,
+                )
+                for compress_ratio in self.compress_block_tables
+            }
         self._init_sparse_offload_state()
 
         # sparse_mla_topk_lens: actual token count per token for each compress_ratio (SWA + compressed)
@@ -518,6 +532,29 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 num_contexts=self.num_contexts,
                 num_seqs=self.num_seqs,
             )
+        high_tables = getattr(self, "mixed_high_block_table", None)
+        if high_tables and self.kv_cache_manager.high_layers:
+            manager = self.kv_cache_manager
+            for compress_ratio, high_table in high_tables.items():
+                # Any twin of this ratio: all of them share one pool and page scale.
+                layer_idx = next(
+                    (
+                        manager.pp_layers[local]
+                        for local in manager.high_layers
+                        if manager._compress_ratios[manager.pp_layers[local]] == compress_ratio
+                    ),
+                    None,
+                )
+                if layer_idx is None:
+                    continue
+                table = torch.full(
+                    (self.num_seqs, high_table.shape[1]),
+                    -1,
+                    dtype=torch.int32,
+                    pin_memory=prefer_pinned(),
+                )
+                manager.fill_retained_page_table(self.request_ids, layer_idx, table.numpy())
+                high_table[: self.num_seqs].copy_(table, non_blocking=True)
 
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
         """Prepare SWA/compressed local indices and sparse_mla_topk_lens."""
@@ -752,6 +789,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             )
         if state is not None:
             state.is_prefill = True
+
+    def _has_mixed_precision_kv(self) -> bool:
+        # No staging: the gather's FP8 scratch already is one; retained rows are overlaid onto it.
+        return False
 
     def prepare(self) -> None:
         self._validate_ragged_verification()

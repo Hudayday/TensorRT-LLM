@@ -679,7 +679,6 @@ def test_mixed_precision_public_options():
             "use_kv_cache_manager_v2=True",
         ),
         ({"attn_backend": "vanilla"}, ValueError, "TRTLLM and FLASHINFER"),
-        ({"sparse_attention_config": {"algorithm": "rocket"}}, ValueError, "sparse"),
         (
             {
                 "kv_connector_config": {
@@ -703,7 +702,7 @@ def test_mixed_precision_public_options():
         ),
         ({"max_beam_width": 2}, ValueError, "single-beam"),
     ],
-    ids=("v1", "auto_v2", "backend", "sparse", "connector", "speculative", "compression", "beam"),
+    ids=("v1", "auto_v2", "backend", "connector", "speculative", "compression", "beam"),
 )
 @pytest.mark.cpu_only
 def test_mixed_precision_llm_args_validation(overrides, error, match):

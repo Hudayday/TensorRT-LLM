@@ -1461,6 +1461,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # _init_mixed_precision assigns fresh per-instance values.
     low_precision_dtype: Optional[DataType] = None
     high_layers: dict[int, int] = {}
+    retained_dtype: Optional[DataType] = None
+    # Set by each manager class that hosts retained-token twins; not inherited.
+    _supports_mixed_precision_kv = True
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -2063,6 +2066,9 @@ class KVCacheManagerV2(BaseResourceManager):
         assert candidate is not None
         self.kv_cache_manager_py_config = config
         self.impl = candidate
+        # Zero the retained pools: never-written rows must not read as FP8 NaN.
+        for local in self.high_layers:
+            self._get_mixed_precision_buffers(local, "NHD", "high").zero_()
         self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
@@ -2586,6 +2592,9 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_block_scale_role(self, role_a: DataRole, layer_id: int) -> Optional[DataRole]:
         """Select block scales for a role and local layer in the pool mapping."""
         if self._get_layer_dtype_by_local_id(layer_id) != DataType.NVFP4 or role_a != Role.KEY:
+            return None
+        # Retained-token twins hold plain rows without block scales.
+        if int(layer_id) in self.high_layers.values():
             return None
         return Role.KEY_BLOCK_SCALE
 
@@ -3519,6 +3528,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Local layer id -> layer id of its retained-token (high-precision) twin.
         self.high_layers: dict[int, int] = {}
         self.low_precision_dtype: Optional[DataType] = None
+        self.retained_dtype: Optional[DataType] = None
         self.first_n = self.last_n = 0
         # The engine's sequence capacity. KV estimation lowers self.max_seq_len
         # to fit the temporary cache; the attention staging copy is sized from
@@ -3529,18 +3539,18 @@ class KVCacheManagerV2(BaseResourceManager):
         mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
         if mixed is None:
             return
-        # Managers with their own pools (hybrid, sparse) are not wired up yet.
-        if type(self) is not KVCacheManagerV2:
+        if not type(self).__dict__.get("_supports_mixed_precision_kv", False):
             raise NotImplementedError(
-                f"kv_cache_config.dtype={kv_cache_config.dtype!r} is only supported by the "
-                f"standard KV cache manager, not {type(self).__name__}"
+                f"kv_cache_config.dtype={kv_cache_config.dtype!r} is not supported by "
+                f"{type(self).__name__}"
             )
         self.first_n, self.last_n = mixed.first_n, mixed.last_n
         if torch.cuda.get_device_capability()[0] not in (10, 12):
             raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")
         self.low_precision_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
-        retained_dtype = str_dtype_to_binding(mixed.high)
-        if dtype != retained_dtype:
+        self.retained_dtype = str_dtype_to_binding(mixed.high)
+        # Native NVFP4 pools (sparse MLA) stay the low-precision pool; twins use mixed.high.
+        if dtype != self.retained_dtype and dtype != DataType.NVFP4:
             raise ValueError(
                 f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the retained tokens in "
                 f"{mixed.high}, but the model's KV cache dtype resolved to {dtype}."
@@ -3590,8 +3600,8 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         if self.mapping.cp_size != 1:
             raise NotImplementedError("Mixed precision requires CP=1")
-        if self.dtype not in (DataType.HALF, DataType.BF16, DataType.FP8):
-            raise ValueError("Mixed precision requires FP16/BF16/FP8 high KV")
+        if self.dtype not in (DataType.HALF, DataType.BF16, DataType.FP8, DataType.NVFP4):
+            raise ValueError("Mixed precision requires FP16/BF16/FP8/NVFP4 KV")
         layers = list(config.layers)
         # Disaggregated transfer derives collision-free layer ids for the
         # retained-token twins from this (model layer, kind) mapping.
@@ -3613,7 +3623,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.tokens_per_block
                 * self.num_kv_heads_per_layer[layer_id]
                 * self.head_dim_per_layer[layer_id],
-                self.dtype,
+                self.retained_dtype,
             )
             buffers = [
                 BufferConfig(role=buffer.role, size=page_bytes)
@@ -3634,7 +3644,18 @@ class KVCacheManagerV2(BaseResourceManager):
 
         if not self.high_layers:
             return config
-        self._layer_attn_to_layer_id = layer_attn_to_layer_id
+        existing = getattr(self, "_layer_attn_to_layer_id", None)
+        if existing:
+            # A manager with its own (model layer, kind) ids keeps them and gains the twins.
+            existing.update(
+                {
+                    key: value
+                    for key, value in layer_attn_to_layer_id.items()
+                    if key[1] is _MixedPrecisionLayerKind.HIGH_PRECISION
+                }
+            )
+        else:
+            self._layer_attn_to_layer_id = layer_attn_to_layer_id
         # A configured pool_ratio must now cover the appended retained-token
         # group as well; the runtime rejects a mismatched length.
         return replace(config, layers=layers)
@@ -3650,7 +3671,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 // self.num_kv_heads_per_layer[layer_offset]
             )
         else:
-            layer, dtype = self.high_layers[layer_offset], self.dtype
+            layer, dtype = self.high_layers[layer_offset], self.retained_dtype
             width = self.head_dim_per_layer[layer_offset]
         address = self.impl.get_mem_pool_base_address(layer, Role.KEY, PageIndexMode.SHARED)
         shape = [
@@ -3675,18 +3696,26 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         local = self.layer_offsets[layer_idx]
         for role, layer in enumerate((local, self.high_layers[local])):
-            pool_id = int(self.impl.get_layer_group_id(layer))
-            scale = int(self.impl.get_page_index_converter(layer, Role.KEY).scale)
-            for row, req_id in enumerate(request_ids):
-                kv_cache = self.kv_cache_map[req_id]
-                count = min(kv_cache.num_blocks, out.shape[2])
-                base = kv_cache.get_base_page_indices(pool_id)[:count]
-                np.copyto(
-                    out[role, row, :count],
-                    np.where(
-                        base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale // self.kv_factor
-                    ),
-                )
+            self._fill_page_table(layer, request_ids, out[role])
+
+    def _fill_page_table(self, layer: int, request_ids: List[int], out: np.ndarray) -> None:
+        """Write the ``(batch, pages)`` page table of one manager layer into ``out``."""
+        pool_id = int(self.impl.get_layer_group_id(layer))
+        scale = int(self.impl.get_page_index_converter(layer, Role.KEY).scale)
+        for row, req_id in enumerate(request_ids):
+            kv_cache = self.kv_cache_map[req_id]
+            count = min(kv_cache.num_blocks, out.shape[1])
+            base = kv_cache.get_base_page_indices(pool_id)[:count]
+            np.copyto(
+                out[row, :count],
+                np.where(base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale // self.kv_factor),
+            )
+
+    def fill_retained_page_table(
+        self, request_ids: List[int], layer_idx: int, out: np.ndarray
+    ) -> None:
+        """Write the ``(batch, pages)`` page table of ``layer_idx``'s retained-token twin."""
+        self._fill_page_table(self.high_layers[self.layer_offsets[layer_idx]], request_ids, out)
 
     def get_mixed_precision_page_tables(
         self, request_ids: List[int], layer_idx: int
@@ -6817,7 +6846,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 return layer.bytes_per_token()
             return layer.bytes_per_token(data_role)
 
-        if self._is_mixed_precision_layer(local_layer_idx):
+        # A native NVFP4 pool keeps its row format; the inline codec only replaces FP16/BF16/FP8.
+        if self._is_mixed_precision_layer(local_layer_idx) and self.dtype != DataType.NVFP4:
             return self._mixed_precision_layer_bytes_per_token(local_layer_idx, data_role)
         if self.dtype not in (
             DataType.FP8,
