@@ -2324,7 +2324,7 @@ TypedVec<LifeCycleId, KvCache::TakenPage> KvCache::_takeUncommittedPage(
 // calls _onStopCommitting() — callers do not need post-call cleanup.
 // ---------------------------------------------------------------------------
 
-void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
+void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm, bool preserveFresh)
 {
     TLLM_CHECK_DEBUG(mCommitState == CommitState::ALLOWED);
     TLLM_CHECK_DEBUG(ord == mNumCommittedBlocks);
@@ -2400,7 +2400,7 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
         // Existing block: rebase — reuse existing block's committed pages.
         // Mirrors Python's `elif tree_block.is_full and allow_seq_rebasing and is_full` path.
         std::vector<BatchedLockTarget> reuseTasks;
-        std::vector<LifeCycleId> missingPages;
+        std::vector<std::pair<LifeCycleId, bool>> pagesToCommit;
         std::vector<std::pair<LifeCycleId, BlockPage>> originalPages;
         std::vector<StaleBackup> originalLocks;
         auto restorePages = FuncGuard(
@@ -2429,10 +2429,14 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
             {
                 existingPage = nullptr;
             }
+            auto const* attention = std::get_if<AttnLifeCycle>(&mManager->lifeCycles()[lc]);
+            bool const preserveCurrent = preserveFresh && !blockPageGetPage(bp)->isCommitted() && attention
+                && !attention->windowSize.has_value() && !attention->isSparse && attention->requiresPrefixCoverage()
+                && existingPage != nullptr;
             bool isLocked = std::holds_alternative<SharedPageLock>(bp);
-            if (existingPage == nullptr)
+            if (existingPage == nullptr || preserveCurrent)
             {
-                missingPages.push_back(lc);
+                pagesToCommit.emplace_back(lc, !preserveCurrent);
             }
             else
             {
@@ -2462,8 +2466,8 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
                 _offloadSparseHistory({ord, ord + 1}, mHistoryLength);
         }
         restorePages.cancel();
-        // Publish missing lifecycle pages only after migrations and offload can no longer fail.
-        for (LifeCycleId lc : missingPages)
+        // Finalize fresh pages only after migrations and offload can no longer fail.
+        for (auto const& [lc, attachToBlock] : pagesToCommit)
         {
             auto& bp = sb.pages[kDefaultBeamIndex][lc];
             auto up = dynamicPointerCast<UncommittedPage>(blockPageGetPage(bp));
@@ -2471,8 +2475,8 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
                 continue;
             bool const isLocked = std::holds_alternative<SharedPageLock>(bp);
             bp = std::monostate{};
-            auto committed = up->convertToCommitted(newBlock, finishEvent(), numTokens);
-            if (newBlock->eventSink)
+            auto committed = up->convertToCommitted(newBlock, finishEvent(), numTokens, attachToBlock);
+            if (attachToBlock && newBlock->eventSink)
                 newBlock->eventSink->addStoredLifeCycle(*newBlock, lc);
             bp = isLocked ? BlockPage{committed->lock(*this, kDefaultBeamIndex, BlockOrdinal{ord}, lc)}
                           : BlockPage{committed->hold()};
@@ -2542,11 +2546,15 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
 // commit
 // ---------------------------------------------------------------------------
 
-void KvCache::commit(TokenSpan tokens, bool isEnd)
+void KvCache::commit(TokenSpan tokens, bool isEnd, int preserveFirstN, int preserveLastN)
 {
     KVCM2_API_GUARD();
     TLLM_CHECK(isActive());
     auto const apiLock = mManager->lockExclusive();
+    if (preserveFirstN < 0 || preserveLastN < 0)
+    {
+        throw std::invalid_argument("Preserved first/last token counts must be nonnegative");
+    }
     if (tokens.size() == 0)
     {
         if (isEnd)
@@ -2604,10 +2612,17 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
         // Wrapped in recordEventScope() so SharedPageLock::unlock() shares one finish
         // event (mirrors Python's `with self._record_event()`).
         auto scope = recordEventScope();
+        HalfOpenRange<BlockOrdinal> const preserveFirst{
+            BlockOrdinal{0}, BlockOrdinal{divUp(std::min(preserveFirstN, numCommitted), mTokensPerBlock)}};
+        HalfOpenRange<BlockOrdinal> const preserveLast{
+            BlockOrdinal{(numCommitted - std::min(preserveLastN, numCommitted)) / mTokensPerBlock},
+            BlockOrdinal{divUp(numCommitted, mTokensPerBlock)}};
         for (int ordinal = numCommittedBlocksBefore; ordinal < newNumFullBlocks; ++ordinal)
         {
             bool const commitSsm = commitMinSnapshot && ssmLcId.has_value() && ordinal == ssmSnapshotOrdinal;
-            _commitBlock(ordinal, /*isLast=*/false, commitSsm, /*moveSsm=*/isEnd);
+            bool const preserveFresh
+                = preserveFirst.contains(BlockOrdinal{ordinal}) || preserveLast.contains(BlockOrdinal{ordinal});
+            _commitBlock(ordinal, /*isLast=*/false, commitSsm, /*moveSsm=*/isEnd, preserveFresh);
             // _commitBlock transitions to USER_STOP on VIRTUAL_STOP internally.
             if (mCommitState != CommitState::ALLOWED)
                 break;

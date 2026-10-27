@@ -239,12 +239,12 @@ UncommittedPage::~UncommittedPage()
 }
 
 SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
-    SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock)
+    SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock, bool attachToBlock)
 {
     TLLM_CHECK_DEBUG(!scheduledForEviction());
     // Check before building: replacePage() below drops the superseded page, so a failure
     // in between must not lose a usable snapshot.
-    TLLM_CHECK_DEBUG_WITH_INFO(blk->canReplacePage(lifeCycle, numTokensInBlock),
+    TLLM_CHECK_DEBUG_WITH_INFO(!attachToBlock || blk->canReplacePage(lifeCycle, numTokensInBlock),
         "Block slot for this lifecycle already has a page covering more tokens");
     TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE, "Release holder/lock before converting");
 
@@ -255,6 +255,10 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     auto const committedPriority = isSsm ? kvCache->getPriority(blk->ordinal(), lifeCycle) : priority();
     auto committed
         = makeShared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, numTokensInBlock, committedPriority);
+    if (!attachToBlock)
+    {
+        committed->block = nullptr;
+    }
     if (isSsm)
     {
         auto const retention = kvCache->getRetention(blk->ordinal());
@@ -273,8 +277,10 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     TLLM_CHECK_DEBUG(!hasValidSlot() && readyEvent.isClosed());
     TLLM_CHECK_DEBUG_WITH_INFO(committed->hasValidSlot(), "committed page must have a valid slot after transfer");
 
-    // Register in block storage.
-    blk->replacePage(lifeCycle, committed.get());
+    if (attachToBlock)
+    {
+        blk->replacePage(lifeCycle, committed.get());
+    }
 
     return committed;
 }

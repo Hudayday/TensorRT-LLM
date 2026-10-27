@@ -1995,7 +1995,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def(
             "commit",
-            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd)
+            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd,
+                int preserveFirstN, int preserveLastN)
             {
                 // An empty token list with is_end=True must still stop committing, so we do not
                 // early-return on empty; commit() handles it. beam_search_indices is only
@@ -2014,11 +2015,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         TLLM_CHECK_WITH_INFO(!(self.textOnly() && !knownNoDigest),
                             "commit() received a digest token on a text_only sequence — hashing would be corrupted");
                         nb::gil_scoped_release release;
-                        self.commit(view, isEnd);
+                        self.commit(view, isEnd, preserveFirstN, preserveLastN);
                     });
             },
             nb::arg("accepted_input_tokens"), nb::arg("beam_search_indices").none() = nb::none(),
-            nb::arg("is_end") = false)
+            nb::arg("is_end") = false, nb::kw_only(), nb::arg("preserve_first_n") = 0, nb::arg("preserve_last_n") = 0)
         .def("stop_committing", &kv::KvCache::stopCommitting, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_base_page_indices",

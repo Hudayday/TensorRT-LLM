@@ -841,6 +841,65 @@ class TestStorageStatistics(TestKVCacheManagerV2):
 
 
 class TestNoBatching(TestKVCacheManagerV2):
+    @parameterized.expand([(0, 0), (1, 1)])
+    def test_commit_preserves_fresh_boundary_pages(self, first_n: int, last_n: int) -> None:
+        """Retaining fresh pages does not replace the shared canonical values."""
+        self.prepare(4 << 20, 0, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=4096)
+        tokens = [TokenId(i) for i in range(12)]
+        fresh = [TokenId(i + 100) for i in range(12)]
+        group = self.manager.get_layer_group_id(LayerId(0))
+        preserve = first_n > 0 or last_n > 0
+
+        with TemporaryCudaStream([]) as stream:
+            canonical = self.manager.create_kv_cache(input_tokens=tokens)
+            current = self.manager.create_kv_cache(input_tokens=tokens)
+            try:
+                for cache in (canonical, current):
+                    self.assertTrue(cache.resume(stream.handle))
+                    # The protected tail ends at the committed tokens, not capacity.
+                    self.assertTrue(cache.resize(16))
+                self.engine.execute(
+                    [Step(canonical, tokens, []), Step(current, fresh, [])], stream.handle
+                )
+                canonical.commit(tokens)
+                canonical_pages = list(canonical.get_base_page_indices(group))[:3]
+                fresh_pages = list(current.get_base_page_indices(group))[:3]
+                if preserve:
+                    current.commit(tokens, preserve_first_n=first_n, preserve_last_n=last_n)
+                else:
+                    current.commit(tokens)
+                expected = fresh[:4] + tokens[4:8] + fresh[8:] if preserve else tokens
+                expected_pages = (
+                    [fresh_pages[0], canonical_pages[1], fresh_pages[2]]
+                    if preserve
+                    else canonical_pages
+                )
+                self.assertEqual(list(current.get_base_page_indices(group))[:3], expected_pages)
+                self.assertEqual(
+                    [
+                        _introspection.committed_page_is_linked(current, ordinal, group)
+                        for ordinal in range(3)
+                    ],
+                    [not preserve, True, not preserve],
+                )
+                self.engine.execute([Step(current, [], expected)], stream.handle)
+                current.suspend()
+                self.assertTrue(current.resume(stream.handle))
+                self.engine.execute([Step(current, [], expected)], stream.handle)
+            finally:
+                current.close()
+                canonical.close()
+
+            reused = self.manager.create_kv_cache(input_tokens=tokens)
+            try:
+                self.assertEqual(reused.num_committed_tokens, len(tokens))
+                self.assertTrue(reused.resume(stream.handle))
+                self.assertEqual(list(reused.get_base_page_indices(group)), canonical_pages)
+                self.engine.execute([Step(reused, [], tokens)], stream.handle)
+            finally:
+                reused.close()
+        stream.take_finish_event().synchronize()
+
     def test_side_stream_waits_for_a_busy_recycled_slot(self) -> None:
         """A full pool hands out a slot its previous owner's stream still writes.
 

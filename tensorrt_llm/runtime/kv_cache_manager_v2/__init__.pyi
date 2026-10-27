@@ -658,6 +658,9 @@ class _KVCache:
         accepted_input_tokens: Sequence[TokenIdExt],
         beam_search_indices: Sequence[int] | None = None,
         is_end: bool = False,
+        *,
+        preserve_first_n: int = 0,
+        preserve_last_n: int = 0,
     ) -> None: ...
     @property
     def num_committed_tokens(self) -> int: ...

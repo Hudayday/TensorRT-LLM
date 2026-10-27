@@ -345,7 +345,9 @@ public:
     // This is a terminal-memory contract: callers must not perform later writes
     // to this KvCache's memory. The final live pages may be moved into the radix
     // tree instead of copied (SSM state and the last partial block).
-    void commit(TokenSpan tokens, bool isEnd = false);
+    // Preserve fresh full dense pages intersecting the first/last token ranges at this
+    // commit's token endpoint. The pages remain request-local until release.
+    void commit(TokenSpan tokens, bool isEnd = false, int preserveFirstN = 0, int preserveLastN = 0);
 
     // Stop committing (called by close() automatically).
     void stopCommitting();
@@ -713,7 +715,7 @@ private:
     // `commitSsm` snapshots the current SSM state for this block; `moveSsm`
     // moves (vs copies) the live SSM page into the tree (caller must guarantee
     // no later writes to this KvCache's memory). Mirrors Python's _commit_block.
-    void _commitBlock(int ord, bool isLast, bool commitSsm = false, bool moveSsm = false);
+    void _commitBlock(int ord, bool isLast, bool commitSsm = false, bool moveSsm = false, bool preserveFresh = false);
 
     // Re-attach committed tree blocks of ours that the tail-prune walk detached while we
     // still referenced them (triggered by evicting an unheld SSM snapshot). Relinks the

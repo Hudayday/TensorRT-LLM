@@ -168,13 +168,13 @@ public:
         return false;
     }
 
-    // Convert this UncommittedPage into a CommittedPage and attach to `block`.
+    // Convert this UncommittedPage into a CommittedPage, optionally attaching to `block`.
     // The UncommittedPage becomes invalid (slot transferred to CommittedPage).
     //
     // `numTokensInBlock` records the page's token count. See
     // CommittedPage::numTokensInBlock for its attention and SSM interpretations.
     SharedPtr<CommittedPage> convertToCommitted(
-        SharedPtr<Block> block, CachedCudaEvent readyEvent, int numTokensInBlock);
+        SharedPtr<Block> block, CachedCudaEvent readyEvent, int numTokensInBlock, bool attachToBlock = true);
 };
 
 // ---------------------------------------------------------------------------
