@@ -1212,6 +1212,32 @@ def test_oversized_prompt_rejected_with_inflated_max_seq_len():
     assert len(result[0].outputs[0].text) > 0
 
 
+def test_prompt_longer_than_kv_cache_rejected():
+    """A prompt within max_seq_len that the KV cache cannot hold is rejected gracefully.
+
+    The V2 KV cache manager shortens its max_seq_len to what its pools hold and
+    sizes its page tables to it. Admission control must use that length.
+    Otherwise the prompt fails its first KV cache resize and crashes the event
+    loop.
+    """
+    llm = LLM(
+        model=llama_model_path,
+        max_seq_len=1024,
+        max_batch_size=1,
+        max_num_tokens=1024,
+        kv_cache_config=KvCacheConfig(max_tokens=256, enable_block_reuse=False),
+    )
+
+    with pytest.raises(RequestError):
+        llm.generate([[1] * 512], sampling_params=SamplingParams(max_tokens=1))
+
+    # Executor must still be alive
+    result = llm.generate(["Hello"],
+                          sampling_params=SamplingParams(max_tokens=5))
+    assert len(result) == 1
+    assert len(result[0].outputs[0].text) > 0
+
+
 def test_llm_shutdown_executor():
     llm = LLM(
         model=llama_model_path,

@@ -626,6 +626,24 @@ def _create_py_executor_impl(
     return py_executor
 
 
+def _admitted_max_seq_len(
+    kv_cache_creator: Optional[KvCacheCreator],
+    net_max_seq_len: int,
+    model_engine_max_seq_len: int,
+) -> int:
+    """Longest request the executor admits.
+
+    The V2 KV cache manager shortens its max_seq_len to what its pools hold and
+    sizes its page tables to it, so a longer request would fail its first resize
+    and stop the executor loop. Admit up to that length less the
+    speculative-decoding tokens it was given on top.
+    """
+    if kv_cache_creator is None or not kv_cache_creator._is_kv_cache_manager_v2:
+        return net_max_seq_len
+    spec_tokens = model_engine_max_seq_len - net_max_seq_len
+    return min(net_max_seq_len, kv_cache_creator._max_seq_len - spec_tokens)
+
+
 def _create_py_executor(
     llm_args: TorchLlmArgs,
     _startup_timer: _StartupTimer,
@@ -1420,7 +1438,10 @@ def _create_py_executor(
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
             resource_governor_queue=resource_governor_queue,
-            max_seq_len=net_max_seq_len,
+            max_seq_len=(net_max_seq_len
+                         if estimating_kv_cache else _admitted_max_seq_len(
+                             kv_cache_creator, net_max_seq_len,
+                             model_engine_max_seq_len)),
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             max_num_tokens=max_num_tokens,
@@ -1487,7 +1508,9 @@ def _create_py_executor(
                     model_engine=model_engine,
                     lora_config=lora_config,
                     kv_connector_manager=kv_connector_manager,
-                    max_seq_len=net_max_seq_len,
+                    max_seq_len=_admitted_max_seq_len(kv_cache_creator,
+                                                      net_max_seq_len,
+                                                      model_engine_max_seq_len),
                     max_batch_size=max_batch_size,
                     max_beam_width=max_beam_width,
                     max_num_tokens=max_num_tokens,
